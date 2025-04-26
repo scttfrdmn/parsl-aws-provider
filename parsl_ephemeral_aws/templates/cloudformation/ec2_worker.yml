@@ -1,0 +1,177 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Parsl Ephemeral AWS Provider - EC2 Worker Resources'
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC where resources will be created
+
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: Subnet for worker instances
+
+  SecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: Security group for worker instances
+
+  ImageId:
+    Type: AWS::EC2::Image::Id
+    Description: AMI ID for worker instances
+
+  InstanceType:
+    Type: String
+    Default: 't3.medium'
+    Description: Instance type for worker instances
+
+  KeyName:
+    Type: String
+    Description: SSH key pair name for worker instances
+    Default: ''
+
+  BlockId:
+    Type: String
+    Description: Unique ID for the block
+
+  WorkflowId:
+    Type: String
+    Description: Unique ID for the workflow
+
+  UserData:
+    Type: String
+    Description: Base64 encoded user data script
+    Default: ''
+
+  InstanceProfile:
+    Type: String
+    Description: Instance profile ARN for worker instances
+    Default: ''
+
+  NodesPerBlock:
+    Type: Number
+    Default: 1
+    Description: Number of nodes per block
+    MinValue: 1
+    MaxValue: 10
+
+  UseSpotInstances:
+    Type: String
+    Default: 'false'
+    Description: Whether to use spot instances
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  SpotMaxPrice:
+    Type: String
+    Description: Maximum price for spot instances (empty for on-demand price)
+    Default: ''
+
+  Tags:
+    Type: String
+    Description: JSON encoded tags to apply to resources
+    Default: '{}'
+
+Conditions:
+  HasKeyName: !Not [!Equals [!Ref KeyName, '']]
+  HasUserData: !Not [!Equals [!Ref UserData, '']]
+  HasInstanceProfile: !Not [!Equals [!Ref InstanceProfile, '']]
+  UseSpot: !Equals [!Ref UseSpotInstances, 'true']
+  HasSpotMaxPrice: !Not [!Equals [!Ref SpotMaxPrice, '']]
+
+Resources:
+  WorkerNodeLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub 'parsl-worker-${WorkflowId}-${BlockId}'
+      VersionDescription: !Sub 'Launch template for Parsl worker nodes in workflow ${WorkflowId}, block ${BlockId}'
+      LaunchTemplateData:
+        ImageId: !Ref ImageId
+        InstanceType: !Ref InstanceType
+        KeyName: !If [HasKeyName, !Ref KeyName, !Ref 'AWS::NoValue']
+        UserData: !If [HasUserData, !Ref UserData, !Ref 'AWS::NoValue']
+        SecurityGroupIds:
+          - !Ref SecurityGroupId
+        IamInstanceProfile:
+          Arn: !If [HasInstanceProfile, !Ref InstanceProfile, !Ref 'AWS::NoValue']
+        Monitoring:
+          Enabled: true
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: !Sub 'parsl-worker-${WorkflowId}-${BlockId}'
+              - Key: ParslResource
+                Value: 'true'
+              - Key: ParslWorkflowId
+                Value: !Ref WorkflowId
+              - Key: ParslBlockId
+                Value: !Ref BlockId
+              - Key: ParslResourceType
+                Value: 'worker'
+
+  WorkerNodes:
+    Type: AWS::EC2::Instance
+    Condition: !Not [!Condition UseSpot]
+    # Using Fn::Cidr to create a count loop
+    Count: !Ref NodesPerBlock
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref WorkerNodeLaunchTemplate
+        Version: !GetAtt WorkerNodeLaunchTemplate.LatestVersionNumber
+      SubnetId: !Ref SubnetId
+      Tags:
+        - Key: Name
+          Value: !Sub 'parsl-worker-${WorkflowId}-${BlockId}-${!Count.Index}'
+        - Key: ParslResource
+          Value: 'true'
+        - Key: ParslWorkflowId
+          Value: !Ref WorkflowId
+        - Key: ParslBlockId
+          Value: !Ref BlockId
+        - Key: ParslNodeIndex
+          Value: !Ref 'Count.Index'
+
+  SpotFleetRole:
+    Type: AWS::IAM::Role
+    Condition: UseSpot
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: spotfleet.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonEC2SpotFleetTaggingRole
+
+  SpotWorkerNodes:
+    Type: AWS::EC2::SpotFleet
+    Condition: UseSpot
+    Properties:
+      SpotFleetRequestConfigData:
+        IamFleetRole: !GetAtt SpotFleetRole.Arn
+        AllocationStrategy: lowestPrice
+        TargetCapacity: !Ref NodesPerBlock
+        SpotPrice: !If [HasSpotMaxPrice, !Ref SpotMaxPrice, !Ref 'AWS::NoValue']
+        TerminateInstancesWithExpiration: true
+        Type: maintain
+        LaunchTemplateConfigs:
+          - LaunchTemplateSpecification:
+              LaunchTemplateId: !Ref WorkerNodeLaunchTemplate
+              Version: !GetAtt WorkerNodeLaunchTemplate.LatestVersionNumber
+            Overrides:
+              - SubnetId: !Ref SubnetId
+
+Outputs:
+  LaunchTemplateId:
+    Description: ID of the launch template
+    Value: !Ref WorkerNodeLaunchTemplate
+
+  WorkerNodesId:
+    Description: IDs of the worker nodes
+    Value: !If [UseSpot, !Ref SpotWorkerNodes, !Join [',', !Ref WorkerNodes]]
+
+  BlockId:
+    Description: Block ID
+    Value: !Ref BlockId

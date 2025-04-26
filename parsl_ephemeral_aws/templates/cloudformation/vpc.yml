@@ -1,0 +1,175 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Parsl Ephemeral AWS Provider - VPC Network Resources'
+
+Parameters:
+  VpcCidr:
+    Type: String
+    Description: CIDR block for the VPC
+    Default: '10.0.0.0/16'
+    AllowedPattern: '^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/([0-9]|[1-2][0-9]|3[0-2]))$'
+
+  SubnetCidr:
+    Type: String
+    Description: CIDR block for the subnet
+    Default: '10.0.0.0/24'
+    AllowedPattern: '^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/([0-9]|[1-2][0-9]|3[0-2]))$'
+
+  AvailabilityZone:
+    Type: AWS::EC2::AvailabilityZone::Name
+    Description: Availability Zone for the subnet
+    Default: ''
+
+  UsePublicIps:
+    Type: String
+    Description: Whether to assign public IPs to instances
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  WorkflowId:
+    Type: String
+    Description: Unique ID for the workflow
+
+  Tags:
+    Type: String
+    Description: JSON encoded tags to apply to resources
+    Default: '{}'
+
+Conditions:
+  AssignPublicIp: !Equals [!Ref UsePublicIps, 'true']
+  HasAvailabilityZone: !Not [!Equals [!Ref AvailabilityZone, '']]
+
+Resources:
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub 'parsl-vpc-${WorkflowId}'
+        - Key: ParslResource
+          Value: 'true'
+        - Key: ParslWorkflowId
+          Value: !Ref WorkflowId
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub 'parsl-igw-${WorkflowId}'
+        - Key: ParslResource
+          Value: 'true'
+        - Key: ParslWorkflowId
+          Value: !Ref WorkflowId
+
+  VPCGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  Subnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref SubnetCidr
+      AvailabilityZone: !If [HasAvailabilityZone, !Ref AvailabilityZone, !Ref 'AWS::NoValue']
+      MapPublicIpOnLaunch: !If [AssignPublicIp, true, false]
+      Tags:
+        - Key: Name
+          Value: !Sub 'parsl-subnet-${WorkflowId}'
+        - Key: ParslResource
+          Value: 'true'
+        - Key: ParslWorkflowId
+          Value: !Ref WorkflowId
+
+  RouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub 'parsl-rt-${WorkflowId}'
+        - Key: ParslResource
+          Value: 'true'
+        - Key: ParslWorkflowId
+          Value: !Ref WorkflowId
+
+  InternetRoute:
+    Type: AWS::EC2::Route
+    DependsOn: VPCGatewayAttachment
+    Properties:
+      RouteTableId: !Ref RouteTable
+      DestinationCidrBlock: '0.0.0.0/0'
+      GatewayId: !Ref InternetGateway
+
+  SubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref Subnet
+      RouteTableId: !Ref RouteTable
+
+  SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub 'Security group for Parsl workflow ${WorkflowId}'
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: '0.0.0.0/0'
+          Description: 'SSH access'
+        - IpProtocol: tcp
+          FromPort: 54000
+          ToPort: 55000
+          CidrIp: '0.0.0.0/0'
+          Description: 'Parsl communication ports'
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          FromPort: -1
+          ToPort: -1
+          CidrIp: '0.0.0.0/0'
+          Description: 'Allow all outbound traffic'
+      Tags:
+        - Key: Name
+          Value: !Sub 'parsl-sg-${WorkflowId}'
+        - Key: ParslResource
+          Value: 'true'
+        - Key: ParslWorkflowId
+          Value: !Ref WorkflowId
+
+  SecurityGroupSelfIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref SecurityGroup
+      IpProtocol: '-1'
+      FromPort: -1
+      ToPort: -1
+      SourceSecurityGroupId: !Ref SecurityGroup
+      Description: 'Allow all traffic within security group'
+
+Outputs:
+  VpcId:
+    Description: ID of the VPC
+    Value: !Ref VPC
+
+  SubnetId:
+    Description: ID of the subnet
+    Value: !Ref Subnet
+
+  SecurityGroupId:
+    Description: ID of the security group
+    Value: !Ref SecurityGroup
+
+  RouteTableId:
+    Description: ID of the route table
+    Value: !Ref RouteTable
+
+  InternetGatewayId:
+    Description: ID of the internet gateway
+    Value: !Ref InternetGateway

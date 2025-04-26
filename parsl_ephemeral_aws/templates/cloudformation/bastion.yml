@@ -1,0 +1,198 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Parsl Ephemeral AWS Provider - Bastion Host for Detached Mode'
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC where resources will be created
+
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: Subnet for the bastion host
+
+  SecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: Security group for the bastion host
+
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    Description: Instance type for the bastion host
+    AllowedValues:
+      - t3.nano
+      - t3.micro
+      - t3.small
+      - t3.medium
+      - t4g.nano
+      - t4g.micro
+      - t4g.small
+
+  ImageId:
+    Type: AWS::EC2::Image::Id
+    Description: AMI ID for the bastion host
+
+  KeyName:
+    Type: String
+    Description: SSH key pair name for the bastion host
+    Default: ''
+
+  WorkflowId:
+    Type: String
+    Description: Unique ID for the workflow
+
+  UserData:
+    Type: String
+    Description: Base64 encoded user data script
+    Default: ''
+
+  UseSpotInstance:
+    Type: String
+    Default: 'false'
+    Description: Whether to use spot instances
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  SpotMaxPrice:
+    Type: String
+    Description: Maximum price for spot instances (empty for on-demand price)
+    Default: ''
+
+  IdleTimeout:
+    Type: Number
+    Default: 30
+    Description: Minutes to wait before shutting down if idle
+
+  Tags:
+    Type: String
+    Description: JSON encoded tags to apply to resources
+    Default: '{}'
+
+Conditions:
+  HasKeyName: !Not [!Equals [!Ref KeyName, '']]
+  HasUserData: !Not [!Equals [!Ref UserData, '']]
+  UseSpot: !Equals [!Ref UseSpotInstance, 'true']
+  HasSpotMaxPrice: !Not [!Equals [!Ref SpotMaxPrice, '']]
+
+Resources:
+  BastionHostRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: BastionHostPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeInstances
+                  - ec2:DescribeInstanceStatus
+                  - ec2:StartInstances
+                  - ec2:StopInstances
+                  - ec2:TerminateInstances
+                  - ec2:CreateTags
+                  - ec2:DescribeTags
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - ssm:PutParameter
+                  - ssm:GetParameter
+                  - ssm:DeleteParameter
+                Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/parsl/workflows/${WorkflowId}/*'
+      Tags:
+        - Key: ParslResource
+          Value: 'true'
+        - Key: ParslWorkflowId
+          Value: !Ref WorkflowId
+        - Key: Name
+          Value: !Sub 'parsl-bastion-role-${WorkflowId}'
+
+  BastionHostInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref BastionHostRole
+
+  BastionHost:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      ImageId: !Ref ImageId
+      SubnetId: !Ref SubnetId
+      SecurityGroupIds:
+        - !Ref SecurityGroupId
+      IamInstanceProfile: !Ref BastionHostInstanceProfile
+      KeyName: !If [HasKeyName, !Ref KeyName, !Ref 'AWS::NoValue']
+      UserData: !If [HasUserData, !Ref UserData, !Ref 'AWS::NoValue']
+      InstanceInitiatedShutdownBehavior: terminate
+      Monitoring: true
+      Tags:
+        - Key: Name
+          Value: !Sub 'parsl-bastion-${WorkflowId}'
+        - Key: ParslResource
+          Value: 'true'
+        - Key: ParslWorkflowId
+          Value: !Ref WorkflowId
+        - Key: ParslResourceType
+          Value: 'bastion'
+        - Key: ParslIdleTimeout
+          Value: !Ref IdleTimeout
+
+  SpotBastionHost:
+    Type: AWS::EC2::SpotFleet
+    Condition: UseSpot
+    Properties:
+      SpotFleetRequestConfigData:
+        IamFleetRole: !GetAtt BastionHostRole.Arn
+        AllocationStrategy: lowestPrice
+        TargetCapacity: 1
+        SpotPrice: !If [HasSpotMaxPrice, !Ref SpotMaxPrice, !Ref 'AWS::NoValue']
+        TerminateInstancesWithExpiration: true
+        Type: maintain
+        LaunchSpecifications:
+          - InstanceType: !Ref InstanceType
+            ImageId: !Ref ImageId
+            SubnetId: !Ref SubnetId
+            SecurityGroups:
+              - GroupId: !Ref SecurityGroupId
+            IamInstanceProfile:
+              Arn: !GetAtt BastionHostInstanceProfile.Arn
+            KeyName: !If [HasKeyName, !Ref KeyName, !Ref 'AWS::NoValue']
+            UserData: !If [HasUserData, !Ref UserData, !Ref 'AWS::NoValue']
+            Monitoring:
+              Enabled: true
+            TagSpecifications:
+              - ResourceType: instance
+                Tags:
+                  - Key: Name
+                    Value: !Sub 'parsl-bastion-spot-${WorkflowId}'
+                  - Key: ParslResource
+                    Value: 'true'
+                  - Key: ParslWorkflowId
+                    Value: !Ref WorkflowId
+                  - Key: ParslResourceType
+                    Value: 'bastion'
+                  - Key: ParslIdleTimeout
+                    Value: !Ref IdleTimeout
+
+Outputs:
+  BastionHostId:
+    Description: ID of the bastion host
+    Value: !If [UseSpot, !Ref SpotBastionHost, !Ref BastionHost]
+
+  BastionHostRole:
+    Description: IAM role for the bastion host
+    Value: !Ref BastionHostRole
+
+  BastionHostRoleArn:
+    Description: ARN of the IAM role for the bastion host
+    Value: !GetAtt BastionHostRole.Arn

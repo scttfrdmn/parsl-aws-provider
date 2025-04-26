@@ -1,0 +1,153 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Parsl Ephemeral AWS Provider - Lambda Worker Resources'
+
+Parameters:
+  FunctionName:
+    Type: String
+    Description: Name of the Lambda function
+    Default: ''
+
+  Runtime:
+    Type: String
+    Description: Lambda function runtime
+    Default: 'python3.9'
+    AllowedValues:
+      - 'python3.8'
+      - 'python3.9'
+      - 'python3.10'
+      - 'python3.11'
+      - 'python3.12'
+
+  Handler:
+    Type: String
+    Description: Lambda function handler
+    Default: 'handler.main'
+
+  MemorySize:
+    Type: Number
+    Description: Memory size for Lambda function in MB
+    Default: 1024
+    MinValue: 128
+    MaxValue: 10240
+
+  Timeout:
+    Type: Number
+    Description: Timeout for Lambda function in seconds
+    Default: 900
+    MinValue: 1
+    MaxValue: 900
+
+  CodeS3Bucket:
+    Type: String
+    Description: S3 bucket containing Lambda function code
+    Default: ''
+
+  CodeS3Key:
+    Type: String
+    Description: S3 key for Lambda function code
+    Default: ''
+
+  CodeZipContent:
+    Type: String
+    Description: Base64 encoded ZIP file content
+    Default: ''
+
+  VpcId:
+    Type: String
+    Description: VPC ID for Lambda function VPC config
+    Default: ''
+
+  SubnetIds:
+    Type: CommaDelimitedList
+    Description: Subnet IDs for Lambda function VPC config
+    Default: ''
+
+  SecurityGroupIds:
+    Type: CommaDelimitedList
+    Description: Security group IDs for Lambda function VPC config
+    Default: ''
+
+  WorkflowId:
+    Type: String
+    Description: Unique ID for the workflow
+
+  JobId:
+    Type: String
+    Description: Unique ID for the job
+
+  Tags:
+    Type: String
+    Description: JSON encoded tags to apply to resources
+    Default: '{}'
+
+Conditions:
+  HasVpcConfig: !Not [!Equals [!Ref VpcId, '']]
+  HasS3Code: !And 
+    - !Not [!Equals [!Ref CodeS3Bucket, '']]
+    - !Not [!Equals [!Ref CodeS3Key, '']]
+  HasZipCode: !Not [!Equals [!Ref CodeZipContent, '']]
+  HasFunctionName: !Not [!Equals [!Ref FunctionName, '']]
+
+Resources:
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - !If 
+          - HasVpcConfig
+          - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+          - !Ref 'AWS::NoValue'
+      Tags:
+        - Key: ParslResource
+          Value: 'true'
+        - Key: ParslWorkflowId
+          Value: !Ref WorkflowId
+        - Key: ParslJobId
+          Value: !Ref JobId
+
+  LambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !If 
+        - HasFunctionName
+        - !Ref FunctionName
+        - !Sub 'parsl-worker-${WorkflowId}-${JobId}'
+      Runtime: !Ref Runtime
+      Handler: !Ref Handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      MemorySize: !Ref MemorySize
+      Timeout: !Ref Timeout
+      Code:
+        S3Bucket: !If [HasS3Code, !Ref CodeS3Bucket, !Ref 'AWS::NoValue']
+        S3Key: !If [HasS3Code, !Ref CodeS3Key, !Ref 'AWS::NoValue']
+        ZipFile: !If [HasZipCode, !Ref CodeZipContent, !Ref 'AWS::NoValue']
+      VpcConfig: !If 
+        - HasVpcConfig
+        - SubnetIds: !Ref SubnetIds
+          SecurityGroupIds: !Ref SecurityGroupIds
+        - !Ref 'AWS::NoValue'
+      Tags:
+        ParslResource: 'true'
+        ParslWorkflowId: !Ref WorkflowId
+        ParslJobId: !Ref JobId
+
+Outputs:
+  LambdaFunctionName:
+    Description: Name of the Lambda function
+    Value: !Ref LambdaFunction
+
+  LambdaFunctionArn:
+    Description: ARN of the Lambda function
+    Value: !GetAtt LambdaFunction.Arn
+
+  LambdaExecutionRoleArn:
+    Description: ARN of the Lambda execution role
+    Value: !GetAtt LambdaExecutionRole.Arn
