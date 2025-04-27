@@ -39,8 +39,10 @@ This document outlines the next steps for continuing development of the Parsl Ep
   - ✅ Added integration tests for spot interruption handling with LocalStack
   - ✅ Added integration tests for state persistence across operating modes
   - ✅ Added integration tests for error scenarios and recovery
-  - Use LocalStack for local AWS API emulation
-  - Create more test workflow scenarios for each operating mode
+  - ✅ Added integration tests for autoscaling workflows
+  - ✅ Added integration tests for multi-node/MPI workflows
+  - ✅ Added integration tests for provider lifecycle
+  - ✅ Use LocalStack for AWS API emulation
 
 - **BATS Testing**: Add Bash Automated Testing System for shell scripts
   - Set up BATS framework for testing shell scripts
