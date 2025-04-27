@@ -325,6 +325,15 @@ For a complete list of configuration options, see the [Configuration Reference](
 
 ## Examples
 
+The `examples/` directory contains detailed examples for each operating mode:
+
+- [`standard_mode.py`](examples/standard_mode.py) - Direct client-to-worker communication via EC2 instances
+- [`detached_mode.py`](examples/detached_mode.py) - Persistent infrastructure with bastion host for long-running workflows
+- [`serverless_mode.py`](examples/serverless_mode.py) - Lambda and Fargate execution for serverless workloads
+- [`basic_usage.py`](examples/basic_usage.py) - Combined example showing all three modes
+
+Each example includes comprehensive comments explaining mode-specific features and configuration options.
+
 ### Basic Workflow with Auto-Scaling
 
 ```python
