@@ -167,6 +167,7 @@ RESOURCE_TYPE_ROUTE_TABLE = "route_table"
 RESOURCE_TYPE_BASTION = "bastion_host"
 RESOURCE_TYPE_CLUSTER = "ecs_cluster"
 RESOURCE_TYPE_CLOUDFORMATION_STACK = "cloudformation_stack"
+RESOURCE_TYPE_SPOT_FLEET = "spot_fleet"
 
 # Parsl worker environment variables
 WORKER_ENV_VARS = {

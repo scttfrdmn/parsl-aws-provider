@@ -29,6 +29,7 @@ from parsl_ephemeral_aws.constants import (
     RESOURCE_TYPE_SECURITY_GROUP,
     RESOURCE_TYPE_SUBNET,
     RESOURCE_TYPE_VPC,
+    RESOURCE_TYPE_SPOT_FLEET,
     STATUS_CANCELED,
     STATUS_COMPLETED,
     STATUS_FAILED,
@@ -42,8 +43,10 @@ from parsl_ephemeral_aws.exceptions import (
     ResourceCreationError,
     ResourceDeletionError,
     ResourceNotFoundError,
+    SpotFleetError,
 )
 from parsl_ephemeral_aws.modes.base import OperatingMode
+from parsl_ephemeral_aws.compute.spot_fleet import SpotFleetManager
 from parsl_ephemeral_aws.utils.aws import (
     create_tags,
     delete_resource,
@@ -60,7 +63,223 @@ class StandardMode(OperatingMode):
     
     In standard mode, EC2 instances are created for computation with direct
     communication between the client and worker nodes.
+    
+    This mode supports regular EC2 instances, spot instances, and spot fleet
+    requests for more reliable and cost-effective computation.
     """
+    
+    def __init__(
+        self,
+        provider_id: str,
+        session: boto3.Session,
+        state_store: Any,
+        image_id: Optional[str] = None,
+        instance_type: str = "t3.micro",
+        worker_init: str = "",
+        vpc_id: Optional[str] = None,
+        subnet_id: Optional[str] = None,
+        security_group_id: Optional[str] = None,
+        key_name: Optional[str] = None,
+        use_spot: bool = False,
+        spot_max_price: Optional[str] = None,
+        spot_allocation_strategy: str = "capacity-optimized",
+        additional_tags: Optional[Dict[str, str]] = None,
+        auto_shutdown: bool = True,
+        max_idle_time: int = 300,
+        create_vpc: bool = True,
+        use_public_ips: bool = True,
+        custom_ami: bool = False,
+        debug: bool = False,
+        use_spot_fleet: bool = False,
+        instance_types: Optional[List[str]] = None,
+        nodes_per_block: int = 1,
+        spot_max_price_percentage: Optional[int] = None,
+        **kwargs: Any,
+    ) -> None:
+        """Initialize the standard mode.
+        
+        Parameters
+        ----------
+        provider_id : str
+            Unique identifier for the provider instance
+        session : boto3.Session
+            AWS session for API calls
+        state_store : Any
+            Store for persisting state
+        image_id : Optional[str], optional
+            EC2 AMI ID to use for instances, by default None
+        instance_type : str, optional
+            EC2 instance type for compute resources, by default "t3.micro"
+        worker_init : str, optional
+            Script to execute during worker initialization, by default ""
+        vpc_id : Optional[str], optional
+            Existing VPC ID to use, by default None
+        subnet_id : Optional[str], optional
+            Existing subnet ID to use, by default None
+        security_group_id : Optional[str], optional
+            Existing security group ID to use, by default None
+        key_name : Optional[str], optional
+            EC2 key pair name for SSH access, by default None
+        use_spot : bool, optional
+            Whether to use spot instances, by default False
+        spot_max_price : Optional[str], optional
+            Maximum price for spot instances, by default None
+        spot_allocation_strategy : str, optional
+            Allocation strategy for spot instances, by default "capacity-optimized"
+        additional_tags : Optional[Dict[str, str]], optional
+            Tags to apply to created resources, by default None
+        auto_shutdown : bool, optional
+            Whether to automatically shut down idle resources, by default True
+        max_idle_time : int, optional
+            Maximum idle time in seconds before shutdown, by default 300
+        create_vpc : bool, optional
+            Whether to create a new VPC if vpc_id is not provided, by default True
+        use_public_ips : bool, optional
+            Whether to assign public IPs to instances, by default True
+        custom_ami : bool, optional
+            Whether image_id refers to a custom AMI, by default False
+        debug : bool, optional
+            Whether to enable debug logging, by default False
+        use_spot_fleet : bool, optional
+            Whether to use Spot Fleet for spot instances, by default False
+        instance_types : Optional[List[str]], optional
+            List of instance types to use with Spot Fleet, by default None
+        nodes_per_block : int, optional
+            Number of nodes per block, by default 1
+        spot_max_price_percentage : Optional[int], optional
+            Maximum spot price as a percentage of on-demand price, by default None
+        """
+        # Call parent __init__ with standard params
+        super().__init__(
+            provider_id=provider_id,
+            session=session,
+            state_store=state_store,
+            image_id=image_id,
+            instance_type=instance_type,
+            worker_init=worker_init,
+            vpc_id=vpc_id,
+            subnet_id=subnet_id,
+            security_group_id=security_group_id,
+            key_name=key_name,
+            use_spot=use_spot,
+            spot_max_price=spot_max_price,
+            spot_allocation_strategy=spot_allocation_strategy,
+            additional_tags=additional_tags,
+            auto_shutdown=auto_shutdown,
+            max_idle_time=max_idle_time,
+            create_vpc=create_vpc,
+            use_public_ips=use_public_ips,
+            custom_ami=custom_ami,
+            debug=debug,
+            **kwargs,
+        )
+        
+        # Standard mode specific attributes
+        self.use_spot_fleet = use_spot_fleet
+        self.instance_types = instance_types or []
+        self.nodes_per_block = nodes_per_block
+        self.spot_max_price_percentage = spot_max_price_percentage
+        
+        # Initialize SpotFleetManager if using spot fleet
+        self.spot_fleet_manager = None
+        if self.use_spot and self.use_spot_fleet:
+            # Create a simplified provider object for the SpotFleetManager
+            # The SpotFleetManager expects a provider object with certain attributes
+            provider = type('SimpleProvider', (), {
+                'workflow_id': self.provider_id,
+                'region': self.session.region_name,
+                'aws_access_key_id': session._session.get_credentials().access_key,
+                'aws_secret_access_key': session._session.get_credentials().secret_key,
+                'aws_session_token': session._session.get_credentials().token,
+                'aws_profile': None,
+                'vpc_id': self.vpc_id,
+                'subnet_id': self.subnet_id,
+                'security_group_id': self.security_group_id,
+                'image_id': self.image_id,
+                'instance_type': self.instance_type,
+                'instance_types': self.instance_types,
+                'key_name': self.key_name,
+                'use_public_ips': self.use_public_ips,
+                'nodes_per_block': self.nodes_per_block,
+                'spot_max_price_percentage': self.spot_max_price_percentage,
+                'worker_init': self.worker_init,
+                'tags': self.additional_tags,
+            })
+            
+            logger.debug("Initializing SpotFleetManager for StandardMode")
+            self.spot_fleet_manager = SpotFleetManager(provider)
+    
+    def save_state(self) -> None:
+        """Save the current state to the state store."""
+        # Include spot fleet state in the standard state dictionary
+        if self.use_spot_fleet and self.spot_fleet_manager:
+            spot_fleet_state = {
+                "blocks": self.spot_fleet_manager.blocks,
+                "fleet_requests": self.spot_fleet_manager.fleet_requests,
+                "instances": self.spot_fleet_manager.instances,
+                "enabled": True,
+            }
+            
+            # Get the current state
+            state = {
+                "resources": self.resources,
+                "provider_id": self.provider_id,
+                "mode": self.__class__.__name__,
+                "vpc_id": self.vpc_id,
+                "subnet_id": self.subnet_id,
+                "security_group_id": self.security_group_id,
+                "initialized": self.initialized,
+                "use_spot_fleet": self.use_spot_fleet,
+                "spot_fleet_state": spot_fleet_state,
+            }
+            
+            try:
+                self.state_store.save_state(state)
+                logger.debug(f"Saved state including SpotFleetManager with {len(self.spot_fleet_manager.blocks)} blocks")
+            except Exception as e:
+                logger.error(f"Failed to save state: {e}")
+        else:
+            # Call parent implementation if not using spot fleet
+            super().save_state()
+    
+    def load_state(self) -> bool:
+        """Load state from the state store.
+        
+        Returns
+        -------
+        bool
+            True if state was loaded successfully, False otherwise
+        """
+        try:
+            state = self.state_store.load_state()
+            if state and state.get("provider_id") == self.provider_id:
+                self.resources = state.get("resources", {})
+                self.vpc_id = state.get("vpc_id", self.vpc_id)
+                self.subnet_id = state.get("subnet_id", self.subnet_id)
+                self.security_group_id = state.get("security_group_id", self.security_group_id)
+                self.initialized = state.get("initialized", False)
+                
+                # Load SpotFleetManager state if available
+                if (self.use_spot_fleet and self.spot_fleet_manager and 
+                    state.get("use_spot_fleet", False) and state.get("spot_fleet_state")):
+                    
+                    spot_fleet_state = state.get("spot_fleet_state", {})
+                    
+                    if spot_fleet_state.get("blocks"):
+                        self.spot_fleet_manager.blocks = spot_fleet_state.get("blocks", {})
+                    if spot_fleet_state.get("fleet_requests"):
+                        self.spot_fleet_manager.fleet_requests = spot_fleet_state.get("fleet_requests", {})
+                    if spot_fleet_state.get("instances"):
+                        self.spot_fleet_manager.instances = spot_fleet_state.get("instances", {})
+                        
+                    logger.debug(f"Loaded SpotFleetManager state with {len(self.spot_fleet_manager.blocks)} blocks")
+                
+                logger.debug(f"Loaded state with {len(self.resources)} resources")
+                return True
+        except Exception as e:
+            logger.error(f"Failed to load state: {e}")
+        
+        return False
 
     def initialize(self) -> None:
         """Initialize standard mode infrastructure.
@@ -463,8 +682,13 @@ class StandardMode(OperatingMode):
             instance_id = self._create_instance(init_script, job_id, job_name)
             
             # Track the resource
+            resource_type = RESOURCE_TYPE_EC2
+            # Check if this is actually a Spot Fleet block ID
+            if self.use_spot_fleet and self.spot_fleet_manager and instance_id in self.spot_fleet_manager.blocks:
+                resource_type = RESOURCE_TYPE_SPOT_FLEET
+                
             self.resources[instance_id] = {
-                "type": RESOURCE_TYPE_EC2,
+                "type": resource_type,
                 "job_id": job_id,
                 "job_name": job_name or "unnamed",
                 "status": STATUS_PENDING,
@@ -625,13 +849,20 @@ class StandardMode(OperatingMode):
         Returns
         -------
         str
-            EC2 instance ID
+            EC2 instance ID or block ID for spot fleet
         
         Raises
         ------
         ResourceCreationError
             If spot instance creation fails
+        SpotFleetError
+            If spot fleet creation fails
         """
+        # Check if using spot fleet
+        if self.use_spot_fleet and self.spot_fleet_manager:
+            return self._create_spot_fleet_instance(run_args)
+            
+        # Traditional spot instance request
         ec2 = self.session.client("ec2")
         
         # Extract tags
@@ -683,6 +914,84 @@ class StandardMode(OperatingMode):
         except Exception as e:
             logger.error(f"Failed to create spot instance: {e}")
             raise ResourceCreationError(f"Failed to create spot instance: {e}") from e
+    
+    def _create_spot_fleet_instance(self, run_args: Dict[str, Any]) -> str:
+        """Create a spot fleet instance.
+        
+        Parameters
+        ----------
+        run_args : Dict[str, Any]
+            Arguments for EC2 instance creation
+        
+        Returns
+        -------
+        str
+            Block ID for the spot fleet
+        
+        Raises
+        ------
+        SpotFleetError
+            If spot fleet creation fails
+        """
+        if not self.spot_fleet_manager:
+            raise ResourceCreationError("SpotFleetManager not initialized")
+            
+        # Extract job ID from tags
+        job_id = None
+        if "TagSpecifications" in run_args and run_args["TagSpecifications"]:
+            for tag in run_args["TagSpecifications"][0].get("Tags", []):
+                if tag["Key"] == "JobId":
+                    job_id = tag["Value"]
+                    break
+                    
+        if not job_id:
+            job_id = str(uuid.uuid4())
+            
+        # Extract user data
+        user_data = None
+        if "UserData" in run_args:
+            user_data = run_args["UserData"]
+            self.spot_fleet_manager.provider.worker_init = user_data
+        
+        try:
+            # Create the spot fleet
+            blocks = self.spot_fleet_manager.create_blocks(1)
+            
+            if not blocks:
+                logger.error("SpotFleetManager.create_blocks returned empty blocks dictionary")
+                raise ResourceCreationError("Failed to create Spot Fleet blocks")
+                
+            # Get the block ID (should be only one)
+            block_id = next(iter(blocks.keys()))
+            
+            logger.info(f"Created Spot Fleet block {block_id} for job {job_id}")
+            
+            # Wait for block to be running
+            max_wait = 300  # 5 minutes
+            start_time = time.time()
+            
+            while time.time() - start_time < max_wait:
+                status = self.spot_fleet_manager.get_block_status(block_id)
+                logger.debug(f"Spot Fleet block {block_id} status: {status}")
+                
+                if status == STATUS_RUNNING:
+                    break
+                elif status in [STATUS_FAILED, STATUS_CANCELED, STATUS_COMPLETED]:
+                    raise ResourceCreationError(f"Spot Fleet block failed with status {status}")
+                    
+                time.sleep(10)
+                
+            if time.time() - start_time >= max_wait:
+                logger.warning(f"Timeout waiting for Spot Fleet block {block_id} to be running")
+                
+            return block_id
+            
+        except SpotFleetError as e:
+            logger.error(f"Failed to create Spot Fleet: {e}")
+            raise
+        except Exception as e:
+            logger.error(f"Unexpected error creating Spot Fleet: {e}")
+            raise ResourceCreationError(f"Failed to create Spot Fleet: {e}") from e
 
     def get_job_status(self, resource_ids: List[str]) -> Dict[str, str]:
         """Get the status of jobs.
@@ -705,11 +1014,18 @@ class StandardMode(OperatingMode):
         
         # Group IDs by resource type
         ec2_instances = []
+        spot_fleet_blocks = []
         
         for resource_id in resource_ids:
             resource = self.resources.get(resource_id)
-            if resource and resource.get("type") == RESOURCE_TYPE_EC2:
+            if not resource:
+                status_map[resource_id] = STATUS_UNKNOWN
+                continue
+                
+            if resource.get("type") == RESOURCE_TYPE_EC2:
                 ec2_instances.append(resource_id)
+            elif resource.get("type") == RESOURCE_TYPE_SPOT_FLEET:
+                spot_fleet_blocks.append(resource_id)
             else:
                 status_map[resource_id] = STATUS_UNKNOWN
         
@@ -744,6 +1060,20 @@ class StandardMode(OperatingMode):
                 for instance_id in ec2_instances:
                     status_map[instance_id] = STATUS_UNKNOWN
         
+        # Check Spot Fleet status
+        if spot_fleet_blocks and self.use_spot_fleet and self.spot_fleet_manager:
+            for block_id in spot_fleet_blocks:
+                try:
+                    status = self.spot_fleet_manager.get_block_status(block_id)
+                    status_map[block_id] = status
+                    
+                    # Update resource state
+                    if block_id in self.resources:
+                        self.resources[block_id]["status"] = status
+                except Exception as e:
+                    logger.error(f"Failed to get Spot Fleet block status for {block_id}: {e}")
+                    status_map[block_id] = STATUS_UNKNOWN
+        
         # Save state with updated status
         self.save_state()
             
@@ -770,11 +1100,18 @@ class StandardMode(OperatingMode):
         
         # Group IDs by resource type
         ec2_instances = []
+        spot_fleet_blocks = []
         
         for resource_id in resource_ids:
             resource = self.resources.get(resource_id)
-            if resource and resource.get("type") == RESOURCE_TYPE_EC2:
+            if not resource:
+                cancel_map[resource_id] = STATUS_UNKNOWN
+                continue
+                
+            if resource.get("type") == RESOURCE_TYPE_EC2:
                 ec2_instances.append(resource_id)
+            elif resource.get("type") == RESOURCE_TYPE_SPOT_FLEET:
+                spot_fleet_blocks.append(resource_id)
             else:
                 cancel_map[resource_id] = STATUS_UNKNOWN
         
@@ -805,6 +1142,24 @@ class StandardMode(OperatingMode):
                 for instance_id in ec2_instances:
                     cancel_map[instance_id] = STATUS_FAILED
         
+        # Cancel Spot Fleet blocks
+        if spot_fleet_blocks and self.use_spot_fleet and self.spot_fleet_manager:
+            for block_id in spot_fleet_blocks:
+                try:
+                    self.spot_fleet_manager.terminate_block(block_id)
+                    cancel_map[block_id] = STATUS_CANCELED
+                    
+                    # Update resource state
+                    if block_id in self.resources:
+                        self.resources[block_id]["status"] = STATUS_CANCELED
+                        
+                    logger.info(f"Canceled Spot Fleet block {block_id}")
+                except Exception as e:
+                    logger.error(f"Failed to cancel Spot Fleet block {block_id}: {e}")
+                    cancel_map[block_id] = STATUS_FAILED
+                    if block_id in self.resources:
+                        self.resources[block_id]["status"] = STATUS_FAILED
+        
         # Save state with updated status
         self.save_state()
             
@@ -825,11 +1180,17 @@ class StandardMode(OperatingMode):
         
         # Group IDs by resource type
         ec2_instances = []
+        spot_fleet_blocks = []
         
         for resource_id in resource_ids:
             resource = self.resources.get(resource_id)
-            if resource and resource.get("type") == RESOURCE_TYPE_EC2:
+            if not resource:
+                continue
+                
+            if resource.get("type") == RESOURCE_TYPE_EC2:
                 ec2_instances.append(resource_id)
+            elif resource.get("type") == RESOURCE_TYPE_SPOT_FLEET:
+                spot_fleet_blocks.append(resource_id)
         
         # Terminate EC2 instances
         if ec2_instances:
@@ -852,6 +1213,23 @@ class StandardMode(OperatingMode):
                         del self.resources[instance_id]
             except Exception as e:
                 logger.error(f"Unexpected error terminating EC2 instances: {e}")
+        
+        # Terminate Spot Fleet blocks
+        if spot_fleet_blocks and self.use_spot_fleet and self.spot_fleet_manager:
+            for block_id in spot_fleet_blocks:
+                try:
+                    self.spot_fleet_manager.terminate_block(block_id)
+                    logger.info(f"Terminated Spot Fleet block {block_id}")
+                    
+                    # Remove resource from tracking
+                    if block_id in self.resources:
+                        del self.resources[block_id]
+                except Exception as e:
+                    logger.error(f"Failed to terminate Spot Fleet block {block_id}: {e}")
+                    
+                    # Still remove resource from tracking
+                    if block_id in self.resources:
+                        del self.resources[block_id]
         
         # Save state with updated resources
         self.save_state()
@@ -925,6 +1303,14 @@ class StandardMode(OperatingMode):
                 except Exception as e:
                     logger.error(f"Failed to delete VPC {self.vpc_id}: {e}")
             
+            # Clean up Spot Fleet resources if using spot fleet
+            if self.use_spot_fleet and self.spot_fleet_manager:
+                try:
+                    self.spot_fleet_manager.cleanup_all_resources()
+                    logger.info("Cleaned up all Spot Fleet resources")
+                except Exception as e:
+                    logger.error(f"Failed to clean up Spot Fleet resources: {e}")
+            
             # Clear initialization flag
             self.initialized = False
             
@@ -951,12 +1337,21 @@ class StandardMode(OperatingMode):
             "vpc": [],
             "subnet": [],
             "security_group": [],
+            "spot_fleet": [],
         }
         
-        # Add EC2 instances
+        # Add EC2 instances and Spot Fleet blocks
         for resource_id, resource in self.resources.items():
             if resource.get("type") == RESOURCE_TYPE_EC2:
                 result["ec2_instances"].append({
+                    "id": resource_id,
+                    "job_id": resource.get("job_id"),
+                    "job_name": resource.get("job_name"),
+                    "status": resource.get("status"),
+                    "created_at": resource.get("created_at"),
+                })
+            elif resource.get("type") == RESOURCE_TYPE_SPOT_FLEET:
+                result["spot_fleet"].append({
                     "id": resource_id,
                     "job_id": resource.get("job_id"),
                     "job_name": resource.get("job_name"),
@@ -984,6 +1379,24 @@ class StandardMode(OperatingMode):
                 "vpc_id": self.vpc_id,
             })
         
+        # Add detailed Spot Fleet information if available
+        if self.use_spot_fleet and self.spot_fleet_manager:
+            # Add fleet requests
+            for fleet_id, fleet in self.spot_fleet_manager.fleet_requests.items():
+                block_id = fleet.get("block_id")
+                if block_id:
+                    fleet_details = {
+                        "id": fleet_id,
+                        "block_id": block_id,
+                        "status": fleet.get("status"),
+                        "created_at": fleet.get("created_at"),
+                        "target_capacity": fleet.get("target_capacity"),
+                    }
+                    
+                    # Check if this fleet is already in the result
+                    if not any(f["id"] == fleet_id for f in result["spot_fleet"]):
+                        result["spot_fleet"].append(fleet_details)
+        
         return result
 
     def cleanup_all(self) -> None:
@@ -998,3 +1411,11 @@ class StandardMode(OperatingMode):
             logger.info(f"Cleaned up {len(resource_ids)} resources")
         else:
             logger.debug("No resources to clean up")
+            
+        # Clean up Spot Fleet resources if using spot fleet
+        if self.use_spot_fleet and self.spot_fleet_manager:
+            try:
+                self.spot_fleet_manager.cleanup_all_resources()
+                logger.info("Cleaned up all Spot Fleet resources")
+            except Exception as e:
+                logger.error(f"Failed to clean up Spot Fleet resources: {e}")
