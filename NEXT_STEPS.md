@@ -29,22 +29,36 @@ This document outlines the next steps for continuing development of the Parsl Ep
 
 - **Unit Tests**: Create unit tests for all classes and methods
   - ✅ Added unit tests for SpotFleet in ServerlessMode
+  - ✅ Added unit tests for spot interruption handling
+  - ✅ Added unit tests for state persistence mechanisms
+  - ✅ Added comprehensive error handling tests
   - Mock AWS API calls using `moto` library
-  - Test state persistence mechanisms
-  - Test error handling scenarios
 
 - **Integration Tests**: Develop integration tests that verify end-to-end functionality
   - ✅ Added integration tests for SpotFleet in ServerlessMode
+  - ✅ Added integration tests for spot interruption handling with LocalStack
+  - ✅ Added integration tests for state persistence across operating modes
+  - ✅ Added integration tests for error scenarios and recovery
   - Use LocalStack for local AWS API emulation
-  - Create test workflow scenarios for each operating mode
-  - Verify resource creation, job execution, and cleanup
+  - Create more test workflow scenarios for each operating mode
+
+- **BATS Testing**: Add Bash Automated Testing System for shell scripts
+  - Set up BATS framework for testing shell scripts
+  - Create tests for any shell scripts in the project
+  - Test environment setup scripts
+  - Test utility scripts
 
 ### 2. CI/CD Pipeline Setup
 
 - Set up GitHub Actions for automatic testing
 - Configure build and publish pipeline for PyPI
 - Create release management workflow
-- Implement code quality checks (linting, typing, coverage)
+- Implement code quality checks
+  - Python linting with flake8/ruff
+  - Static type checking with mypy
+  - Test coverage reporting
+  - Shell script linting with shellcheck
+  - Security scanning with bandit
 
 ### 3. Documentation Expansion
 
@@ -63,11 +77,15 @@ This document outlines the next steps for continuing development of the Parsl Ep
 - **Spot Instance Management**: 
   - ✅ Implemented SpotFleet in DetachedMode
   - ✅ Implemented SpotFleet in ServerlessMode
-  - Add spot interruption handling with task recovery
+  - ✅ Added spot interruption handling with task recovery
 - **Auto-scaling Policies**: Implement advanced scaling policies
 - **Cross-region Support**: Add support for multi-region deployments
 - **GPU Support**: Enhance GPU instance support for ML workloads
 - **Custom Image Building**: Add tools for custom AMI/container creation
+- **Shell Scripts and Utilities**:
+  - Create helper scripts for common operations
+  - Build environment setup scripts
+  - Implement instance initialization scripts
 
 ### 5. Performance Optimization
 
