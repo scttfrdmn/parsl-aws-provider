@@ -1,349 +1,790 @@
-"""EphemeralAWSProvider implementation.
+"""
+Parsl Ephemeral AWS Provider implementation.
+
+This module implements the main provider class that conforms to the Parsl
+execution provider interface.
 
 SPDX-License-Identifier: Apache-2.0
 SPDX-FileCopyrightText: 2025 Scott Friedman and Project Contributors
 """
 
-from typing import Dict, List, Optional, Union, Any
-import uuid
 import logging
+import os
+import time
+import uuid
+from enum import Enum
+from typing import Any, Dict, List, Optional, Tuple, Union
 
+import boto3
+import parsl
 from parsl.providers.base import ExecutionProvider
-from parsl.launchers import Launcher
+from parsl.utils import RepresentationMixin
+from typeguard import typechecked
 
-from .constants import (
-    DEFAULT_INSTANCE_TYPE, 
+from parsl_ephemeral_aws.constants import (
+    DEFAULT_INSTANCE_TYPE,
+    DEFAULT_MAX_BLOCKS,
+    DEFAULT_MAX_IDLE_TIME,
+    DEFAULT_MIN_BLOCKS,
+    DEFAULT_MODE,
     DEFAULT_REGION,
-    MODE_STANDARD,
-    MODE_DETACHED,
-    MODE_SERVERLESS,
-    STATE_STORE_PARAMETER,
-    STATE_STORE_S3,
-    STATE_STORE_FILE,
-    STATE_STORE_NONE,
-    WORKER_TYPE_EC2,
-    WORKER_TYPE_LAMBDA,
-    WORKER_TYPE_ECS,
-    WORKER_TYPE_AUTO
+    DEFAULT_WORKER_INIT,
 )
-from .modes.standard import StandardMode
-from .modes.detached import DetachedMode
-from .modes.serverless import ServerlessMode
+from parsl_ephemeral_aws.exceptions import (
+    ProviderConfigurationError,
+    ProviderError,
+    ResourceCreationError,
+)
+from parsl_ephemeral_aws.modes.base import OperatingMode
+from parsl_ephemeral_aws.modes.detached import DetachedMode
+from parsl_ephemeral_aws.modes.serverless import ServerlessMode
+from parsl_ephemeral_aws.modes.standard import StandardMode
+from parsl_ephemeral_aws.state.base import StateStore
+from parsl_ephemeral_aws.state.file import FileStateStore
+from parsl_ephemeral_aws.state.parameter_store import ParameterStoreStateStore
+from parsl_ephemeral_aws.state.s3 import S3StateStore
+from parsl_ephemeral_aws.utils.aws import create_session
 
 
 logger = logging.getLogger(__name__)
 
 
-class EphemeralAWSProvider(ExecutionProvider):
+class OperatingModeType(str, Enum):
+    """Supported operating modes for the provider."""
+
+    STANDARD = "standard"
+    DETACHED = "detached"
+    SERVERLESS = "serverless"
+
+
+class StateStoreType(str, Enum):
+    """Supported state persistence options."""
+
+    FILE = "file"
+    PARAMETER_STORE = "parameter_store"
+    S3 = "s3"
+
+
+class ComputeType(str, Enum):
+    """Supported compute resource types."""
+
+    EC2 = "ec2"
+    LAMBDA = "lambda"
+    ECS = "ecs"
+
+
+@typechecked
+class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
     """Ephemeral AWS Provider for Parsl.
-    
-    This provider creates ephemeral AWS resources for executing Parsl workflows.
-    All resources (including VPC, security groups, etc.) are cleaned up automatically
+
+    The Ephemeral AWS Provider allows Parsl to execute tasks on ephemeral
+    AWS resources that are created on-demand and automatically cleaned up
     when no longer needed.
-    
+
     Parameters
     ----------
-    image_id : str
-        AWS AMI ID to use for instances
+    image_id : str, optional
+        EC2 AMI ID to use for instances. Required when using EC2 instances.
     instance_type : str, optional
-        EC2 instance type to use, by default 't3.medium'
+        EC2 instance type. Default is 't3.micro'.
     region : str, optional
-        AWS region to use, by default 'us-east-1'
-    init_blocks : int, optional
-        Initial number of blocks to provision, by default 1
-    min_blocks : int, optional
-        Minimum number of blocks to maintain, by default 0
-    max_blocks : int, optional
-        Maximum number of blocks to provision, by default 10
-    nodes_per_block : int, optional
-        Number of nodes per block, by default 1
-    use_spot_instances : bool, optional
-        Whether to use spot instances, by default False
-    spot_max_price_percentage : int, optional
-        Maximum spot price as percentage of on-demand, by default 80
-    spot_interruption_behavior : str, optional
-        What to do if spot instance is interrupted, by default 'terminate'
+        AWS region. Default is 'us-east-1'.
     mode : str, optional
-        Operating mode: 'standard', 'detached', or 'serverless', by default 'standard'
-    state_store : str, optional
-        State persistence mechanism, by default 'parameter_store'
-    state_prefix : str, optional
-        Prefix for state storage keys, by default '/parsl/workflows'
-    use_public_ips : bool, optional
-        Whether to assign public IPs to instances, by default True
+        Operating mode ('standard', 'detached', or 'serverless'). Default is 'standard'.
+    min_blocks : int, optional
+        Minimum number of blocks. Default is 0.
+    max_blocks : int, optional
+        Maximum number of blocks. Default is 10.
     worker_init : str, optional
-        Commands to run on worker startup, by default ''
-    worker_type : str, optional
-        Type of worker to use, by default 'ec2'
-    launcher : Launcher, optional
-        Parsl launcher to use
-    bastion_instance_type : str, optional
-        EC2 instance type for bastion host, by default 't3.micro'
-    bastion_idle_timeout : int, optional
-        Minutes to wait before shutting down idle bastion, by default 30
+        Initialization script for workers. Default is an empty script.
+    vpc_id : str, optional
+        Existing VPC ID to use. If not provided, a new VPC will be created.
+    subnet_id : str, optional
+        Existing subnet ID to use. If not provided, a new subnet will be created.
+    security_group_id : str, optional
+        Existing security group ID to use. If not provided, a new security group will be created.
+    key_name : str, optional
+        EC2 key pair name for SSH access. If not provided, instances will be created without a key pair.
+    profile_name : str, optional
+        AWS profile name to use. If not provided, the default profile will be used.
+    state_store_type : str, optional
+        Type of state store to use ('file', 'parameter_store', or 's3'). Default is 'file'.
+    state_file_path : str, optional
+        Path to state file when using 'file' state store. Default is 'ephemeral_aws_state.json'.
+    s3_bucket : str, optional
+        S3 bucket name when using 's3' state store.
+    s3_key : str, optional
+        S3 key name when using 's3' state store. Default is 'ephemeral_aws_state.json'.
+    parameter_store_path : str, optional
+        Parameter Store path when using 'parameter_store' state store.
+        Default is '/parsl/ephemeral_aws_state'.
+    use_spot : bool, optional
+        Whether to use spot instances. Default is False.
+    spot_max_price : str, optional
+        Maximum price for spot instances. Default is on-demand price.
+    spot_allocation_strategy : str, optional
+        Allocation strategy for spot instances. Default is 'capacity-optimized'.
+    additional_tags : Dict[str, str], optional
+        Additional tags to apply to AWS resources.
     auto_shutdown : bool, optional
-        Whether to automatically shut down when idle, by default True
-    lambda_memory : int, optional
-        Memory in MB for Lambda functions, by default 1024
-    lambda_timeout : int, optional
-        Timeout in seconds for Lambda functions, by default 900
-    ecs_task_cpu : int, optional
-        CPU units for ECS tasks, by default 1024
-    ecs_task_memory : int, optional
-        Memory in MB for ECS tasks, by default 2048
-    ecs_container_image : str, optional
-        Container image for ECS tasks, by default None
-    use_ec2_fleet : bool, optional
-        Whether to use EC2 Fleet for instance provisioning, by default False
-    instance_types : List[Dict], optional
-        List of instance types to use with EC2 Fleet, by default None
-    workflow_id : str, optional
-        Unique ID for the workflow, by default None (auto-generated)
-    aws_access_key_id : str, optional
-        AWS access key ID, by default None (uses environment or instance profile)
-    aws_secret_access_key : str, optional
-        AWS secret access key, by default None (uses environment or instance profile)
-    aws_session_token : str, optional
-        AWS session token, by default None (uses environment or instance profile)
-    aws_profile : str, optional
-        AWS profile name, by default None (uses default profile)
-    tags : Dict[str, str], optional
-        Additional tags to apply to AWS resources, by default None
+        Whether to automatically shut down idle resources. Default is True.
+    max_idle_time : int, optional
+        Maximum idle time in seconds before shutdown. Default is 300 (5 minutes).
+    compute_type : str, optional
+        Type of compute resource when using serverless mode ('ec2', 'lambda', or 'ecs').
+        Default is 'ec2'.
+    bastion_instance_type : str, optional
+        Instance type for bastion host when using detached mode. Default is 't3.micro'.
+    memory_size : int, optional
+        Memory size in MB for Lambda functions. Default is 1024.
+    timeout : int, optional
+        Timeout in seconds for Lambda functions. Default is 300.
+    debug : bool, optional
+        Whether to enable debug logging. Default is False.
+    create_vpc : bool, optional
+        Whether to create a new VPC if vpc_id is not provided. Default is True.
+    use_public_ips : bool, optional
+        Whether to assign public IPs to instances. Default is True.
+    custom_ami : bool, optional
+        Whether image_id refers to a custom AMI. Default is False.
+    provider_id : str, optional
+        Provider ID for distinguishing between multiple providers. Default is a UUID.
     """
-    
+
+    @typechecked
     def __init__(
         self,
-        image_id: str,
+        image_id: Optional[str] = None,
         instance_type: str = DEFAULT_INSTANCE_TYPE,
         region: str = DEFAULT_REGION,
-        init_blocks: int = 1,
-        min_blocks: int = 0,
-        max_blocks: int = 10,
-        nodes_per_block: int = 1,
-        use_spot_instances: bool = False,
-        spot_max_price_percentage: int = 80,
-        spot_interruption_behavior: str = 'terminate',
-        mode: str = MODE_STANDARD,
-        state_store: str = STATE_STORE_PARAMETER,
-        state_prefix: str = '/parsl/workflows',
-        use_public_ips: bool = True,
-        worker_init: str = '',
-        worker_type: str = WORKER_TYPE_EC2,
-        launcher: Optional[Launcher] = None,
-        bastion_instance_type: str = 't3.micro',
-        bastion_idle_timeout: int = 30,
+        mode: str = DEFAULT_MODE,
+        min_blocks: int = DEFAULT_MIN_BLOCKS,
+        max_blocks: int = DEFAULT_MAX_BLOCKS,
+        worker_init: str = DEFAULT_WORKER_INIT,
+        vpc_id: Optional[str] = None,
+        subnet_id: Optional[str] = None,
+        security_group_id: Optional[str] = None,
+        key_name: Optional[str] = None,
+        profile_name: Optional[str] = None,
+        state_store_type: str = StateStoreType.FILE,
+        state_file_path: str = "ephemeral_aws_state.json",
+        s3_bucket: Optional[str] = None,
+        s3_key: str = "ephemeral_aws_state.json",
+        parameter_store_path: str = "/parsl/ephemeral_aws_state",
+        use_spot: bool = False,
+        spot_max_price: Optional[str] = None,
+        spot_allocation_strategy: str = "capacity-optimized",
+        additional_tags: Optional[Dict[str, str]] = None,
         auto_shutdown: bool = True,
-        lambda_memory: int = 1024,
-        lambda_timeout: int = 900,
-        ecs_task_cpu: int = 1024,
-        ecs_task_memory: int = 2048,
-        ecs_container_image: Optional[str] = None,
-        use_ec2_fleet: bool = False,
-        instance_types: Optional[List[Dict[str, Any]]] = None,
-        workflow_id: Optional[str] = None,
-        aws_access_key_id: Optional[str] = None,
-        aws_secret_access_key: Optional[str] = None,
-        aws_session_token: Optional[str] = None,
-        aws_profile: Optional[str] = None,
-        tags: Optional[Dict[str, str]] = None,
+        max_idle_time: int = DEFAULT_MAX_IDLE_TIME,
+        compute_type: str = ComputeType.EC2,
+        bastion_instance_type: str = "t3.micro",
+        memory_size: int = 1024,
+        timeout: int = 300,
+        debug: bool = False,
+        create_vpc: bool = True,
+        use_public_ips: bool = True,
+        custom_ami: bool = False,
+        provider_id: Optional[str] = None,
+        **kwargs: Any,
     ) -> None:
         """Initialize the Ephemeral AWS Provider."""
+        # Initialize the base provider
         super().__init__()
-        
-        # Generate a unique ID for this workflow if not provided
-        self.workflow_id = workflow_id or f"parsl-{str(uuid.uuid4())[:8]}"
-        
-        # Store configuration
+
+        # Configure logging
+        if debug:
+            logger.setLevel(logging.DEBUG)
+
+        # Validate configuration
+        self._validate_config(
+            image_id=image_id,
+            mode=mode,
+            compute_type=compute_type,
+            state_store_type=state_store_type,
+            s3_bucket=s3_bucket,
+        )
+
+        # Set basic attributes
         self.image_id = image_id
         self.instance_type = instance_type
         self.region = region
-        self.init_blocks = init_blocks
+        self.mode_type = OperatingModeType(mode.lower())
         self.min_blocks = min_blocks
         self.max_blocks = max_blocks
-        self.nodes_per_block = nodes_per_block
-        self.use_spot_instances = use_spot_instances
-        self.spot_max_price_percentage = spot_max_price_percentage
-        self.spot_interruption_behavior = spot_interruption_behavior
-        self.mode = mode.lower()
-        self.state_store = state_store
-        self.state_prefix = state_prefix
-        self.use_public_ips = use_public_ips
         self.worker_init = worker_init
-        self.worker_type = worker_type
-        self.launcher = launcher
-        self.bastion_instance_type = bastion_instance_type
-        self.bastion_idle_timeout = bastion_idle_timeout
+        self.vpc_id = vpc_id
+        self.subnet_id = subnet_id
+        self.security_group_id = security_group_id
+        self.key_name = key_name
+        self.profile_name = profile_name
+        self.state_store_type = StateStoreType(state_store_type.lower())
+        self.state_file_path = state_file_path
+        self.s3_bucket = s3_bucket
+        self.s3_key = s3_key
+        self.parameter_store_path = parameter_store_path
+        self.use_spot = use_spot
+        self.spot_max_price = spot_max_price
+        self.spot_allocation_strategy = spot_allocation_strategy
+        self.additional_tags = additional_tags or {}
         self.auto_shutdown = auto_shutdown
-        self.lambda_memory = lambda_memory
-        self.lambda_timeout = lambda_timeout
-        self.ecs_task_cpu = ecs_task_cpu
-        self.ecs_task_memory = ecs_task_memory
-        self.ecs_container_image = ecs_container_image
-        self.use_ec2_fleet = use_ec2_fleet
-        self.instance_types = instance_types or []
-        
-        # AWS authentication
-        self.aws_access_key_id = aws_access_key_id
-        self.aws_secret_access_key = aws_secret_access_key
-        self.aws_session_token = aws_session_token
-        self.aws_profile = aws_profile
-        
-        # Additional tags
-        self.tags = tags or {}
-        
+        self.max_idle_time = max_idle_time
+        self.compute_type = ComputeType(compute_type.lower())
+        self.bastion_instance_type = bastion_instance_type
+        self.memory_size = memory_size
+        self.timeout = timeout
+        self.debug = debug
+        self.create_vpc = create_vpc
+        self.use_public_ips = use_public_ips
+        self.custom_ami = custom_ami
+        self.provider_id = provider_id or str(uuid.uuid4())
+        self.kwargs = kwargs
+
         # Initialize state
-        self.resources = {}
-        self.blocks = {}
-        
-        # Validate configuration
-        self._validate_configuration()
-        
-        # Initialize mode handler
-        if self.mode == MODE_STANDARD:
-            self.mode_handler = StandardMode(self)
-        elif self.mode == MODE_DETACHED:
-            self.mode_handler = DetachedMode(self)
-        elif self.mode == MODE_SERVERLESS:
-            self.mode_handler = ServerlessMode(self)
+        self.session = create_session(region=self.region, profile_name=self.profile_name)
+        self.state_store = self._initialize_state_store()
+        self.operating_mode = self._initialize_operating_mode()
+        self.resources: Dict[str, Dict[str, Any]] = {}
+        self.job_map: Dict[str, Dict[str, Any]] = {}
+
+        logger.info(f"Initialized EphemeralAWSProvider in {self.mode_type.value} mode")
+
+    def _validate_config(
+        self,
+        image_id: Optional[str],
+        mode: str,
+        compute_type: str,
+        state_store_type: str,
+        s3_bucket: Optional[str],
+    ) -> None:
+        """Validate the configuration parameters.
+
+        Parameters
+        ----------
+        image_id : Optional[str]
+            EC2 AMI ID to use for instances.
+        mode : str
+            Operating mode.
+        compute_type : str
+            Type of compute resource.
+        state_store_type : str
+            Type of state store to use.
+        s3_bucket : Optional[str]
+            S3 bucket name when using 's3' state store.
+
+        Raises
+        ------
+        ProviderConfigurationError
+            If the configuration is invalid.
+        """
+        # Validate operating mode
+        try:
+            mode_type = OperatingModeType(mode.lower())
+        except ValueError:
+            raise ProviderConfigurationError(
+                f"Invalid operating mode: {mode}. Must be one of: "
+                f"{', '.join([m.value for m in OperatingModeType])}"
+            )
+
+        # Validate image_id for EC2-based modes
+        if mode_type in [OperatingModeType.STANDARD, OperatingModeType.DETACHED]:
+            if compute_type.lower() == ComputeType.EC2 and not image_id:
+                raise ProviderConfigurationError(
+                    "image_id is required when using EC2 instances"
+                )
+
+        # Validate state store type
+        try:
+            store_type = StateStoreType(state_store_type.lower())
+        except ValueError:
+            raise ProviderConfigurationError(
+                f"Invalid state store type: {state_store_type}. Must be one of: "
+                f"{', '.join([s.value for s in StateStoreType])}"
+            )
+
+        # Validate S3 bucket when using S3 state store
+        if store_type == StateStoreType.S3 and not s3_bucket:
+            raise ProviderConfigurationError(
+                "s3_bucket is required when using 's3' state store"
+            )
+
+        # Validate compute type
+        try:
+            ComputeType(compute_type.lower())
+        except ValueError:
+            raise ProviderConfigurationError(
+                f"Invalid compute type: {compute_type}. Must be one of: "
+                f"{', '.join([c.value for c in ComputeType])}"
+            )
+
+    def _initialize_state_store(self) -> StateStore:
+        """Initialize the state store based on configuration.
+
+        Returns
+        -------
+        StateStore
+            The initialized state store.
+        """
+        if self.state_store_type == StateStoreType.FILE:
+            return FileStateStore(
+                file_path=self.state_file_path, provider_id=self.provider_id
+            )
+        elif self.state_store_type == StateStoreType.PARAMETER_STORE:
+            return ParameterStoreStateStore(
+                session=self.session,
+                path=self.parameter_store_path,
+                provider_id=self.provider_id,
+            )
+        elif self.state_store_type == StateStoreType.S3:
+            if not self.s3_bucket:
+                raise ProviderConfigurationError(
+                    "s3_bucket is required when using 's3' state store"
+                )
+            return S3StateStore(
+                session=self.session,
+                bucket=self.s3_bucket,
+                key=self.s3_key,
+                provider_id=self.provider_id,
+            )
         else:
-            raise ValueError(f"Invalid mode: {mode}. Must be '{MODE_STANDARD}', '{MODE_DETACHED}', or '{MODE_SERVERLESS}'.")
-        
-        # Set up initial blocks if requested
-        if self.init_blocks > 0:
-            logger.info(f"Initializing {self.init_blocks} blocks")
-            self.scale_out(self.init_blocks)
-        
-    def _validate_configuration(self) -> None:
-        """Validate the provider configuration."""
-        
-        # Validate mode
-        if self.mode not in [MODE_STANDARD, MODE_DETACHED, MODE_SERVERLESS]:
-            raise ValueError(f"Invalid mode: {self.mode}. Must be '{MODE_STANDARD}', '{MODE_DETACHED}', or '{MODE_SERVERLESS}'.")
-        
-        # Validate worker type
-        if self.worker_type not in [WORKER_TYPE_EC2, WORKER_TYPE_LAMBDA, WORKER_TYPE_ECS, WORKER_TYPE_AUTO]:
-            raise ValueError(f"Invalid worker type: {self.worker_type}. Must be '{WORKER_TYPE_EC2}', '{WORKER_TYPE_LAMBDA}', '{WORKER_TYPE_ECS}', or '{WORKER_TYPE_AUTO}'.")
-        
-        # Validate state store
-        if self.state_store not in [STATE_STORE_PARAMETER, STATE_STORE_S3, STATE_STORE_FILE, STATE_STORE_NONE]:
-            raise ValueError(f"Invalid state store: {self.state_store}. Must be '{STATE_STORE_PARAMETER}', '{STATE_STORE_S3}', '{STATE_STORE_FILE}', or '{STATE_STORE_NONE}'.")
-        
-        # Validate block counts
-        if self.max_blocks < self.min_blocks:
-            raise ValueError(f"max_blocks ({self.max_blocks}) cannot be less than min_blocks ({self.min_blocks}).")
-            
-        # Serverless mode requires lambda or ecs worker type
-        if self.mode == MODE_SERVERLESS and self.worker_type == WORKER_TYPE_EC2:
-            raise ValueError(f"Serverless mode requires worker_type to be '{WORKER_TYPE_LAMBDA}', '{WORKER_TYPE_ECS}', or '{WORKER_TYPE_AUTO}'.")
-            
-        # EC2 fleet requires instance types
-        if self.use_ec2_fleet and not self.instance_types:
-            raise ValueError("EC2 Fleet requires instance_types to be specified.")
-            
-        # Lambda worker type validation
-        if self.worker_type == WORKER_TYPE_LAMBDA:
-            if self.lambda_memory < 128 or self.lambda_memory > 10240:
-                raise ValueError(f"Lambda memory must be between 128 and 10240 MB, got {self.lambda_memory} MB.")
-            if self.lambda_timeout < 1 or self.lambda_timeout > 900:
-                raise ValueError(f"Lambda timeout must be between 1 and 900 seconds, got {self.lambda_timeout} seconds.")
-                
-        # ECS worker type validation
-        if self.worker_type == WORKER_TYPE_ECS:
-            if self.ecs_task_cpu < 256:
-                raise ValueError(f"ECS task CPU must be at least 256 units, got {self.ecs_task_cpu} units.")
-            if self.ecs_task_memory < 512:
-                raise ValueError(f"ECS task memory must be at least 512 MB, got {self.ecs_task_memory} MB.")
-        
-    def submit(self, command: str, tasks_per_node: int, job_name: str = "") -> Dict[str, Any]:
-        """Submit a job for execution.
-        
+            raise ProviderConfigurationError(
+                f"Unsupported state store type: {self.state_store_type}"
+            )
+
+    def _initialize_operating_mode(self) -> OperatingMode:
+        """Initialize the operating mode based on configuration.
+
+        Returns
+        -------
+        OperatingMode
+            The initialized operating mode.
+        """
+        common_params = {
+            "provider_id": self.provider_id,
+            "session": self.session,
+            "state_store": self.state_store,
+            "image_id": self.image_id,
+            "instance_type": self.instance_type,
+            "worker_init": self.worker_init,
+            "vpc_id": self.vpc_id,
+            "subnet_id": self.subnet_id,
+            "security_group_id": self.security_group_id,
+            "key_name": self.key_name,
+            "use_spot": self.use_spot,
+            "spot_max_price": self.spot_max_price,
+            "spot_allocation_strategy": self.spot_allocation_strategy,
+            "additional_tags": self.additional_tags,
+            "auto_shutdown": self.auto_shutdown,
+            "max_idle_time": self.max_idle_time,
+            "create_vpc": self.create_vpc,
+            "use_public_ips": self.use_public_ips,
+            "custom_ami": self.custom_ami,
+            "debug": self.debug,
+        }
+
+        if self.mode_type == OperatingModeType.STANDARD:
+            return StandardMode(**common_params)
+        elif self.mode_type == OperatingModeType.DETACHED:
+            return DetachedMode(
+                bastion_instance_type=self.bastion_instance_type, **common_params
+            )
+        elif self.mode_type == OperatingModeType.SERVERLESS:
+            return ServerlessMode(
+                compute_type=self.compute_type,
+                memory_size=self.memory_size,
+                timeout=self.timeout,
+                **common_params,
+            )
+        else:
+            raise ProviderConfigurationError(
+                f"Unsupported operating mode: {self.mode_type}"
+            )
+
+    def submit(
+        self, command: str, tasks_per_node: int, job_name: Optional[str] = None
+    ) -> str:
+        """Submit a job to execute the specified command.
+
         Parameters
         ----------
         command : str
-            Command to execute
+            Command to execute.
         tasks_per_node : int
-            Number of tasks per node
-        job_name : str, optional
-            Name for the job, by default ""
-            
+            Number of tasks to run per node.
+        job_name : Optional[str]
+            Name for the job.
+
         Returns
         -------
-        Dict[str, Any]
-            Dictionary containing job ID
+        str
+            Job ID for tracking status.
         """
-        logger.info(f"Submitting job: {command[:50]}{'...' if len(command) > 50 else ''}")
-        return self.mode_handler.submit(command, tasks_per_node, job_name)
-    
-    def status(self, job_ids: List[Any]) -> List[Dict[str, Any]]:
-        """Get the status of jobs.
-        
+        job_name = job_name or f"parsl-job-{str(uuid.uuid4())[:8]}"
+        job_id = f"{self.provider_id}-{str(uuid.uuid4())}"
+
+        # Check if we have capacity
+        if len(self.resources) >= self.max_blocks:
+            logger.warning(
+                f"Cannot submit job {job_name}, already at max_blocks = {self.max_blocks}"
+            )
+            raise ProviderError(
+                f"Cannot submit job, already at max_blocks = {self.max_blocks}"
+            )
+
+        # Submit the job to the operating mode
+        try:
+            resource_id = self.operating_mode.submit_job(
+                job_id=job_id,
+                command=command,
+                tasks_per_node=tasks_per_node,
+                job_name=job_name,
+            )
+
+            # Record the job in our internal maps
+            self.resources[resource_id] = {
+                "job_id": job_id,
+                "job_name": job_name,
+                "status": "PENDING",
+                "tasks_per_node": tasks_per_node,
+                "command": command,
+                "timestamp": time.time(),
+            }
+
+            self.job_map[job_id] = {
+                "resource_id": resource_id,
+                "job_name": job_name,
+                "status": "PENDING",
+            }
+
+            # Update the state store
+            self._save_state()
+
+            logger.info(f"Submitted job {job_name} with ID {job_id}")
+            return job_id
+
+        except Exception as e:
+            logger.error(f"Failed to submit job {job_name}: {e}")
+            raise ProviderError(f"Failed to submit job: {e}")
+
+    def status(self, job_ids: List[str]) -> List[Dict[str, str]]:
+        """Get the status of a list of jobs.
+
         Parameters
         ----------
-        job_ids : List[Any]
-            List of job IDs to check
-            
+        job_ids : List[str]
+            List of job IDs.
+
         Returns
         -------
-        List[Dict[str, Any]]
-            List of job status dictionaries
+        List[Dict[str, str]]
+            List of dictionaries containing job status information.
         """
-        logger.debug(f"Checking status of {len(job_ids)} jobs")
-        return self.mode_handler.status(job_ids)
-    
-    def cancel(self, job_ids: List[Any]) -> List[Dict[str, Any]]:
-        """Cancel jobs.
-        
+        statuses = []
+
+        try:
+            # Get status from the operating mode
+            status_map = self.operating_mode.get_job_status(
+                [
+                    self.job_map[job_id]["resource_id"]
+                    for job_id in job_ids
+                    if job_id in self.job_map
+                ]
+            )
+
+            # Update our internal state
+            for job_id in job_ids:
+                if job_id in self.job_map:
+                    resource_id = self.job_map[job_id]["resource_id"]
+                    if resource_id in status_map:
+                        status = status_map[resource_id]
+                        self.job_map[job_id]["status"] = status
+                        if resource_id in self.resources:
+                            self.resources[resource_id]["status"] = status
+                        statuses.append({"job_id": job_id, "status": status})
+                    else:
+                        # If the resource isn't found, it might have been cleaned up
+                        statuses.append({"job_id": job_id, "status": "COMPLETED"})
+                else:
+                    # Job ID not found in our map
+                    statuses.append({"job_id": job_id, "status": "UNKNOWN"})
+
+            # Save the updated state
+            self._save_state()
+
+            return statuses
+
+        except Exception as e:
+            logger.error(f"Failed to get status for jobs {job_ids}: {e}")
+            return [{"job_id": job_id, "status": "UNKNOWN"} for job_id in job_ids]
+
+    def cancel(self, job_ids: List[str]) -> List[Dict[str, str]]:
+        """Cancel specified jobs.
+
         Parameters
         ----------
-        job_ids : List[Any]
-            List of job IDs to cancel
-            
+        job_ids : List[str]
+            List of job IDs to cancel.
+
         Returns
         -------
-        List[Dict[str, Any]]
-            List of job status dictionaries
+        List[Dict[str, str]]
+            List of dictionaries containing job cancellation status.
         """
-        logger.info(f"Cancelling {len(job_ids)} jobs")
-        return self.mode_handler.cancel(job_ids)
-    
-    def scale_out(self, blocks: int) -> List[str]:
-        """Scale out the infrastructure by the specified number of blocks.
-        
+        cancelations = []
+
+        try:
+            # Resources to terminate
+            resources_to_terminate = [
+                self.job_map[job_id]["resource_id"]
+                for job_id in job_ids
+                if job_id in self.job_map
+            ]
+
+            # Cancel jobs in the operating mode
+            cancel_map = self.operating_mode.cancel_jobs(resources_to_terminate)
+
+            # Update our internal state
+            for job_id in job_ids:
+                if job_id in self.job_map:
+                    resource_id = self.job_map[job_id]["resource_id"]
+                    if resource_id in cancel_map:
+                        status = cancel_map[resource_id]
+                        self.job_map[job_id]["status"] = status
+                        if resource_id in self.resources:
+                            self.resources[resource_id]["status"] = status
+                        cancelations.append({"job_id": job_id, "status": status})
+                    else:
+                        # If the resource isn't found, it might have been cleaned up
+                        cancelations.append({"job_id": job_id, "status": "UNKNOWN"})
+                else:
+                    # Job ID not found in our map
+                    cancelations.append({"job_id": job_id, "status": "UNKNOWN"})
+
+            # Clean up resources
+            self._cleanup_resources()
+
+            # Save the updated state
+            self._save_state()
+
+            return cancelations
+
+        except Exception as e:
+            logger.error(f"Failed to cancel jobs {job_ids}: {e}")
+            return [{"job_id": job_id, "status": "UNKNOWN"} for job_id in job_ids]
+
+    def _save_state(self) -> None:
+        """Save the current state to the state store."""
+        state = {
+            "provider_id": self.provider_id,
+            "mode": self.mode_type.value,
+            "resources": self.resources,
+            "job_map": self.job_map,
+            "timestamp": time.time(),
+        }
+
+        try:
+            self.state_store.save_state(state)
+            logger.debug("Saved provider state")
+        except Exception as e:
+            logger.error(f"Failed to save provider state: {e}")
+
+    def _load_state(self) -> None:
+        """Load the state from the state store."""
+        try:
+            state = self.state_store.load_state()
+            if state and state.get("provider_id") == self.provider_id:
+                self.resources = state.get("resources", {})
+                self.job_map = state.get("job_map", {})
+                logger.info(f"Loaded state with {len(self.resources)} resources")
+        except Exception as e:
+            logger.error(f"Failed to load provider state: {e}")
+
+    def _cleanup_resources(self) -> None:
+        """Clean up resources that are completed or failed."""
+        resources_to_cleanup = []
+
+        # Find resources to clean up
+        for resource_id, resource in self.resources.items():
+            status = resource.get("status", "UNKNOWN")
+            if status in ["COMPLETED", "FAILED", "CANCELED"]:
+                resources_to_cleanup.append(resource_id)
+            elif (
+                self.auto_shutdown
+                and status == "RUNNING"
+                and time.time() - resource.get("timestamp", 0) > self.max_idle_time
+            ):
+                # Auto-shutdown for idle resources
+                logger.info(
+                    f"Resource {resource_id} has been idle for "
+                    f"{time.time() - resource.get('timestamp', 0)} seconds, "
+                    f"exceeding max_idle_time {self.max_idle_time}"
+                )
+                resources_to_cleanup.append(resource_id)
+
+        # Clean up resources
+        if resources_to_cleanup:
+            try:
+                self.operating_mode.cleanup_resources(resources_to_cleanup)
+
+                # Update internal state
+                for resource_id in resources_to_cleanup:
+                    if resource_id in self.resources:
+                        job_id = self.resources[resource_id].get("job_id")
+                        del self.resources[resource_id]
+                        if job_id and job_id in self.job_map:
+                            del self.job_map[job_id]
+
+                # Save the updated state
+                self._save_state()
+
+                logger.info(f"Cleaned up {len(resources_to_cleanup)} resources")
+            except Exception as e:
+                logger.error(f"Failed to clean up resources: {e}")
+
+    def scale_in(self, blocks: int) -> List[str]:
+        """Scale in the number of blocks by the specified amount.
+
         Parameters
         ----------
         blocks : int
-            Number of blocks to add
-            
+            Number of blocks to scale in by.
+
         Returns
         -------
         List[str]
-            List of block IDs
+            List of job IDs that were terminated.
         """
-        logger.info(f"Scaling out by {blocks} blocks")
-        return self.mode_handler.scale_out(blocks)
-    
-    def scale_in(self, blocks: Optional[int] = None, block_ids: Optional[List[str]] = None) -> List[str]:
-        """Scale in the infrastructure.
-        
+        if blocks <= 0:
+            return []
+
+        # Find running resources to terminate
+        running_resources = [
+            resource_id
+            for resource_id, resource in self.resources.items()
+            if resource.get("status") == "RUNNING"
+        ]
+
+        # Limit to the requested number of blocks
+        resources_to_terminate = running_resources[:blocks]
+        job_ids = [
+            self.resources[resource_id].get("job_id")
+            for resource_id in resources_to_terminate
+            if resource_id in self.resources
+        ]
+
+        # Cancel the selected jobs
+        self.cancel(job_ids)
+
+        return job_ids
+
+    def scale_out(self, blocks: int) -> List[str]:
+        """Scale out resources by the specified number of blocks.
+
         Parameters
         ----------
-        blocks : Optional[int], optional
-            Number of blocks to remove, by default None
-        block_ids : Optional[List[str]], optional
-            Specific block IDs to remove, by default None
-            
+        blocks : int
+            Number of blocks to scale out by.
+
         Returns
         -------
         List[str]
-            List of block IDs removed
+            List of job IDs for the new resources.
         """
-        if blocks is not None:
-            logger.info(f"Scaling in by {blocks} blocks")
-        elif block_ids is not None:
-            logger.info(f"Scaling in blocks: {block_ids}")
-        return self.mode_handler.scale_in(blocks, block_ids)
-    
+        # Not implemented in the base provider
+        # This would be implemented by Parsl's strategy components
+        return []
+
     def shutdown(self) -> None:
-        """Shutdown the provider, releasing all resources."""
-        logger.info("Shutting down provider")
-        return self.mode_handler.shutdown()
+        """Shutdown the provider and cleanup all resources."""
+        logger.info("Shutting down EphemeralAWSProvider")
+
+        try:
+            # Cancel all jobs
+            job_ids = list(self.job_map.keys())
+            if job_ids:
+                self.cancel(job_ids)
+
+            # Clean up infrastructure
+            self.operating_mode.cleanup_infrastructure()
+
+            # Clear state
+            self.resources = {}
+            self.job_map = {}
+
+            # Save the empty state
+            self._save_state()
+
+            logger.info("Provider shutdown complete")
+        except Exception as e:
+            logger.error(f"Error during provider shutdown: {e}")
+
+    def list_resources(self) -> Dict[str, List[Dict[str, Any]]]:
+        """List all resources created by this provider.
+
+        Returns
+        -------
+        Dict[str, List[Dict[str, Any]]]
+            Dictionary of resource types and their details.
+        """
+        try:
+            return self.operating_mode.list_resources()
+        except Exception as e:
+            logger.error(f"Failed to list resources: {e}")
+            return {}
+
+    def cleanup_all(self) -> None:
+        """Clean up all resources created by this provider."""
+        logger.info("Cleaning up all resources")
+
+        try:
+            # Clean up all resources in the operating mode
+            self.operating_mode.cleanup_all()
+
+            # Clear state
+            self.resources = {}
+            self.job_map = {}
+
+            # Save the empty state
+            self._save_state()
+
+            logger.info("All resources cleaned up")
+        except Exception as e:
+            logger.error(f"Failed to clean up all resources: {e}")
+            raise ProviderError(f"Failed to clean up all resources: {e}")
+
+    @property
+    def status_polling_interval(self) -> int:
+        """Return the status polling interval for the provider.
+
+        Returns
+        -------
+        int
+            Polling interval in seconds.
+        """
+        return 60
+
+    @property
+    def label(self) -> str:
+        """Return the label for the provider.
+
+        Returns
+        -------
+        str
+            Provider label.
+        """
+        return f"ephemeral-aws-{self.mode_type.value}-{self.provider_id[:8]}"
+
+    def __repr__(self) -> str:
+        """Return string representation of the provider.
+
+        Returns
+        -------
+        str
+            String representation.
+        """
+        return (
+            f"EphemeralAWSProvider(mode={self.mode_type.value}, "
+            f"region={self.region}, "
+            f"min_blocks={self.min_blocks}, "
+            f"max_blocks={self.max_blocks})"
+        )

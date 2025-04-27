@@ -1,4 +1,5 @@
-"""AWS utility functions for Parsl Ephemeral AWS Provider.
+"""
+AWS utility functions for the EphemeralAWSProvider.
 
 SPDX-License-Identifier: Apache-2.0
 SPDX-FileCopyrightText: 2025 Scott Friedman and Project Contributors
@@ -6,264 +7,489 @@ SPDX-FileCopyrightText: 2025 Scott Friedman and Project Contributors
 
 import logging
 import time
-from typing import Dict, Any, Optional, List, Tuple
+from typing import Any, Dict, List, Optional, Union
 
 import boto3
-import botocore.exceptions
+from botocore.exceptions import ClientError
 
-from ..exceptions import ConfigurationError
+from parsl_ephemeral_aws.constants import DEFAULT_AMI_MAPPING, DEFAULT_REGION
+from parsl_ephemeral_aws.exceptions import (
+    AMINotFoundError,
+    AWSAuthenticationError,
+    AWSConnectionError,
+    ResourceCreationError,
+    ResourceDeletionError,
+    ResourceNotFoundError,
+)
 
 
 logger = logging.getLogger(__name__)
 
 
-def create_aws_session(
+def create_session(
     region: Optional[str] = None,
+    profile_name: Optional[str] = None,
     aws_access_key_id: Optional[str] = None,
     aws_secret_access_key: Optional[str] = None,
     aws_session_token: Optional[str] = None,
-    profile_name: Optional[str] = None,
-    retry_attempts: int = 5
+    endpoint_url: Optional[str] = None,
 ) -> boto3.Session:
-    """Create an AWS session with proper credentials and configuration.
-    
+    """Create a boto3 session with the given parameters.
+
     Parameters
     ----------
     region : Optional[str], optional
-        AWS region to use, by default None (uses default from config/profile)
-    aws_access_key_id : Optional[str], optional
-        AWS access key ID, by default None (uses environment or profile)
-    aws_secret_access_key : Optional[str], optional
-        AWS secret access key, by default None (uses environment or profile)
-    aws_session_token : Optional[str], optional
-        AWS session token, by default None (uses environment or profile)
+        AWS region to use, by default None
     profile_name : Optional[str], optional
-        AWS profile name, by default None (uses default profile)
-    retry_attempts : int, optional
-        Number of retry attempts for AWS API calls, by default 5
-        
+        AWS profile name to use, by default None
+    aws_access_key_id : Optional[str], optional
+        AWS access key ID, by default None
+    aws_secret_access_key : Optional[str], optional
+        AWS secret access key, by default None
+    aws_session_token : Optional[str], optional
+        AWS session token, by default None
+    endpoint_url : Optional[str], optional
+        Custom endpoint URL for AWS services (e.g., for LocalStack), by default None
+
     Returns
     -------
     boto3.Session
-        Configured AWS session
-    
+        The created boto3 session
+
     Raises
     ------
-    ConfigurationError
-        If AWS credentials could not be found or configured
+    AWSAuthenticationError
+        If authentication fails
+    AWSConnectionError
+        If connection to AWS services fails
     """
     try:
-        # Create session with provided credentials
-        session_kwargs = {}
-        
-        if region is not None:
-            session_kwargs['region_name'] = region
-            
-        if aws_access_key_id is not None and aws_secret_access_key is not None:
-            session_kwargs['aws_access_key_id'] = aws_access_key_id
-            session_kwargs['aws_secret_access_key'] = aws_secret_access_key
-            
-            if aws_session_token is not None:
-                session_kwargs['aws_session_token'] = aws_session_token
-                
-        if profile_name is not None:
-            session_kwargs['profile_name'] = profile_name
-            
-        session = boto3.Session(**session_kwargs)
-        
-        # Configure retry behavior
-        config = botocore.config.Config(
-            retries={
-                'max_attempts': retry_attempts,
-                'mode': 'standard'
-            }
+        session = boto3.Session(
+            region_name=region or DEFAULT_REGION,
+            profile_name=profile_name,
+            aws_access_key_id=aws_access_key_id,
+            aws_secret_access_key=aws_secret_access_key,
+            aws_session_token=aws_session_token,
         )
         
-        # Test the session by creating an EC2 client and making a simple API call
-        ec2_client = session.client('ec2', config=config)
-        ec2_client.describe_regions(DryRun=False)
+        # Verify that the session is valid by calling a simple operation
+        sts = session.client("sts", endpoint_url=endpoint_url)
+        sts.get_caller_identity()
         
-        logger.debug(f"Successfully created AWS session with region: {session.region_name}")
+        logger.debug(f"Created AWS session for region {session.region_name}")
         return session
-        
-    except botocore.exceptions.NoCredentialsError:
-        error_msg = (
-            "AWS credentials not found. Please provide credentials via environment variables, "
-            "AWS config file, IAM instance profile, or session parameters."
-        )
-        logger.error(error_msg)
-        raise ConfigurationError(error_msg)
-        
-    except botocore.exceptions.ClientError as e:
-        error_code = e.response['Error']['Code']
-        error_msg = e.response['Error']['Message']
-        
-        if error_code == 'AuthFailure':
-            logger.error(f"AWS authentication failed: {error_msg}")
-            raise ConfigurationError(f"AWS authentication failed: {error_msg}")
-        elif error_code == 'UnauthorizedOperation':
-            logger.error(f"Insufficient permissions for AWS operations: {error_msg}")
-            raise ConfigurationError(f"Insufficient permissions for AWS operations: {error_msg}")
-        else:
-            logger.error(f"AWS session creation failed: {error_code} - {error_msg}")
-            raise ConfigurationError(f"AWS session creation failed: {error_code} - {error_msg}")
-        
-    except Exception as e:
-        logger.error(f"Unexpected error creating AWS session: {e}")
-        raise ConfigurationError(f"Unexpected error creating AWS session: {e}")
-
-
-def get_aws_account_id(session: boto3.Session) -> str:
-    """Get the AWS account ID for the current session.
     
+    except ClientError as e:
+        if "InvalidClientTokenId" in str(e) or "AccessDenied" in str(e):
+            logger.error(f"AWS authentication failed: {e}")
+            raise AWSAuthenticationError(f"AWS authentication failed: {e}") from e
+        else:
+            logger.error(f"AWS connection failed: {e}")
+            raise AWSConnectionError(f"AWS connection failed: {e}") from e
+    except Exception as e:
+        logger.error(f"Failed to create AWS session: {e}")
+        raise AWSConnectionError(f"Failed to create AWS session: {e}") from e
+
+
+def get_default_ami(region: str) -> str:
+    """Get the default AMI ID for the given region.
+
     Parameters
     ----------
-    session : boto3.Session
-        AWS session
-        
+    region : str
+        AWS region
+
     Returns
     -------
     str
-        AWS account ID
+        Default AMI ID for the region
+
+    Raises
+    ------
+    AMINotFoundError
+        If no default AMI is found for the region
     """
-    try:
-        client = session.client('sts')
-        return client.get_caller_identity()['Account']
-    except Exception as e:
-        logger.error(f"Error getting AWS account ID: {e}")
-        raise
+    if region in DEFAULT_AMI_MAPPING:
+        return DEFAULT_AMI_MAPPING[region]
+    else:
+        message = f"No default AMI found for region {region}"
+        logger.error(message)
+        raise AMINotFoundError(message)
 
 
-def wait_for_aws_resource(
-    check_func,
+def wait_for_resource(
     resource_id: str,
-    target_states: List[str],
-    failure_states: List[str],
-    description: str = "resource",
-    timeout: int = 300,
-    interval: int = 5
-) -> Tuple[bool, str]:
-    """Wait for an AWS resource to reach a desired state.
-    
+    waiter_name: str,
+    service_client: Any,
+    waiter_config: Optional[Dict[str, Any]] = None,
+    resource_name: str = "resource",
+) -> None:
+    """Wait for a resource to reach the desired state.
+
     Parameters
     ----------
-    check_func : callable
-        Function that takes a resource ID and returns its current state
     resource_id : str
-        ID of the resource to check
-    target_states : List[str]
-        List of states that indicate success
-    failure_states : List[str]
-        List of states that indicate failure
-    description : str, optional
-        Description of the resource, by default "resource"
-    timeout : int, optional
-        Maximum time to wait in seconds, by default 300
-    interval : int, optional
-        Time between checks in seconds, by default 5
-        
-    Returns
-    -------
-    Tuple[bool, str]
-        (True, current_state) if resource reached a target state,
-        (False, current_state) if resource reached a failure state or timed out
-    """
-    start_time = time.time()
-    end_time = start_time + timeout
-    
-    logger.debug(f"Waiting for {description} {resource_id} to reach one of {target_states}")
-    
-    while time.time() < end_time:
-        try:
-            current_state = check_func(resource_id)
-            
-            if current_state in target_states:
-                logger.debug(f"{description.capitalize()} {resource_id} reached target state: {current_state}")
-                return True, current_state
-            
-            if current_state in failure_states:
-                logger.warning(f"{description.capitalize()} {resource_id} reached failure state: {current_state}")
-                return False, current_state
-            
-            logger.debug(f"{description.capitalize()} {resource_id} current state: {current_state}, waiting...")
-            time.sleep(interval)
-            
-        except Exception as e:
-            logger.error(f"Error checking {description} {resource_id} state: {e}")
-            time.sleep(interval)
-    
-    logger.warning(f"Timeout waiting for {description} {resource_id} to reach one of {target_states}")
-    return False, "timeout"
+        Resource ID to wait for
+    waiter_name : str
+        Name of the waiter to use
+    service_client : Any
+        Boto3 service client
+    waiter_config : Optional[Dict[str, Any]], optional
+        Waiter configuration, by default None
+    resource_name : str, optional
+        Name of the resource for logging purposes, by default "resource"
 
-
-def get_default_tags(provider: Any) -> List[Dict[str, str]]:
-    """Get default tags for AWS resources.
-    
-    Parameters
-    ----------
-    provider : EphemeralAWSProvider
-        Provider instance
-        
-    Returns
-    -------
-    List[Dict[str, str]]
-        List of tag dictionaries
-    """
-    tags = [
-        {'Key': 'ParslManagedResource', 'Value': 'true'},
-        {'Key': 'ParslWorkflowId', 'Value': provider.workflow_id},
-    ]
-    
-    # Add provider tags
-    if provider.tags:
-        for key, value in provider.tags.items():
-            tags.append({'Key': key, 'Value': value})
-            
-    return tags
-
-
-def get_available_regions() -> List[str]:
-    """Get available AWS regions.
-    
-    Returns
-    -------
-    List[str]
-        List of region names
+    Raises
+    ------
+    ResourceCreationError
+        If the resource fails to reach the desired state
     """
     try:
-        ec2_client = boto3.client('ec2')
-        regions = [region['RegionName'] for region in ec2_client.describe_regions()['Regions']]
-        return regions
-    except Exception as e:
-        logger.error(f"Error getting available AWS regions: {e}")
-        return []
-
-
-def get_instance_type_offerings(session: boto3.Session, region: str) -> List[str]:
-    """Get available instance types in a region.
+        logger.debug(f"Waiting for {resource_name} {resource_id} ({waiter_name})")
+        waiter = service_client.get_waiter(waiter_name)
+        
+        config = {
+            "WaiterConfig": {
+                "Delay": 5,  # Seconds between attempts
+                "MaxAttempts": 60  # Maximum number of attempts (5 minutes)
+            }
+        }
+        
+        if waiter_config:
+            config["WaiterConfig"].update(waiter_config)
+        
+        if waiter_name in ["instance_running", "instance_status_ok"]:
+            waiter.wait(InstanceIds=[resource_id], **config)
+        elif waiter_name in ["vpc_available", "vpc_exists"]:
+            waiter.wait(VpcIds=[resource_id], **config)
+        elif waiter_name in ["subnet_available"]:
+            waiter.wait(SubnetIds=[resource_id], **config)
+        elif waiter_name in ["security_group_exists"]:
+            waiter.wait(GroupIds=[resource_id], **config)
+        elif waiter_name in ["function_active", "function_exists"]:
+            waiter.wait(FunctionName=resource_id, **config)
+        elif waiter_name in ["task_running", "task_stopped"]:
+            waiter.wait(Tasks=[resource_id], **config)
+        elif "stack" in waiter_name:
+            waiter.wait(StackName=resource_id, **config)
+        else:
+            # Generic wait for resources without specific waiter support
+            logger.debug(f"Using generic wait for {resource_name} {resource_id}")
+            waiter.wait(Id=resource_id, **config)
+        
+        logger.debug(f"{resource_name.capitalize()} {resource_id} reached desired state")
     
+    except Exception as e:
+        logger.error(f"Error waiting for {resource_name} {resource_id}: {e}")
+        raise ResourceCreationError(
+            f"Error waiting for {resource_name} {resource_id}: {e}"
+        ) from e
+
+
+def create_tags(
+    resource_ids: Union[str, List[str]],
+    tags: Dict[str, str],
+    session: boto3.Session,
+    region: Optional[str] = None,
+) -> None:
+    """Create tags for AWS resources.
+
     Parameters
     ----------
+    resource_ids : Union[str, List[str]]
+        Resource ID or list of resource IDs to tag
+    tags : Dict[str, str]
+        Tags to apply to the resources
     session : boto3.Session
-        AWS session
-    region : str
-        AWS region
-        
+        Boto3 session to use
+    region : Optional[str], optional
+        AWS region, by default None
+
+    Raises
+    ------
+    ResourceCreationError
+        If tagging fails
+    """
+    if not isinstance(resource_ids, list):
+        resource_ids = [resource_ids]
+    
+    if not resource_ids:
+        logger.debug("No resources to tag")
+        return
+    
+    if not tags:
+        logger.debug("No tags to apply")
+        return
+    
+    # Convert tags dictionary to AWS Tags format
+    aws_tags = [{"Key": key, "Value": value} for key, value in tags.items()]
+    
+    try:
+        ec2 = session.client("ec2", region_name=region)
+        ec2.create_tags(Resources=resource_ids, Tags=aws_tags)
+        logger.debug(f"Created tags for resources {resource_ids}: {tags}")
+    except Exception as e:
+        logger.error(f"Failed to create tags for resources {resource_ids}: {e}")
+        # Don't raise an exception here, as tagging failure should not abort the operation
+        logger.warning("Continuing despite tag creation failure")
+
+
+def get_resources_by_tags(
+    tags: Dict[str, str],
+    session: boto3.Session,
+    region: Optional[str] = None,
+    resource_type: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Get AWS resources by tags.
+
+    Parameters
+    ----------
+    tags : Dict[str, str]
+        Tags to filter resources by
+    session : boto3.Session
+        Boto3 session to use
+    region : Optional[str], optional
+        AWS region, by default None
+    resource_type : Optional[str], optional
+        Resource type to filter by, by default None
+
     Returns
     -------
-    List[str]
-        List of available instance types
+    List[Dict[str, Any]]
+        List of resources matching the tags
+
+    Raises
+    ------
+    AWSConnectionError
+        If connection to AWS services fails
+    """
+    # Convert tags dictionary to AWS filter format
+    filters = [{"Name": f"tag:{key}", "Values": [value]} for key, value in tags.items()]
+    
+    if resource_type:
+        filters.append({"Name": "resource-type", "Values": [resource_type]})
+    
+    try:
+        ec2 = session.client("ec2", region_name=region)
+        response = ec2.describe_tags(Filters=filters)
+        
+        # Get unique resource IDs
+        resource_ids = list(set(tag["ResourceId"] for tag in response["Tags"]))
+        
+        # Get resource details
+        resources = []
+        
+        if resource_ids:
+            if not resource_type or resource_type == "instance":
+                try:
+                    instance_response = ec2.describe_instances(
+                        InstanceIds=[
+                            rid for rid in resource_ids 
+                            if rid.startswith("i-")
+                        ]
+                    )
+                    for reservation in instance_response.get("Reservations", []):
+                        resources.extend(reservation.get("Instances", []))
+                except ClientError:
+                    # Some resource IDs might not be instances
+                    pass
+            
+            if not resource_type or resource_type == "vpc":
+                try:
+                    vpc_response = ec2.describe_vpcs(
+                        VpcIds=[
+                            rid for rid in resource_ids 
+                            if rid.startswith("vpc-")
+                        ]
+                    )
+                    resources.extend(vpc_response.get("Vpcs", []))
+                except ClientError:
+                    pass
+            
+            if not resource_type or resource_type == "subnet":
+                try:
+                    subnet_response = ec2.describe_subnets(
+                        SubnetIds=[
+                            rid for rid in resource_ids 
+                            if rid.startswith("subnet-")
+                        ]
+                    )
+                    resources.extend(subnet_response.get("Subnets", []))
+                except ClientError:
+                    pass
+            
+            if not resource_type or resource_type == "security-group":
+                try:
+                    sg_response = ec2.describe_security_groups(
+                        GroupIds=[
+                            rid for rid in resource_ids 
+                            if rid.startswith("sg-")
+                        ]
+                    )
+                    resources.extend(sg_response.get("SecurityGroups", []))
+                except ClientError:
+                    pass
+        
+        return resources
+    
+    except Exception as e:
+        logger.error(f"Failed to get resources by tags: {e}")
+        raise AWSConnectionError(f"Failed to get resources by tags: {e}") from e
+
+
+def delete_resource(
+    resource_id: str,
+    session: boto3.Session,
+    resource_type: str,
+    region: Optional[str] = None,
+    force: bool = False,
+) -> bool:
+    """Delete an AWS resource.
+
+    Parameters
+    ----------
+    resource_id : str
+        Resource ID to delete
+    session : boto3.Session
+        Boto3 session to use
+    resource_type : str
+        Type of resource to delete
+    region : Optional[str], optional
+        AWS region, by default None
+    force : bool, optional
+        Whether to force deletion even if resource is in use, by default False
+
+    Returns
+    -------
+    bool
+        True if the resource was deleted, False otherwise
+
+    Raises
+    ------
+    ResourceDeletionError
+        If deletion fails
+    ResourceNotFoundError
+        If the resource is not found
     """
     try:
-        ec2_client = session.client('ec2', region_name=region)
-        paginator = ec2_client.get_paginator('describe_instance_type_offerings')
-        instance_types = []
+        if resource_type == "instance":
+            ec2 = session.client("ec2", region_name=region)
+            ec2.terminate_instances(InstanceIds=[resource_id])
+            logger.debug(f"Terminated EC2 instance {resource_id}")
+            return True
         
-        for page in paginator.paginate(LocationType='region', Filters=[{'Name': 'location', 'Values': [region]}]):
-            for offering in page['InstanceTypeOfferings']:
-                instance_types.append(offering['InstanceType'])
+        elif resource_type == "vpc":
+            ec2 = session.client("ec2", region_name=region)
+            
+            # Delete all resources within the VPC
+            if force:
+                # Get all subnets in the VPC
+                subnets = ec2.describe_subnets(
+                    Filters=[{"Name": "vpc-id", "Values": [resource_id]}]
+                )
+                for subnet in subnets.get("Subnets", []):
+                    delete_resource(
+                        subnet["SubnetId"], session, "subnet", region, force
+                    )
                 
-        return sorted(instance_types)
+                # Get all security groups in the VPC
+                security_groups = ec2.describe_security_groups(
+                    Filters=[{"Name": "vpc-id", "Values": [resource_id]}]
+                )
+                for sg in security_groups.get("SecurityGroups", []):
+                    if sg["GroupName"] != "default":  # Can't delete default SG
+                        delete_resource(
+                            sg["GroupId"], session, "security-group", region, force
+                        )
+                
+                # Get internet gateways attached to the VPC
+                igws = ec2.describe_internet_gateways(
+                    Filters=[{"Name": "attachment.vpc-id", "Values": [resource_id]}]
+                )
+                for igw in igws.get("InternetGateways", []):
+                    ec2.detach_internet_gateway(
+                        InternetGatewayId=igw["InternetGatewayId"],
+                        VpcId=resource_id
+                    )
+                    delete_resource(
+                        igw["InternetGatewayId"], session, "internet-gateway", region, force
+                    )
+            
+            # Delete the VPC
+            ec2.delete_vpc(VpcId=resource_id)
+            logger.debug(f"Deleted VPC {resource_id}")
+            return True
+        
+        elif resource_type == "subnet":
+            ec2 = session.client("ec2", region_name=region)
+            ec2.delete_subnet(SubnetId=resource_id)
+            logger.debug(f"Deleted subnet {resource_id}")
+            return True
+        
+        elif resource_type == "security-group":
+            ec2 = session.client("ec2", region_name=region)
+            ec2.delete_security_group(GroupId=resource_id)
+            logger.debug(f"Deleted security group {resource_id}")
+            return True
+        
+        elif resource_type == "internet-gateway":
+            ec2 = session.client("ec2", region_name=region)
+            ec2.delete_internet_gateway(InternetGatewayId=resource_id)
+            logger.debug(f"Deleted internet gateway {resource_id}")
+            return True
+        
+        elif resource_type == "function":
+            lambda_client = session.client("lambda", region_name=region)
+            lambda_client.delete_function(FunctionName=resource_id)
+            logger.debug(f"Deleted Lambda function {resource_id}")
+            return True
+        
+        elif resource_type == "task":
+            ecs = session.client("ecs", region_name=region)
+            ecs.stop_task(task=resource_id, cluster="default")
+            logger.debug(f"Stopped ECS task {resource_id}")
+            return True
+        
+        elif resource_type == "cloudformation-stack":
+            cfn = session.client("cloudformation", region_name=region)
+            cfn.delete_stack(StackName=resource_id)
+            # Wait for stack deletion
+            logger.debug(f"Initiated deletion of CloudFormation stack {resource_id}")
+            logger.debug(f"Waiting for stack {resource_id} to be deleted...")
+            waiter = cfn.get_waiter("stack_delete_complete")
+            waiter.wait(
+                StackName=resource_id,
+                WaiterConfig={
+                    "Delay": 10,
+                    "MaxAttempts": 30
+                }
+            )
+            logger.debug(f"Deleted CloudFormation stack {resource_id}")
+            return True
+        
+        else:
+            logger.warning(f"Unsupported resource type: {resource_type}")
+            return False
+    
+    except ClientError as e:
+        error_code = e.response.get("Error", {}).get("Code", "")
+        
+        if any(code in error_code for code in ["NotFound", "InvalidSubnetID.NotFound", 
+                                              "InvalidVpcID.NotFound", "InvalidGroup.NotFound",
+                                              "InvalidInternetGatewayID.NotFound",
+                                              "ResourceNotFoundException"]):
+            logger.debug(f"Resource {resource_id} not found or already deleted")
+            raise ResourceNotFoundError(
+                f"Resource {resource_id} not found or already deleted"
+            ) from e
+        else:
+            logger.error(f"Failed to delete {resource_type} {resource_id}: {e}")
+            raise ResourceDeletionError(
+                f"Failed to delete {resource_type} {resource_id}: {e}"
+            ) from e
+    
     except Exception as e:
-        logger.error(f"Error getting instance type offerings for region {region}: {e}")
-        return []
+        logger.error(f"Failed to delete {resource_type} {resource_id}: {e}")
+        raise ResourceDeletionError(
+            f"Failed to delete {resource_type} {resource_id}: {e}"
+        ) from e
