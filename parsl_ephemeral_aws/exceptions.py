@@ -165,6 +165,30 @@ class TaskTimeoutError(JobExecutionError):
     pass
 
 
+class SpotInterruptionError(SpotInstanceError):
+    """Error related to spot instance interruption."""
+
+    pass
+
+
+class CheckpointError(EphemeralAWSError):
+    """Error saving or loading checkpoint data."""
+
+    pass
+
+
+class CheckpointNotFoundError(CheckpointError):
+    """No checkpoint found for the given task."""
+
+    pass
+
+
+class TaskRecoveryError(EphemeralAWSError):
+    """Error recovering a task after spot interruption."""
+
+    pass
+
+
 class InvalidStateError(ProviderError):
     """Provider is in an invalid state for the requested operation."""
 

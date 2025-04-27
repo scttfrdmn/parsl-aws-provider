@@ -56,6 +56,11 @@ from parsl_ephemeral_aws.exceptions import (
 from parsl_ephemeral_aws.modes.base import OperatingMode
 from parsl_ephemeral_aws.compute.lambda_func import LambdaManager
 from parsl_ephemeral_aws.compute.ecs import ECSManager
+from parsl_ephemeral_aws.compute.spot_interruption import (
+    SpotInterruptionMonitor,
+    SpotInterruptionHandler,
+    ParslSpotInterruptionHandler,
+)
 from parsl_ephemeral_aws.utils.aws import (
     create_tags,
     delete_resource,
@@ -228,6 +233,23 @@ class ServerlessMode(OperatingMode):
         self.lambda_manager = None
         self.ecs_manager = None
         self.cf_client = self.session.client('cloudformation')
+        
+        # Initialize spot interruption handling if enabled
+        self.spot_interruption_monitor = None
+        self.spot_interruption_handler = None
+        
+        if (self.use_spot or self.use_spot_fleet) and self.spot_interruption_handling:
+            if not self.checkpoint_bucket and self.spot_interruption_handling:
+                logger.warning("Spot interruption handling is enabled but no checkpoint bucket specified")
+            else:
+                logger.debug("Initializing SpotInterruptionMonitor and Handler for ServerlessMode")
+                self.spot_interruption_monitor = SpotInterruptionMonitor(self.session)
+                self.spot_interruption_handler = ParslSpotInterruptionHandler(
+                    session=self.session,
+                    checkpoint_bucket=self.checkpoint_bucket,
+                    checkpoint_prefix=self.checkpoint_prefix
+                )
+                self.spot_interruption_monitor.start_monitoring()
 
     def initialize(self) -> None:
         """Initialize serverless mode infrastructure.
@@ -883,6 +905,52 @@ class ServerlessMode(OperatingMode):
                 "use_spot_fleet": self.use_spot_fleet,
             })
             
+            # Register with spot interruption monitor if needed
+            if self.use_spot_fleet and self.spot_interruption_handling and self.spot_interruption_monitor and self.spot_interruption_handler:
+                # We need to wait for and fetch the fleet request ID from the outputs
+                start_time = time.time()
+                fleet_request_id = None
+                
+                # Wait for up to 3 minutes for stack to create resources
+                while time.time() - start_time < 180 and not fleet_request_id:
+                    try:
+                        # Check if the stack has output values yet
+                        stack_response = self.cf_client.describe_stacks(StackName=stack_name)
+                        stack_status = stack_response['Stacks'][0]['StackStatus']
+                        
+                        # Only check outputs if stack is complete
+                        if stack_status == 'CREATE_COMPLETE':
+                            outputs = stack_response['Stacks'][0].get('Outputs', [])
+                            
+                            for output in outputs:
+                                if output['OutputKey'] == 'SpotFleetRequestId':
+                                    fleet_request_id = output['OutputValue']
+                                    break
+                            
+                            if fleet_request_id:
+                                # Save fleet ID in resource data
+                                self.resources[resource_id]["fleet_request_id"] = fleet_request_id
+                                
+                                # Register with interruption monitor
+                                self.spot_interruption_monitor.register_fleet(
+                                    fleet_request_id,
+                                    self.spot_interruption_handler.handle_fleet_interruption
+                                )
+                                logger.info(f"Registered spot fleet {fleet_request_id} for interruption handling")
+                                break
+                        
+                        # If stack is still being created, wait and check again
+                        if 'CREATE_IN_PROGRESS' in stack_status:
+                            time.sleep(10)
+                        else:
+                            # If stack has failed or is in any other state, log and break
+                            if stack_status != 'CREATE_COMPLETE':
+                                logger.warning(f"Stack {stack_name} is in state {stack_status}, not waiting for fleet ID")
+                            break
+                    except Exception as e:
+                        logger.error(f"Error getting spot fleet ID from stack {stack_name}: {e}")
+                        break
+            
             logger.debug(f"Created CloudFormation stack {stack_name} for ECS job {job_id}")
                 
         except Exception as e:
@@ -1345,6 +1413,16 @@ class ServerlessMode(OperatingMode):
         # Delete all resources first
         if self.resources:
             self.cleanup_all()
+            
+        # Stop spot interruption monitoring if enabled
+        if self.spot_interruption_monitor:
+            try:
+                self.spot_interruption_monitor.stop_monitoring()
+                logger.info("Stopped spot interruption monitoring")
+            except Exception as e:
+                logger.error(f"Failed to stop spot interruption monitoring: {e}")
+            self.spot_interruption_monitor = None
+            self.spot_interruption_handler = None
         
         # Check if we created a VPC using CloudFormation
         stack_name = f"parsl-vpc-{self.provider_id[:8]}"
@@ -1532,3 +1610,81 @@ class ServerlessMode(OperatingMode):
             logger.info(f"Cleaned up {len(resource_ids)} resources")
         else:
             logger.debug("No resources to clean up")
+            
+    def save_state(self) -> None:
+        """Save the current state to the state store."""
+        state = {
+            "resources": self.resources,
+            "provider_id": self.provider_id,
+            "mode": self.__class__.__name__,
+            "vpc_id": self.vpc_id,
+            "subnet_id": self.subnet_id,
+            "security_group_id": self.security_group_id,
+            "initialized": self.initialized,
+            "use_spot": self.use_spot,
+            "use_spot_fleet": self.use_spot_fleet,
+            "spot_interruption_handling": self.spot_interruption_handling,
+        }
+        
+        try:
+            self.state_store.save_state(state)
+        except Exception as e:
+            logger.error(f"Failed to save state: {e}")
+            
+    def load_state(self) -> bool:
+        """Load state from the state store.
+        
+        Returns
+        -------
+        bool
+            True if state was loaded successfully, False otherwise
+        """
+        try:
+            state = self.state_store.load_state()
+            if state and state.get("provider_id") == self.provider_id:
+                self.resources = state.get("resources", {})
+                self.vpc_id = state.get("vpc_id", self.vpc_id)
+                self.subnet_id = state.get("subnet_id", self.subnet_id)
+                self.security_group_id = state.get("security_group_id", self.security_group_id)
+                self.initialized = state.get("initialized", False)
+                
+                # Check if spot interruption handling was previously enabled
+                previous_spot_handling = state.get("spot_interruption_handling", False)
+                if previous_spot_handling != self.spot_interruption_handling:
+                    logger.info(f"Spot interruption handling changed from {previous_spot_handling} to {self.spot_interruption_handling}")
+                    
+                    # Initialize or clean up spot interruption handling based on new setting
+                    if self.spot_interruption_handling and (self.use_spot or self.use_spot_fleet):
+                        if not self.spot_interruption_monitor:
+                            logger.debug("Initializing SpotInterruptionMonitor and Handler after state load")
+                            self.spot_interruption_monitor = SpotInterruptionMonitor(self.session)
+                            self.spot_interruption_handler = ParslSpotInterruptionHandler(
+                                session=self.session,
+                                checkpoint_bucket=self.checkpoint_bucket,
+                                checkpoint_prefix=self.checkpoint_prefix
+                            )
+                            self.spot_interruption_monitor.start_monitoring()
+                    elif not self.spot_interruption_handling and self.spot_interruption_monitor:
+                        logger.debug("Stopping SpotInterruptionMonitor after state load")
+                        self.spot_interruption_monitor.stop_monitoring()
+                        self.spot_interruption_monitor = None
+                        self.spot_interruption_handler = None
+                
+                # Re-register existing spot fleet resources with interruption monitor if needed
+                if self.spot_interruption_handling and self.spot_interruption_monitor and self.spot_interruption_handler:
+                    for resource_id, resource in self.resources.items():
+                        from parsl_ephemeral_aws.constants import RESOURCE_TYPE_SPOT_FLEET
+                        if resource.get("resource_type") == RESOURCE_TYPE_SPOT_FLEET and resource.get("fleet_request_id"):
+                            fleet_request_id = resource.get("fleet_request_id")
+                            self.spot_interruption_monitor.register_fleet(
+                                fleet_request_id,
+                                self.spot_interruption_handler.handle_fleet_interruption
+                            )
+                            logger.info(f"Re-registered spot fleet {fleet_request_id} for interruption handling")
+                
+                logger.debug(f"Loaded state with {len(self.resources)} resources")
+                return True
+        except Exception as e:
+            logger.error(f"Failed to load state: {e}")
+        
+        return False

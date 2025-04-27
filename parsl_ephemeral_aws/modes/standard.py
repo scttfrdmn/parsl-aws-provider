@@ -47,6 +47,11 @@ from parsl_ephemeral_aws.exceptions import (
 )
 from parsl_ephemeral_aws.modes.base import OperatingMode
 from parsl_ephemeral_aws.compute.spot_fleet import SpotFleetManager
+from parsl_ephemeral_aws.compute.spot_interruption import (
+    SpotInterruptionMonitor,
+    SpotInterruptionHandler,
+    ParslSpotInterruptionHandler,
+)
 from parsl_ephemeral_aws.utils.aws import (
     create_tags,
     delete_resource,
@@ -182,6 +187,9 @@ class StandardMode(OperatingMode):
         
         # Initialize SpotFleetManager if using spot fleet
         self.spot_fleet_manager = None
+        self.spot_interruption_monitor = None
+        self.spot_interruption_handler = None
+        
         if self.use_spot and self.use_spot_fleet:
             # Create a simplified provider object for the SpotFleetManager
             # The SpotFleetManager expects a provider object with certain attributes
@@ -208,10 +216,37 @@ class StandardMode(OperatingMode):
             
             logger.debug("Initializing SpotFleetManager for StandardMode")
             self.spot_fleet_manager = SpotFleetManager(provider)
+        
+        # Initialize spot interruption handling if enabled
+        if self.use_spot and self.spot_interruption_handling:
+            if not self.checkpoint_bucket and self.spot_interruption_handling:
+                logger.warning("Spot interruption handling is enabled but no checkpoint bucket specified")
+            else:
+                logger.debug("Initializing SpotInterruptionMonitor and Handler")
+                self.spot_interruption_monitor = SpotInterruptionMonitor(self.session)
+                self.spot_interruption_handler = ParslSpotInterruptionHandler(
+                    session=self.session,
+                    checkpoint_bucket=self.checkpoint_bucket,
+                    checkpoint_prefix=self.checkpoint_prefix
+                )
+                self.spot_interruption_monitor.start_monitoring()
     
     def save_state(self) -> None:
         """Save the current state to the state store."""
-        # Include spot fleet state in the standard state dictionary
+        # Default state
+        state = {
+            "resources": self.resources,
+            "provider_id": self.provider_id,
+            "mode": self.__class__.__name__,
+            "vpc_id": self.vpc_id,
+            "subnet_id": self.subnet_id,
+            "security_group_id": self.security_group_id,
+            "initialized": self.initialized,
+            "use_spot_fleet": self.use_spot_fleet,
+            "spot_interruption_handling": self.spot_interruption_handling,
+        }
+        
+        # Include spot fleet state if applicable
         if self.use_spot_fleet and self.spot_fleet_manager:
             spot_fleet_state = {
                 "blocks": self.spot_fleet_manager.blocks,
@@ -219,19 +254,7 @@ class StandardMode(OperatingMode):
                 "instances": self.spot_fleet_manager.instances,
                 "enabled": True,
             }
-            
-            # Get the current state
-            state = {
-                "resources": self.resources,
-                "provider_id": self.provider_id,
-                "mode": self.__class__.__name__,
-                "vpc_id": self.vpc_id,
-                "subnet_id": self.subnet_id,
-                "security_group_id": self.security_group_id,
-                "initialized": self.initialized,
-                "use_spot_fleet": self.use_spot_fleet,
-                "spot_fleet_state": spot_fleet_state,
-            }
+            state["spot_fleet_state"] = spot_fleet_state
             
             try:
                 self.state_store.save_state(state)
@@ -259,6 +282,28 @@ class StandardMode(OperatingMode):
                 self.security_group_id = state.get("security_group_id", self.security_group_id)
                 self.initialized = state.get("initialized", False)
                 
+                # Check if spot interruption handling was previously enabled
+                previous_spot_handling = state.get("spot_interruption_handling", False)
+                if previous_spot_handling != self.spot_interruption_handling:
+                    logger.info(f"Spot interruption handling changed from {previous_spot_handling} to {self.spot_interruption_handling}")
+                    
+                    # Initialize or clean up spot interruption handling based on new setting
+                    if self.spot_interruption_handling and self.use_spot:
+                        if not self.spot_interruption_monitor:
+                            logger.debug("Initializing SpotInterruptionMonitor and Handler after state load")
+                            self.spot_interruption_monitor = SpotInterruptionMonitor(self.session)
+                            self.spot_interruption_handler = ParslSpotInterruptionHandler(
+                                session=self.session,
+                                checkpoint_bucket=self.checkpoint_bucket,
+                                checkpoint_prefix=self.checkpoint_prefix
+                            )
+                            self.spot_interruption_monitor.start_monitoring()
+                    elif not self.spot_interruption_handling and self.spot_interruption_monitor:
+                        logger.debug("Stopping SpotInterruptionMonitor after state load")
+                        self.spot_interruption_monitor.stop_monitoring()
+                        self.spot_interruption_monitor = None
+                        self.spot_interruption_handler = None
+                
                 # Load SpotFleetManager state if available
                 if (self.use_spot_fleet and self.spot_fleet_manager and 
                     state.get("use_spot_fleet", False) and state.get("spot_fleet_state")):
@@ -273,6 +318,17 @@ class StandardMode(OperatingMode):
                         self.spot_fleet_manager.instances = spot_fleet_state.get("instances", {})
                         
                     logger.debug(f"Loaded SpotFleetManager state with {len(self.spot_fleet_manager.blocks)} blocks")
+                    
+                    # Re-register spot fleets with interruption monitor if needed
+                    if self.spot_interruption_handling and self.spot_interruption_monitor and self.spot_interruption_handler:
+                        for block_id, block_data in self.spot_fleet_manager.blocks.items():
+                            fleet_requests = block_data.get("fleet_requests", [])
+                            for fleet_request_id in fleet_requests:
+                                self.spot_interruption_monitor.register_fleet(
+                                    fleet_request_id,
+                                    self.spot_interruption_handler.handle_fleet_interruption
+                                )
+                                logger.info(f"Re-registered spot fleet {fleet_request_id} for interruption handling")
                 
                 logger.debug(f"Loaded state with {len(self.resources)} resources")
                 return True
@@ -910,6 +966,14 @@ class StandardMode(OperatingMode):
             # Wait for instance to be running
             wait_for_resource(instance_id, "instance_running", ec2, resource_name="EC2 spot instance")
             
+            # Register with spot interruption monitor if enabled
+            if self.spot_interruption_handling and self.spot_interruption_monitor and self.spot_interruption_handler:
+                self.spot_interruption_monitor.register_instance(
+                    instance_id, 
+                    self.spot_interruption_handler.handle_instance_interruption
+                )
+                logger.info(f"Registered spot instance {instance_id} for interruption handling")
+            
             return instance_id
         except Exception as e:
             logger.error(f"Failed to create spot instance: {e}")
@@ -983,6 +1047,17 @@ class StandardMode(OperatingMode):
                 
             if time.time() - start_time >= max_wait:
                 logger.warning(f"Timeout waiting for Spot Fleet block {block_id} to be running")
+            
+            # Register spot fleet with spot interruption monitor if enabled
+            if self.spot_interruption_handling and self.spot_interruption_monitor and self.spot_interruption_handler:
+                # Get fleet instances
+                fleet_requests = self.spot_fleet_manager.blocks.get(block_id, {}).get("fleet_requests", [])
+                for fleet_request_id in fleet_requests:
+                    self.spot_interruption_monitor.register_fleet(
+                        fleet_request_id,
+                        self.spot_interruption_handler.handle_fleet_interruption
+                    )
+                    logger.info(f"Registered spot fleet {fleet_request_id} for interruption handling")
                 
             return block_id
             
@@ -1246,6 +1321,16 @@ class StandardMode(OperatingMode):
             self.cleanup_all()
         
         try:
+            # Stop spot interruption monitoring if enabled
+            if self.spot_interruption_monitor:
+                try:
+                    self.spot_interruption_monitor.stop_monitoring()
+                    logger.info("Stopped spot interruption monitoring")
+                except Exception as e:
+                    logger.error(f"Failed to stop spot interruption monitoring: {e}")
+                self.spot_interruption_monitor = None
+                self.spot_interruption_handler = None
+            
             # Delete security group
             if self.security_group_id:
                 try:

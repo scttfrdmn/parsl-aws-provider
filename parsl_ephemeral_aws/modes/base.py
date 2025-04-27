@@ -53,6 +53,14 @@ class OperatingMode(abc.ABC):
         Maximum price for spot instances
     spot_allocation_strategy : str
         Allocation strategy for spot instances
+    spot_interruption_handling : bool
+        Whether to enable spot interruption handling
+    checkpoint_bucket : Optional[str]
+        S3 bucket name for storing task checkpoints
+    checkpoint_prefix : str
+        S3 key prefix for checkpoint data
+    checkpoint_interval : int
+        Interval between checkpoints in seconds
     additional_tags : Dict[str, str]
         Tags to apply to created resources
     auto_shutdown : bool
@@ -84,6 +92,10 @@ class OperatingMode(abc.ABC):
         use_spot: bool = False,
         spot_max_price: Optional[str] = None,
         spot_allocation_strategy: str = "capacity-optimized",
+        spot_interruption_handling: bool = False,
+        checkpoint_bucket: Optional[str] = None,
+        checkpoint_prefix: str = "parsl/checkpoints",
+        checkpoint_interval: int = 60,
         additional_tags: Optional[Dict[str, str]] = None,
         auto_shutdown: bool = True,
         max_idle_time: int = 300,
@@ -123,6 +135,14 @@ class OperatingMode(abc.ABC):
             Maximum price for spot instances, by default None
         spot_allocation_strategy : str, optional
             Allocation strategy for spot instances, by default "capacity-optimized"
+        spot_interruption_handling : bool, optional
+            Whether to enable spot interruption handling, by default False
+        checkpoint_bucket : Optional[str], optional
+            S3 bucket name for storing task checkpoints, by default None
+        checkpoint_prefix : str, optional
+            S3 key prefix for checkpoint data, by default "parsl/checkpoints"
+        checkpoint_interval : int, optional
+            Interval between checkpoints in seconds, by default 60
         additional_tags : Optional[Dict[str, str]], optional
             Tags to apply to created resources, by default None
         auto_shutdown : bool, optional
@@ -151,6 +171,10 @@ class OperatingMode(abc.ABC):
         self.use_spot = use_spot
         self.spot_max_price = spot_max_price
         self.spot_allocation_strategy = spot_allocation_strategy
+        self.spot_interruption_handling = spot_interruption_handling
+        self.checkpoint_bucket = checkpoint_bucket
+        self.checkpoint_prefix = checkpoint_prefix
+        self.checkpoint_interval = checkpoint_interval
         self.additional_tags = additional_tags or {}
         self.auto_shutdown = auto_shutdown
         self.max_idle_time = max_idle_time

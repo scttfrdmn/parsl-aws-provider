@@ -272,6 +272,12 @@ provider = EphemeralAWSProvider(
     use_spot_instances=True,
     spot_max_price_percentage=80,
     spot_interruption_behavior='hibernate',  # 'terminate', 'stop', or 'hibernate'
+    
+    # Enable checkpointing to handle interruptions
+    spot_interruption_handling=True,
+    checkpoint_bucket='my-parsl-checkpoints',
+    checkpoint_prefix='workflow/checkpoints',
+    checkpoint_interval=60,  # Seconds between checkpoints
 )
 ```
 
@@ -373,6 +379,7 @@ The `examples/` directory contains detailed examples for each operating mode:
 - [`serverless_mode.py`](examples/serverless_mode.py) - Lambda and Fargate execution for serverless workloads
 - [`basic_usage.py`](examples/basic_usage.py) - Combined example showing all three modes
 - [`spot_fleet_example.py`](examples/spot_fleet_example.py) - Using Spot Fleet for reliable spot instance management
+- [`spot_interruption_example.py`](examples/spot_interruption_example.py) - Handling spot instance interruptions with checkpointing
 
 Each example includes comprehensive comments explaining mode-specific features and configuration options.
 

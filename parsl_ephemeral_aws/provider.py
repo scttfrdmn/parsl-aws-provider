@@ -34,6 +34,7 @@ from parsl_ephemeral_aws.exceptions import (
     ProviderConfigurationError,
     ProviderError,
     ResourceCreationError,
+    SpotInterruptionError,
 )
 from parsl_ephemeral_aws.modes.base import OperatingMode
 from parsl_ephemeral_aws.modes.detached import DetachedMode
@@ -44,6 +45,11 @@ from parsl_ephemeral_aws.state.file import FileStateStore
 from parsl_ephemeral_aws.state.parameter_store import ParameterStoreStateStore
 from parsl_ephemeral_aws.state.s3 import S3StateStore
 from parsl_ephemeral_aws.utils.aws import create_session
+from parsl_ephemeral_aws.compute.spot_interruption import (
+    SpotInterruptionMonitor,
+    SpotInterruptionHandler,
+    ParslSpotInterruptionHandler,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -124,6 +130,14 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
         Maximum price for spot instances. Default is on-demand price.
     spot_allocation_strategy : str, optional
         Allocation strategy for spot instances. Default is 'capacity-optimized'.
+    spot_interruption_handling : bool, optional
+        Whether to enable spot interruption handling. Default is False.
+    checkpoint_bucket : Optional[str], optional
+        S3 bucket name for storing task checkpoints, required if spot_interruption_handling is True.
+    checkpoint_prefix : str, optional
+        S3 key prefix for checkpoint data. Default is 'parsl/checkpoints'.
+    checkpoint_interval : int, optional
+        Interval between checkpoints in seconds. Default is 60.
     additional_tags : Dict[str, str], optional
         Additional tags to apply to AWS resources.
     auto_shutdown : bool, optional
@@ -174,6 +188,10 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
         use_spot: bool = False,
         spot_max_price: Optional[str] = None,
         spot_allocation_strategy: str = "capacity-optimized",
+        spot_interruption_handling: bool = False,
+        checkpoint_bucket: Optional[str] = None,
+        checkpoint_prefix: str = "parsl/checkpoints",
+        checkpoint_interval: int = 60,
         additional_tags: Optional[Dict[str, str]] = None,
         auto_shutdown: bool = True,
         max_idle_time: int = DEFAULT_MAX_IDLE_TIME,
@@ -373,6 +391,10 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
             "use_spot": self.use_spot,
             "spot_max_price": self.spot_max_price,
             "spot_allocation_strategy": self.spot_allocation_strategy,
+            "spot_interruption_handling": self.spot_interruption_handling,
+            "checkpoint_bucket": self.checkpoint_bucket,
+            "checkpoint_prefix": self.checkpoint_prefix,
+            "checkpoint_interval": self.checkpoint_interval,
             "additional_tags": self.additional_tags,
             "auto_shutdown": self.auto_shutdown,
             "max_idle_time": self.max_idle_time,

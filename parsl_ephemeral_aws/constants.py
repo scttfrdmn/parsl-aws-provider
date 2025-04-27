@@ -100,6 +100,10 @@ DEFAULT_ECS_CLUSTER_NAME = "parsl-ephemeral-cluster"
 # Spot instance defaults
 DEFAULT_SPOT_ALLOCATION_STRATEGY = "capacity-optimized"
 DEFAULT_SPOT_INSTANCE_INTERRUPTION_BEHAVIOR = "terminate"
+DEFAULT_SPOT_INTERRUPTION_CHECK_INTERVAL = 30  # seconds - how often to check for interruption notices
+DEFAULT_SPOT_INTERRUPTION_LEAD_TIME = 120  # seconds - minimum lead time for recovery before termination
+DEFAULT_SPOT_CHECKPOINT_INTERVAL = 60  # seconds - how often to checkpoint long-running tasks
+DEFAULT_SPOT_MAX_RECOVERY_ATTEMPTS = 3  # maximum number of recovery attempts for a task
 
 # Tag defaults
 DEFAULT_TAG_PREFIX = "parsl-ephemeral"

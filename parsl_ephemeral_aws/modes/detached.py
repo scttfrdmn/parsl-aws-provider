@@ -61,6 +61,11 @@ from parsl_ephemeral_aws.utils.aws import (
     get_cf_template,
 )
 from parsl_ephemeral_aws.compute.spot_fleet_cleanup import cleanup_all_spot_fleet_resources
+from parsl_ephemeral_aws.compute.spot_interruption import (
+    SpotInterruptionMonitor,
+    SpotInterruptionHandler,
+    ParslSpotInterruptionHandler,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -154,6 +159,23 @@ class DetachedMode(OperatingMode):
         self.instance_types = instance_types or []
         self.nodes_per_block = nodes_per_block
         self.spot_max_price_percentage = spot_max_price_percentage
+        
+        # Initialize spot interruption handling if enabled
+        self.spot_interruption_monitor = None
+        self.spot_interruption_handler = None
+        
+        if self.use_spot and self.spot_interruption_handling:
+            if not self.checkpoint_bucket and self.spot_interruption_handling:
+                logger.warning("Spot interruption handling is enabled but no checkpoint bucket specified")
+            else:
+                logger.debug("Initializing SpotInterruptionMonitor and Handler for DetachedMode")
+                self.spot_interruption_monitor = SpotInterruptionMonitor(self.session)
+                self.spot_interruption_handler = ParslSpotInterruptionHandler(
+                    session=self.session,
+                    checkpoint_bucket=self.checkpoint_bucket,
+                    checkpoint_prefix=self.checkpoint_prefix
+                )
+                self.spot_interruption_monitor.start_monitoring()
         
         # Update resources dict to include bastion host
         self.resources = self.resources or {}
@@ -2076,6 +2098,16 @@ if __name__ == '__main__':
         # Only delete networking if not preserving bastion
         if not self.preserve_bastion:
             try:
+                # Stop spot interruption monitoring if enabled
+                if self.spot_interruption_monitor:
+                    try:
+                        self.spot_interruption_monitor.stop_monitoring()
+                        logger.info("Stopped spot interruption monitoring")
+                    except Exception as e:
+                        logger.error(f"Failed to stop spot interruption monitoring: {e}")
+                    self.spot_interruption_monitor = None
+                    self.spot_interruption_handler = None
+                
                 # Delete security group
                 if self.security_group_id:
                     try:
@@ -2249,6 +2281,7 @@ if __name__ == '__main__':
             "bastion_id": self.bastion_id,
             "bastion_host_type": self.bastion_host_type,
             "stack_name": self.stack_name,
+            "spot_interruption_handling": self.spot_interruption_handling,
         }
         
         try:
@@ -2276,6 +2309,46 @@ if __name__ == '__main__':
                 self.bastion_id = state.get("bastion_id", self.bastion_id)
                 self.bastion_host_type = state.get("bastion_host_type", self.bastion_host_type)
                 self.stack_name = state.get("stack_name", self.stack_name)
+                
+                # Check if spot interruption handling was previously enabled
+                previous_spot_handling = state.get("spot_interruption_handling", False)
+                if previous_spot_handling != self.spot_interruption_handling:
+                    logger.info(f"Spot interruption handling changed from {previous_spot_handling} to {self.spot_interruption_handling}")
+                    
+                    # Initialize or clean up spot interruption handling based on new setting
+                    if self.spot_interruption_handling and self.use_spot:
+                        if not self.spot_interruption_monitor:
+                            logger.debug("Initializing SpotInterruptionMonitor and Handler after state load")
+                            self.spot_interruption_monitor = SpotInterruptionMonitor(self.session)
+                            self.spot_interruption_handler = ParslSpotInterruptionHandler(
+                                session=self.session,
+                                checkpoint_bucket=self.checkpoint_bucket,
+                                checkpoint_prefix=self.checkpoint_prefix
+                            )
+                            self.spot_interruption_monitor.start_monitoring()
+                    elif not self.spot_interruption_handling and self.spot_interruption_monitor:
+                        logger.debug("Stopping SpotInterruptionMonitor after state load")
+                        self.spot_interruption_monitor.stop_monitoring()
+                        self.spot_interruption_monitor = None
+                        self.spot_interruption_handler = None
+                
+                # Re-register existing spot instances with interruption monitor if needed
+                if self.spot_interruption_handling and self.spot_interruption_monitor and self.spot_interruption_handler:
+                    for resource_id, resource in self.resources.items():
+                        if resource.get("type") == RESOURCE_TYPE_EC2 and resource.get("is_spot", False):
+                            self.spot_interruption_monitor.register_instance(
+                                resource_id,
+                                self.spot_interruption_handler.handle_instance_interruption
+                            )
+                            logger.info(f"Re-registered spot instance {resource_id} for interruption handling")
+                        elif resource.get("type") == RESOURCE_TYPE_SPOT_FLEET and resource.get("fleet_request_id"):
+                            fleet_request_id = resource.get("fleet_request_id")
+                            self.spot_interruption_monitor.register_fleet(
+                                fleet_request_id,
+                                self.spot_interruption_handler.handle_fleet_interruption
+                            )
+                            logger.info(f"Re-registered spot fleet {fleet_request_id} for interruption handling")
+                
                 logger.debug(f"Loaded state with {len(self.resources)} resources")
                 return True
         except Exception as e:
