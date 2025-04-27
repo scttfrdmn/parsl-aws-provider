@@ -142,17 +142,79 @@ The Ephemeral AWS Provider operates with the following components:
 
 ### Operating Modes
 
+The Ephemeral AWS Provider supports three distinct operating modes to accommodate different workflow requirements and environments:
+
 #### Standard Mode
 
-Your client directly communicates with worker nodes. This works well when your client has a stable internet connection and is suitable for development or smaller workflows.
+In Standard mode, your client machine directly communicates with worker nodes in AWS. This mode:
+
+- Provides the simplest deployment architecture
+- Requires your client to maintain a stable connection for the duration of the workflow
+- Offers the lowest latency for task submission and result retrieval
+- Works well for development, testing, and smaller production workflows
+- Requires your client to have outbound connectivity to the worker nodes
+
+Example configuration:
+```python
+provider = EphemeralAWSProvider(
+    image_id='ami-12345678',
+    instance_type='t3.medium',
+    region='us-west-2',
+    mode='standard',  # This is the default mode
+    # Other configuration parameters...
+)
+```
 
 #### Detached Mode
 
-Runs a small bastion/coordinator instance in AWS that manages workers, allowing your client to disconnect while computation continues. Great for long-running workflows or situations where your client is behind a NAT or has an unstable connection.
+Detached mode runs a small bastion/coordinator instance in AWS that manages the worker fleet. This mode:
+
+- Allows your client to disconnect after workflow submission
+- Continues running your workflow even if your client loses connectivity
+- Uses a persistent coordinator instance to manage job distribution
+- Is ideal for long-running workflows, unstable client connections, or clients behind NAT/firewalls
+- Provides built-in workflow state persistence
+- Supports auto-shutdown of the coordinator when workflow completes
+
+Example configuration:
+```python
+provider = EphemeralAWSProvider(
+    image_id='ami-12345678',
+    instance_type='t3.medium',
+    region='us-west-2',
+    mode='detached',
+    bastion_instance_type='t3.micro',
+    bastion_idle_timeout=30,  # Minutes before auto-shutdown when idle
+    state_store='parameter_store',  # Required for workflow resumption
+    # Other configuration parameters...
+)
+```
 
 #### Serverless Mode
 
-Uses AWS Lambda and/or ECS/Fargate to execute tasks without any EC2 instances. Best for event-driven or sporadic workloads with short-running tasks.
+Serverless mode eliminates the need for persistent EC2 instances by using AWS Lambda and/or ECS/Fargate. This mode:
+
+- Offers true pay-per-use pricing with no idle costs
+- Scales from zero to thousands of concurrent tasks in seconds
+- Is ideal for event-driven, sporadic, or burst workloads
+- Works best with short-running tasks (under 15 minutes for Lambda)
+- Provides automatic cleanup with zero maintenance
+- Supports both compute-optimized and memory-optimized workloads
+
+Example configuration:
+```python
+provider = EphemeralAWSProvider(
+    region='us-west-2',
+    mode='serverless',
+    worker_type='lambda',  # Or 'ecs', or 'auto' to let the provider choose
+    lambda_memory=1024,    # MB
+    lambda_timeout=900,    # Seconds (max 15 minutes)
+    # For ECS/Fargate:
+    # ecs_task_cpu=1024,     # CPU units
+    # ecs_task_memory=2048,  # MB
+    # Other configuration parameters...
+)
+```
 
 ## Advanced Features
 
