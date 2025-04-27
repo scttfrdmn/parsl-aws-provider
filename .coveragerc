@@ -1,0 +1,23 @@
+[run]
+source = parsl_ephemeral_aws
+omit =
+    */tests/*
+    */templates/*
+    */setup.py
+    */__init__.py
+
+[report]
+exclude_lines =
+    pragma: no cover
+    def __repr__
+    raise NotImplementedError
+    if __name__ == .__main__.:
+    pass
+    raise ImportError
+    except ImportError
+
+[html]
+directory = coverage_html_report
+
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2025 Scott Friedman and Project Contributors
