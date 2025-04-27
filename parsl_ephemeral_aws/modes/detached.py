@@ -60,6 +60,7 @@ from parsl_ephemeral_aws.utils.aws import (
     wait_for_resource,
     get_cf_template,
 )
+from parsl_ephemeral_aws.compute.spot_fleet_cleanup import cleanup_all_spot_fleet_resources
 
 
 logger = logging.getLogger(__name__)
@@ -2202,7 +2203,33 @@ if __name__ == '__main__':
         """Clean up all resources created by this mode."""
         logger.info("Cleaning up all resources")
         
-        # Just call cleanup_infrastructure with preserve_bastion=False
+        # First clean up Spot Fleet IAM roles if we're using Spot Fleet
+        if self.use_spot_fleet:
+            try:
+                logger.info(f"Cleaning up Spot Fleet resources for workflow {self.workflow_id}")
+                cleanup_results = cleanup_all_spot_fleet_resources(
+                    session=self.session,
+                    workflow_id=self.workflow_id,
+                    cancel_active_requests=True,
+                    cleanup_iam_roles=True
+                )
+                
+                # Log cleanup results
+                if cleanup_results["cancelled_requests"]:
+                    logger.info(f"Cancelled {len(cleanup_results['cancelled_requests'])} Spot Fleet requests")
+                
+                if cleanup_results["cleaned_roles"]:
+                    logger.info(f"Cleaned up {len(cleanup_results['cleaned_roles'])} Spot Fleet IAM roles")
+                
+                if cleanup_results["errors"]:
+                    logger.warning(f"Encountered {len(cleanup_results['errors'])} errors during Spot Fleet cleanup")
+                    for error in cleanup_results["errors"]:
+                        logger.warning(f"Spot Fleet cleanup error: {error}")
+            except Exception as e:
+                logger.error(f"Error cleaning up Spot Fleet resources: {e}")
+                # Continue with regular cleanup
+        
+        # Call cleanup_infrastructure with preserve_bastion=False
         old_value = self.preserve_bastion
         self.preserve_bastion = False
         self.cleanup_infrastructure()
