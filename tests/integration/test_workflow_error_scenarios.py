@@ -32,11 +32,11 @@ from parsl_ephemeral_aws.exceptions import (
 from parsl_ephemeral_aws.utils.localstack import is_localstack_available, get_localstack_session
 
 
-# Skip all tests if LocalStack is not available
-pytestmark = pytest.mark.skipif(
-    not is_localstack_available(),
-    reason="LocalStack is not available. Make sure it's running on port 4566."
-)
+# Mark tests as requiring LocalStack
+pytestmark = [
+    pytest.mark.integration,
+    pytest.mark.localstack
+]
 
 
 @pytest.mark.integration
