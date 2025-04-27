@@ -1,68 +1,81 @@
-"""Base state implementation for Parsl Ephemeral AWS Provider.
+"""
+Base state store interface for the EphemeralAWSProvider.
 
 SPDX-License-Identifier: Apache-2.0
 SPDX-FileCopyrightText: 2025 Scott Friedman and Project Contributors
 """
 
-from abc import ABC, abstractmethod
-from typing import Dict, Any, Optional
+import abc
+import logging
+from typing import Any, Dict, Optional
 
 
-class StateStore(ABC):
-    """Base class for state persistence mechanisms."""
+logger = logging.getLogger(__name__)
+
+
+class StateStore(abc.ABC):
+    """Abstract base class for provider state stores.
     
-    @abstractmethod
-    def save_state(self, state_key: str, state_data: Dict[str, Any]) -> None:
-        """Save provider state.
+    A state store is responsible for persisting and retrieving the provider's state.
+    Different implementations store state in different locations, such as local files,
+    AWS Parameter Store, or S3.
+    
+    Attributes
+    ----------
+    provider_id : str
+        Unique identifier for the provider instance
+    """
+
+    def __init__(self, provider_id: str) -> None:
+        """Initialize the state store.
         
         Parameters
         ----------
-        state_key : str
-            Key to store the state under
-        state_data : Dict[str, Any]
-            State data to save
+        provider_id : str
+            Unique identifier for the provider instance
+        """
+        self.provider_id = provider_id
+        logger.debug(f"Initialized {self.__class__.__name__}")
+
+    @abc.abstractmethod
+    def save_state(self, state: Dict[str, Any]) -> None:
+        """Save the provider state.
+        
+        Parameters
+        ----------
+        state : Dict[str, Any]
+            Provider state to save
+            
+        Raises
+        ------
+        StateStoreError
+            If saving state fails
         """
         pass
-    
-    @abstractmethod
-    def load_state(self, state_key: str) -> Optional[Dict[str, Any]]:
-        """Load provider state.
+
+    @abc.abstractmethod
+    def load_state(self) -> Optional[Dict[str, Any]]:
+        """Load the provider state.
         
-        Parameters
-        ----------
-        state_key : str
-            Key to load the state from
-            
         Returns
         -------
         Optional[Dict[str, Any]]
-            Loaded state data, or None if not found
-        """
-        pass
-    
-    @abstractmethod
-    def delete_state(self, state_key: str) -> None:
-        """Delete provider state.
-        
-        Parameters
-        ----------
-        state_key : str
-            Key to delete the state for
-        """
-        pass
-    
-    @abstractmethod
-    def list_states(self, prefix: str) -> Dict[str, Dict[str, Any]]:
-        """List all states with a given prefix.
-        
-        Parameters
-        ----------
-        prefix : str
-            Prefix to list states for
+            Provider state if it exists, None otherwise
             
-        Returns
-        -------
-        Dict[str, Dict[str, Any]]
-            Dictionary mapping state keys to state data
+        Raises
+        ------
+        StateStoreError
+            If loading state fails
+        """
+        pass
+
+    @abc.abstractmethod
+    def delete_state(self) -> None:
+        """Delete the provider state.
+        
+        Raises
+        ------
+        StateStoreError
+            If deleting state fails
         """
         pass
