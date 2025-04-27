@@ -126,6 +126,27 @@ class SpotInstanceError(EC2InstanceError):
     pass
 
 
+class SpotFleetError(EC2InstanceError):
+    """Error managing EC2 Spot Fleet."""
+
+    pass
+
+
+class SpotFleetRequestError(SpotFleetError):
+    """Error creating or managing Spot Fleet requests."""
+
+    pass
+
+
+class SpotFleetThrottlingError(SpotFleetError):
+    """AWS API throttling for Spot Fleet operations."""
+    
+    def __init__(self, message="AWS Spot Fleet API request was throttled", operation=None, retry_after=None):
+        self.operation = operation
+        self.retry_after = retry_after
+        super().__init__(message)
+
+
 class OperatingModeError(ProviderError):
     """Error in operating mode functionality."""
 

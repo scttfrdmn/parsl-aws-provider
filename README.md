@@ -18,7 +18,7 @@ Unlike the standard Parsl AWS provider, this implementation:
 
 - **Truly ephemeral**: All resources (including VPC, security groups, etc.) are cleaned up automatically
 - **Flexible compute options**: Supports EC2, Spot instances, Lambda, and ECS/Fargate
-- **Modern AWS integration**: Uses EC2 Fleet, auto-scaling groups, and other advanced AWS features
+- **Modern AWS integration**: Uses EC2 Fleet, Spot Fleet, auto-scaling groups, and other advanced AWS features
 - **Resilient execution**: Intelligently handles spot interruptions with state persistence
 - **Multi-mode operation**: Choose between standard, detached, or serverless execution modes
 
@@ -286,9 +286,9 @@ provider = EphemeralAWSProvider(
 )
 ```
 
-### EC2 Fleet for Diverse Instance Types
+### EC2 Fleet and Spot Fleet for Diverse Instance Types
 
-Use multiple instance types for better availability and pricing:
+Use multiple instance types for better availability and pricing with EC2 Fleet:
 
 ```python
 provider = EphemeralAWSProvider(
@@ -299,6 +299,18 @@ provider = EphemeralAWSProvider(
         {'type': 'm5.large', 'weight': 2},
         {'type': 'c5.large', 'weight': 2},
     ],
+)
+```
+
+Or use AWS Spot Fleet for more reliable spot instance management:
+
+```python
+provider = EphemeralAWSProvider(
+    # Basic configuration...
+    use_spot=True,
+    use_spot_fleet=True,  # Use Spot Fleet instead of individual spot requests
+    instance_types=["c5.large", "c5d.large", "m5.large", "r5.large"],
+    spot_max_price_percentage=100,  # Maximum percentage of on-demand price
 )
 ```
 
@@ -331,6 +343,7 @@ The `examples/` directory contains detailed examples for each operating mode:
 - [`detached_mode.py`](examples/detached_mode.py) - Persistent infrastructure with bastion host for long-running workflows
 - [`serverless_mode.py`](examples/serverless_mode.py) - Lambda and Fargate execution for serverless workloads
 - [`basic_usage.py`](examples/basic_usage.py) - Combined example showing all three modes
+- [`spot_fleet_example.py`](examples/spot_fleet_example.py) - Using Spot Fleet for reliable spot instance management
 
 Each example includes comprehensive comments explaining mode-specific features and configuration options.
 
@@ -465,6 +478,10 @@ The ephemeral AWS provider requires the following AWS permissions:
                 "ec2:CreateFleet",
                 "ec2:DeleteFleet",
                 "ec2:DescribeFleets",
+                "ec2:RequestSpotFleet",
+                "ec2:CancelSpotFleetRequests",
+                "ec2:DescribeSpotFleetRequests",
+                "ec2:DescribeSpotFleetInstances",
                 "ssm:PutParameter",
                 "ssm:GetParameter",
                 "ssm:DeleteParameter",
@@ -478,7 +495,13 @@ The ephemeral AWS provider requires the following AWS permissions:
                 "ecs:RunTask",
                 "ecs:StopTask",
                 "ecs:DescribeTasks",
-                "iam:PassRole"
+                "iam:PassRole",
+                "iam:CreateRole",
+                "iam:DeleteRole",
+                "iam:AttachRolePolicy",
+                "iam:DetachRolePolicy",
+                "iam:GetRole",
+                "iam:ListAttachedRolePolicies"
             ],
             "Resource": "*"
         }
@@ -523,8 +546,10 @@ Common issues and solutions:
 
 ### Spot instances being interrupted frequently
 
+- Use Spot Fleet (`use_spot_fleet=True`) for more reliable spot instance management
 - Try different instance types or availability zones
 - Increase the spot max price percentage
+- Configure multiple instance types to improve availability and pricing
 - Switch to on-demand instances for critical workloads
 
 ### Long workflow initialization times
