@@ -1,0 +1,23 @@
+# ShellCheck configuration for Parsl Ephemeral AWS Provider
+
+# Allow using 'source' command
+disable=SC1091
+
+# Allow [ $1 = "foo" ] without quotes to match common style
+disable=SC2086
+
+# Allow local variables to be lowercase only
+disable=SC2043
+
+# Enable check for common portability issues
+enable=check-unassigned-uppercase
+
+# Specify shell dialect
+shell=bash
+
+# External sources to read
+source-path=SCRIPTDIR
+source-path=tests/bats
+
+# Exclude certain files from checking
+exclude=vendor/*
