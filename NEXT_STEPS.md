@@ -28,11 +28,13 @@ This document outlines the next steps for continuing development of the Parsl Ep
 ### 1. Unit and Integration Testing
 
 - **Unit Tests**: Create unit tests for all classes and methods
+  - ✅ Added unit tests for SpotFleet in ServerlessMode
   - Mock AWS API calls using `moto` library
   - Test state persistence mechanisms
   - Test error handling scenarios
 
 - **Integration Tests**: Develop integration tests that verify end-to-end functionality
+  - ✅ Added integration tests for SpotFleet in ServerlessMode
   - Use LocalStack for local AWS API emulation
   - Create test workflow scenarios for each operating mode
   - Verify resource creation, job execution, and cleanup
@@ -51,12 +53,17 @@ This document outlines the next steps for continuing development of the Parsl Ep
 - Add tutorials for different use cases
 - Document configuration options in detail
 - Add architecture diagrams
+- ✅ Document SpotFleet support in ServerlessMode
+- ✅ Created detailed example for SpotFleet in ServerlessMode
 
 ### 4. Additional Features
 
 - **Resource Monitoring**: Add CloudWatch integration for resource metrics
 - **Cost Tracking**: Implement cost estimation and tracking
-- **Spot Instance Management**: Add sophisticated spot instance handling
+- **Spot Instance Management**: 
+  - ✅ Implemented SpotFleet in DetachedMode
+  - ✅ Implemented SpotFleet in ServerlessMode
+  - Add spot interruption handling with task recovery
 - **Auto-scaling Policies**: Implement advanced scaling policies
 - **Cross-region Support**: Add support for multi-region deployments
 - **GPU Support**: Enhance GPU instance support for ML workloads

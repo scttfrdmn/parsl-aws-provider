@@ -10,11 +10,31 @@ Thank you for your interest in contributing to this project! Here's how you can 
    git clone https://github.com/your-username/parsl-aws-provider.git
    cd parsl-aws-provider
    ```
-3. Create a virtual environment and install development dependencies
+3. Set up your Python environment (we recommend using pyenv)
    ```bash
-   python -m venv venv
-   source venv/bin/activate  # On Windows: venv\Scripts\activate
-   pip install -e ".[dev]"
+   # Install pyenv (if not already installed)
+   # MacOS: brew install pyenv
+   # Linux: curl https://pyenv.run | bash
+   # Windows: See https://github.com/pyenv-win/pyenv-win#installation
+
+   # Install the appropriate Python version
+   pyenv install 3.9.16
+   
+   # Set the local Python version for this project
+   pyenv local 3.9.16
+   ```
+4. Create a virtual environment and install development dependencies
+   ```bash
+   # Create a virtual environment in the project directory
+   python -m venv .venv
+   
+   # Activate the virtual environment
+   source .venv/bin/activate  # On Linux/macOS
+   # OR
+   .venv\Scripts\activate     # On Windows
+   
+   # Install development dependencies
+   pip install -e ".[dev,test]"
    ```
 
 ## Development Workflow

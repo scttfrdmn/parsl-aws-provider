@@ -1,6 +1,39 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: 'Parsl Ephemeral AWS Provider - ECS/Fargate Worker Resources'
 
+Mappings:
+  RegionMap:
+    us-east-1:
+      AMI: ami-0c55b159cbfafe1f0
+    us-east-2:
+      AMI: ami-002068ed284fb165b
+    us-west-1:
+      AMI: ami-0d382e80be7ffdae5
+    us-west-2:
+      AMI: ami-0a634ae95e11c6f91
+    eu-west-1:
+      AMI: ami-0860a63209d7da3d6
+    eu-west-2:
+      AMI: ami-0bca7a6ffed76bcca
+    eu-west-3:
+      AMI: ami-068a45d114884a8fe
+    eu-central-1:
+      AMI: ami-076431be45f8fcbf8
+    ap-northeast-1:
+      AMI: ami-0318ecd6d05daa212
+    ap-northeast-2:
+      AMI: ami-0a10b2721688ce9d2
+    ap-southeast-1:
+      AMI: ami-0d728fd4e52be968f
+    ap-southeast-2:
+      AMI: ami-075a72b1992cb0687
+    ap-south-1:
+      AMI: ami-0ebc1ac48dfd14136
+    ca-central-1:
+      AMI: ami-0b8cfb6b86d697313
+    sa-east-1:
+      AMI: ami-0b032e878a66c3b68
+
 Parameters:
   ClusterName:
     Type: String
@@ -95,6 +128,30 @@ Parameters:
       - 'true'
       - 'false'
 
+  UseSpotFleet:
+    Type: String
+    Description: Whether to use EC2 Spot Fleet instead of Fargate/Fargate Spot
+    Default: 'false'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  InstanceTypes:
+    Type: String
+    Description: JSON-encoded list of instance types to use with Spot Fleet
+    Default: '[]'
+
+  NodesPerBlock:
+    Type: Number
+    Description: Number of nodes per block for Spot Fleet
+    Default: 1
+    MinValue: 1
+
+  SpotMaxPricePercentage:
+    Type: String
+    Description: Maximum spot price as percentage of on-demand price (empty for on-demand max)
+    Default: ''
+
   Tags:
     Type: String
     Description: JSON encoded tags to apply to resources
@@ -104,8 +161,12 @@ Conditions:
   HasVpcConfig: !Not [!Equals [!Ref VpcId, '']]
   HasCommand: !Not [!Equals [!Ref Command, '']]
   UseFargateSpot: !Equals [!Ref UseSpot, 'true']
+  UseSpotFleet: !Equals [!Ref UseSpotFleet, 'true']
   HasClusterName: !Not [!Equals [!Ref ClusterName, '']]
   HasTaskFamily: !Not [!Equals [!Ref TaskFamily, '']]
+  HasSpotMaxPrice: !Not [!Equals [!Ref SpotMaxPricePercentage, '']]
+  UseFargate: !Not [!Condition UseSpotFleet]
+  AssignPublicIpEnabled: !Equals [!Ref AssignPublicIp, 'ENABLED']
 
 Resources:
   ECSCluster:
@@ -165,6 +226,28 @@ Resources:
         - Key: ParslJobId
           Value: !Ref JobId
 
+  SpotFleetRole:
+    Type: AWS::IAM::Role
+    Condition: UseSpotFleet
+    Properties:
+      RoleName: !Sub 'parsl-aws-spot-fleet-role-${WorkflowId}-${JobId}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: spotfleet.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonEC2SpotFleetTaggingRole
+      Tags:
+        - Key: ParslResource
+          Value: 'true'
+        - Key: ParslWorkflowId
+          Value: !Ref WorkflowId
+        - Key: ParslJobId
+          Value: !Ref JobId
+
   LogGroup:
     Type: AWS::Logs::LogGroup
     Properties:
@@ -213,6 +296,7 @@ Resources:
 
   ECSService:
     Type: AWS::ECS::Service
+    Condition: UseFargate
     Properties:
       Cluster: !Ref ECSCluster
       TaskDefinition: !Ref TaskDefinition
@@ -236,6 +320,87 @@ Resources:
         - Key: ParslJobId
           Value: !Ref JobId
 
+
+  SpotFleetRequest:
+    Type: AWS::EC2::SpotFleet
+    Condition: UseSpotFleet
+    Properties:
+      SpotFleetRequestConfigData:
+        AllocationStrategy: diversified
+        IamFleetRole: !GetAtt SpotFleetRole.Arn
+        TargetCapacity: !Ref NodesPerBlock
+        TerminateInstancesWithExpiration: true
+        Type: maintain
+        ReplaceUnhealthyInstances: true
+        InstanceInterruptionBehavior: terminate
+        LaunchTemplateConfigs: 
+          - LaunchTemplateSpecification:
+              LaunchTemplateId: !Ref SpotFleetLaunchTemplate
+              Version: !GetAtt SpotFleetLaunchTemplate.LatestVersionNumber
+            Overrides:
+              - InstanceType: t3.small
+                SubnetId: !Select [0, !Ref SubnetIds]
+              - InstanceType: t3a.small
+                SubnetId: !Select [0, !Ref SubnetIds]
+              - InstanceType: t3.medium
+                SubnetId: !Select [0, !Ref SubnetIds]
+              - InstanceType: t3a.medium
+                SubnetId: !Select [0, !Ref SubnetIds]
+              - InstanceType: m5.large
+                SubnetId: !Select [0, !Ref SubnetIds]
+              - InstanceType: m5a.large
+                SubnetId: !Select [0, !Ref SubnetIds]
+        TagSpecifications:
+          - ResourceType: spot-fleet-request
+            Tags:
+              - Key: ParslResource
+                Value: 'true'
+              - Key: ParslWorkflowId
+                Value: !Ref WorkflowId
+              - Key: ParslJobId
+                Value: !Ref JobId
+              - Key: Name
+                Value: !Sub 'parsl-spot-fleet-${WorkflowId}-${JobId}'
+          - ResourceType: instance
+            Tags:
+              - Key: ParslResource
+                Value: 'true'
+              - Key: ParslWorkflowId
+                Value: !Ref WorkflowId
+              - Key: ParslJobId
+                Value: !Ref JobId
+              - Key: Name
+                Value: !Sub 'parsl-spot-fleet-instance-${WorkflowId}-${JobId}'
+              
+  SpotFleetLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Condition: UseSpotFleet
+    Properties:
+      LaunchTemplateData:
+        NetworkInterfaces:
+          - DeviceIndex: 0
+            Groups: !Ref SecurityGroupIds
+            AssociatePublicIpAddress: !If [AssignPublicIpEnabled, true, false]
+        UserData:
+          Fn::Base64:
+            !Sub |
+              #!/bin/bash
+              echo "Starting Parsl worker..."
+              mkdir -p /tmp/parsl
+              echo "${Command}" > /tmp/parsl/command.sh
+              chmod +x /tmp/parsl/command.sh
+              /tmp/parsl/command.sh
+              echo "Parsl worker completed."
+        TagSpecifications:
+          - ResourceType: launch-template
+            Tags:
+              - Key: ParslResource
+                Value: 'true'
+              - Key: ParslWorkflowId
+                Value: !Ref WorkflowId
+              - Key: ParslJobId
+                Value: !Ref JobId
+
 Outputs:
   ClusterName:
     Description: Name of the ECS cluster
@@ -247,7 +412,13 @@ Outputs:
 
   ServiceName:
     Description: Name of the ECS service
+    Condition: UseFargate
     Value: !GetAtt ECSService.Name
+
+  SpotFleetRequestId:
+    Description: ID of the Spot Fleet request
+    Condition: UseSpotFleet
+    Value: !Ref SpotFleetRequest
 
   LogGroupName:
     Description: Name of the CloudWatch Logs log group

@@ -71,7 +71,8 @@ class ServerlessMode(OperatingMode):
     
     In serverless mode, AWS Lambda and/or ECS/Fargate are used to execute tasks
     without any EC2 instances. This mode is suitable for event-driven or sporadic
-    workloads with short-running tasks.
+    workloads with short-running tasks. It also supports EC2 SpotFleet for improved
+    reliability and cost savings when more substantial compute resources are needed.
     
     Attributes
     ----------
@@ -87,6 +88,16 @@ class ServerlessMode(OperatingMode):
         Memory for ECS tasks in MB
     ecs_container_image : str
         Container image for ECS tasks
+    use_spot : bool
+        Whether to use spot instances for ECS tasks (Fargate Spot)
+    use_spot_fleet : bool
+        Whether to use Spot Fleet for EC2 instance deployment
+    instance_types : List[str]
+        List of instance types to use with Spot Fleet
+    nodes_per_block : int
+        Number of nodes per block for Spot Fleet
+    spot_max_price_percentage : Optional[float]
+        Maximum spot price as percentage of on-demand price
     lambda_manager : LambdaManager
         Manager for Lambda functions
     ecs_manager : ECSManager
@@ -110,6 +121,11 @@ class ServerlessMode(OperatingMode):
         security_group_id: Optional[str] = None,
         use_public_ips: bool = True,
         create_vpc: bool = True,
+        use_spot: bool = False,
+        use_spot_fleet: bool = False,
+        instance_types: Optional[List[str]] = None,
+        nodes_per_block: int = 1,
+        spot_max_price_percentage: Optional[float] = None,
         additional_tags: Optional[Dict[str, str]] = None,
         debug: bool = False,
         **kwargs: Any,
@@ -148,6 +164,21 @@ class ServerlessMode(OperatingMode):
             Whether to assign public IPs to ECS tasks, by default True
         create_vpc : bool, optional
             Whether to create a new VPC if vpc_id is not provided, by default True
+        use_spot : bool, optional
+            Whether to use spot instances for ECS tasks (Fargate Spot), by default False
+        use_spot_fleet : bool, optional
+            Whether to use Spot Fleet for EC2 instance deployment, by default False.
+            If True, this overrides the use_spot parameter and uses EC2 Spot Fleet
+            instead of Fargate Spot.
+        instance_types : Optional[List[str]], optional
+            List of instance types to use with Spot Fleet, by default None.
+            If not provided but use_spot_fleet is True, a default set of instance
+            types will be used.
+        nodes_per_block : int, optional
+            Number of nodes per block for Spot Fleet, by default 1
+        spot_max_price_percentage : Optional[float], optional
+            Maximum spot price as percentage of on-demand price, by default None.
+            If None, AWS will use the current spot market price up to the on-demand price.
         additional_tags : Optional[Dict[str, str]], optional
             Tags to apply to created resources, by default None
         debug : bool, optional
@@ -182,6 +213,16 @@ class ServerlessMode(OperatingMode):
         self.ecs_task_cpu = ecs_task_cpu
         self.ecs_task_memory = ecs_task_memory
         self.ecs_container_image = ecs_container_image
+        
+        # Spot and Spot Fleet configuration
+        self.use_spot = use_spot
+        self.use_spot_fleet = use_spot_fleet
+        self.instance_types = instance_types or [
+            "t3.small", "t3a.small", "t3.medium", "t3a.medium",
+            "m5.large", "m5a.large", "c5.large", "c5a.large"
+        ]
+        self.nodes_per_block = nodes_per_block
+        self.spot_max_price_percentage = spot_max_price_percentage
         
         # Initialize compute managers
         self.lambda_manager = None
@@ -706,7 +747,12 @@ class ServerlessMode(OperatingMode):
     def _submit_ecs_job(
         self, job_id: str, command: str, tasks_per_node: int, job_name: Optional[str], resource_id: str
     ) -> None:
-        """Submit a job to ECS/Fargate.
+        """Submit a job to ECS/Fargate or EC2 using SpotFleet.
+        
+        This method supports two deployment modes:
+        1. ECS/Fargate: The default mode, which uses serverless containers
+        2. EC2 SpotFleet: When use_spot_fleet=True, deploys EC2 instances using SpotFleet
+           for improved reliability and cost savings
         
         Parameters
         ----------
@@ -798,7 +844,23 @@ class ServerlessMode(OperatingMode):
                     },
                     {
                         'ParameterKey': 'UseSpot',
-                        'ParameterValue': 'true' if self.use_spot else 'false'
+                        'ParameterValue': 'true' if self.use_spot and not self.use_spot_fleet else 'false'
+                    },
+                    {
+                        'ParameterKey': 'UseSpotFleet',
+                        'ParameterValue': 'true' if self.use_spot_fleet else 'false'
+                    },
+                    {
+                        'ParameterKey': 'InstanceTypes',
+                        'ParameterValue': json.dumps(self.instance_types) if self.use_spot_fleet else '[]'
+                    },
+                    {
+                        'ParameterKey': 'NodesPerBlock',
+                        'ParameterValue': str(self.nodes_per_block) if self.use_spot_fleet else '1'
+                    },
+                    {
+                        'ParameterKey': 'SpotMaxPricePercentage',
+                        'ParameterValue': str(self.spot_max_price_percentage) if self.spot_max_price_percentage else ''
                     }
                 ],
                 Tags=[
@@ -810,9 +872,15 @@ class ServerlessMode(OperatingMode):
             )
             
             # Store reference to stack in resource data
+            resource_type = RESOURCE_TYPE_ECS_TASK
+            if self.use_spot_fleet:
+                from parsl_ephemeral_aws.constants import RESOURCE_TYPE_SPOT_FLEET
+                resource_type = RESOURCE_TYPE_SPOT_FLEET
+            
             self.resources[resource_id].update({
                 "stack_name": stack_name,
-                "resource_type": RESOURCE_TYPE_ECS_TASK,
+                "resource_type": resource_type,
+                "use_spot_fleet": self.use_spot_fleet,
             })
             
             logger.debug(f"Created CloudFormation stack {stack_name} for ECS job {job_id}")
@@ -882,8 +950,30 @@ class ServerlessMode(OperatingMode):
                                 status = STATUS_RUNNING
                     
                     elif worker_type == WORKER_TYPE_ECS:
-                        if self.ecs_manager:
-                            # For ECS, we get the cluster and service name from stack outputs
+                        # Check if this is a SpotFleet resource
+                        if resource.get("use_spot_fleet"):
+                            # For SpotFleet resources, we need to check the fleet status
+                            outputs = response['Stacks'][0].get('Outputs', [])
+                            fleet_request_id = None
+                            
+                            for output in outputs:
+                                if output['OutputKey'] == 'SpotFleetRequestId':
+                                    fleet_request_id = output['OutputValue']
+                                    break
+                            
+                            if fleet_request_id:
+                                # If we haven't stored the fleet_request_id yet, do so
+                                if "fleet_request_id" not in resource:
+                                    self.resources[resource_id]["fleet_request_id"] = fleet_request_id
+                                    from parsl_ephemeral_aws.constants import RESOURCE_TYPE_SPOT_FLEET
+                                    self.resources[resource_id]["resource_type"] = RESOURCE_TYPE_SPOT_FLEET
+                                
+                                # Check SpotFleet status
+                                status = self._get_spot_fleet_status(fleet_request_id)
+                            else:
+                                status = STATUS_RUNNING
+                        elif self.ecs_manager:
+                            # For standard ECS, we get the cluster and service name from stack outputs
                             outputs = response['Stacks'][0].get('Outputs', [])
                             cluster_name = None
                             service_name = None
@@ -961,6 +1051,69 @@ class ServerlessMode(OperatingMode):
             # After timeout, assume success (in a real impl, we'd check CloudWatch)
             return STATUS_SUCCEEDED
 
+    def _get_spot_fleet_status(self, fleet_request_id: str) -> str:
+        """Get the status of a Spot Fleet request.
+        
+        Parameters
+        ----------
+        fleet_request_id : str
+            ID of the Spot Fleet request
+            
+        Returns
+        -------
+        str
+            Job status
+        """
+        ec2_client = self.session.client('ec2')
+        
+        try:
+            # Get Spot Fleet request details
+            response = ec2_client.describe_spot_fleet_requests(
+                SpotFleetRequestIds=[fleet_request_id]
+            )
+            
+            if not response.get('SpotFleetRequestConfigs'):
+                return STATUS_UNKNOWN
+                
+            fleet_config = response['SpotFleetRequestConfigs'][0]
+            fleet_status = fleet_config['SpotFleetRequestState']
+            
+            # Map fleet status to Parsl status
+            if fleet_status == 'submitted':
+                return STATUS_PENDING
+            elif fleet_status == 'active':
+                # Check if target capacity is fulfilled
+                fulfilled_capacity = fleet_config.get('FulfilledCapacity', 0)
+                target_capacity = fleet_config.get('SpotFleetRequestConfig', {}).get('TargetCapacity', 0)
+                
+                if fulfilled_capacity >= target_capacity:
+                    # All requested instances are running
+                    # To determine if job is complete, ideally we'd check instance status
+                    # For now, we assume running
+                    return STATUS_RUNNING
+                else:
+                    # Still waiting for instances
+                    return STATUS_PENDING
+            elif fleet_status == 'cancelled_running':
+                # Fleet is being cancelled but instances still running
+                return STATUS_RUNNING
+            elif fleet_status == 'cancelled_terminating':
+                # Fleet is cancelled and instances are terminating
+                return STATUS_CANCELLED
+            elif fleet_status == 'cancelled':
+                # Fleet is fully cancelled
+                return STATUS_CANCELLED
+            elif fleet_status == 'failed':
+                return STATUS_FAILED
+            elif fleet_status == 'modify_in_progress':
+                return STATUS_RUNNING
+            else:
+                return STATUS_UNKNOWN
+                
+        except Exception as e:
+            logger.error(f"Error getting Spot Fleet status for {fleet_request_id}: {e}")
+            return STATUS_UNKNOWN
+    
     def _get_ecs_status(self, cluster_name: str, service_name: str) -> str:
         """Get the status of an ECS service.
         
@@ -1073,6 +1226,7 @@ class ServerlessMode(OperatingMode):
             return {}
             
         cancel_map = {}
+        ec2_client = self.session.client('ec2')
         
         for resource_id in resource_ids:
             resource = self.resources.get(resource_id)
@@ -1085,9 +1239,24 @@ class ServerlessMode(OperatingMode):
             if not stack_name:
                 cancel_map[resource_id] = STATUS_UNKNOWN
                 continue
-                
+            
             try:
-                # Delete the CloudFormation stack to cancel the job
+                # Check if this is a SpotFleet resource and handle it specially
+                from parsl_ephemeral_aws.constants import RESOURCE_TYPE_SPOT_FLEET
+                if resource.get("resource_type") == RESOURCE_TYPE_SPOT_FLEET and resource.get("fleet_request_id"):
+                    fleet_request_id = resource.get("fleet_request_id")
+                    
+                    # Cancel the Spot Fleet request directly for immediate termination
+                    try:
+                        ec2_client.cancel_spot_fleet_requests(
+                            SpotFleetRequestIds=[fleet_request_id],
+                            TerminateInstances=True
+                        )
+                        logger.info(f"Cancelled Spot Fleet request {fleet_request_id} for job {resource.get('job_id')}")
+                    except Exception as e:
+                        logger.warning(f"Error cancelling Spot Fleet request {fleet_request_id}: {e}")
+                
+                # Always delete the CloudFormation stack to cancel the job
                 self.cf_client.delete_stack(StackName=stack_name)
                 
                 # Mark as cancelled
@@ -1241,6 +1410,34 @@ class ServerlessMode(OperatingMode):
             except Exception as e:
                 logger.error(f"Error cleaning up ECS manager resources: {e}")
         
+        # Cleanup SpotFleet resources if needed
+        if self.use_spot_fleet:
+            try:
+                # Import and use SpotFleet cleanup utility
+                from parsl_ephemeral_aws.compute.spot_fleet_cleanup import cleanup_all_spot_fleet_resources
+                cleanup_result = cleanup_all_spot_fleet_resources(
+                    session=self.session,
+                    workflow_id=self.provider_id,
+                    cancel_active_requests=True,
+                    cleanup_iam_roles=True
+                )
+                
+                # Log cleanup results
+                if cleanup_result:
+                    # Log successful operations
+                    if cleanup_result.get("cancelled_requests"):
+                        logger.info(f"Cancelled {len(cleanup_result['cancelled_requests'])} SpotFleet requests")
+                    
+                    if cleanup_result.get("cleaned_roles"):
+                        logger.info(f"Cleaned up {len(cleanup_result['cleaned_roles'])} IAM roles")
+                    
+                    # Log errors
+                    if cleanup_result.get("errors"):
+                        for error in cleanup_result["errors"]:
+                            logger.warning(f"SpotFleet cleanup error: {error}")
+            except Exception as e:
+                logger.error(f"Error cleaning up SpotFleet resources: {e}")
+        
         # Clear initialization flag
         self.initialized = False
         
@@ -1260,6 +1457,7 @@ class ServerlessMode(OperatingMode):
         result: Dict[str, List[Dict[str, Any]]] = {
             "lambda_functions": [],
             "ecs_tasks": [],
+            "spot_fleet_requests": [],
             "vpc": [],
             "subnet": [],
             "security_group": [],
@@ -1279,14 +1477,26 @@ class ServerlessMode(OperatingMode):
                     "stack_name": resource.get("stack_name"),
                 })
             elif worker_type == WORKER_TYPE_ECS:
-                result["ecs_tasks"].append({
-                    "id": resource_id,
-                    "job_id": resource.get("job_id"),
-                    "job_name": resource.get("job_name"),
-                    "status": resource.get("status"),
-                    "created_at": resource.get("created_at"),
-                    "stack_name": resource.get("stack_name"),
-                })
+                # Check if this is a SpotFleet resource
+                if resource.get("use_spot_fleet") and resource.get("fleet_request_id"):
+                    result["spot_fleet_requests"].append({
+                        "id": resource_id,
+                        "job_id": resource.get("job_id"),
+                        "job_name": resource.get("job_name"),
+                        "status": resource.get("status"),
+                        "created_at": resource.get("created_at"),
+                        "stack_name": resource.get("stack_name"),
+                        "fleet_request_id": resource.get("fleet_request_id"),
+                    })
+                else:
+                    result["ecs_tasks"].append({
+                        "id": resource_id,
+                        "job_id": resource.get("job_id"),
+                        "job_name": resource.get("job_name"),
+                        "status": resource.get("status"),
+                        "created_at": resource.get("created_at"),
+                        "stack_name": resource.get("stack_name"),
+                    })
         
         # Add VPC if available
         if self.vpc_id:

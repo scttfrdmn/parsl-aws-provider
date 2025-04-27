@@ -24,7 +24,7 @@ Unlike the standard Parsl AWS provider, this implementation:
 
 ## Development
 
-This project requires Python 3.12+ and uses pyenv for Python version management.
+This project supports Python 3.9+ and uses pyenv for Python version management.
 
 ### Setting Up Development Environment
 
@@ -33,16 +33,18 @@ This project requires Python 3.12+ and uses pyenv for Python version management.
 git clone https://github.com/scttfrdmn/parsl-aws-provider.git
 cd parsl-aws-provider
 
-# Ensure you have Python 3.12+ via pyenv
-pyenv install 3.12.2
-pyenv local 3.12.2
+# Ensure you have the correct Python version via pyenv
+pyenv install 3.9.16
+pyenv local 3.9.16
 
 # Create a virtual environment
-python -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
+python -m venv .venv
+source .venv/bin/activate  # On Linux/macOS
+# OR
+.venv\Scripts\activate     # On Windows
 
 # Install development dependencies
-pip install -e ".[dev]"
+pip install -e ".[dev,test]"
 ```
 
 ### Running Tests
@@ -57,7 +59,19 @@ pytest --cov=parsl_ephemeral_aws
 # Run linting and type checking
 flake8 parsl_ephemeral_aws tests
 mypy parsl_ephemeral_aws
+
+# Format code
+black parsl_ephemeral_aws tests
 ```
+
+### Development Guidelines
+
+- Always use a virtual environment
+- Run linting and tests before submitting PRs
+- Follow PEP 8 style guidelines
+- Document all public APIs with docstrings
+- Write unit tests for new functionality
+- Ensure backward compatibility when making changes
 
 ## Installation
 
@@ -200,6 +214,7 @@ Serverless mode eliminates the need for persistent EC2 instances by using AWS La
 - Works best with short-running tasks (under 15 minutes for Lambda)
 - Provides automatic cleanup with zero maintenance
 - Supports both compute-optimized and memory-optimized workloads
+- Supports AWS SpotFleet for more reliable and cost-effective EC2 resources when needed
 
 Example configuration:
 ```python
@@ -213,6 +228,20 @@ provider = EphemeralAWSProvider(
     # ecs_task_cpu=1024,     # CPU units
     # ecs_task_memory=2048,  # MB
     # Other configuration parameters...
+)
+```
+
+For workloads that need more substantial compute power but still benefit from serverless management, you can enable SpotFleet in ServerlessMode:
+
+```python
+provider = EphemeralAWSProvider(
+    region='us-west-2',
+    mode='serverless',
+    worker_type='ecs',
+    use_spot_fleet=True,
+    instance_types=["t3.medium", "t3a.medium", "m5.large"],
+    nodes_per_block=2,
+    spot_max_price_percentage=80,  # 80% of on-demand price
 )
 ```
 
@@ -482,6 +511,8 @@ The ephemeral AWS provider requires the following AWS permissions:
                 "ec2:CancelSpotFleetRequests",
                 "ec2:DescribeSpotFleetRequests",
                 "ec2:DescribeSpotFleetInstances",
+                "ec2:ModifySpotFleetRequest",
+                "ec2:DescribeSpotFleetRequestHistory",
                 "ssm:PutParameter",
                 "ssm:GetParameter",
                 "ssm:DeleteParameter",

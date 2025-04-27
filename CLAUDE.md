@@ -265,6 +265,50 @@ Be aware of these limitations when working with Claude Code:
 
 For these limitations, use Claude to generate test plans or templates that you can execute yourself.
 
+## Python Environment Setup
+
+When working on this project, follow these Python environment management practices:
+
+1. **Using pyenv**: Use pyenv to manage Python versions
+   ```bash
+   # Install the appropriate Python version
+   pyenv install 3.9.16
+   
+   # Set the local Python version for this project
+   cd /path/to/parsl-aws-provider
+   pyenv local 3.9.16
+   ```
+
+2. **Virtual environments**: Always use virtual environments to isolate dependencies
+   ```bash
+   # Create a virtual environment in the project directory
+   python -m venv .venv
+   
+   # Activate the virtual environment
+   source .venv/bin/activate  # On Linux/macOS
+   .venv\Scripts\activate     # On Windows
+   
+   # Install development dependencies
+   pip install -e ".[dev,test]"
+   ```
+
+3. **Requirements management**: 
+   - Use `requirements.txt` for production dependencies
+   - Use `requirements-dev.txt` for development and testing dependencies
+   - Use `setup.py` or `pyproject.toml` for package metadata
+
+4. **Linting and formatting**:
+   ```bash
+   # Run linting checks
+   flake8 parsl_ephemeral_aws tests
+   
+   # Run type checking
+   mypy parsl_ephemeral_aws
+   
+   # Format code
+   black parsl_ephemeral_aws tests
+   ```
+
 ## Best Practices
 
 When developing this project with Claude Code:
@@ -275,6 +319,7 @@ When developing this project with Claude Code:
 4. **Testing focus**: Emphasize test development alongside feature development
 5. **Error handling**: Pay special attention to AWS error scenarios
 6. **Resource tracking**: Ensure all created resources are traceable and cleanup-able
+7. **Environment consistency**: Ensure all development uses the same Python environment
 
 ## Example Complete Function Request
 
