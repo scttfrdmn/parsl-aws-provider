@@ -5,6 +5,9 @@ omit =
     */templates/*
     */setup.py
     */__init__.py
+    */venv/*
+    */.venv/*
+    */.eggs/*
 
 [report]
 exclude_lines =
@@ -15,9 +18,14 @@ exclude_lines =
     pass
     raise ImportError
     except ImportError
+    # Exclude mocking-specific code from coverage
+    if not MOTO_AVAILABLE:
+    if not LOCALSTACK_AVAILABLE:
+    def mock_decorator
 
 [html]
 directory = coverage_html_report
+title = Parsl Ephemeral AWS Provider Coverage Report
 
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: 2025 Scott Friedman and Project Contributors
