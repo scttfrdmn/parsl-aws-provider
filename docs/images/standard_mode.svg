@@ -1,0 +1,102 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<svg width="800" height="500" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">
+  <style>
+    .label { font-family: Arial, sans-serif; font-size: 14px; }
+    .title { font-family: Arial, sans-serif; font-size: 18px; font-weight: bold; }
+    .box { stroke: #333; stroke-width: 2px; }
+    .aws-orange { fill: #FF9900; }
+    .aws-dark { fill: #232F3E; }
+    .client { fill: #4B8BF5; }
+    .worker { fill: #34A853; }
+    .arrow { stroke: #666; stroke-width: 2; marker-end: url(#arrowhead); }
+    .network { stroke: #888; stroke-width: 1; stroke-dasharray: 5,5; }
+  </style>
+
+  <defs>
+    <marker id="arrowhead" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+      <polygon points="0 0, 10 3.5, 0 7" fill="#666" />
+    </marker>
+  </defs>
+
+  <!-- Background AWS Cloud -->
+  <rect x="200" y="50" width="550" height="400" rx="20" ry="20" fill="#F7F7F7" stroke="#888" stroke-width="1" stroke-dasharray="5,5" />
+  <text x="475" y="80" text-anchor="middle" class="label">AWS Cloud</text>
+
+  <!-- VPC -->
+  <rect x="250" y="100" width="450" height="300" rx="10" ry="10" fill="#E8F4FA" stroke="#333" stroke-width="1" />
+  <text x="475" y="120" text-anchor="middle" class="label">Virtual Private Cloud (VPC)</text>
+
+  <!-- Client Machine -->
+  <rect x="50" y="200" width="120" height="80" rx="5" ry="5" class="box client" />
+  <text x="110" y="240" text-anchor="middle" fill="white" class="label">Client Machine</text>
+  <text x="110" y="260" text-anchor="middle" fill="white" class="label">Parsl</text>
+
+  <!-- EC2 Instances -->
+  <g transform="translate(300, 180)">
+    <rect width="100" height="80" rx="5" ry="5" class="box worker" />
+    <text x="50" y="30" text-anchor="middle" fill="white" class="label">EC2 Worker</text>
+    <text x="50" y="50" text-anchor="middle" fill="white" class="label">Instance</text>
+  </g>
+
+  <g transform="translate(450, 180)">
+    <rect width="100" height="80" rx="5" ry="5" class="box worker" />
+    <text x="50" y="30" text-anchor="middle" fill="white" class="label">EC2 Worker</text>
+    <text x="50" y="50" text-anchor="middle" fill="white" class="label">Instance</text>
+  </g>
+
+  <g transform="translate(600, 180)">
+    <rect width="100" height="80" rx="5" ry="5" class="box worker" />
+    <text x="50" y="30" text-anchor="middle" fill="white" class="label">EC2 Worker</text>
+    <text x="50" y="50" text-anchor="middle" fill="white" class="label">Instance</text>
+  </g>
+
+  <!-- AWS Services -->
+  <g transform="translate(300, 320)">
+    <rect width="100" height="60" rx="5" ry="5" class="box aws-orange" />
+    <text x="50" y="35" text-anchor="middle" fill="white" class="label">Security</text>
+    <text x="50" y="50" text-anchor="middle" fill="white" class="label">Groups</text>
+  </g>
+
+  <g transform="translate(450, 320)">
+    <rect width="100" height="60" rx="5" ry="5" class="box aws-orange" />
+    <text x="50" y="35" text-anchor="middle" fill="white" class="label">Parameter</text>
+    <text x="50" y="50" text-anchor="middle" fill="white" class="label">Store</text>
+  </g>
+
+  <g transform="translate(600, 320)">
+    <rect width="100" height="60" rx="5" ry="5" class="box aws-orange" />
+    <text x="50" y="35" text-anchor="middle" fill="white" class="label">Spot Fleet</text>
+    <text x="50" y="50" text-anchor="middle" fill="white" class="label">(Optional)</text>
+  </g>
+
+  <!-- Connection Arrows -->
+  <line x1="170" y1="220" x2="290" y2="220" class="arrow" />
+  <line x1="170" y1="240" x2="290" y2="240" class="arrow" />
+  
+  <line x1="170" y1="230" x2="440" y2="230" class="arrow" />
+  <line x1="170" y1="250" x2="440" y2="250" class="arrow" />
+  
+  <line x1="170" y1="215" x2="590" y2="215" class="arrow" />
+  <line x1="170" y1="255" x2="590" y2="255" class="arrow" />
+
+  <!-- AWS Management Arrows -->
+  <line x1="110" y1="280" x2="110" y2="400" class="arrow" />
+  <line x1="110" y1="400" x2="475" y2="400" class="arrow" />
+  <text x="290" y="420" text-anchor="middle" class="label">Resource Management</text>
+
+  <!-- Title -->
+  <text x="400" y="30" text-anchor="middle" class="title">Standard Mode Architecture</text>
+  
+  <!-- Legend -->
+  <rect x="50" y="430" width="15" height="15" class="client" />
+  <text x="75" y="443" class="label">Client</text>
+  
+  <rect x="130" y="430" width="15" height="15" class="worker" />
+  <text x="155" y="443" class="label">Worker Node</text>
+  
+  <rect x="230" y="430" width="15" height="15" class="aws-orange" />
+  <text x="255" y="443" class="label">AWS Service</text>
+  
+  <line x1="300" y1="437" x2="330" y2="437" class="arrow" />
+  <text x="370" y="443" class="label">Communication</text>
+</svg>

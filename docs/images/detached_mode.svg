@@ -1,0 +1,113 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<svg width="800" height="500" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">
+  <style>
+    .label { font-family: Arial, sans-serif; font-size: 14px; }
+    .title { font-family: Arial, sans-serif; font-size: 18px; font-weight: bold; }
+    .box { stroke: #333; stroke-width: 2px; }
+    .aws-orange { fill: #FF9900; }
+    .aws-dark { fill: #232F3E; }
+    .client { fill: #4B8BF5; }
+    .bastion { fill: #9C27B0; }
+    .worker { fill: #34A853; }
+    .arrow { stroke: #666; stroke-width: 2; marker-end: url(#arrowhead); }
+    .dashed-arrow { stroke: #666; stroke-width: 2; stroke-dasharray: 5,5; marker-end: url(#arrowhead); }
+    .network { stroke: #888; stroke-width: 1; stroke-dasharray: 5,5; }
+  </style>
+
+  <defs>
+    <marker id="arrowhead" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+      <polygon points="0 0, 10 3.5, 0 7" fill="#666" />
+    </marker>
+  </defs>
+
+  <!-- Background AWS Cloud -->
+  <rect x="200" y="50" width="550" height="400" rx="20" ry="20" fill="#F7F7F7" stroke="#888" stroke-width="1" stroke-dasharray="5,5" />
+  <text x="475" y="80" text-anchor="middle" class="label">AWS Cloud</text>
+
+  <!-- VPC -->
+  <rect x="250" y="100" width="450" height="300" rx="10" ry="10" fill="#E8F4FA" stroke="#333" stroke-width="1" />
+  <text x="475" y="120" text-anchor="middle" class="label">Virtual Private Cloud (VPC)</text>
+
+  <!-- Client Machine -->
+  <rect x="50" y="200" width="120" height="80" rx="5" ry="5" class="box client" />
+  <text x="110" y="240" text-anchor="middle" fill="white" class="label">Client Machine</text>
+  <text x="110" y="260" text-anchor="middle" fill="white" class="label">Parsl</text>
+
+  <!-- Bastion Host -->
+  <rect x="300" y="150" width="120" height="80" rx="5" ry="5" class="box bastion" />
+  <text x="360" y="190" text-anchor="middle" fill="white" class="label">Bastion Host</text>
+  <text x="360" y="210" text-anchor="middle" fill="white" class="label">Coordinator</text>
+
+  <!-- EC2 Instances -->
+  <g transform="translate(300, 280)">
+    <rect width="100" height="80" rx="5" ry="5" class="box worker" />
+    <text x="50" y="30" text-anchor="middle" fill="white" class="label">EC2 Worker</text>
+    <text x="50" y="50" text-anchor="middle" fill="white" class="label">Instance</text>
+  </g>
+
+  <g transform="translate(450, 280)">
+    <rect width="100" height="80" rx="5" ry="5" class="box worker" />
+    <text x="50" y="30" text-anchor="middle" fill="white" class="label">EC2 Worker</text>
+    <text x="50" y="50" text-anchor="middle" fill="white" class="label">Instance</text>
+  </g>
+
+  <g transform="translate(600, 280)">
+    <rect width="100" height="80" rx="5" ry="5" class="box worker" />
+    <text x="50" y="30" text-anchor="middle" fill="white" class="label">EC2 Worker</text>
+    <text x="50" y="50" text-anchor="middle" fill="white" class="label">Instance</text>
+  </g>
+
+  <!-- AWS Services -->
+  <g transform="translate(450, 150)">
+    <rect width="100" height="60" rx="5" ry="5" class="box aws-orange" />
+    <text x="50" y="35" text-anchor="middle" fill="white" class="label">Parameter</text>
+    <text x="50" y="50" text-anchor="middle" fill="white" class="label">Store</text>
+  </g>
+
+  <g transform="translate(600, 150)">
+    <rect width="100" height="60" rx="5" ry="5" class="box aws-orange" />
+    <text x="50" y="35" text-anchor="middle" fill="white" class="label">S3</text>
+    <text x="50" y="50" text-anchor="middle" fill="white" class="label">State Storage</text>
+  </g>
+
+  <!-- Connection Arrows -->
+  <!-- Client to Bastion connection -->
+  <line x1="170" y1="220" x2="290" y2="190" class="arrow" />
+  <line x1="290" y1="210" x2="170" y2="240" class="arrow" />
+  <text x="230" y="180" text-anchor="middle" class="label">Initial Connection</text>
+  
+  <!-- Client to Bastion optional connection -->
+  <line x1="170" y1="250" x2="290" y2="230" class="dashed-arrow" />
+  <text x="230" y="260" text-anchor="middle" class="label">Optional Reconnection</text>
+  
+  <!-- Bastion to Worker connections -->
+  <line x1="350" y1="230" x2="350" y2="280" class="arrow" />
+  <line x1="370" y1="230" x2="500" y2="280" class="arrow" />
+  <line x1="390" y1="230" x2="650" y2="280" class="arrow" />
+
+  <!-- Bastion to State Services -->
+  <line x1="420" y1="180" x2="440" y2="180" class="arrow" />
+  <line x1="500" y1="180" x2="590" y2="180" class="arrow" />
+
+  <!-- Title -->
+  <text x="400" y="30" text-anchor="middle" class="title">Detached Mode Architecture</text>
+  
+  <!-- Legend -->
+  <rect x="50" y="430" width="15" height="15" class="client" />
+  <text x="75" y="443" class="label">Client</text>
+  
+  <rect x="130" y="430" width="15" height="15" class="bastion" />
+  <text x="155" y="443" class="label">Bastion/Coordinator</text>
+  
+  <rect x="310" y="430" width="15" height="15" class="worker" />
+  <text x="335" y="443" class="label">Worker Node</text>
+  
+  <rect x="420" y="430" width="15" height="15" class="aws-orange" />
+  <text x="445" y="443" class="label">AWS Service</text>
+  
+  <line x1="490" y1="437" x2="510" y2="437" class="arrow" />
+  <text x="540" y="443" class="label">Connection</text>
+  
+  <line x1="580" y1="437" x2="600" y2="437" class="dashed-arrow" />
+  <text x="640" y="443" class="label">Optional Connection</text>
+</svg>
