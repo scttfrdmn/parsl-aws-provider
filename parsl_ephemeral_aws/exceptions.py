@@ -48,8 +48,26 @@ class ResourceDeletionError(ProviderError):
     pass
 
 
+class ResourceCleanupError(ResourceDeletionError):
+    """Error cleaning up AWS resources."""
+
+    pass
+
+
 class ResourceNotFoundError(ProviderError):
     """Requested AWS resource not found."""
+
+    pass
+
+
+class ConfigurationError(ProviderConfigurationError):
+    """Error in provider configuration."""
+
+    pass
+
+
+class JobSubmissionError(ProviderError):
+    """Error submitting job for execution."""
 
     pass
 

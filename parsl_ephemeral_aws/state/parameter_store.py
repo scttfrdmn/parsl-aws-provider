@@ -278,3 +278,7 @@ class ParameterStoreState(StateStore):
         except Exception as e:
             logger.error(f"Error cleaning up workflow states from Parameter Store: {e}")
             raise StateError(f"Failed to clean up workflow states: {e}")
+
+
+# Alias for backwards compatibility
+ParameterStoreStateStore = ParameterStoreState

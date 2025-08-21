@@ -97,6 +97,10 @@ DEFAULT_LAMBDA_HANDLER = "handler.lambda_handler"
 DEFAULT_ECS_TASK_CPU = 1024  # CPU units
 DEFAULT_ECS_TASK_MEMORY = 2048  # MB
 DEFAULT_ECS_CLUSTER_NAME = "parsl-ephemeral-cluster"
+# Aliases for compatibility
+DEFAULT_ECS_CPU = DEFAULT_ECS_TASK_CPU
+DEFAULT_ECS_MEMORY = DEFAULT_ECS_TASK_MEMORY
+DEFAULT_ECS_CONTAINER_IMAGE = "public.ecr.aws/lambda/python:3.9"
 
 # Spot instance defaults
 DEFAULT_SPOT_ALLOCATION_STRATEGY = "capacity-optimized"
@@ -114,6 +118,11 @@ DEFAULT_SPOT_MAX_RECOVERY_ATTEMPTS = 3  # maximum number of recovery attempts fo
 
 # Tag defaults
 DEFAULT_TAG_PREFIX = "parsl-ephemeral"
+TAG_PREFIX = DEFAULT_TAG_PREFIX  # Alias for compatibility
+TAG_NAME = "Name"
+TAG_WORKFLOW_ID = "WorkflowId"
+TAG_JOB_ID = "JobId"
+TAG_BLOCK_ID = "BlockId"
 DEFAULT_REQUIRED_TAGS = {
     "Name": "parsl-ephemeral",
     "CreatedBy": "ParslEphemeralAWSProvider",

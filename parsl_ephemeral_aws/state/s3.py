@@ -354,3 +354,7 @@ class S3State(StateStore):
         except Exception as e:
             logger.error(f"Error deleting S3 bucket: {e}")
             return False
+
+
+# Alias for backwards compatibility
+S3StateStore = S3State
