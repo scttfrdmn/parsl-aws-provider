@@ -5,13 +5,13 @@ SPDX-FileCopyrightText: 2025 Scott Friedman and Project Contributors
 """
 
 import logging
-from typing import Dict, List, Optional, Any
+from typing import List, Optional, Any
 
 import boto3
 from botocore.exceptions import ClientError
 
 from ..exceptions import ResourceCreationError, ResourceCleanupError
-from ..constants import TAG_PREFIX, TAG_NAME, TAG_WORKFLOW_ID, DEFAULT_SG_NAME
+from ..constants import TAG_NAME, TAG_WORKFLOW_ID, DEFAULT_SG_NAME
 
 
 logger = logging.getLogger(__name__)
@@ -19,44 +19,46 @@ logger = logging.getLogger(__name__)
 
 class SecurityGroupManager:
     """Manager for AWS security group resources."""
-    
+
     def __init__(self, provider: Any) -> None:
         """Initialize the security group manager.
-        
+
         Parameters
         ----------
         provider : EphemeralAWSProvider
             The provider instance
         """
         self.provider = provider
-        
+
         # Initialize AWS session
         session_kwargs = {}
         if self.provider.aws_access_key_id and self.provider.aws_secret_access_key:
             session_kwargs["aws_access_key_id"] = self.provider.aws_access_key_id
-            session_kwargs["aws_secret_access_key"] = self.provider.aws_secret_access_key
-            
+            session_kwargs[
+                "aws_secret_access_key"
+            ] = self.provider.aws_secret_access_key
+
         if self.provider.aws_session_token:
             session_kwargs["aws_session_token"] = self.provider.aws_session_token
-            
+
         if self.provider.aws_profile:
             session_kwargs["profile_name"] = self.provider.aws_profile
-            
+
         self.aws_session = boto3.Session(
-            region_name=self.provider.region,
-            **session_kwargs
+            region_name=self.provider.region, **session_kwargs
         )
-        
+
         # Initialize clients
-        self.ec2_client = self.aws_session.client('ec2')
-        
+        self.ec2_client = self.aws_session.client("ec2")
+
         # Track resources for cleanup
         self.security_groups = {}  # type: Dict[str, Dict[str, Any]]
-    
-    def create_security_group(self, vpc_id: str, name: Optional[str] = None, 
-                             description: Optional[str] = None) -> str:
+
+    def create_security_group(
+        self, vpc_id: str, name: Optional[str] = None, description: Optional[str] = None
+    ) -> str:
         """Create a security group.
-        
+
         Parameters
         ----------
         vpc_id : str
@@ -65,7 +67,7 @@ class SecurityGroupManager:
             Name of the security group, by default None (auto-generated)
         description : Optional[str], optional
             Description of the security group, by default None (auto-generated)
-            
+
         Returns
         -------
         str
@@ -75,10 +77,10 @@ class SecurityGroupManager:
             # Generate name and description if not provided
             if not name:
                 name = f"{DEFAULT_SG_NAME}-{self.provider.workflow_id}"
-                
+
             if not description:
                 description = f"Security group for Parsl Ephemeral AWS Provider ({self.provider.workflow_id})"
-            
+
             # Create security group
             sg_response = self.ec2_client.create_security_group(
                 GroupName=name,
@@ -86,46 +88,57 @@ class SecurityGroupManager:
                 VpcId=vpc_id,
                 TagSpecifications=[
                     {
-                        'ResourceType': 'security-group',
-                        'Tags': [
-                            {'Key': 'Name', 'Value': name},
-                            {'Key': TAG_NAME, 'Value': 'true'},
-                            {'Key': TAG_WORKFLOW_ID, 'Value': self.provider.workflow_id}
-                        ]
+                        "ResourceType": "security-group",
+                        "Tags": [
+                            {"Key": "Name", "Value": name},
+                            {"Key": TAG_NAME, "Value": "true"},
+                            {
+                                "Key": TAG_WORKFLOW_ID,
+                                "Value": self.provider.workflow_id,
+                            },
+                        ],
                     }
-                ]
+                ],
             )
-            security_group_id = sg_response['GroupId']
-            
+            security_group_id = sg_response["GroupId"]
+
             # Store security group information
             self.security_groups[security_group_id] = {
-                'id': security_group_id,
-                'name': name,
-                'vpc_id': vpc_id,
-                'rules': []
+                "id": security_group_id,
+                "name": name,
+                "vpc_id": vpc_id,
+                "rules": [],
             }
-            
+
             logger.info(f"Created security group: {security_group_id}")
-            
+
             # Add provider tags
             if self.provider.tags:
                 self.ec2_client.create_tags(
                     Resources=[security_group_id],
-                    Tags=[{'Key': k, 'Value': v} for k, v in self.provider.tags.items()]
+                    Tags=[
+                        {"Key": k, "Value": v} for k, v in self.provider.tags.items()
+                    ],
                 )
-            
+
             return security_group_id
-            
+
         except ClientError as e:
             logger.error(f"Error creating security group: {e}")
             raise ResourceCreationError(f"Failed to create security group: {e}")
-    
-    def add_ingress_rule(self, security_group_id: str, ip_protocol: str, from_port: int, 
-                        to_port: int, cidr_blocks: Optional[List[str]] = None,
-                        source_group_ids: Optional[List[str]] = None,
-                        description: Optional[str] = None) -> None:
+
+    def add_ingress_rule(
+        self,
+        security_group_id: str,
+        ip_protocol: str,
+        from_port: int,
+        to_port: int,
+        cidr_blocks: Optional[List[str]] = None,
+        source_group_ids: Optional[List[str]] = None,
+        description: Optional[str] = None,
+    ) -> None:
         """Add an ingress rule to a security group.
-        
+
         Parameters
         ----------
         security_group_id : str
@@ -146,62 +159,77 @@ class SecurityGroupManager:
         try:
             # Prepare IP permissions
             ip_permissions = [
-                {
-                    'IpProtocol': ip_protocol,
-                    'FromPort': from_port,
-                    'ToPort': to_port
-                }
+                {"IpProtocol": ip_protocol, "FromPort": from_port, "ToPort": to_port}
             ]
-            
+
             # Add CIDR blocks if provided
             if cidr_blocks:
-                ip_permissions[0]['IpRanges'] = [
-                    {'CidrIp': cidr, 'Description': description} if description else {'CidrIp': cidr}
+                ip_permissions[0]["IpRanges"] = [
+                    {"CidrIp": cidr, "Description": description}
+                    if description
+                    else {"CidrIp": cidr}
                     for cidr in cidr_blocks
                 ]
-            
+
             # Add source security groups if provided
             if source_group_ids:
-                ip_permissions[0]['UserIdGroupPairs'] = [
-                    {'GroupId': group_id, 'Description': description} if description else {'GroupId': group_id}
+                ip_permissions[0]["UserIdGroupPairs"] = [
+                    {"GroupId": group_id, "Description": description}
+                    if description
+                    else {"GroupId": group_id}
                     for group_id in source_group_ids
                 ]
-            
+
             # Add ingress rule
             self.ec2_client.authorize_security_group_ingress(
-                GroupId=security_group_id,
-                IpPermissions=ip_permissions
+                GroupId=security_group_id, IpPermissions=ip_permissions
             )
-            
+
             # Update security group information
             if security_group_id in self.security_groups:
-                self.security_groups[security_group_id]['rules'].append({
-                    'type': 'ingress',
-                    'ip_protocol': ip_protocol,
-                    'from_port': from_port,
-                    'to_port': to_port,
-                    'cidr_blocks': cidr_blocks,
-                    'source_group_ids': source_group_ids,
-                    'description': description
-                })
-            
-            logger.info(f"Added ingress rule to security group {security_group_id}: {ip_protocol} {from_port}-{to_port}")
-            
+                self.security_groups[security_group_id]["rules"].append(
+                    {
+                        "type": "ingress",
+                        "ip_protocol": ip_protocol,
+                        "from_port": from_port,
+                        "to_port": to_port,
+                        "cidr_blocks": cidr_blocks,
+                        "source_group_ids": source_group_ids,
+                        "description": description,
+                    }
+                )
+
+            logger.info(
+                f"Added ingress rule to security group {security_group_id}: {ip_protocol} {from_port}-{to_port}"
+            )
+
         except ClientError as e:
             # If rule already exists, log but don't raise
-            if e.response['Error']['Code'] == 'InvalidPermission.Duplicate':
-                logger.warning(f"Rule already exists in security group {security_group_id}: {e}")
+            if e.response["Error"]["Code"] == "InvalidPermission.Duplicate":
+                logger.warning(
+                    f"Rule already exists in security group {security_group_id}: {e}"
+                )
                 return
-            
-            logger.error(f"Error adding ingress rule to security group {security_group_id}: {e}")
-            raise ResourceCreationError(f"Failed to add ingress rule to security group {security_group_id}: {e}")
-    
-    def add_egress_rule(self, security_group_id: str, ip_protocol: str, from_port: int, 
-                       to_port: int, cidr_blocks: Optional[List[str]] = None,
-                       destination_group_ids: Optional[List[str]] = None,
-                       description: Optional[str] = None) -> None:
+
+            logger.error(
+                f"Error adding ingress rule to security group {security_group_id}: {e}"
+            )
+            raise ResourceCreationError(
+                f"Failed to add ingress rule to security group {security_group_id}: {e}"
+            )
+
+    def add_egress_rule(
+        self,
+        security_group_id: str,
+        ip_protocol: str,
+        from_port: int,
+        to_port: int,
+        cidr_blocks: Optional[List[str]] = None,
+        destination_group_ids: Optional[List[str]] = None,
+        description: Optional[str] = None,
+    ) -> None:
         """Add an egress rule to a security group.
-        
+
         Parameters
         ----------
         security_group_id : str
@@ -222,63 +250,75 @@ class SecurityGroupManager:
         try:
             # Prepare IP permissions
             ip_permissions = [
-                {
-                    'IpProtocol': ip_protocol,
-                    'FromPort': from_port,
-                    'ToPort': to_port
-                }
+                {"IpProtocol": ip_protocol, "FromPort": from_port, "ToPort": to_port}
             ]
-            
+
             # Add CIDR blocks if provided
             if cidr_blocks:
-                ip_permissions[0]['IpRanges'] = [
-                    {'CidrIp': cidr, 'Description': description} if description else {'CidrIp': cidr}
+                ip_permissions[0]["IpRanges"] = [
+                    {"CidrIp": cidr, "Description": description}
+                    if description
+                    else {"CidrIp": cidr}
                     for cidr in cidr_blocks
                 ]
-            
+
             # Add destination security groups if provided
             if destination_group_ids:
-                ip_permissions[0]['UserIdGroupPairs'] = [
-                    {'GroupId': group_id, 'Description': description} if description else {'GroupId': group_id}
+                ip_permissions[0]["UserIdGroupPairs"] = [
+                    {"GroupId": group_id, "Description": description}
+                    if description
+                    else {"GroupId": group_id}
                     for group_id in destination_group_ids
                 ]
-            
+
             # Add egress rule
             self.ec2_client.authorize_security_group_egress(
-                GroupId=security_group_id,
-                IpPermissions=ip_permissions
+                GroupId=security_group_id, IpPermissions=ip_permissions
             )
-            
+
             # Update security group information
             if security_group_id in self.security_groups:
-                self.security_groups[security_group_id]['rules'].append({
-                    'type': 'egress',
-                    'ip_protocol': ip_protocol,
-                    'from_port': from_port,
-                    'to_port': to_port,
-                    'cidr_blocks': cidr_blocks,
-                    'destination_group_ids': destination_group_ids,
-                    'description': description
-                })
-            
-            logger.info(f"Added egress rule to security group {security_group_id}: {ip_protocol} {from_port}-{to_port}")
-            
+                self.security_groups[security_group_id]["rules"].append(
+                    {
+                        "type": "egress",
+                        "ip_protocol": ip_protocol,
+                        "from_port": from_port,
+                        "to_port": to_port,
+                        "cidr_blocks": cidr_blocks,
+                        "destination_group_ids": destination_group_ids,
+                        "description": description,
+                    }
+                )
+
+            logger.info(
+                f"Added egress rule to security group {security_group_id}: {ip_protocol} {from_port}-{to_port}"
+            )
+
         except ClientError as e:
             # If rule already exists, log but don't raise
-            if e.response['Error']['Code'] == 'InvalidPermission.Duplicate':
-                logger.warning(f"Rule already exists in security group {security_group_id}: {e}")
+            if e.response["Error"]["Code"] == "InvalidPermission.Duplicate":
+                logger.warning(
+                    f"Rule already exists in security group {security_group_id}: {e}"
+                )
                 return
-            
-            logger.error(f"Error adding egress rule to security group {security_group_id}: {e}")
-            raise ResourceCreationError(f"Failed to add egress rule to security group {security_group_id}: {e}")
-    
-    def configure_default_rules(self, security_group_id: str,
-                               allow_ssh: bool = True,
-                               allow_parsl_ports: bool = True,
-                               allow_all_outbound: bool = True,
-                               allow_self_traffic: bool = True) -> None:
+
+            logger.error(
+                f"Error adding egress rule to security group {security_group_id}: {e}"
+            )
+            raise ResourceCreationError(
+                f"Failed to add egress rule to security group {security_group_id}: {e}"
+            )
+
+    def configure_default_rules(
+        self,
+        security_group_id: str,
+        allow_ssh: bool = True,
+        allow_parsl_ports: bool = True,
+        allow_all_outbound: bool = True,
+        allow_self_traffic: bool = True,
+    ) -> None:
         """Configure default rules for a security group.
-        
+
         Parameters
         ----------
         security_group_id : str
@@ -297,59 +337,71 @@ class SecurityGroupManager:
             if allow_ssh:
                 self.add_ingress_rule(
                     security_group_id=security_group_id,
-                    ip_protocol='tcp',
+                    ip_protocol="tcp",
                     from_port=22,
                     to_port=22,
-                    cidr_blocks=['0.0.0.0/0'],
-                    description='SSH access'
+                    cidr_blocks=["0.0.0.0/0"],
+                    description="SSH access",
                 )
-            
+
             # Allow Parsl's default port range
             if allow_parsl_ports:
                 self.add_ingress_rule(
                     security_group_id=security_group_id,
-                    ip_protocol='tcp',
+                    ip_protocol="tcp",
                     from_port=54000,
                     to_port=55000,
-                    cidr_blocks=['0.0.0.0/0'],
-                    description='Parsl communication ports'
+                    cidr_blocks=["0.0.0.0/0"],
+                    description="Parsl communication ports",
                 )
-            
+
             # Allow all traffic within security group
             if allow_self_traffic:
                 self.add_ingress_rule(
                     security_group_id=security_group_id,
-                    ip_protocol='-1',  # All protocols
-                    from_port=-1,      # All ports
-                    to_port=-1,        # All ports
+                    ip_protocol="-1",  # All protocols
+                    from_port=-1,  # All ports
+                    to_port=-1,  # All ports
                     source_group_ids=[security_group_id],
-                    description='All traffic within security group'
+                    description="All traffic within security group",
                 )
-            
+
             # Allow all outbound traffic
             if allow_all_outbound:
                 # Security groups allow all outbound traffic by default in AWS,
                 # but we'll add it explicitly for clarity and in case it was removed
                 self.add_egress_rule(
                     security_group_id=security_group_id,
-                    ip_protocol='-1',  # All protocols
-                    from_port=-1,      # All ports
-                    to_port=-1,        # All ports
-                    cidr_blocks=['0.0.0.0/0'],
-                    description='All outbound traffic'
+                    ip_protocol="-1",  # All protocols
+                    from_port=-1,  # All ports
+                    to_port=-1,  # All ports
+                    cidr_blocks=["0.0.0.0/0"],
+                    description="All outbound traffic",
                 )
-            
-            logger.info(f"Configured default rules for security group {security_group_id}")
-            
+
+            logger.info(
+                f"Configured default rules for security group {security_group_id}"
+            )
+
         except Exception as e:
-            logger.error(f"Error configuring default rules for security group {security_group_id}: {e}")
-            raise ResourceCreationError(f"Failed to configure default rules for security group {security_group_id}: {e}")
-    
-    def revoke_ingress_rule(self, security_group_id: str, ip_protocol: str, from_port: int, 
-                           to_port: int, cidr_blocks: Optional[List[str]] = None,
-                           source_group_ids: Optional[List[str]] = None) -> None:
+            logger.error(
+                f"Error configuring default rules for security group {security_group_id}: {e}"
+            )
+            raise ResourceCreationError(
+                f"Failed to configure default rules for security group {security_group_id}: {e}"
+            )
+
+    def revoke_ingress_rule(
+        self,
+        security_group_id: str,
+        ip_protocol: str,
+        from_port: int,
+        to_port: int,
+        cidr_blocks: Optional[List[str]] = None,
+        source_group_ids: Optional[List[str]] = None,
+    ) -> None:
         """Revoke an ingress rule from a security group.
-        
+
         Parameters
         ----------
         security_group_id : str
@@ -368,53 +420,71 @@ class SecurityGroupManager:
         try:
             # Prepare IP permissions
             ip_permissions = [
-                {
-                    'IpProtocol': ip_protocol,
-                    'FromPort': from_port,
-                    'ToPort': to_port
-                }
+                {"IpProtocol": ip_protocol, "FromPort": from_port, "ToPort": to_port}
             ]
-            
+
             # Add CIDR blocks if provided
             if cidr_blocks:
-                ip_permissions[0]['IpRanges'] = [{'CidrIp': cidr} for cidr in cidr_blocks]
-            
+                ip_permissions[0]["IpRanges"] = [
+                    {"CidrIp": cidr} for cidr in cidr_blocks
+                ]
+
             # Add source security groups if provided
             if source_group_ids:
-                ip_permissions[0]['UserIdGroupPairs'] = [{'GroupId': group_id} for group_id in source_group_ids]
-            
+                ip_permissions[0]["UserIdGroupPairs"] = [
+                    {"GroupId": group_id} for group_id in source_group_ids
+                ]
+
             # Revoke ingress rule
             self.ec2_client.revoke_security_group_ingress(
-                GroupId=security_group_id,
-                IpPermissions=ip_permissions
+                GroupId=security_group_id, IpPermissions=ip_permissions
             )
-            
+
             # Update security group information
             if security_group_id in self.security_groups:
                 # Filter out the revoked rule
                 updated_rules = []
-                for rule in self.security_groups[security_group_id]['rules']:
-                    if (rule['type'] == 'ingress' and
-                        rule['ip_protocol'] == ip_protocol and
-                        rule['from_port'] == from_port and
-                        rule['to_port'] == to_port and
-                        ((cidr_blocks and rule.get('cidr_blocks') == cidr_blocks) or
-                         (source_group_ids and rule.get('source_group_ids') == source_group_ids))):
+                for rule in self.security_groups[security_group_id]["rules"]:
+                    if (
+                        rule["type"] == "ingress"
+                        and rule["ip_protocol"] == ip_protocol
+                        and rule["from_port"] == from_port
+                        and rule["to_port"] == to_port
+                        and (
+                            (cidr_blocks and rule.get("cidr_blocks") == cidr_blocks)
+                            or (
+                                source_group_ids
+                                and rule.get("source_group_ids") == source_group_ids
+                            )
+                        )
+                    ):
                         continue
                     updated_rules.append(rule)
-                self.security_groups[security_group_id]['rules'] = updated_rules
-            
-            logger.info(f"Revoked ingress rule from security group {security_group_id}: {ip_protocol} {from_port}-{to_port}")
-            
+                self.security_groups[security_group_id]["rules"] = updated_rules
+
+            logger.info(
+                f"Revoked ingress rule from security group {security_group_id}: {ip_protocol} {from_port}-{to_port}"
+            )
+
         except ClientError as e:
-            logger.error(f"Error revoking ingress rule from security group {security_group_id}: {e}")
-            raise ResourceCleanupError(f"Failed to revoke ingress rule from security group {security_group_id}: {e}")
-    
-    def revoke_egress_rule(self, security_group_id: str, ip_protocol: str, from_port: int, 
-                          to_port: int, cidr_blocks: Optional[List[str]] = None,
-                          destination_group_ids: Optional[List[str]] = None) -> None:
+            logger.error(
+                f"Error revoking ingress rule from security group {security_group_id}: {e}"
+            )
+            raise ResourceCleanupError(
+                f"Failed to revoke ingress rule from security group {security_group_id}: {e}"
+            )
+
+    def revoke_egress_rule(
+        self,
+        security_group_id: str,
+        ip_protocol: str,
+        from_port: int,
+        to_port: int,
+        cidr_blocks: Optional[List[str]] = None,
+        destination_group_ids: Optional[List[str]] = None,
+    ) -> None:
         """Revoke an egress rule from a security group.
-        
+
         Parameters
         ----------
         security_group_id : str
@@ -433,51 +503,64 @@ class SecurityGroupManager:
         try:
             # Prepare IP permissions
             ip_permissions = [
-                {
-                    'IpProtocol': ip_protocol,
-                    'FromPort': from_port,
-                    'ToPort': to_port
-                }
+                {"IpProtocol": ip_protocol, "FromPort": from_port, "ToPort": to_port}
             ]
-            
+
             # Add CIDR blocks if provided
             if cidr_blocks:
-                ip_permissions[0]['IpRanges'] = [{'CidrIp': cidr} for cidr in cidr_blocks]
-            
+                ip_permissions[0]["IpRanges"] = [
+                    {"CidrIp": cidr} for cidr in cidr_blocks
+                ]
+
             # Add destination security groups if provided
             if destination_group_ids:
-                ip_permissions[0]['UserIdGroupPairs'] = [{'GroupId': group_id} for group_id in destination_group_ids]
-            
+                ip_permissions[0]["UserIdGroupPairs"] = [
+                    {"GroupId": group_id} for group_id in destination_group_ids
+                ]
+
             # Revoke egress rule
             self.ec2_client.revoke_security_group_egress(
-                GroupId=security_group_id,
-                IpPermissions=ip_permissions
+                GroupId=security_group_id, IpPermissions=ip_permissions
             )
-            
+
             # Update security group information
             if security_group_id in self.security_groups:
                 # Filter out the revoked rule
                 updated_rules = []
-                for rule in self.security_groups[security_group_id]['rules']:
-                    if (rule['type'] == 'egress' and
-                        rule['ip_protocol'] == ip_protocol and
-                        rule['from_port'] == from_port and
-                        rule['to_port'] == to_port and
-                        ((cidr_blocks and rule.get('cidr_blocks') == cidr_blocks) or
-                         (destination_group_ids and rule.get('destination_group_ids') == destination_group_ids))):
+                for rule in self.security_groups[security_group_id]["rules"]:
+                    if (
+                        rule["type"] == "egress"
+                        and rule["ip_protocol"] == ip_protocol
+                        and rule["from_port"] == from_port
+                        and rule["to_port"] == to_port
+                        and (
+                            (cidr_blocks and rule.get("cidr_blocks") == cidr_blocks)
+                            or (
+                                destination_group_ids
+                                and rule.get("destination_group_ids")
+                                == destination_group_ids
+                            )
+                        )
+                    ):
                         continue
                     updated_rules.append(rule)
-                self.security_groups[security_group_id]['rules'] = updated_rules
-            
-            logger.info(f"Revoked egress rule from security group {security_group_id}: {ip_protocol} {from_port}-{to_port}")
-            
+                self.security_groups[security_group_id]["rules"] = updated_rules
+
+            logger.info(
+                f"Revoked egress rule from security group {security_group_id}: {ip_protocol} {from_port}-{to_port}"
+            )
+
         except ClientError as e:
-            logger.error(f"Error revoking egress rule from security group {security_group_id}: {e}")
-            raise ResourceCleanupError(f"Failed to revoke egress rule from security group {security_group_id}: {e}")
-    
+            logger.error(
+                f"Error revoking egress rule from security group {security_group_id}: {e}"
+            )
+            raise ResourceCleanupError(
+                f"Failed to revoke egress rule from security group {security_group_id}: {e}"
+            )
+
     def delete_security_group(self, security_group_id: str) -> None:
         """Delete a security group.
-        
+
         Parameters
         ----------
         security_group_id : str
@@ -488,44 +571,50 @@ class SecurityGroupManager:
             try:
                 self.ec2_client.describe_security_groups(GroupIds=[security_group_id])
             except ClientError as e:
-                if e.response['Error']['Code'] == 'InvalidGroup.NotFound':
-                    logger.warning(f"Security group {security_group_id} not found, skipping delete")
+                if e.response["Error"]["Code"] == "InvalidGroup.NotFound":
+                    logger.warning(
+                        f"Security group {security_group_id} not found, skipping delete"
+                    )
                     if security_group_id in self.security_groups:
                         self.security_groups.pop(security_group_id)
                     return
                 raise
-            
+
             # Delete security group
             self.ec2_client.delete_security_group(GroupId=security_group_id)
-            
+
             # Remove from tracked security groups
             if security_group_id in self.security_groups:
                 self.security_groups.pop(security_group_id)
-            
+
             logger.info(f"Deleted security group: {security_group_id}")
-            
+
         except ClientError as e:
             logger.error(f"Error deleting security group {security_group_id}: {e}")
-            raise ResourceCleanupError(f"Failed to delete security group {security_group_id}: {e}")
-    
+            raise ResourceCleanupError(
+                f"Failed to delete security group {security_group_id}: {e}"
+            )
+
     def cleanup_security_groups(self) -> None:
         """Clean up all security groups."""
         for security_group_id in list(self.security_groups.keys()):
             try:
                 self.delete_security_group(security_group_id)
             except Exception as e:
-                logger.error(f"Error cleaning up security group {security_group_id}: {e}")
-    
+                logger.error(
+                    f"Error cleaning up security group {security_group_id}: {e}"
+                )
+
     def find_security_groups_by_tag(self, tag_key: str, tag_value: str) -> List[str]:
         """Find security groups by tag.
-        
+
         Parameters
         ----------
         tag_key : str
             Tag key to search for
         tag_value : str
             Tag value to search for
-            
+
         Returns
         -------
         List[str]
@@ -533,39 +622,38 @@ class SecurityGroupManager:
         """
         try:
             response = self.ec2_client.describe_security_groups(
-                Filters=[
-                    {
-                        'Name': f'tag:{tag_key}',
-                        'Values': [tag_value]
-                    }
-                ]
+                Filters=[{"Name": f"tag:{tag_key}", "Values": [tag_value]}]
             )
-            
-            security_group_ids = [sg['GroupId'] for sg in response['SecurityGroups']]
-            
+
+            security_group_ids = [sg["GroupId"] for sg in response["SecurityGroups"]]
+
             # Add to tracked security groups
-            for sg in response['SecurityGroups']:
-                sg_id = sg['GroupId']
+            for sg in response["SecurityGroups"]:
+                sg_id = sg["GroupId"]
                 if sg_id not in self.security_groups:
                     self.security_groups[sg_id] = {
-                        'id': sg_id,
-                        'name': sg.get('GroupName', ''),
-                        'vpc_id': sg.get('VpcId', ''),
-                        'rules': []
+                        "id": sg_id,
+                        "name": sg.get("GroupName", ""),
+                        "vpc_id": sg.get("VpcId", ""),
+                        "rules": [],
                     }
-            
+
             return security_group_ids
-            
+
         except ClientError as e:
-            logger.error(f"Error finding security groups by tag {tag_key}={tag_value}: {e}")
+            logger.error(
+                f"Error finding security groups by tag {tag_key}={tag_value}: {e}"
+            )
             return []
-    
+
     def find_workflow_security_groups(self) -> List[str]:
         """Find security groups for the current workflow.
-        
+
         Returns
         -------
         List[str]
             List of security group IDs for the current workflow
         """
-        return self.find_security_groups_by_tag(TAG_WORKFLOW_ID, self.provider.workflow_id)
+        return self.find_security_groups_by_tag(
+            TAG_WORKFLOW_ID, self.provider.workflow_id
+        )

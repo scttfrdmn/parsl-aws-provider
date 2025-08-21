@@ -45,7 +45,7 @@ Each example demonstrates specific features of the provider. You can modify the 
 - Region
 - Instance types
 - Scaling options (number of nodes, max blocks, etc.)
-- Spot pricing options 
+- Spot pricing options
 - Storage options
 - Network configuration
 - Worker initialization commands

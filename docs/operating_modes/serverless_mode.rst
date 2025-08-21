@@ -39,35 +39,35 @@ Here's a basic configuration for Serverless Mode:
    from parsl.config import Config
    from parsl.executors import HighThroughputExecutor
    from parsl_ephemeral_aws import EphemeralAWSProvider
-   
+
    provider = EphemeralAWSProvider(
        # Specify Serverless Mode
        mode='serverless',
        region='us-west-2',
-       
+
        # Choose worker type: 'lambda', 'ecs', or 'auto'
        worker_type='auto',  # Let the provider decide based on task requirements
-       
+
        # Lambda configuration
        lambda_memory=1024,          # MB
        lambda_timeout=900,          # Seconds (max 15 minutes)
        lambda_max_concurrency=100,  # Max concurrent functions
-       
+
        # ECS/Fargate configuration
        ecs_task_cpu=1024,           # CPU units (1024 = 1 vCPU)
        ecs_task_memory=2048,        # MB
        ecs_max_tasks=10,            # Max concurrent tasks
-       
+
        # Container configuration
        container_image='public.ecr.aws/amazonlinux/amazonlinux:2',  # Default image
        # Alternatively, use a custom image
        # container_image='123456789012.dkr.ecr.us-west-2.amazonaws.com/my-image:latest',
-       
+
        # State persistence (recommended)
        state_store='parameter_store',
        state_prefix='/parsl/serverless',
    )
-   
+
    config = Config(
        executors=[
            HighThroughputExecutor(
@@ -204,14 +204,14 @@ For more compute-intensive tasks that still benefit from serverless management, 
        mode='serverless',
        region='us-west-2',
        worker_type='auto',
-       
+
        # Enable Spot Fleet for compute-intensive tasks
        use_spot_fleet=True,
        instance_types=["t3.medium", "t3a.medium", "m5.large"],
        spot_max_price_percentage=80,
        min_blocks=0,
        max_blocks=10,
-       
+
        # Continue using Lambda for quick tasks
        lambda_memory=1024,
        lambda_timeout=900,
@@ -233,35 +233,35 @@ Here's a complete example showing a Serverless Mode workflow:
    from parsl.config import Config
    from parsl.executors import HighThroughputExecutor
    from parsl_ephemeral_aws import EphemeralAWSProvider
-   
+
    # Configure AWS Provider in Serverless Mode
    provider = EphemeralAWSProvider(
        # Mode configuration
        mode='serverless',
        region='us-west-2',
        worker_type='auto',
-       
+
        # Lambda configuration
        lambda_memory=1024,
        lambda_timeout=900,
        lambda_max_concurrency=50,
-       
+
        # ECS configuration
        ecs_task_cpu=1024,
        ecs_task_memory=2048,
        ecs_max_tasks=10,
-       
+
        # State persistence
        state_store='parameter_store',
        state_prefix='/parsl/serverless-demo',
-       
+
        # Optional: custom dependencies for Lambda
        lambda_python_dependencies=[
            'numpy==1.21.0',
            'pandas==1.3.0'
        ],
    )
-   
+
    # Create Parsl configuration
    config = Config(
        executors=[
@@ -271,58 +271,58 @@ Here's a complete example showing a Serverless Mode workflow:
            )
        ]
    )
-   
+
    # Load the configuration
    parsl.load(config)
-   
+
    # Define some apps
    @parsl.python_app
    def quick_task(x):
        """This task will likely run on Lambda."""
        import numpy as np
        import time
-       
+
        # Simulate short work
        time.sleep(2)
        result = np.sum([x**i for i in range(1000)])
-       
+
        return {
            'input': x,
            'result': result,
            'task_type': 'quick'
        }
-   
+
    @parsl.python_app
    def medium_task(x):
        """This task will likely run on ECS/Fargate."""
        import numpy as np
        import time
-       
+
        # Simulate medium-length work
        time.sleep(300)  # 5 minutes
-       
+
        # Generate and process a large array
        data = np.random.rand(10000, 10000)
        result = np.mean(data, axis=0).sum() * x
-       
+
        return {
            'input': x,
            'result': float(result),
            'task_type': 'medium'
        }
-   
+
    # Submit a mix of tasks
    quick_results = [quick_task(i) for i in range(50)]
    medium_results = [medium_task(i) for i in range(5)]
-   
+
    # Wait for and print some quick results
    for i, r in enumerate(quick_results[:5]):
        print(f"Quick task {i} result: {r.result()['result']}")
-   
+
    # Wait for and print medium results
    for i, r in enumerate(medium_results):
        print(f"Medium task {i} result: {r.result()['result']}")
-   
+
    # Clean up
    parsl.dfk().cleanup()
 
@@ -332,48 +332,48 @@ Container Customization
 To use a custom container image with ECS/Fargate:
 
 1. **Create a Dockerfile**:
-   
+
    .. code-block:: Dockerfile
-   
+
       FROM amazonlinux:2
-      
+
       # Install Python and dependencies
       RUN yum update -y && \
           yum install -y python3 python3-devel gcc && \
           yum clean all
-      
+
       # Install Python packages
       RUN pip3 install --upgrade pip && \
           pip3 install numpy scipy pandas scikit-learn
-      
+
       # Set working directory
       WORKDIR /app
-      
+
       # Set the entrypoint
       ENTRYPOINT ["python3"]
 
 2. **Build and push to Amazon ECR**:
-   
+
    .. code-block:: bash
-   
+
       # Create ECR repository if needed
       aws ecr create-repository --repository-name parsl-worker
-      
+
       # Authenticate Docker to ECR
       aws ecr get-login-password | docker login --username AWS --password-stdin \
           123456789012.dkr.ecr.us-west-2.amazonaws.com
-      
+
       # Build and tag the image
       docker build -t parsl-worker .
       docker tag parsl-worker:latest 123456789012.dkr.ecr.us-west-2.amazonaws.com/parsl-worker:latest
-      
+
       # Push to ECR
       docker push 123456789012.dkr.ecr.us-west-2.amazonaws.com/parsl-worker:latest
 
 3. **Use the custom image in configuration**:
-   
+
    .. code-block:: python
-   
+
       provider = EphemeralAWSProvider(
           mode='serverless',
           region='us-west-2',

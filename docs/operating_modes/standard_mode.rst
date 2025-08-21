@@ -36,26 +36,26 @@ Here's a basic configuration for Standard Mode:
    from parsl.config import Config
    from parsl.executors import HighThroughputExecutor
    from parsl_ephemeral_aws import EphemeralAWSProvider
-   
+
    provider = EphemeralAWSProvider(
        # Standard Mode is the default (no need to specify mode='standard')
        image_id='ami-12345678',
        instance_type='t3.medium',
        region='us-west-2',
-       
+
        # Block parameters
        init_blocks=1,
        min_blocks=0,
        max_blocks=10,
-       
+
        # Network settings
        use_public_ips=True,  # Important for direct communication
-       
+
        # Optional: spot instance settings
        use_spot_instances=True,
        spot_max_price_percentage=80,
    )
-   
+
    config = Config(
        executors=[
            HighThroughputExecutor(
@@ -155,7 +155,7 @@ Here's a complete example showing a Standard Mode workflow:
    from parsl.executors import HighThroughputExecutor
    from parsl_ephemeral_aws import EphemeralAWSProvider
    import time
-   
+
    # Configure AWS Provider in Standard Mode
    provider = EphemeralAWSProvider(
        image_id='ami-0c55b159cbfafe1f0',  # Amazon Linux 2 (update to current AMI)
@@ -176,7 +176,7 @@ Here's a complete example showing a Standard Mode workflow:
        state_store='parameter_store',
        state_prefix='/parsl/demo',
    )
-   
+
    # Create Parsl configuration
    config = Config(
        executors=[
@@ -186,36 +186,36 @@ Here's a complete example showing a Standard Mode workflow:
            )
        ]
    )
-   
+
    # Load the configuration
    parsl.load(config)
-   
+
    # Define a compute-intensive app
    @parsl.python_app
    def compute(x):
        import numpy as np
        import time
        import socket
-       
+
        # Simulate work
        time.sleep(2)
        result = np.sum([x**i for i in range(1000)])
-       
+
        return {
            'input': x,
            'result': result,
            'hostname': socket.gethostname()
        }
-   
+
    # Submit multiple tasks
    results = []
    for i in range(20):
        results.append(compute(i))
-   
+
    # Print results as they complete
    for r in results:
        print(f"Task result from {r.result()['hostname']}: {r.result()['result']}")
-   
+
    # Clean up all AWS resources
    parsl.dfk().cleanup()
 

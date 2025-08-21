@@ -9,14 +9,11 @@ SPDX-FileCopyrightText: 2025 Scott Friedman and Project Contributors
 """
 
 import logging
-import os
 import time
 import uuid
 from enum import Enum
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional
 
-import boto3
-import parsl
 from parsl.providers.base import ExecutionProvider
 from parsl.utils import RepresentationMixin
 from typeguard import typechecked
@@ -33,8 +30,6 @@ from parsl_ephemeral_aws.constants import (
 from parsl_ephemeral_aws.exceptions import (
     ProviderConfigurationError,
     ProviderError,
-    ResourceCreationError,
-    SpotInterruptionError,
 )
 from parsl_ephemeral_aws.modes.base import OperatingMode
 from parsl_ephemeral_aws.modes.detached import DetachedMode
@@ -45,11 +40,6 @@ from parsl_ephemeral_aws.state.file import FileStateStore
 from parsl_ephemeral_aws.state.parameter_store import ParameterStoreStateStore
 from parsl_ephemeral_aws.state.s3 import S3StateStore
 from parsl_ephemeral_aws.utils.aws import create_session
-from parsl_ephemeral_aws.compute.spot_interruption import (
-    SpotInterruptionMonitor,
-    SpotInterruptionHandler,
-    ParslSpotInterruptionHandler,
-)
 
 
 logger = logging.getLogger(__name__)
@@ -259,7 +249,9 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
         self.kwargs = kwargs
 
         # Initialize state
-        self.session = create_session(region=self.region, profile_name=self.profile_name)
+        self.session = create_session(
+            region=self.region, profile_name=self.profile_name
+        )
         self.state_store = self._initialize_state_store()
         self.operating_mode = self._initialize_operating_mode()
         self.resources: Dict[str, Dict[str, Any]] = {}

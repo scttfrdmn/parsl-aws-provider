@@ -92,25 +92,25 @@ provider = EphemeralAWSProvider(
     image_id='ami-12345678',  # Amazon Linux 2 AMI
     instance_type='t3.medium',
     region='us-west-2',
-    
+
     # Block parameters
     init_blocks=1,
     min_blocks=0,
     max_blocks=10,
     nodes_per_block=1,
-    
+
     # Ephemeral settings
     use_spot_instances=True,
     spot_max_price_percentage=80,  # 80% of on-demand price
     instance_termination_policy='terminate',  # 'terminate', 'stop', or 'hibernate'
-    
+
     # State persistence
     state_store='parameter_store',  # 'parameter_store', 's3', 'file', 'none'
     state_prefix='/parsl/workflows',
-    
+
     # Network settings
     use_public_ips=True,
-    
+
     # Worker initialization
     worker_init='pip install -r requirements.txt',
 )
@@ -272,7 +272,7 @@ provider = EphemeralAWSProvider(
     use_spot_instances=True,
     spot_max_price_percentage=80,
     spot_interruption_behavior='hibernate',  # 'terminate', 'stop', or 'hibernate'
-    
+
     # Enable checkpointing to handle interruptions
     spot_interruption_handling=True,
     checkpoint_bucket='my-parsl-checkpoints',

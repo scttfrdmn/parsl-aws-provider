@@ -15,11 +15,11 @@ logger = logging.getLogger(__name__)
 
 class StateStore(abc.ABC):
     """Abstract base class for provider state stores.
-    
+
     A state store is responsible for persisting and retrieving the provider's state.
     Different implementations store state in different locations, such as local files,
     AWS Parameter Store, or S3.
-    
+
     Attributes
     ----------
     provider_id : str
@@ -28,7 +28,7 @@ class StateStore(abc.ABC):
 
     def __init__(self, provider_id: str) -> None:
         """Initialize the state store.
-        
+
         Parameters
         ----------
         provider_id : str
@@ -40,12 +40,12 @@ class StateStore(abc.ABC):
     @abc.abstractmethod
     def save_state(self, state: Dict[str, Any]) -> None:
         """Save the provider state.
-        
+
         Parameters
         ----------
         state : Dict[str, Any]
             Provider state to save
-            
+
         Raises
         ------
         StateStoreError
@@ -56,12 +56,12 @@ class StateStore(abc.ABC):
     @abc.abstractmethod
     def load_state(self) -> Optional[Dict[str, Any]]:
         """Load the provider state.
-        
+
         Returns
         -------
         Optional[Dict[str, Any]]
             Provider state if it exists, None otherwise
-            
+
         Raises
         ------
         StateStoreError
@@ -72,7 +72,7 @@ class StateStore(abc.ABC):
     @abc.abstractmethod
     def delete_state(self) -> None:
         """Delete the provider state.
-        
+
         Raises
         ------
         StateStoreError

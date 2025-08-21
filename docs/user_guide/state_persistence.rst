@@ -104,27 +104,27 @@ To enable state persistence, set the following parameters in your provider confi
 .. code-block:: python
 
    from parsl_ephemeral_aws import EphemeralAWSProvider
-   
+
    provider = EphemeralAWSProvider(
        # Basic provider configuration
        image_id='ami-12345678',
        instance_type='t3.medium',
        region='us-west-2',
-       
+
        # State persistence configuration
        state_store='parameter_store',  # 'parameter_store', 's3', or 'file'
        state_prefix='/parsl/workflows/my-workflow',  # Optional prefix
-       
+
        # Optional: additional backend-specific settings
        state_config={
            # Parameter Store specific settings
            'parameter_type': 'String',  # 'String', 'StringList', or 'SecureString'
            'parameter_tier': 'Standard',  # 'Standard' or 'Advanced'
-           
+
            # S3 specific settings
            'bucket_name': 'my-parsl-state-bucket',  # Custom bucket name
            'versioning': True,  # Enable S3 versioning
-           
+
            # File specific settings
            'directory': '/path/to/state',  # Custom directory path
            'backup': True,  # Enable file backups
@@ -199,7 +199,7 @@ Parameter Store Example
        image_id='ami-12345678',
        instance_type='t3.medium',
        region='us-west-2',
-       
+
        # Parameter Store configuration
        state_store='parameter_store',
        state_prefix='/parsl/workflows/genome-analysis',
@@ -219,7 +219,7 @@ S3 Example
        image_id='ami-12345678',
        instance_type='t3.medium',
        region='us-west-2',
-       
+
        # S3 configuration
        state_store='s3',
        state_prefix='workflows/climate-model',
@@ -239,7 +239,7 @@ File Example (Standard Mode Only)
        image_id='ami-12345678',
        instance_type='t3.medium',
        region='us-west-2',
-       
+
        # File configuration
        state_store='file',
        state_prefix='ml-training',
@@ -255,20 +255,20 @@ Workflow Recovery
 To recover a workflow from persisted state:
 
 1. **Use the same state configuration**:
-   
+
    .. code-block:: python
-   
+
       # Use the same state_store and state_prefix as the original workflow
       provider = EphemeralAWSProvider(
           region='us-west-2',
           state_store='parameter_store',
           state_prefix='/parsl/workflows/my-workflow',
       )
-   
+
 2. **Load the Parsl configuration**:
-   
+
    .. code-block:: python
-   
+
       config = Config(
           executors=[
               HighThroughputExecutor(
@@ -277,21 +277,21 @@ To recover a workflow from persisted state:
               )
           ]
       )
-      
+
       parsl.load(config)
-   
+
 3. **Retrieve futures if needed**:
-   
+
    If you saved task IDs from the original session, you can retrieve the futures:
-   
+
    .. code-block:: python
-   
+
       # Original session
       task_ids = [f.tid for f in futures]
-      
+
       # Recovery session
       recovered_futures = [parsl.dfk().tasks[tid] for tid in task_ids]
-      
+
       # Now you can use recovered_futures as normal
       for f in recovered_futures:
           print(f.result())
@@ -328,13 +328,13 @@ You can manually manage state using the provider's API:
 
    # Save current state to a specific key
    provider.save_state("manual-checkpoint")
-   
+
    # Load state from a specific key
    provider.load_state("manual-checkpoint")
-   
+
    # List available state keys
    state_keys = provider.list_states()
-   
+
    # Delete a specific state key
    provider.delete_state("old-checkpoint")
 
@@ -350,7 +350,7 @@ If state becomes corrupted, you can reset it:
 
    # Completely reset the provider state
    provider.reset_state()
-   
+
    # Reset only worker state
    provider.reset_worker_state()
 

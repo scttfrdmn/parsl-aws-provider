@@ -112,7 +112,7 @@ provider = EphemeralAWSProvider(
     region='us-west-2',
     use_spot_instances=True,
     # Enable instance hibernation on interruption
-    spot_interruption_behavior='hibernate',  
+    spot_interruption_behavior='hibernate',
     # Enable state persistence to resume jobs
     state_store='s3',
     state_bucket='my-parsl-state',
@@ -206,7 +206,7 @@ provider = EphemeralAWSProvider(
     worker_init='''
         # Verify GPU is visible
         nvidia-smi
-        
+
         # Install CUDA toolkit and libraries
         pip install torch==2.0.0+cu118 torchvision==0.15.1+cu118 -f https://download.pytorch.org/whl/torch_stable.html
     '''
@@ -225,7 +225,7 @@ provider = EphemeralAWSProvider(
     worker_init='''
         # Install CUDA toolkit
         pip install torch==2.0.0+cu118
-        
+
         # Configure for multi-GPU
         export CUDA_VISIBLE_DEVICES=0,1,2,3
     '''
@@ -248,17 +248,17 @@ ami_id = create_custom_ami(
     installation_script='''
         # Update system
         sudo yum update -y
-        
+
         # Install Python dependencies
         sudo yum install -y python3-devel gcc
-        
+
         # Install commonly used packages
         pip3 install numpy scipy pandas tensorflow
-        
+
         # Install MPI
         sudo yum install -y openmpi-devel
         pip3 install mpi4py
-        
+
         # Clean up
         sudo yum clean all
         rm -rf ~/.cache/pip
@@ -389,7 +389,7 @@ class DynamoDBState(StateStore):
         self.table_name = table_name
         self.dynamodb = boto3.resource('dynamodb')
         self.table = self.dynamodb.Table(table_name)
-        
+
     def save_state(self, state_key, state_data):
         self.table.put_item(
             Item={
@@ -398,7 +398,7 @@ class DynamoDBState(StateStore):
                 'StateData': json.dumps(state_data)
             }
         )
-        
+
     def load_state(self, state_key):
         response = self.table.get_item(
             Key={'StateKey': state_key}
@@ -406,12 +406,12 @@ class DynamoDBState(StateStore):
         if 'Item' in response:
             return json.loads(response['Item']['StateData'])
         return None
-        
+
     def delete_state(self, state_key):
         self.table.delete_item(
             Key={'StateKey': state_key}
         )
-        
+
     def list_states(self, prefix):
         response = self.table.scan(
             FilterExpression=boto3.dynamodb.conditions.Key('StateKey').begins_with(prefix)

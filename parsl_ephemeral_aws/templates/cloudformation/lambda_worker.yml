@@ -82,7 +82,7 @@ Parameters:
 
 Conditions:
   HasVpcConfig: !Not [!Equals [!Ref VpcId, '']]
-  HasS3Code: !And 
+  HasS3Code: !And
     - !Not [!Equals [!Ref CodeS3Bucket, '']]
     - !Not [!Equals [!Ref CodeS3Key, '']]
   HasZipCode: !Not [!Equals [!Ref CodeZipContent, '']]
@@ -101,7 +101,7 @@ Resources:
             Action: sts:AssumeRole
       ManagedPolicyArns:
         - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
-        - !If 
+        - !If
           - HasVpcConfig
           - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
           - !Ref 'AWS::NoValue'
@@ -116,7 +116,7 @@ Resources:
   LambdaFunction:
     Type: AWS::Lambda::Function
     Properties:
-      FunctionName: !If 
+      FunctionName: !If
         - HasFunctionName
         - !Ref FunctionName
         - !Sub 'parsl-worker-${WorkflowId}-${JobId}'
@@ -129,7 +129,7 @@ Resources:
         S3Bucket: !If [HasS3Code, !Ref CodeS3Bucket, !Ref 'AWS::NoValue']
         S3Key: !If [HasS3Code, !Ref CodeS3Key, !Ref 'AWS::NoValue']
         ZipFile: !If [HasZipCode, !Ref CodeZipContent, !Ref 'AWS::NoValue']
-      VpcConfig: !If 
+      VpcConfig: !If
         - HasVpcConfig
         - SubnetIds: !Ref SubnetIds
           SecurityGroupIds: !Ref SecurityGroupIds

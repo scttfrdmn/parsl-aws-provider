@@ -158,10 +158,10 @@ provider = EphemeralAWSProvider(
     worker_init='''
         # Install dependencies
         pip install numpy scipy pandas matplotlib
-        
+
         # Set up environment
         export PYTHONPATH=$PYTHONPATH:/path/to/your/modules
-        
+
         # Download data
         aws s3 cp s3://your-bucket/data/ /tmp/data/ --recursive
     '''

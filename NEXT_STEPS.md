@@ -16,7 +16,7 @@ This document outlines the next steps for continuing development of the Parsl Ep
 3. **State Persistence**
    - Abstract base class for state stores
    - File-based state implementation
-   - AWS Parameter Store implementation 
+   - AWS Parameter Store implementation
    - S3-based state implementation
 
 4. **Example Scripts**
@@ -76,7 +76,7 @@ This document outlines the next steps for continuing development of the Parsl Ep
 
 - **Resource Monitoring**: Add CloudWatch integration for resource metrics
 - **Cost Tracking**: Implement cost estimation and tracking
-- **Spot Instance Management**: 
+- **Spot Instance Management**:
   - ✅ Implemented SpotFleet in DetachedMode
   - ✅ Implemented SpotFleet in ServerlessMode
   - ✅ Added spot interruption handling with task recovery

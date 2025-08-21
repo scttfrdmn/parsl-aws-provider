@@ -146,17 +146,17 @@ provider = EphemeralAWSProvider(
     mode=ServerlessMode(
         region="us-west-2",
         worker_type="auto",  # "lambda", "ecs", or "auto"
-        
+
         # Lambda configuration
         lambda_memory=1024,  # MB
         lambda_timeout=900,  # Seconds (max 15 minutes)
         lambda_runtime="python3.9",
-        
+
         # Fargate configuration
         ecs_task_cpu=1024,  # CPU units
         ecs_task_memory=2048,  # MB
         ecs_container_image="123456789012.dkr.ecr.us-west-2.amazonaws.com/parsl-worker:latest",
-        
+
         min_blocks=0,
         max_blocks=100,  # Scales to many concurrent invocations
     ),
@@ -251,7 +251,7 @@ provider = EphemeralAWSProvider(
 
 Workflows designed for one mode may need adjustments to work in another mode:
 
-1. **Standard → Detached**: Usually works with minimal changes 
+1. **Standard → Detached**: Usually works with minimal changes
 2. **Standard/Detached → Serverless**: May require:
    - Breaking down long-running tasks
    - Packaging dependencies for Lambda/containers

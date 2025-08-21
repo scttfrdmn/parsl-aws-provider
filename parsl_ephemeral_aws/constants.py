@@ -100,9 +100,15 @@ DEFAULT_ECS_CLUSTER_NAME = "parsl-ephemeral-cluster"
 # Spot instance defaults
 DEFAULT_SPOT_ALLOCATION_STRATEGY = "capacity-optimized"
 DEFAULT_SPOT_INSTANCE_INTERRUPTION_BEHAVIOR = "terminate"
-DEFAULT_SPOT_INTERRUPTION_CHECK_INTERVAL = 30  # seconds - how often to check for interruption notices
-DEFAULT_SPOT_INTERRUPTION_LEAD_TIME = 120  # seconds - minimum lead time for recovery before termination
-DEFAULT_SPOT_CHECKPOINT_INTERVAL = 60  # seconds - how often to checkpoint long-running tasks
+DEFAULT_SPOT_INTERRUPTION_CHECK_INTERVAL = (
+    30  # seconds - how often to check for interruption notices
+)
+DEFAULT_SPOT_INTERRUPTION_LEAD_TIME = (
+    120  # seconds - minimum lead time for recovery before termination
+)
+DEFAULT_SPOT_CHECKPOINT_INTERVAL = (
+    60  # seconds - how often to checkpoint long-running tasks
+)
 DEFAULT_SPOT_MAX_RECOVERY_ATTEMPTS = 3  # maximum number of recovery attempts for a task
 
 # Tag defaults
@@ -128,7 +134,9 @@ STATUS_RUNNING = "RUNNING"
 STATUS_COMPLETED = "COMPLETED"
 STATUS_FAILED = "FAILED"
 STATUS_CANCELED = "CANCELED"
+STATUS_CANCELLED = "CANCELED"  # British spelling alias
 STATUS_UNKNOWN = "UNKNOWN"
+STATUS_SUCCEEDED = "COMPLETED"  # Alias for compatibility
 
 # Parsl status mapping
 # Maps provider-specific statuses to Parsl's standard statuses
@@ -162,6 +170,7 @@ ECS_STATUS_MAPPING = {
 # Resource type constants
 RESOURCE_TYPE_EC2 = "ec2_instance"
 RESOURCE_TYPE_LAMBDA = "lambda_function"
+RESOURCE_TYPE_LAMBDA_FUNCTION = "lambda_function"  # Alias for compatibility
 RESOURCE_TYPE_ECS_TASK = "ecs_task"
 RESOURCE_TYPE_VPC = "vpc"
 RESOURCE_TYPE_SUBNET = "subnet"
@@ -171,7 +180,13 @@ RESOURCE_TYPE_ROUTE_TABLE = "route_table"
 RESOURCE_TYPE_BASTION = "bastion_host"
 RESOURCE_TYPE_CLUSTER = "ecs_cluster"
 RESOURCE_TYPE_CLOUDFORMATION_STACK = "cloudformation_stack"
+RESOURCE_TYPE_CLOUDFORMATION = "cloudformation_stack"  # Alias for compatibility
 RESOURCE_TYPE_SPOT_FLEET = "spot_fleet"
+
+# Worker type constants
+WORKER_TYPE_LAMBDA = "lambda"
+WORKER_TYPE_ECS = "ecs"
+WORKER_TYPE_AUTO = "auto"
 
 # Parsl worker environment variables
 WORKER_ENV_VARS = {

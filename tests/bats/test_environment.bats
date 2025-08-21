@@ -35,7 +35,7 @@ teardown() {
   if [[ -z "$CI" ]]; then
     skip "Not in CI environment"
   fi
-  
+
   # Check for required environment variables
   [[ -n "$AWS_REGION" ]] || (echo "AWS_REGION is not set" && false)
   [[ -n "$AWS_ACCESS_KEY_ID" || -n "$AWS_PROFILE" ]] || (echo "Neither AWS_ACCESS_KEY_ID nor AWS_PROFILE is set" && false)
@@ -46,7 +46,7 @@ teardown() {
   # Check if AWS CLI is installed
   run which aws
   [ "$status" -eq 0 ]
-  
+
   # Try a basic AWS command using our mock
   run aws ec2 describe-instances
   [ "$status" -eq 0 ]
@@ -58,7 +58,7 @@ teardown() {
   # Check Python version is at least 3.9
   run python3 -c "import sys; sys.exit(0 if sys.version_info >= (3, 9) else 1)"
   [ "$status" -eq 0 ]
-  
+
   # Check boto3 is installed
   run python3 -c "import boto3; print('boto3 version:', boto3.__version__)"
   [ "$status" -eq 0 ]
@@ -73,7 +73,7 @@ teardown() {
   [ -d "$PROJ_ROOT/parsl_ephemeral_aws/compute" ]
   [ -d "$PROJ_ROOT/parsl_ephemeral_aws/state" ]
   [ -d "$PROJ_ROOT/tests" ]
-  
+
   # Check for essential files
   [ -f "$PROJ_ROOT/setup.py" ]
   [ -f "$PROJ_ROOT/requirements.txt" ]
@@ -85,11 +85,11 @@ teardown() {
   run aws ec2 describe-instances
   [ "$status" -eq 0 ]
   [[ "$output" == *"i-0123456789abcdef0"* ]]
-  
+
   run aws ec2 run-instances
   [ "$status" -eq 0 ]
   [[ "$output" == *"i-0123456789abcdef0"* ]]
-  
+
   # Test S3 commands
   run aws s3 ls
   [ "$status" -eq 0 ]

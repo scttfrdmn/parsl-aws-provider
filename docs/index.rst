@@ -1,7 +1,7 @@
 Parsl Ephemeral AWS Provider
 ==========================
 
-A modern, flexible AWS provider for the `Parsl <https://parsl-project.org/>`_ parallel scripting library 
+A modern, flexible AWS provider for the `Parsl <https://parsl-project.org/>`_ parallel scripting library
 that leverages ephemeral resources for cost-effective, scalable scientific computation.
 
 .. image:: https://badge.fury.io/py/parsl-ephemeral-aws.svg
@@ -29,8 +29,8 @@ that leverages ephemeral resources for cost-effective, scalable scientific compu
    :alt: codecov
 
 .. note::
-   
-   The Parsl Ephemeral AWS Provider enables seamless execution of Parsl workflows on dynamically provisioned 
+
+   The Parsl Ephemeral AWS Provider enables seamless execution of Parsl workflows on dynamically provisioned
    AWS resources with true ephemerality - resources are created when needed and destroyed when not,
    minimizing costs while maximizing scalability.
 
@@ -51,37 +51,37 @@ Documentation Overview
    .. grid-item-card:: Getting Started
       :link: getting_started/index
       :link-type: doc
-      
+
       Learn how to install and get up and running quickly with basic examples.
 
    .. grid-item-card:: User Guide
       :link: user_guide/index
       :link-type: doc
-      
+
       Comprehensive documentation for core features and configurations.
 
    .. grid-item-card:: Operating Modes
       :link: operating_modes/index
       :link-type: doc
-      
+
       Explore the different operating modes: Standard, Detached, and Serverless.
 
    .. grid-item-card:: Advanced Topics
       :link: advanced_topics/index
       :link-type: doc
-      
+
       Dive into advanced features like spot interruption handling, MPI, and more.
 
    .. grid-item-card:: Developer Guide
       :link: developer/index
       :link-type: doc
-      
+
       Contributing, architecture, testing, and extending the provider.
 
    .. grid-item-card:: Examples & Tutorials
       :link: examples/index
       :link-type: doc
-      
+
       Complete working examples and tutorials for common use cases.
 
 Quick Example
@@ -92,26 +92,26 @@ Quick Example
    from parsl.config import Config
    from parsl.executors import HighThroughputExecutor
    from parsl_ephemeral_aws import EphemeralAWSProvider
-   
+
    # Configure the ephemeral AWS provider
    provider = EphemeralAWSProvider(
        image_id='ami-12345678',  # Amazon Linux 2 AMI
        instance_type='t3.medium',
        region='us-west-2',
-       
+
        # Block parameters
        init_blocks=1,
        min_blocks=0,
        max_blocks=10,
-       
+
        # Ephemeral settings
        use_spot_instances=True,
        spot_max_price_percentage=80,  # 80% of on-demand price
-       
+
        # State persistence
        state_store='parameter_store',  # 'parameter_store', 's3', 'file', 'none'
    )
-   
+
    # Create Parsl configuration
    config = Config(
        executors=[
@@ -121,16 +121,16 @@ Quick Example
            )
        ]
    )
-   
+
    # Load the configuration
    import parsl
    parsl.load(config)
-   
+
    # Define and run your Parsl workflows
    @parsl.python_app
    def hello_world():
        return "Hello, World!"
-   
+
    result = hello_world()
    print(result.result())
 

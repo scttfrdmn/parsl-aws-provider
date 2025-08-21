@@ -41,7 +41,7 @@ User Guide
 .. toctree::
    :maxdepth: 2
    :caption: User Guide
-   
+
    user/installation
    user/quickstart
    user/configuration
@@ -59,7 +59,7 @@ API Reference
 .. toctree::
    :maxdepth: 2
    :caption: API Reference
-   
+
    api/provider
    api/modes
    api/compute
@@ -74,7 +74,7 @@ Advanced Topics
 .. toctree::
    :maxdepth: 2
    :caption: Advanced Topics
-   
+
    advanced/spot_instances
    advanced/mpi_support
    advanced/custom_networking
@@ -89,7 +89,7 @@ Developer Guide
 .. toctree::
    :maxdepth: 2
    :caption: Developer Guide
-   
+
    dev/architecture
    dev/contributing
    dev/testing
@@ -101,7 +101,7 @@ Developer Guide
 .. toctree::
    :maxdepth: 1
    :caption: Additional Information
-   
+
    changelog
    license
 

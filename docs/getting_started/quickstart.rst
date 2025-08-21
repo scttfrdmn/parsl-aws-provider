@@ -20,12 +20,12 @@ First, let's create a minimal configuration for running a Parsl workflow on AWS:
        image_id='ami-0c55b159cbfafe1f0',  # Amazon Linux 2 AMI (replace with current AMI)
        instance_type='t3.micro',          # Small instance type for testing
        region='us-west-2',                # AWS region to use
-       
+
        # Resource allocation parameters
        init_blocks=1,                     # Start with one block of resources
        min_blocks=0,                      # Allow scaling down to zero
        max_blocks=1,                      # Limit to one block for testing
-       
+
        # Basic AWS configuration
        use_public_ips=True,               # Use public IPs for connectivity
        key_name=None,                     # No SSH key for this example
@@ -59,7 +59,7 @@ Now let's define a simple "Hello World" app and run it:
 
    # Run the app
    future = hello()
-   
+
    # Wait for the result and print it
    print(f"Result: {future.result()}")
 
@@ -90,7 +90,7 @@ Here's a complete example that you can run:
    from parsl.config import Config
    from parsl.executors import HighThroughputExecutor
    from parsl_ephemeral_aws import EphemeralAWSProvider
-   
+
    # Configure the AWS Provider
    provider = EphemeralAWSProvider(
        image_id='ami-0c55b159cbfafe1f0',    # Replace with current Amazon Linux 2 AMI
@@ -101,7 +101,7 @@ Here's a complete example that you can run:
        max_blocks=1,
        use_public_ips=True,
    )
-   
+
    # Create Parsl configuration
    config = Config(
        executors=[
@@ -112,29 +112,29 @@ Here's a complete example that you can run:
            )
        ]
    )
-   
+
    # Load the configuration
    parsl.load(config)
-   
+
    # Define some apps
    @parsl.python_app
    def hello(name):
        import socket
        host = socket.gethostname()
        return f"Hello {name} from {host}"
-   
+
    @parsl.python_app
    def add(a, b):
        return a + b
-   
+
    # Run the apps
    hello_future = hello("World")
    add_future = add(2, 3)
-   
+
    # Wait for and print results
    print(hello_future.result())
    print(f"2 + 3 = {add_future.result()}")
-   
+
    # Clean up
    parsl.dfk().cleanup()
 

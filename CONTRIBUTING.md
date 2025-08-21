@@ -19,7 +19,7 @@ Thank you for your interest in contributing to this project! Here's how you can 
 
    # Install the appropriate Python version
    pyenv install 3.9.16
-   
+
    # Set the local Python version for this project
    pyenv local 3.9.16
    ```
@@ -27,12 +27,12 @@ Thank you for your interest in contributing to this project! Here's how you can 
    ```bash
    # Create a virtual environment in the project directory
    python -m venv .venv
-   
+
    # Activate the virtual environment
    source .venv/bin/activate  # On Linux/macOS
    # OR
    .venv\Scripts\activate     # On Windows
-   
+
    # Install development dependencies
    pip install -e ".[dev,test]"
    ```
@@ -48,13 +48,13 @@ Thank you for your interest in contributing to this project! Here's how you can 
    ```bash
    # Format code with black
    black parsl_ephemeral_aws tests
-   
+
    # Sort imports with isort
    isort parsl_ephemeral_aws tests
-   
+
    # Run linting
    flake8 parsl_ephemeral_aws tests
-   
+
    # Run type checking
    mypy parsl_ephemeral_aws
    ```
@@ -63,7 +63,7 @@ Thank you for your interest in contributing to this project! Here's how you can 
    ```bash
    # Run tests
    pytest tests/
-   
+
    # Run tests with coverage
    pytest --cov=parsl_ephemeral_aws tests/
    ```

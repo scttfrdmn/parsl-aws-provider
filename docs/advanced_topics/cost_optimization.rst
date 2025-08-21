@@ -51,21 +51,21 @@ Spot instances offer up to 90% cost savings compared to on-demand prices but can
    provider = EphemeralAWSProvider(
        # Basic configuration
        region='us-west-2',
-       
+
        # Spot configuration
        use_spot_instances=True,
        use_spot_fleet=True,
-       
+
        # Diversify instance types for better availability
        instance_types=[
-           'm5.large', 'm5a.large', 'm5n.large',   
-           'c5.large', 'c5a.large', 
+           'm5.large', 'm5a.large', 'm5n.large',
+           'c5.large', 'c5a.large',
            'r5.large', 'r5a.large',
        ],
-       
+
        # Set appropriate price limit
        spot_max_price_percentage=80,  # 80% of on-demand price
-       
+
        # Optimize for cost vs. availability
        allocation_strategy='lowestPrice',  # For maximum cost savings
        # or
@@ -88,7 +88,7 @@ Regularly analyze your workload characteristics to identify optimal instance typ
    provider = EphemeralAWSProvider(
        # Use the right instance size
        instance_type='c5.large',  # Instead of c5.4xlarge if underutilized
-       
+
        # Or use spot fleet with weighted capacity
        use_spot_fleet=True,
        instance_types=[
@@ -96,7 +96,7 @@ Regularly analyze your workload characteristics to identify optimal instance typ
            {'type': 'c5.xlarge', 'weight': 2},  # Twice the capacity
            {'type': 'c5.2xlarge', 'weight': 4},  # Four times the capacity
        ],
-       
+
        # Let Spot Fleet optimize capacity vs. cost
        target_capacity=4,  # Total capacity needed
    )
@@ -114,10 +114,10 @@ AWS Graviton processors offer better price-performance ratios:
            'm6g.large',  # Graviton2
            'r6g.large',  # Graviton2
        ],
-       
+
        # Ensure your AMI supports ARM
        image_id='ami-0123456789abcdef0',  # ARM-compatible AMI
-       
+
        # Worker initialization for ARM compatibility
        worker_init='''
            # Install ARM-compatible packages
@@ -137,16 +137,16 @@ Proper autoscaling ensures you only pay for needed resources:
        # Basic configuration
        region='us-west-2',
        instance_type='t3.medium',
-       
+
        # Start small
        init_blocks=1,
-       
+
        # Scale to zero when idle
        min_blocks=0,
-       
+
        # Set reasonable maximum
        max_blocks=10,
-       
+
        # Scale down quickly when idle
        idle_timeout=300,  # 5 minutes
    )
@@ -161,14 +161,14 @@ For highly variable workloads with periods of inactivity, use Serverless Mode:
        # Serverless mode
        mode='serverless',
        region='us-west-2',
-       
+
        # Configure for cost efficiency
        worker_type='auto',  # Choose the most cost-effective service
-       
+
        # Lambda configuration
        lambda_memory=1024,  # Only pay for what you need
        lambda_timeout=300,  # Set appropriate timeout
-       
+
        # ECS/Fargate configuration
        ecs_task_cpu=512,   # 0.5 vCPU
        ecs_task_memory=1024,  # 1 GB
@@ -183,13 +183,13 @@ For Lambda-based workloads, optimize memory and timeout:
    provider = EphemeralAWSProvider(
        mode='serverless',
        worker_type='lambda',
-       
+
        # Start with lower memory and increase only if needed
        lambda_memory=1024,  # 1 GB
-       
+
        # Set timeout based on actual task duration
        lambda_timeout=60,  # 1 minute for short tasks
-       
+
        # Only include necessary dependencies
        lambda_python_dependencies=[
            'numpy==1.21.0',  # Specify only what you need
@@ -209,10 +209,10 @@ For predictable, steady-state workloads, consider Reserved Instances:
        # Match your Reserved Instance attributes exactly
        region='us-west-2',
        instance_type='m5.large',  # Same as your RI
-       
+
        # Maintain minimum blocks to utilize RIs
        min_blocks=5,  # If you have 5 Reserved Instances
-       
+
        # Use spot for bursting above RI capacity
        use_spot_instances=True,
    )
@@ -230,13 +230,13 @@ Configure appropriate EBS volumes:
        # Basic configuration
        region='us-west-2',
        instance_type='m5.large',
-       
+
        # Minimize root volume size
        root_volume_size=20,  # GB, minimum required
-       
+
        # Use gp3 for better performance/cost
        root_volume_type='gp3',
-       
+
        # Only add EBS volumes if needed
        ebs_volumes=[
            {
@@ -256,7 +256,7 @@ For temporary data, use instance store volumes:
    provider = EphemeralAWSProvider(
        # Choose instance types with instance store
        instance_type='m5d.large',  # 'd' indicates NVMe instance store
-       
+
        # Initialize the instance store
        worker_init='''
            # Format and mount instance store
@@ -264,7 +264,7 @@ For temporary data, use instance store volumes:
            sudo mkdir -p /mnt/instance-store
            sudo mount /dev/nvme1n1 /mnt/instance-store
            sudo chmod 777 /mnt/instance-store
-           
+
            # Use it for temporary data
            export TMPDIR=/mnt/instance-store/tmp
            mkdir -p $TMPDIR
@@ -280,7 +280,7 @@ When using S3 for state persistence or data storage:
    provider = EphemeralAWSProvider(
        # Basic configuration
        region='us-west-2',
-       
+
        # S3 state persistence configuration
        state_store='s3',
        state_prefix='workflow/state',
@@ -303,7 +303,7 @@ For state persistence with Parameter Store:
    provider = EphemeralAWSProvider(
        # Basic configuration
        region='us-west-2',
-       
+
        # Parameter Store configuration
        state_store='parameter_store',
        state_prefix='/parsl/workflows',
@@ -311,7 +311,7 @@ For state persistence with Parameter Store:
            'parameter_type': 'String',  # Use standard tier when possible
            'parameter_tier': 'Standard',  # Less expensive than Advanced
        },
-       
+
        # Clean up parameters after workflow completion
        state_cleanup='always',
    )
@@ -341,7 +341,7 @@ Keep data and compute in the same region:
    # Provider in the same region as your data
    provider = EphemeralAWSProvider(
        region='us-west-2',  # Same region as your S3 bucket
-       
+
        # Use regional S3 endpoint
        worker_init='''
            # Configure AWS CLI to use regional endpoint
@@ -358,7 +358,7 @@ For high-volume access to AWS services, use VPC endpoints:
    provider = EphemeralAWSProvider(
        # Basic configuration
        region='us-west-2',
-       
+
        # Request VPC endpoints creation
        create_vpc_endpoints=True,
        vpc_endpoints=[
@@ -378,30 +378,30 @@ Configure Parsl to minimize unnecessary data transfer:
    from parsl.config import Config
    from parsl.executors import HighThroughputExecutor
    from parsl.data_provider.files import File
-   
+
    provider = EphemeralAWSProvider(
        # Basic configuration
        region='us-west-2',
    )
-   
+
    config = Config(
        executors=[
            HighThroughputExecutor(
                label='aws_executor',
                provider=provider,
-               
+
                # Configure for data efficiency
                storage_access=storage_access,  # Define appropriate storage access
                working_dir='/mnt/instance-store/scratch',  # Use fast local storage
            )
        ]
    )
-   
+
    parsl.load(config)
-   
+
    # Use Parsl's File abstraction for efficient data movement
    input_file = File('s3://my-bucket/input.dat')
-   
+
    @parsl.python_app
    def process_data(file):
        with open(file.local_path, 'r') as f:
@@ -421,11 +421,11 @@ Ensure resources are always cleaned up:
    provider = EphemeralAWSProvider(
        # Basic configuration
        region='us-west-2',
-       
+
        # Ensure cleanup happens
        force_cleanup=True,  # Try harder to clean up resources
        cleanup_on_exit=True,  # Clean up when Python exits
-       
+
        # Don't preserve resources unless needed
        preserve_vpc=False,
        preserve_subnet=False,
@@ -449,10 +449,10 @@ Minimize instance startup time to reduce costs:
        # Basic configuration
        region='us-west-2',
        instance_type='m5.large',
-       
+
        # Use optimized AMI with pre-installed dependencies
        image_id='ami-0123456789abcdef0',  # Custom AMI with dependencies
-       
+
        # Minimal worker initialization
        worker_init='''
            # Only necessary initialization
@@ -470,14 +470,14 @@ Use AWS Cost Explorer and CloudWatch to monitor costs:
    provider = EphemeralAWSProvider(
        # Basic configuration
        region='us-west-2',
-       
+
        # Tag for cost tracking
        tags={
            'Project': 'GenomeAnalysis',
            'CostCenter': 'Research',
            'Environment': 'Production',
        },
-       
+
        # Enable detailed monitoring
        detailed_monitoring=True,
    )
@@ -492,10 +492,10 @@ For workflows that can be paused and resumed:
        # Basic configuration
        region='us-west-2',
        instance_type='m5.large',  # Ensure instance type supports hibernation
-       
+
        # Enable hibernation
        hibernation_enabled=True,
-       
+
        # For spot instances
        spot_interruption_behavior='hibernate',
    )
@@ -509,11 +509,11 @@ Set limits to prevent runaway costs:
    provider = EphemeralAWSProvider(
        # Basic configuration
        region='us-west-2',
-       
+
        # Strict resource limits
        max_blocks=10,  # Maximum number of blocks
        max_instances=20,  # Maximum number of instances
-       
+
        # Budget constraints
        max_cost_per_hour=10.0,  # USD
        budget_alert_threshold=0.8,  # Alert at 80% of budget
@@ -535,13 +535,13 @@ For workflows with predictable phases:
        instance_type='i3.large',  # Storage optimized
        max_blocks=2,
    )
-   
+
    # Mid-workflow reconfiguration for compute phase
    provider.reconfigure(
        instance_type='c5.2xlarge',  # Compute optimized
        max_blocks=10,
    )
-   
+
    # Final phase for data aggregation
    provider.reconfigure(
        instance_type='r5.large',  # Memory optimized
@@ -557,17 +557,17 @@ Optimize for both cost and performance with hybrid instance types:
    provider = EphemeralAWSProvider(
        # Basic configuration
        region='us-west-2',
-       
+
        # Use spot fleet with diverse options
        use_spot_fleet=True,
-       
+
        # Base capacity with burstable instances
        instance_types=[
            {'type': 't3.medium', 'weight': 1, 'priority': 1},  # Base capacity
            {'type': 'c5.large', 'weight': 2, 'priority': 5},   # Burst compute
            {'type': 'r5.large', 'weight': 2, 'priority': 10},  # Burst memory
        ],
-       
+
        # Set priority order for instance selection
        allocation_strategy='prioritized',
    )
@@ -584,7 +584,7 @@ Combine serverless and instance-based execution:
        worker_type='lambda',
        region='us-west-2',
    )
-   
+
    # EC2 provider for larger tasks
    ec2_provider = EphemeralAWSProvider(
        mode='standard',
@@ -592,7 +592,7 @@ Combine serverless and instance-based execution:
        region='us-west-2',
        use_spot_instances=True,
    )
-   
+
    config = Config(
        executors=[
            HighThroughputExecutor(
@@ -605,13 +605,13 @@ Combine serverless and instance-based execution:
            )
        ]
    )
-   
+
    # Small task uses Lambda
    @parsl.python_app(executors=['lambda_executor'])
    def small_task():
        # Quick processing
        pass
-   
+
    # Larger task uses EC2
    @parsl.python_app(executors=['ec2_executor'])
    def large_task():
@@ -629,20 +629,20 @@ For multiple concurrent workflows:
        region='us-west-2',
        instance_type='m5.large',
        max_blocks=20,
-       
+
        # Enable resource sharing
        shared_resources=True,
        resource_sharing_key='shared-key',
-       
+
        # Configure resource allocation
        fair_share=True,
        priority=1,  # Higher numbers get priority
    )
-   
+
    # Each workflow uses the same provider
    config1 = Config(executors=[HighThroughputExecutor(provider=provider)])
    config2 = Config(executors=[HighThroughputExecutor(provider=provider)])
-   
+
    # They share the resources, reducing total cost
 
 **5. Scheduled Workflows**
@@ -654,7 +654,7 @@ For workflows that can run during off-peak hours:
    provider = EphemeralAWSProvider(
        # Basic configuration
        region='us-west-2',
-       
+
        # Schedule specific hours for execution
        scheduled_execution=True,
        execution_hours=[
@@ -662,7 +662,7 @@ For workflows that can run during off-peak hours:
            {'start': '00:00', 'end': '08:00'},  # Overnight hours
            {'start': '22:00', 'end': '23:59'},  # Late night
        ],
-       
+
        # Use Spot instances during these times
        use_spot_instances=True,
        spot_max_price_percentage=60,  # Lower prices during off-hours
@@ -688,7 +688,7 @@ Implement this workflow to continuously optimize costs:
 
    # Get utilization metrics
    metrics = provider.get_performance_metrics()
-   
+
    print(f"CPU Utilization: {metrics['cpu_utilization']:.1f}%")
    print(f"Memory Utilization: {metrics['memory_utilization']:.1f}%")
    print(f"Instance Idle Time: {metrics['idle_time_percentage']:.1f}%")
@@ -699,12 +699,12 @@ Implement this workflow to continuously optimize costs:
 
    # Get optimization recommendations
    recommendations = provider.get_optimization_recommendations()
-   
+
    for rec in recommendations:
        print(f"Recommendation: {rec['action']}")
        print(f"Estimated Savings: ${rec['savings']:.2f}")
        print(f"Confidence: {rec['confidence']*100:.0f}%")
-       
+
        if rec['confidence'] > 0.8 and rec['apply_automatically']:
            print("Applying automatically...")
            provider.apply_recommendation(rec['id'])
@@ -716,7 +716,7 @@ Implement this workflow to continuously optimize costs:
    # Measure impact of changes
    new_costs = provider.estimate_costs()
    savings = baseline['total_cost'] - new_costs['total_cost']
-   
+
    print(f"New estimated cost: ${new_costs['total_cost']:.2f} per hour")
    print(f"Savings: ${savings:.2f} per hour (${savings*24*30:.2f} per month)")
    print(f"Savings percentage: {savings/baseline['total_cost']*100:.1f}%")
@@ -732,12 +732,12 @@ Here's a comprehensive example implementing multiple cost optimization strategie
    from parsl.config import Config
    from parsl.executors import HighThroughputExecutor
    from parsl_ephemeral_aws import EphemeralAWSProvider
-   
+
    # Create a cost-optimized provider
    provider = EphemeralAWSProvider(
        # Region optimization
        region='us-east-1',  # Generally the most cost-effective region
-       
+
        # Compute optimization
        use_spot_instances=True,
        use_spot_fleet=True,
@@ -748,48 +748,48 @@ Here's a comprehensive example implementing multiple cost optimization strategie
        ],
        allocation_strategy='lowestPrice',
        spot_max_price_percentage=70,
-       
+
        # Scaling optimization
        min_blocks=0,       # Scale to zero when idle
        max_blocks=10,
        init_blocks=1,
        idle_timeout=300,   # 5 minutes
-       
+
        # Storage optimization
        root_volume_size=20,
        root_volume_type='gp3',
-       
+
        # State persistence optimization
        state_store='parameter_store',
        state_config={
            'parameter_tier': 'Standard',
        },
        state_cleanup='always',
-       
+
        # Resource tagging for cost analysis
        tags={
            'Project': 'CostOptimizedWorkflow',
            'CostCenter': 'Research',
            'Environment': 'Production',
        },
-       
+
        # Worker initialization optimization
        worker_init='''
            # Optimize package installation
            pip install --no-cache-dir -U pip
            pip install --no-cache-dir numpy scipy pandas
-           
+
            # Configure AWS CLI for efficiency
            aws configure set default.s3.max_concurrent_requests 20
            aws configure set default.s3.max_queue_size 10000
            aws configure set default.s3.use_accelerate_endpoint true
        ''',
-       
+
        # Budget constraints
        max_cost_per_hour=5.0,
        enforce_budget_constraints=True,
    )
-   
+
    # Create Parsl configuration
    config = Config(
        executors=[
@@ -801,41 +801,41 @@ Here's a comprehensive example implementing multiple cost optimization strategie
        ],
        strategy='htex_auto_scale',  # Dynamic scaling
    )
-   
+
    # Load the configuration
    parsl.load(config)
-   
+
    # Example workflow
    @parsl.python_app
    def process_data(file_idx):
        import time
        import numpy as np
-       
+
        # Simulate data processing
        data_size = 1000000
        data = np.random.rand(data_size)
-       
+
        # Process efficiently
        start = time.time()
        result = np.fft.fft(data)
        processing_time = time.time() - start
-       
+
        return {
            'file_idx': file_idx,
            'data_size': data_size,
            'processing_time': processing_time,
            'result_sum': np.sum(result.real),
        }
-   
+
    # Submit tasks
    results = []
    for i in range(100):
        results.append(process_data(i))
-   
+
    # Process results efficiently
    for r in results:
        print(f"Processed file {r.result()['file_idx']} in {r.result()['processing_time']:.2f}s")
-   
+
    # Clean up resources
    parsl.dfk().cleanup()
 

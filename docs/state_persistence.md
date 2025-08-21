@@ -210,19 +210,19 @@ class MyCustomStateStore(StateStore):
         super().__init__(**kwargs)
         self.connection_string = connection_string
         # Initialize your storage backend
-        
+
     def save_state(self, state):
         # Implementation for saving state
         pass
-        
+
     def load_state(self):
         # Implementation for loading state
         pass
-        
+
     def delete_state(self):
         # Implementation for deleting state
         pass
-        
+
     def list_states(self, prefix=None):
         # Implementation for listing states
         pass
@@ -236,7 +236,7 @@ class MyCustomStateStore(StateStore):
    - Use S3StateStore for serverless or cross-environment workflows
 
 2. **Set unique provider IDs and workflow IDs:**
-   - Using unique IDs prevents state collisions 
+   - Using unique IDs prevents state collisions
    - Predictable IDs make recovery easier
 
 3. **Handle state cleanup properly:**

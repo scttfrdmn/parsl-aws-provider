@@ -164,13 +164,13 @@ jobs:
           curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
           unzip awscliv2.zip
           sudo ./aws/install
-          
+
           # Configure AWS CLI to use LocalStack
           aws configure set aws_access_key_id test
           aws configure set aws_secret_access_key test
           aws configure set region us-east-1
           aws configure set output json
-          
+
           # Verify LocalStack is running correctly
           aws --endpoint-url=http://localhost:4566 ec2 describe-regions
       - name: Run integration tests with LocalStack
@@ -180,7 +180,7 @@ jobs:
           export AWS_ACCESS_KEY_ID=test
           export AWS_SECRET_ACCESS_KEY=test
           export AWS_DEFAULT_REGION=us-east-1
-          
+
           # Run the tests
           pytest -xvs tests/integration
 

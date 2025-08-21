@@ -59,19 +59,19 @@ parsl_ephemeral_aws/
 When asking Claude to generate code for this project, follow these guidelines:
 
 1. **Provide context**: Before requesting code, explain the component's purpose and how it integrates with Parsl
-   
+
    Example: "I'm developing an AWS provider for Parsl that supports ephemeral resources. I need a class to manage EC2 instance lifecycle."
 
 2. **Specify requirements**: Clearly state functional requirements, constraints, and dependencies
-   
+
    Example: "The EC2 manager needs to support spot instances, hibernation, and proper cleanup of all resources."
 
 3. **Request iterative development**: For complex components, ask for code in stages
-   
+
    Example: "First, let's implement the basic VPC creation. Then we'll add subnet management and security groups."
 
 4. **Provide examples**: Show snippets of existing code or Parsl interfaces to maintain consistency
-   
+
    Example: "The provider needs to implement the ExecutionProvider interface as shown here: [code snippet]"
 
 ### Code Generation Strategy
@@ -116,7 +116,7 @@ The main provider class should extend Parsl's ExecutionProvider interface. Ask C
 
 Example prompt:
 ```
-I need to implement the core EphemeralAWSProvider class that extends Parsl's ExecutionProvider. 
+I need to implement the core EphemeralAWSProvider class that extends Parsl's ExecutionProvider.
 The class should handle:
 - Configuration processing with sensible defaults
 - Resource provisioning based on blocks
@@ -232,7 +232,7 @@ For working with AWS permissions, ask Claude to:
 
 Example prompt:
 ```
-Let's create an IAM policy that provides the minimum permissions required for the provider. 
+Let's create an IAM policy that provides the minimum permissions required for the provider.
 We need to include permissions for:
 - EC2 instance management
 - VPC and network configuration
@@ -273,7 +273,7 @@ When working on this project, follow these Python environment management practic
    ```bash
    # Install the appropriate Python version
    pyenv install 3.9.16
-   
+
    # Set the local Python version for this project
    cd /path/to/parsl-aws-provider
    pyenv local 3.9.16
@@ -283,16 +283,16 @@ When working on this project, follow these Python environment management practic
    ```bash
    # Create a virtual environment in the project directory
    python -m venv .venv
-   
+
    # Activate the virtual environment
    source .venv/bin/activate  # On Linux/macOS
    .venv\Scripts\activate     # On Windows
-   
+
    # Install development dependencies
    pip install -e ".[dev,test]"
    ```
 
-3. **Requirements management**: 
+3. **Requirements management**:
    - Use `requirements.txt` for production dependencies
    - Use `requirements-dev.txt` for development and testing dependencies
    - Use `setup.py` or `pyproject.toml` for package metadata
@@ -301,10 +301,10 @@ When working on this project, follow these Python environment management practic
    ```bash
    # Run linting checks
    flake8 parsl_ephemeral_aws tests
-   
+
    # Run type checking
    mypy parsl_ephemeral_aws
-   
+
    # Format code
    black parsl_ephemeral_aws tests
    ```
@@ -329,7 +329,7 @@ Here's an example of a complete function request to Claude:
 Please implement the EC2ResourceManager class for our ephemeral AWS provider. This class should:
 
 1. Handle EC2 instance lifecycle (create, terminate, stop, hibernate)
-2. Support both on-demand and spot instances 
+2. Support both on-demand and spot instances
 3. Track all created resources with tags
 4. Provide status reporting compatible with Parsl's job status
 5. Implement complete cleanup of all EC2 resources
@@ -358,4 +358,3 @@ Remember to:
 - Ensure proper error handling and resource cleanup
 
 With this approach, you can leverage Claude Code effectively to build a robust, flexible, and efficient ephemeral AWS provider for Parsl.
-

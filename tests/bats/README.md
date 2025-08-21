@@ -67,7 +67,7 @@ load '/usr/local/lib/bats/bats-file/load.bash'
 setup() {
     # Create temporary directory for test files
     TEST_TEMP_DIR="$(mktemp -d)"
-    
+
     # Source the script being tested
     source "${BATS_TEST_DIRNAME}/../../scripts/script_to_test.sh"
 }
@@ -82,7 +82,7 @@ teardown() {
 @test "Test that script function works" {
     # Run the function
     run function_to_test "argument"
-    
+
     # Assert expectations
     assert_success
     assert_output --partial "expected output"

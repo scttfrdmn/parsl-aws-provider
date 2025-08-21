@@ -67,7 +67,7 @@ This document outlines the next steps and planned features for implementing the 
 
 ### Phase 8: Examples & Demos
 - [ ] Basic compute examples
-- [ ] Detached mode workflow examples 
+- [ ] Detached mode workflow examples
 - [ ] Serverless execution examples
 - [ ] MPI multi-node examples
 - [ ] Spot instance with hibernation examples

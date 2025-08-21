@@ -20,20 +20,20 @@ from parsl.providers import EphemeralAWSProvider
 provider = EphemeralAWSProvider(
     # Basic configuration
     region="us-east-1",
-    
+
     # Enable both spot instances and spot fleet
     use_spot=True,
     use_spot_fleet=True,
-    
+
     # Configure multiple instance types
     instance_types=["t3.small", "t3.medium", "m5.small"],
-    
+
     # Set number of nodes per block
     nodes_per_block=2,
-    
+
     # Maximum price as percentage of on-demand (optional)
     spot_max_price_percentage=80,
-    
+
     # Other standard configuration...
     operating_mode="detached",  # Recommended for long-running workflows
     workflow_id="my-workflow",

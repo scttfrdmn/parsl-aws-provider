@@ -209,23 +209,23 @@ parsl.load(config)
 def train_model(epochs=10):
     import tensorflow as tf
     import numpy as np
-    
+
     # Generate synthetic data
     x_train = np.random.random((1000, 10))
     y_train = np.random.random((1000, 1))
-    
+
     # Create a simple model
     model = tf.keras.models.Sequential([
         tf.keras.layers.Dense(64, activation='relu', input_shape=(10,)),
         tf.keras.layers.Dense(32, activation='relu'),
         tf.keras.layers.Dense(1)
     ])
-    
+
     model.compile(optimizer='adam', loss='mse')
-    
+
     # Train the model
     history = model.fit(x_train, y_train, epochs=epochs, verbose=0)
-    
+
     return {"final_loss": float(history.history['loss'][-1])}
 
 # Train multiple models in parallel
@@ -326,19 +326,19 @@ provider = EphemeralAWSProvider(
     mode='standard',
     min_blocks=0,
     max_blocks=10,
-    
+
     # Custom VPC configuration
     vpc_id='vpc-0123456789abcdef0',  # Optional: Use existing VPC
     subnet_id='subnet-0123456789abcdef0',  # Optional: Use existing subnet
-    
+
     # Alternative: Create new VPC with custom CIDR
     create_vpc=True,  # Create a new VPC if vpc_id not provided
     vpc_cidr='10.0.0.0/16',
-    
+
     # Security group configuration
     security_group_id='sg-0123456789abcdef0',  # Optional: Use existing security group
     create_security_group=True,  # Create a new security group if security_group_id not provided
-    
+
     # Additional ingress rules for security group
     additional_ingress_rules=[
         {
@@ -348,7 +348,7 @@ provider = EphemeralAWSProvider(
             'IpRanges': [{'CidrIp': '0.0.0.0/0'}]
         }
     ],
-    
+
     worker_init="""
         #!/bin/bash
         pip install parsl jupyter
@@ -374,9 +374,9 @@ parsl.load(config)
 def get_instance_info():
     import socket
     import requests
-    
+
     hostname = socket.gethostname()
-    
+
     # Get instance metadata
     try:
         r = requests.get('http://169.254.169.254/latest/meta-data/instance-id', timeout=2)
@@ -389,7 +389,7 @@ def get_instance_info():
         instance_id = "unknown"
         private_ip = "unknown"
         public_ip = "unknown"
-    
+
     return {
         'hostname': hostname,
         'instance_id': instance_id,
@@ -421,10 +421,10 @@ provider = EphemeralAWSProvider(
     mode='standard',
     min_blocks=0,
     max_blocks=5,
-    
+
     # S3 bucket for data staging
     s3_bucket='my-parsl-data-bucket',
-    
+
     worker_init="""
         #!/bin/bash
         pip install parsl boto3 pandas
@@ -452,16 +452,16 @@ parsl.load(config)
 @parsl.python_app
 def process_csv(input_file, outputs=[]):
     import pandas as pd
-    
+
     # Read the input CSV
     df = pd.read_csv(input_file)
-    
+
     # Process the data
     result = df.groupby('category').agg({'value': ['mean', 'std', 'count']})
-    
+
     # Write the result to the output file
     result.to_csv(outputs[0])
-    
+
     return f"Processed {len(df)} rows into {len(result)} categories"
 
 # Create input and output file objects
@@ -523,27 +523,27 @@ def train_and_evaluate(learning_rate, hidden_units, dropout_rate):
     import torch.optim as optim
     from torch.utils.data import DataLoader, TensorDataset
     import numpy as np
-    
+
     # Generate synthetic data
     np.random.seed(42)
     X = np.random.rand(10000, 20).astype(np.float32)
     y = (X[:, 0] + X[:, 1]**2 + np.sin(X[:, 2]) > 1.0).astype(np.float32)
-    
+
     # Split data
     split = int(0.8 * len(X))
     X_train, X_test = X[:split], X[split:]
     y_train, y_test = y[:split], y[split:]
-    
+
     # Convert to PyTorch tensors
     X_train_tensor = torch.tensor(X_train)
     y_train_tensor = torch.tensor(y_train).view(-1, 1)
     X_test_tensor = torch.tensor(X_test)
     y_test_tensor = torch.tensor(y_test).view(-1, 1)
-    
+
     # Create data loaders
     train_dataset = TensorDataset(X_train_tensor, y_train_tensor)
     train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
-    
+
     # Define model
     class MLP(nn.Module):
         def __init__(self, input_dim, hidden_dim, dropout_rate):
@@ -554,7 +554,7 @@ def train_and_evaluate(learning_rate, hidden_units, dropout_rate):
             self.dropout = nn.Dropout(dropout_rate)
             self.relu = nn.ReLU()
             self.sigmoid = nn.Sigmoid()
-            
+
         def forward(self, x):
             x = self.relu(self.fc1(x))
             x = self.dropout(x)
@@ -562,43 +562,43 @@ def train_and_evaluate(learning_rate, hidden_units, dropout_rate):
             x = self.dropout(x)
             x = self.sigmoid(self.fc3(x))
             return x
-    
+
     # Initialize model
     model = MLP(input_dim=20, hidden_dim=hidden_units, dropout_rate=dropout_rate)
-    
+
     # Check if GPU is available
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     model.to(device)
-    
+
     # Define loss function and optimizer
     criterion = nn.BCELoss()
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
-    
+
     # Train model
     epochs = 50
     for epoch in range(epochs):
         model.train()
         for inputs, targets in train_loader:
             inputs, targets = inputs.to(device), targets.to(device)
-            
+
             optimizer.zero_grad()
             outputs = model(inputs)
             loss = criterion(outputs, targets)
             loss.backward()
             optimizer.step()
-    
+
     # Evaluate model
     model.eval()
     with torch.no_grad():
         X_test_tensor = X_test_tensor.to(device)
         y_test_tensor = y_test_tensor.to(device)
-        
+
         test_outputs = model(X_test_tensor)
         test_loss = criterion(test_outputs, y_test_tensor).item()
-        
+
         predictions = (test_outputs > 0.5).float()
         accuracy = (predictions == y_test_tensor).float().mean().item()
-    
+
     return {
         'hyperparameters': {
             'learning_rate': learning_rate,
@@ -690,14 +690,14 @@ parsl.load(config)
 
 # App to align reads to a reference genome
 @parsl.bash_app
-def align_reads(reference, reads, output, cores=8, 
+def align_reads(reference, reads, output, cores=8,
                 stdout=parsl.AUTO_LOGNAME, stderr=parsl.AUTO_LOGNAME):
     return f"""
     # Index the reference genome if index doesn't exist
     if [ ! -f {reference}.bwt ]; then
         bwa index {reference}
     fi
-    
+
     # Align reads to the reference
     bwa mem -t {cores} {reference} {reads} > {output}
     """
@@ -709,7 +709,7 @@ def sam_to_sorted_bam(sam_file, bam_file, cores=8,
     return f"""
     # Convert SAM to BAM and sort
     samtools view -b -@ {cores} {sam_file} | samtools sort -@ {cores} -o {bam_file}
-    
+
     # Index the BAM file
     samtools index {bam_file}
     """
@@ -727,17 +727,17 @@ def call_variants(reference, bam_file, vcf_file, cores=8,
 @parsl.python_app
 def analyze_variants(vcf_file):
     import pysam
-    
+
     # Open the VCF file
     vcf = pysam.VariantFile(vcf_file)
-    
+
     # Count variants by type
     variant_types = {
         'SNP': 0,
         'INDEL': 0,
         'OTHER': 0
     }
-    
+
     # Analyze variants
     for record in vcf.fetch():
         # Determine variant type
@@ -747,7 +747,7 @@ def analyze_variants(vcf_file):
             variant_types['INDEL'] += 1
         else:
             variant_types['OTHER'] += 1
-    
+
     return {
         'vcf_file': vcf_file,
         'total_variants': sum(variant_types.values()),
@@ -801,12 +801,12 @@ provider = EphemeralAWSProvider(
     mode='standard',
     min_blocks=0,
     max_blocks=1,
-    
+
     # Add connection diagnostic flags
     debug=True,
     wait_for_connection=True,
     connection_timeout=120,
-    
+
     worker_init="""
         #!/bin/bash
         pip install parsl
@@ -836,34 +836,34 @@ def diagnostic_check():
     import os
     import subprocess
     import platform
-    
+
     # Basic system info
     hostname = socket.gethostname()
-    
+
     # Network connectivity check
     network_check = {}
     targets = ['8.8.8.8', 'amazon.com', 'github.com']
     for target in targets:
         try:
-            subprocess.check_output(['ping', '-c', '3', target], 
+            subprocess.check_output(['ping', '-c', '3', target],
                                    stderr=subprocess.STDOUT,
                                    universal_newlines=True)
             network_check[target] = "OK"
         except subprocess.CalledProcessError as e:
             network_check[target] = f"FAIL: {e.output}"
-    
+
     # Check environment
     env_vars = {k: v for k, v in os.environ.items() if 'AWS' in k or 'PARSL' in k}
-    
+
     # File system check
     fs_info = {}
     try:
-        df_output = subprocess.check_output(['df', '-h'], 
+        df_output = subprocess.check_output(['df', '-h'],
                                            universal_newlines=True)
         fs_info['df'] = df_output
     except:
         fs_info['df'] = "Failed to run df command"
-    
+
     return {
         'hostname': hostname,
         'platform': platform.platform(),
@@ -966,13 +966,13 @@ provider = EphemeralAWSProvider(
     mode='standard',
     min_blocks=0,
     max_blocks=5,
-    
+
     # Resource tracking options
     tag_resources=True,
     resource_prefix='parsl-demo',
     auto_shutdown=True,
     max_idle_time=300,  # 5 minutes of idle time before shutdown
-    
+
     worker_init="""
         #!/bin/bash
         pip install parsl

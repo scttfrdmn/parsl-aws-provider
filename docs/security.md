@@ -250,7 +250,7 @@ By default, the provider creates a VPC with a single public subnet and security 
        VpcId='vpc-12345678'
    )
    security_group_id = response['GroupId']
-   
+
    # Add minimal ingress rules
    ec2.authorize_security_group_ingress(
        GroupId=security_group_id,
@@ -269,7 +269,7 @@ By default, the provider creates a VPC with a single public subnet and security 
            }
        ]
    )
-   
+
    # Then use this security group in your provider
    provider = EphemeralAWSProvider(
        mode=StandardMode(
@@ -366,7 +366,7 @@ All communication between the provider and AWS services uses HTTPS/TLS. For work
        aws_secret_access_key="wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
        # Other parameters...
    )
-   
+
    # INSTEAD, use environment variables, IAM roles, or AWS profiles
    provider = EphemeralAWSProvider(
        aws_profile="parsl-profile",  # Or omit to use default credentials

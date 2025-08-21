@@ -6,20 +6,13 @@ SPDX-FileCopyrightText: 2025 Scott Friedman and Project Contributors
 
 import pytest
 import boto3
-import json
 import os
 import uuid
-import time
 from unittest.mock import patch, MagicMock
 
-import moto
 from moto import mock_ec2, mock_iam, mock_cloudformation
 
 from parsl_ephemeral_aws.modes.serverless import ServerlessMode
-from parsl_ephemeral_aws.exceptions import (
-    ResourceCreationError,
-    JobSubmissionError,
-)
 from parsl_ephemeral_aws.constants import (
     RESOURCE_TYPE_SPOT_FLEET,
     WORKER_TYPE_ECS,
@@ -38,7 +31,7 @@ class TestServerlessModeSpotFleetIntegration:
     @pytest.fixture
     def aws_session(self):
         """Create a real boto3 session that will use moto's mocks."""
-        return boto3.Session(region_name='us-east-1')
+        return boto3.Session(region_name="us-east-1")
 
     @pytest.fixture
     def mock_state_store(self):
@@ -58,13 +51,18 @@ class TestServerlessModeSpotFleetIntegration:
     def serverless_mode(self, aws_session, mock_state_store, provider_id):
         """Create a ServerlessMode instance for testing."""
         # Create a custom template for easier mocking with moto
-        template_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), 
-                                   "parsl_ephemeral_aws", "templates", "cloudformation")
+        template_dir = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
+            "parsl_ephemeral_aws",
+            "templates",
+            "cloudformation",
+        )
         os.makedirs(template_dir, exist_ok=True)
-        
+
         # Create a simple CloudFormation template for testing
         with open(os.path.join(template_dir, "ecs_worker.yml"), "w") as f:
-            f.write("""
+            f.write(
+                """
 AWSTemplateFormatVersion: '2010-09-09'
 Parameters:
   WorkflowId:
@@ -120,11 +118,13 @@ Outputs:
   SpotFleetRequestId:
     Description: ID of the Spot Fleet request
     Value: sfr-12345678
-            """)
-        
+            """
+            )
+
         # Create the VPC template
         with open(os.path.join(template_dir, "vpc.yml"), "w") as f:
-            f.write("""
+            f.write(
+                """
 AWSTemplateFormatVersion: '2010-09-09'
 Parameters:
   VpcCidr:
@@ -156,8 +156,9 @@ Outputs:
   PublicSubnetId:
     Description: Public Subnet ID
     Value: !Ref DummySubnet
-            """)
-            
+            """
+            )
+
         # Create ServerlessMode with SpotFleet
         mode = ServerlessMode(
             provider_id=provider_id,
@@ -170,28 +171,28 @@ Outputs:
             spot_max_price_percentage=80,
             create_vpc=True,
         )
-        
+
         # Setup mocks
-        mode.cf_client = aws_session.client('cloudformation')
+        mode.cf_client = aws_session.client("cloudformation")
         mode.lambda_manager = MagicMock()
         mode.lambda_manager._generate_lambda_code.return_value = b"lambda_code_zip"
-        
+
         # Patch _get_spot_fleet_status to return consistent results in tests
         mode._get_spot_fleet_status = MagicMock(return_value=STATUS_RUNNING)
-        
+
         return mode
 
     def test_integration_initialize_with_spot_fleet(self, serverless_mode):
         """Test initializing infrastructure with SpotFleet support."""
         # Initialize the mode
         serverless_mode.initialize()
-        
+
         # Verify initialization
         assert serverless_mode.initialized is True
         assert serverless_mode.vpc_id is not None
         assert serverless_mode.subnet_id is not None
         assert serverless_mode.security_group_id is not None
-        
+
         # Verify SpotFleet-specific attributes were preserved
         assert serverless_mode.use_spot_fleet is True
         assert len(serverless_mode.instance_types) == 2
@@ -202,29 +203,34 @@ Outputs:
         """Test job submission with SpotFleet."""
         # Initialize first
         serverless_mode.initialize()
-        
+
         # Submit a job
         job_id = "test-job-1"
         command = "echo hello from spot fleet"
         resource_id = serverless_mode.submit_job(job_id, command, 2)
-        
+
         # Verify resource tracking
         assert resource_id in serverless_mode.resources
         assert serverless_mode.resources[resource_id]["job_id"] == job_id
         assert serverless_mode.resources[resource_id]["command"] == command
         assert serverless_mode.resources[resource_id]["status"] == STATUS_PENDING
         assert serverless_mode.resources[resource_id]["use_spot_fleet"] is True
-        
+
         # Get job status (which should update with fleet_request_id)
         status = serverless_mode.get_job_status([resource_id])
-        
+
         # With our mocked _get_spot_fleet_status, should be RUNNING
         assert status[resource_id] == STATUS_RUNNING
-        
+
         # Should have updated tracking with fleet details
         assert "fleet_request_id" in serverless_mode.resources[resource_id]
-        assert serverless_mode.resources[resource_id]["fleet_request_id"] == "sfr-12345678"
-        assert serverless_mode.resources[resource_id]["resource_type"] == RESOURCE_TYPE_SPOT_FLEET
+        assert (
+            serverless_mode.resources[resource_id]["fleet_request_id"] == "sfr-12345678"
+        )
+        assert (
+            serverless_mode.resources[resource_id]["resource_type"]
+            == RESOURCE_TYPE_SPOT_FLEET
+        )
 
     def test_integration_cancel_spot_fleet_job(self, serverless_mode):
         """Test canceling a SpotFleet job."""
@@ -232,13 +238,13 @@ Outputs:
         serverless_mode.initialize()
         job_id = "test-job-2"
         resource_id = serverless_mode.submit_job(job_id, "echo hello", 2)
-        
+
         # Get status to set fleet_request_id
         serverless_mode.get_job_status([resource_id])
-        
+
         # Cancel the job
         cancel_results = serverless_mode.cancel_jobs([resource_id])
-        
+
         # Verify cancellation
         assert cancel_results[resource_id] == STATUS_CANCELLED
         assert serverless_mode.resources[resource_id]["status"] == STATUS_CANCELLED
@@ -249,13 +255,13 @@ Outputs:
         serverless_mode.initialize()
         job_id = "test-job-3"
         resource_id = serverless_mode.submit_job(job_id, "echo hello", 2)
-        
+
         # Get status to set fleet_request_id
         serverless_mode.get_job_status([resource_id])
-        
+
         # List resources
         resources = serverless_mode.list_resources()
-        
+
         # Verify resource listing
         assert "spot_fleet_requests" in resources
         assert len(resources["spot_fleet_requests"]) == 1
@@ -268,44 +274,48 @@ Outputs:
         serverless_mode.initialize()
         job_id = "test-job-4"
         resource_id = serverless_mode.submit_job(job_id, "echo hello", 2)
-        
+
         # Get status to set fleet_request_id
         serverless_mode.get_job_status([resource_id])
-        
+
         # Clean up the resource
         serverless_mode.cleanup_resources([resource_id])
-        
+
         # Verify resource was removed
         assert resource_id not in serverless_mode.resources
-        
+
         # List resources to verify
         resources = serverless_mode.list_resources()
         assert len(resources["spot_fleet_requests"]) == 0
 
-    @patch('parsl_ephemeral_aws.compute.spot_fleet_cleanup.cleanup_all_spot_fleet_resources')
-    def test_integration_cleanup_infrastructure(self, mock_cleanup_spot_fleet, serverless_mode):
+    @patch(
+        "parsl_ephemeral_aws.compute.spot_fleet_cleanup.cleanup_all_spot_fleet_resources"
+    )
+    def test_integration_cleanup_infrastructure(
+        self, mock_cleanup_spot_fleet, serverless_mode
+    ):
         """Test cleaning up all infrastructure with SpotFleet."""
         # Initialize and submit a job
         serverless_mode.initialize()
         job_id = "test-job-5"
         resource_id = serverless_mode.submit_job(job_id, "echo hello", 2)
-        
+
         # Get status to set fleet_request_id
         serverless_mode.get_job_status([resource_id])
-        
+
         # Mock the SpotFleet cleanup utility
         mock_cleanup_spot_fleet.return_value = {
             "cancelled_requests": ["sfr-12345678"],
             "cleaned_roles": ["parsl-aws-spot-fleet-role-test"],
-            "errors": []
+            "errors": [],
         }
-        
+
         # Clean up all infrastructure
         serverless_mode.cleanup_infrastructure()
-        
+
         # Verify SpotFleet cleanup was called
         mock_cleanup_spot_fleet.assert_called_once()
-        
+
         # Verify state was reset
         assert serverless_mode.vpc_id is None
         assert serverless_mode.subnet_id is None

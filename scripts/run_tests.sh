@@ -100,7 +100,7 @@ if [[ "$TEST_TYPE" == "integration" || "$TEST_TYPE" == "all" ]] && [[ "$SKIP_LOC
     echo "To start LocalStack:"
     echo "  docker run -d --name localstack -p 4566:4566 -p 4571:4571 localstack/localstack"
     echo "To skip this check, use --skip-localstack-check"
-    
+
     read -p "Do you want to continue anyway? (y/N) " response
     if [[ ! "$response" =~ ^[Yy]$ ]]; then
       exit 1
@@ -126,9 +126,9 @@ fi
 if [[ "$COVERAGE" == "true" ]]; then
   echo "Collecting coverage information..."
   python3 -m pytest "$TEST_PATH" -v --cov=parsl_ephemeral_aws --cov-report=term --cov-report=html --cov-config="$PROJECT_ROOT/.coveragerc"
-  
+
   echo "Coverage report written to $PROJECT_ROOT/coverage_html_report/"
-  
+
   # Print coverage summary
   echo "Coverage summary:"
   python3 -m coverage report

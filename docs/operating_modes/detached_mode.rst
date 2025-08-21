@@ -38,11 +38,11 @@ Here's a basic configuration for Detached Mode:
    from parsl.config import Config
    from parsl.executors import HighThroughputExecutor
    from parsl_ephemeral_aws import EphemeralAWSProvider
-   
+
    provider = EphemeralAWSProvider(
        # Specify Detached Mode
        mode='detached',
-       
+
        # Worker configuration
        image_id='ami-12345678',
        instance_type='t3.medium',
@@ -50,21 +50,21 @@ Here's a basic configuration for Detached Mode:
        init_blocks=1,
        min_blocks=0,
        max_blocks=10,
-       
+
        # Bastion configuration
        bastion_instance_type='t3.micro',
        bastion_image_id='ami-12345678',  # Optional: use specific AMI
        bastion_idle_timeout=30,          # Minutes before auto-shutdown when idle
-       
+
        # State persistence (required for detached mode)
        state_store='parameter_store',    # 'parameter_store', 's3', or 'file'
        state_prefix='/parsl/workflows',
-       
+
        # Optional: spot instance settings
        use_spot_instances=True,
        spot_max_price_percentage=80,
    )
-   
+
    config = Config(
        executors=[
            HighThroughputExecutor(
@@ -192,32 +192,32 @@ Here's a complete example showing a Detached Mode workflow:
    from parsl.config import Config
    from parsl.executors import HighThroughputExecutor
    from parsl_ephemeral_aws import EphemeralAWSProvider
-   
+
    # Configure AWS Provider in Detached Mode
    provider = EphemeralAWSProvider(
        # Mode and region
        mode='detached',
        region='us-west-2',
-       
+
        # Worker configuration
        image_id='ami-0c55b159cbfafe1f0',  # Amazon Linux 2 (update to current AMI)
        instance_type='t3.medium',
        init_blocks=2,
        min_blocks=0,
        max_blocks=10,
-       
+
        # Bastion configuration
        bastion_instance_type='t3.micro',
        bastion_idle_timeout=60,  # Auto-shutdown after 60 minutes idle
-       
+
        # State persistence
        state_store='parameter_store',
        state_prefix='/parsl/detached-demo',
-       
+
        # Use spot instances for cost savings
        use_spot_instances=True,
        spot_max_price_percentage=70,
-       
+
        # Worker initialization
        worker_init='''
            sudo yum update -y
@@ -226,7 +226,7 @@ Here's a complete example showing a Detached Mode workflow:
            python3 -m pip install numpy scipy pandas
        ''',
    )
-   
+
    # Create Parsl configuration
    config = Config(
        executors=[
@@ -236,10 +236,10 @@ Here's a complete example showing a Detached Mode workflow:
            )
        ]
    )
-   
+
    # Load the configuration
    parsl.load(config)
-   
+
    # Define a compute-intensive app
    @parsl.python_app
    def long_compute(x):
@@ -247,32 +247,32 @@ Here's a complete example showing a Detached Mode workflow:
        import time
        import socket
        import datetime
-       
+
        # Simulate long-running work
        time.sleep(300)  # 5 minutes
        result = np.sum([x**i for i in range(1000)])
-       
+
        return {
            'input': x,
            'result': result,
            'hostname': socket.gethostname(),
            'timestamp': datetime.datetime.now().isoformat()
        }
-   
+
    # Submit multiple tasks
    results = []
    for i in range(20):
        results.append(long_compute(i))
-   
+
    print("Tasks submitted and now running on the bastion.")
    print("You can now disconnect. The workflow will continue running.")
    print(f"State is saved with prefix: /parsl/detached-demo")
    print("To reconnect, use the same configuration with the same state_prefix.")
-   
+
    # Optional: Wait for some results before disconnecting
    for r in results[:2]:
        print(f"Task completed on {r.result()['hostname']} at {r.result()['timestamp']}")
-   
+
    # The client can now exit or disconnect
    # The bastion will continue running the tasks and will auto-shutdown
    # when complete (after idle_timeout minutes)
@@ -288,7 +288,7 @@ To reconnect to a running workflow:
    from parsl.config import Config
    from parsl.executors import HighThroughputExecutor
    from parsl_ephemeral_aws import EphemeralAWSProvider
-   
+
    # Use the SAME configuration, especially state_prefix
    provider = EphemeralAWSProvider(
        mode='detached',
@@ -296,7 +296,7 @@ To reconnect to a running workflow:
        state_store='parameter_store',
        state_prefix='/parsl/detached-demo',  # MUST match the original
    )
-   
+
    config = Config(
        executors=[
            HighThroughputExecutor(
@@ -305,13 +305,13 @@ To reconnect to a running workflow:
            )
        ]
    )
-   
+
    # This will reconnect to the existing workflow
    parsl.load(config)
-   
+
    # Now you can check task status
    # If you saved the future objects, you can retrieve them from the DFK
-   
+
    # Hint: To manage futures across sessions, save their IDs
    # future_ids = [f.tid for f in results]
    # And later retrieve them:

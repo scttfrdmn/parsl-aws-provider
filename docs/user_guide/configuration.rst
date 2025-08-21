@@ -21,19 +21,19 @@ The minimum configuration requires only a few parameters:
    from parsl.config import Config
    from parsl.executors import HighThroughputExecutor
    from parsl_ephemeral_aws import EphemeralAWSProvider
-   
+
    provider = EphemeralAWSProvider(
        # Core parameters
        region='us-west-2',            # AWS region
        image_id='ami-12345678',       # AMI ID for worker instances
        instance_type='t3.medium',     # Instance type for workers
-       
+
        # Parsl block parameters
        init_blocks=1,                 # Initial number of blocks to provision
        min_blocks=0,                  # Minimum number of blocks to maintain
        max_blocks=10,                 # Maximum number of blocks allowed
    )
-   
+
    config = Config(
        executors=[
            HighThroughputExecutor(
@@ -78,17 +78,17 @@ The provider supports three operating modes:
        # Basic configuration
        region='us-west-2',
        instance_type='t3.medium',
-       
+
        # Mode selection
        mode='standard',  # 'standard', 'detached', or 'serverless'
-       
+
        # Standard Mode specific parameters
        # (none, this is the default mode)
-       
+
        # Detached Mode specific parameters
        bastion_instance_type='t3.micro',   # Only used in Detached Mode
        bastion_idle_timeout=30,            # In minutes, 0 for no timeout
-       
+
        # Serverless Mode specific parameters
        worker_type='auto',                 # 'lambda', 'ecs', or 'auto'
        lambda_memory=1024,                 # MB for Lambda functions
@@ -155,19 +155,19 @@ You can customize AWS resources with these parameters:
        # Basic configuration
        region='us-west-2',
        instance_type='t3.medium',
-       
+
        # Network configuration
        vpc_id='vpc-12345678',              # Use existing VPC
        subnet_id='subnet-12345678',        # Use existing subnet
        security_group_id='sg-12345678',    # Use existing security group
        use_public_ips=True,                # Assign public IPs to instances
-       
+
        # Compute configuration
        key_name='my-key-pair',             # EC2 key pair for SSH access
        iam_instance_profile='MyProfile',   # IAM instance profile
        placement_group='my-placement',     # EC2 placement group
        availability_zone='us-west-2a',     # Specific AZ to use
-       
+
        # Storage configuration
        root_volume_size=30,                # Size in GB for the root volume
        ebs_volumes=[                       # Additional EBS volumes
@@ -177,7 +177,7 @@ You can customize AWS resources with these parameters:
                'volume_type': 'gp3',
            }
        ],
-       
+
        # Tags for all resources
        tags={
            'Project': 'MyProject',
@@ -245,12 +245,12 @@ The provider supports AWS Spot Instances for cost savings:
        # Basic configuration
        region='us-west-2',
        instance_type='t3.medium',
-       
+
        # Spot instance configuration
        use_spot_instances=True,               # Use spot instances
        spot_max_price_percentage=80,          # Max price as percentage of on-demand
        spot_interruption_behavior='terminate', # 'terminate', 'stop', or 'hibernate'
-       
+
        # Spot Fleet configuration (advanced)
        use_spot_fleet=True,                   # Use Spot Fleet instead of single requests
        instance_types=[                       # Multiple instance types for diversity
@@ -304,25 +304,25 @@ Configure state persistence for recovery capabilities:
        # Basic configuration
        region='us-west-2',
        instance_type='t3.medium',
-       
+
        # State persistence configuration
        state_store='parameter_store',          # 'parameter_store', 's3', 'file', or 'none'
        state_prefix='/parsl/workflow-1',       # Prefix for state storage
-       
+
        # Persistence options
        state_cleanup='always',                 # 'always', 'never', or 'success'
        state_retention_days=7,                 # Days to retain state
-       
+
        # Backend-specific configuration
        state_config={
            # Parameter Store options
            'parameter_type': 'String',         # 'String', 'StringList', or 'SecureString'
            'parameter_tier': 'Standard',       # 'Standard' or 'Advanced'
-           
+
            # S3 options
            'bucket_name': 'my-parsl-state',    # Custom bucket name
            'versioning': True,                 # Enable S3 versioning
-           
+
            # File options
            'directory': '/path/to/state',      # Custom directory path
            'backup': True,                     # Enable file backups
@@ -358,20 +358,20 @@ Customize worker initialization with boot scripts or environment variables:
        # Basic configuration
        region='us-west-2',
        instance_type='t3.medium',
-       
+
        # Worker initialization
        worker_init='''
            # Update packages
            sudo yum update -y
-           
+
            # Install dependencies
            sudo yum install -y python3-devel gcc git
-           
+
            # Install Python packages
            python3 -m pip install --upgrade pip
            python3 -m pip install numpy scipy pandas scikit-learn
        ''',
-       
+
        # Environment variables
        worker_environment={
            'PYTHONUNBUFFERED': '1',
@@ -397,12 +397,12 @@ Configure how the provider integrates with Parsl:
 .. code-block:: python
 
    from parsl.launchers import MpiRunLauncher
-   
+
    provider = EphemeralAWSProvider(
        # Basic configuration
        region='us-west-2',
        instance_type='t3.medium',
-       
+
        # Parsl integration
        launcher=MpiRunLauncher(),               # Custom launcher for workers
        cmd_timeout=60,                          # Command timeout in seconds
@@ -436,13 +436,13 @@ Additional advanced configuration options:
        # Basic configuration
        region='us-west-2',
        instance_type='t3.medium',
-       
+
        # AWS credentials (if not using default profile)
        aws_access_key_id='AKIAXXXXXXXXXXXXXXXX',
        aws_secret_access_key='xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx',
        aws_session_token='xxxxxxxx',           # For temporary credentials
        aws_profile='my-profile',               # Use a specific AWS profile
-       
+
        # Advanced networking
        vpc_cidr_block='10.0.0.0/16',           # Custom VPC CIDR block
        subnet_cidr_block='10.0.0.0/24',        # Custom subnet CIDR block
@@ -462,7 +462,7 @@ Additional advanced configuration options:
                'description': 'Web access',
            },
        ],
-       
+
        # Debugging options
        debug=True,                              # Enable debug logging
        verbose=True,                            # Enable verbose output
@@ -516,22 +516,22 @@ Standard Mode with Spot Instances
        region='us-west-2',
        instance_type='m5.large',
        image_id='ami-0c55b159cbfafe1f0',  # Amazon Linux 2
-       
+
        # Block parameters
        init_blocks=1,
        min_blocks=0,
        max_blocks=10,
-       
+
        # Spot configuration
        use_spot_instances=True,
        spot_max_price_percentage=70,
-       
+
        # Tag resources
        tags={
            'Project': 'DataProcessing',
            'Environment': 'Production',
        },
-       
+
        # Worker initialization
        worker_init='''
            sudo yum update -y
@@ -549,25 +549,25 @@ Detached Mode with State Persistence
        # Mode
        mode='detached',
        region='us-west-2',
-       
+
        # Worker configuration
        instance_type='c5.2xlarge',
        image_id='ami-0c55b159cbfafe1f0',
-       
+
        # Block parameters
        init_blocks=2,
        min_blocks=0,
        max_blocks=20,
-       
+
        # Bastion configuration
        bastion_instance_type='t3.small',
        bastion_idle_timeout=60,  # Minutes
-       
+
        # State persistence
        state_store='parameter_store',
        state_prefix='/parsl/production-workflow',
        state_cleanup='never',  # Preserve state for analysis
-       
+
        # Use key pair for SSH access
        key_name='my-key-pair',
    )
@@ -581,10 +581,10 @@ Serverless Mode with Lambda and ECS
        # Mode
        mode='serverless',
        region='us-west-2',
-       
+
        # Use both Lambda and ECS
        worker_type='auto',
-       
+
        # Lambda configuration
        lambda_memory=2048,
        lambda_timeout=900,
@@ -594,12 +594,12 @@ Serverless Mode with Lambda and ECS
            'pandas==1.3.0',
            'scikit-learn==0.24.2',
        ],
-       
+
        # ECS configuration
        ecs_task_cpu=2048,   # 2 vCPU
        ecs_task_memory=4096,  # 4 GB
        ecs_max_tasks=20,
-       
+
        # State persistence
        state_store='s3',
        state_prefix='serverless-workflow',
@@ -614,37 +614,37 @@ Multi-node MPI Configuration
 .. code-block:: python
 
    from parsl.launchers import MpiRunLauncher
-   
+
    provider = EphemeralAWSProvider(
        region='us-west-2',
        instance_type='c5n.18xlarge',  # High-performance networking
        image_id='ami-0c55b159cbfafe1f0',
-       
+
        # Multi-node configuration
        nodes_per_block=4,  # 4 nodes per block for MPI
        init_blocks=1,
        max_blocks=5,
-       
+
        # MPI launcher
        launcher=MpiRunLauncher(
            bind_cmd="--bind-to core",
            overrides="--allow-run-as-root"
        ),
-       
+
        # Worker initialization for MPI
        worker_init='''
            sudo yum update -y
            sudo amazon-linux-extras install -y lustre2.10
            sudo yum install -y openmpi-devel
-           
+
            # Configure MPI
            echo "export PATH=$PATH:/usr/lib64/openmpi/bin" >> ~/.bashrc
            echo "export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/lib64/openmpi/lib" >> ~/.bashrc
-           
+
            # Install Python dependencies
            python3 -m pip install mpi4py numpy scipy
        ''',
-       
+
        # Network optimization
        placement_group='cluster',  # Use cluster placement group
    )

@@ -331,7 +331,7 @@ configure_logger(
            mkdir -p ~/.pip
            echo "[global]" > ~/.pip/pip.conf
            echo "cache-dir=/tmp/pip-cache" >> ~/.pip/pip.conf
-           
+
            # Install only what's needed
            pip install --no-cache-dir numpy
        '''

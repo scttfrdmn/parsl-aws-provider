@@ -121,15 +121,15 @@ For greater control or to integrate with existing infrastructure, you can provid
        # Basic configuration
        region='us-west-2',
        instance_type='t3.medium',
-       
+
        # Existing network resources
        vpc_id='vpc-12345678',
        subnet_id='subnet-12345678',
        security_group_id='sg-12345678',
-       
+
        # Existing IAM resources
        iam_instance_profile='MyInstanceProfile',
-       
+
        # Do not delete provided resources on cleanup
        preserve_vpc=True,
        preserve_subnet=True,
@@ -169,7 +169,7 @@ You can specify additional tags to apply to all resources:
        # Basic configuration
        region='us-west-2',
        instance_type='t3.medium',
-       
+
        # Custom tags
        tags={
            'Project': 'GenomeAnalysis',
@@ -228,20 +228,20 @@ Scaling Workflow
    * Scale-in decisions prioritize newer, healthier instances
 
 4. **Control Parameters**
-   
+
    .. code-block:: python
-   
+
       provider = EphemeralAWSProvider(
           # Basic configuration
           region='us-west-2',
           instance_type='t3.medium',
-          
+
           # Scaling parameters
           min_blocks=1,
           max_blocks=20,
           init_blocks=2,
           nodes_per_block=2,
-          
+
           # Scaling control
           scaling_interval=60,        # Seconds between scaling decisions
           idle_timeout=300,           # Seconds before idle block termination
@@ -298,13 +298,13 @@ Monitoring Configuration
        # Basic configuration
        region='us-west-2',
        instance_type='t3.medium',
-       
+
        # Monitoring configuration
        monitoring_enabled=True,
        monitoring_interval=30,          # Seconds between monitoring checks
        health_check_interval=60,        # Seconds between health checks
        health_check_threshold=3,        # Failed checks before remediation
-       
+
        # Remediation options
        auto_restart_workers=True,       # Restart failed workers
        replace_unhealthy_workers=True,  # Replace unhealthy instances
@@ -356,15 +356,15 @@ You can control cleanup behavior:
        # Basic configuration
        region='us-west-2',
        instance_type='t3.medium',
-       
+
        # Cleanup configuration
        preserve_vpc=False,             # Don't preserve VPC (default)
        preserve_subnet=False,          # Don't preserve subnet (default)
        preserve_security_group=False,  # Don't preserve security group (default)
-       
+
        # Preserve provided resources
        preserve_provided_resources=True,  # Don't delete resources provided in config
-       
+
        # Force cleanup of all resources
        force_cleanup=False,            # Don't force cleanup if errors occur
    )
@@ -380,12 +380,12 @@ You can preserve resources for reuse or inspection:
        # Basic configuration
        region='us-west-2',
        instance_type='t3.medium',
-       
+
        # Preserve all network resources
        preserve_vpc=True,
        preserve_subnet=True,
        preserve_security_group=True,
-       
+
        # Add identifier for reuse
        tags={
            'Preserved': 'True',
@@ -402,11 +402,11 @@ To reuse these resources later:
    vpc_id = provider.vpc_id
    subnet_id = provider.subnet_id
    security_group_id = provider.security_group_id
-   
+
    print(f"Preserved VPC: {vpc_id}")
    print(f"Preserved Subnet: {subnet_id}")
    print(f"Preserved Security Group: {security_group_id}")
-   
+
    # In a later session, use these resources
    new_provider = EphemeralAWSProvider(
        region='us-west-2',
@@ -428,14 +428,14 @@ Resource Information
 
    # Get all managed resources
    resources = provider.resources
-   
+
    # Get resources by type
    vpc_resources = provider.get_resources_by_type('vpc')
    ec2_resources = provider.get_resources_by_type('ec2')
-   
+
    # Get specific resource by ID
    instance = provider.get_resource('i-12345678abcdef')
-   
+
    # Print resource details
    for resource_id, resource in resources.items():
        print(f"Resource {resource_id} ({resource['type']}): {resource['status']}")
@@ -447,16 +447,16 @@ Resource Operations
 
    # Create a new instance programmatically
    instance_id = provider.create_instance(instance_type='c5.xlarge')
-   
+
    # Terminate a specific instance
    provider.terminate_instance(instance_id)
-   
+
    # Create a new block
    block_id = provider.create_block()
-   
+
    # Scale to a specific number of blocks
    provider.scale_to_blocks(5)
-   
+
    # Get instance status
    status = provider.get_instance_status(instance_id)
    print(f"Instance {instance_id} status: {status}")
@@ -503,7 +503,7 @@ For complex workflows with diverse requirements:
        instance_type='m5.large',
        max_blocks=10,
    )
-   
+
    # Serverless provider for burst capacity
    serverless_provider = EphemeralAWSProvider(
        region='us-west-2',
@@ -512,21 +512,21 @@ For complex workflows with diverse requirements:
        lambda_memory=1024,
        max_blocks=100,  # Much higher limit for burst capacity
    )
-   
+
    # High-memory provider for memory-intensive tasks
    highmen_provider = EphemeralAWSProvider(
        region='us-west-2',
        instance_type='r5.4xlarge',  # Memory-optimized instance
        max_blocks=2,  # Limited due to cost
    )
-   
+
    # GPU provider for accelerated computing
    gpu_provider = EphemeralAWSProvider(
        region='us-west-2',
        instance_type='p3.2xlarge',  # GPU instance
        max_blocks=1,  # Very limited due to cost
    )
-   
+
    config = Config(
        executors=[
            HighThroughputExecutor(label='standard', provider=standard_provider),
@@ -549,21 +549,21 @@ For improved availability or to access region-specific resources:
        instance_type='m5.large',
        max_blocks=5,
    )
-   
+
    # US West provider
    us_west_provider = EphemeralAWSProvider(
        region='us-west-2',
        instance_type='m5.large',
        max_blocks=5,
    )
-   
+
    # EU provider
    eu_provider = EphemeralAWSProvider(
        region='eu-west-1',
        instance_type='m5.large',
        max_blocks=5,
    )
-   
+
    config = Config(
        executors=[
            HighThroughputExecutor(label='us_east', provider=us_east_provider),
@@ -571,18 +571,18 @@ For improved availability or to access region-specific resources:
            HighThroughputExecutor(label='eu', provider=eu_provider),
        ]
    )
-   
+
    # Tasks can be submitted to specific regions
    @parsl.python_app(executors=['us_east'])
    def east_task():
        import socket
        return f"Running in US East: {socket.gethostname()}"
-   
+
    @parsl.python_app(executors=['us_west'])
    def west_task():
        import socket
        return f"Running in US West: {socket.gethostname()}"
-   
+
    @parsl.python_app(executors=['eu'])
    def eu_task():
        import socket
@@ -600,11 +600,11 @@ Usage Reports
 
    # Get resource usage summary
    usage = provider.get_resource_usage()
-   
+
    print(f"Total instances: {usage['total_instances']}")
    print(f"Instance hours: {usage['instance_hours']}")
    print(f"Average active blocks: {usage['avg_active_blocks']}")
-   
+
    # Get cost estimate
    costs = provider.estimate_costs()
    print(f"Estimated cost: ${costs['total_cost']:.2f}")
@@ -619,7 +619,7 @@ Performance Metrics
 
    # Get performance metrics
    metrics = provider.get_performance_metrics()
-   
+
    print(f"Average instance startup time: {metrics['avg_startup_time']:.2f}s")
    print(f"Average scaling response time: {metrics['avg_scaling_response']:.2f}s")
    print(f"Resource creation success rate: {metrics['creation_success_rate']*100:.1f}%")
@@ -631,7 +631,7 @@ Resource Optimization Recommendations
 
    # Get optimization recommendations
    recommendations = provider.get_optimization_recommendations()
-   
+
    print("Resource optimization recommendations:")
    for rec in recommendations:
        print(f"- {rec['recommendation']}")

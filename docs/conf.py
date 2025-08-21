@@ -10,43 +10,43 @@ import os
 import sys
 
 # Add the project root directory to the Python path
-sys.path.insert(0, os.path.abspath('..'))
+sys.path.insert(0, os.path.abspath(".."))
 
-project = 'Parsl Ephemeral AWS Provider'
-copyright = '2025, Scott Friedman and Project Contributors'
-author = 'Scott Friedman and Project Contributors'
-release = '0.1.0'  # Update with the actual version
+project = "Parsl Ephemeral AWS Provider"
+copyright = "2025, Scott Friedman and Project Contributors"
+author = "Scott Friedman and Project Contributors"
+release = "0.1.0"  # Update with the actual version
 
 # -- General configuration ---------------------------------------------------
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#general-configuration
 
 extensions = [
-    'sphinx.ext.autodoc',
-    'sphinx.ext.viewcode',
-    'sphinx.ext.napoleon',
-    'sphinx.ext.intersphinx',
-    'sphinx.ext.autosummary',
-    'sphinx_rtd_theme',
-    'sphinx.ext.githubpages',
-    'myst_parser',
+    "sphinx.ext.autodoc",
+    "sphinx.ext.viewcode",
+    "sphinx.ext.napoleon",
+    "sphinx.ext.intersphinx",
+    "sphinx.ext.autosummary",
+    "sphinx_rtd_theme",
+    "sphinx.ext.githubpages",
+    "myst_parser",
 ]
 
-templates_path = ['_templates']
-exclude_patterns = ['_build', 'Thumbs.db', '.DS_Store', '.venv', 'venv']
+templates_path = ["_templates"]
+exclude_patterns = ["_build", "Thumbs.db", ".DS_Store", ".venv", "venv"]
 
 intersphinx_mapping = {
-    'python': ('https://docs.python.org/3', None),
-    'parsl': ('https://parsl.readthedocs.io/en/stable/', None),
-    'boto3': ('https://boto3.amazonaws.com/v1/documentation/api/latest/', None),
+    "python": ("https://docs.python.org/3", None),
+    "parsl": ("https://parsl.readthedocs.io/en/stable/", None),
+    "boto3": ("https://boto3.amazonaws.com/v1/documentation/api/latest/", None),
 }
 
 # -- Options for HTML output -------------------------------------------------
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#options-for-html-output
 
-html_theme = 'sphinx_rtd_theme'
-html_static_path = ['_static']
-html_logo = '_static/logo.png'  # Add a logo file if you have one
-html_favicon = '_static/favicon.ico'  # Add a favicon if you have one
+html_theme = "sphinx_rtd_theme"
+html_static_path = ["_static"]
+html_logo = "_static/logo.png"  # Add a logo file if you have one
+html_favicon = "_static/favicon.ico"  # Add a favicon if you have one
 
 # -- Napoleon settings ------------------------------------------------------
 napoleon_google_docstring = True
@@ -73,8 +73,8 @@ myst_heading_anchors = 3
 
 # -- Autodoc settings -------------------------------------------------------
 autodoc_default_options = {
-    'members': True,
-    'undoc-members': True,
-    'show-inheritance': True,
+    "members": True,
+    "undoc-members": True,
+    "show-inheritance": True,
 }
-autoclass_content = 'both'
+autoclass_content = "both"

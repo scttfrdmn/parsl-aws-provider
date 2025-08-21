@@ -60,6 +60,12 @@ class StateStoreError(ProviderError):
     pass
 
 
+class StateError(StateStoreError):
+    """General state management error - alias for compatibility."""
+
+    pass
+
+
 class StateSerializationError(StateStoreError):
     """Error serializing state data."""
 
@@ -140,8 +146,13 @@ class SpotFleetRequestError(SpotFleetError):
 
 class SpotFleetThrottlingError(SpotFleetError):
     """AWS API throttling for Spot Fleet operations."""
-    
-    def __init__(self, message="AWS Spot Fleet API request was throttled", operation=None, retry_after=None):
+
+    def __init__(
+        self,
+        message="AWS Spot Fleet API request was throttled",
+        operation=None,
+        retry_after=None,
+    ):
         self.operation = operation
         self.retry_after = retry_after
         super().__init__(message)

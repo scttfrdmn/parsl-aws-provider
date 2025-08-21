@@ -57,7 +57,7 @@ provider = EphemeralAWSProvider(
     image_id='ami-12345678',  # Can be any value in LocalStack
     instance_type='t3.medium',
     region='us-east-1',
-    
+
     # LocalStack configuration
     use_localstack=True,
     localstack_endpoint='http://localhost:4566'
@@ -154,18 +154,18 @@ def setup_mock_aws(ec2_resource, localstack_endpoint):
     # Create a VPC
     vpc = ec2_resource.create_vpc(CidrBlock='10.0.0.0/16')
     vpc.create_tags(Tags=[{'Key': 'Name', 'Value': 'test-vpc'}])
-    
+
     # Create a subnet
     subnet = ec2_resource.create_subnet(
         VpcId=vpc.id,
         CidrBlock='10.0.0.0/24',
         AvailabilityZone='us-east-1a'
     )
-    
+
     # Create and attach an internet gateway
     igw = ec2_resource.create_internet_gateway()
     vpc.attach_internet_gateway(InternetGatewayId=igw.id)
-    
+
     # Create a security group
     sg = ec2_resource.create_security_group(
         GroupName='test-sg',
@@ -188,7 +188,7 @@ def setup_mock_aws(ec2_resource, localstack_endpoint):
             }
         ]
     )
-    
+
     # Return the created resources
     return {
         'vpc_id': vpc.id,
@@ -200,24 +200,24 @@ def setup_mock_aws(ec2_resource, localstack_endpoint):
 def test_ephemeral_aws_provider(setup_mock_aws, localstack_endpoint):
     """Test the EphemeralAWSProvider with LocalStack."""
     from parsl_ephemeral_aws import EphemeralAWSProvider
-    
+
     # Create provider using LocalStack
     provider = EphemeralAWSProvider(
         image_id='ami-12345678',  # Any value works in LocalStack
         instance_type='t3.medium',
         region='us-east-1',
         init_blocks=1,
-        
+
         # Use existing network resources
         vpc_id=setup_mock_aws['vpc_id'],
         subnet_id=setup_mock_aws['subnet_id'],
         security_group_id=setup_mock_aws['security_group_id'],
-        
+
         # LocalStack configuration
         use_localstack=True,
         localstack_endpoint=localstack_endpoint
     )
-    
+
     # Test provider operations
     # ...
 ```
@@ -235,7 +235,7 @@ def test_ec2_instance_creation():
     with patch('boto3.client') as mock_client:
         ec2_mock = MagicMock()
         mock_client.return_value = ec2_mock
-        
+
         # Mock the run_instances response
         ec2_mock.run_instances.return_value = {
             'Instances': [
@@ -247,7 +247,7 @@ def test_ec2_instance_creation():
                 }
             ]
         }
-        
+
         # Test your code that calls run_instances
         # ...
 ```

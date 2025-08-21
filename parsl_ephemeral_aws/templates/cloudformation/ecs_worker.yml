@@ -172,7 +172,7 @@ Resources:
   ECSCluster:
     Type: AWS::ECS::Cluster
     Properties:
-      ClusterName: !If 
+      ClusterName: !If
         - HasClusterName
         - !Ref ClusterName
         - !Sub 'parsl-cluster-${WorkflowId}'
@@ -264,7 +264,7 @@ Resources:
   TaskDefinition:
     Type: AWS::ECS::TaskDefinition
     Properties:
-      Family: !If 
+      Family: !If
         - HasTaskFamily
         - !Ref TaskFamily
         - !Sub 'parsl-task-${WorkflowId}-${JobId}'
@@ -302,7 +302,7 @@ Resources:
       TaskDefinition: !Ref TaskDefinition
       DesiredCount: !Ref TaskCount
       LaunchType: !If [UseFargateSpot, !Ref 'AWS::NoValue', 'FARGATE']
-      CapacityProviderStrategy: !If 
+      CapacityProviderStrategy: !If
         - UseFargateSpot
         - - CapacityProvider: FARGATE_SPOT
             Weight: 1
@@ -333,7 +333,7 @@ Resources:
         Type: maintain
         ReplaceUnhealthyInstances: true
         InstanceInterruptionBehavior: terminate
-        LaunchTemplateConfigs: 
+        LaunchTemplateConfigs:
           - LaunchTemplateSpecification:
               LaunchTemplateId: !Ref SpotFleetLaunchTemplate
               Version: !GetAtt SpotFleetLaunchTemplate.LatestVersionNumber
@@ -371,7 +371,7 @@ Resources:
                 Value: !Ref JobId
               - Key: Name
                 Value: !Sub 'parsl-spot-fleet-instance-${WorkflowId}-${JobId}'
-              
+
   SpotFleetLaunchTemplate:
     Type: AWS::EC2::LaunchTemplate
     Condition: UseSpotFleet

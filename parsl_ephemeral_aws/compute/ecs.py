@@ -5,10 +5,9 @@ SPDX-FileCopyrightText: 2025 Scott Friedman and Project Contributors
 """
 
 import logging
-import uuid
 import json
 import time
-from typing import Dict, List, Optional, Any, Union
+from typing import Dict, Any
 
 import boto3
 from botocore.exceptions import ClientError
@@ -19,13 +18,11 @@ from ..constants import (
     TAG_NAME,
     TAG_WORKFLOW_ID,
     TAG_JOB_ID,
-    DEFAULT_ECS_CLUSTER_NAME,
-    DEFAULT_ECS_TASK_FAMILY,
     STATUS_PENDING,
     STATUS_RUNNING,
     STATUS_SUCCEEDED,
     STATUS_FAILED,
-    STATUS_CANCELLED
+    STATUS_CANCELLED,
 )
 
 
@@ -34,51 +31,52 @@ logger = logging.getLogger(__name__)
 
 class ECSManager:
     """Manager for AWS ECS/Fargate compute resources."""
-    
+
     def __init__(self, provider: Any) -> None:
         """Initialize the ECS manager.
-        
+
         Parameters
         ----------
         provider : EphemeralAWSProvider
             The provider instance
         """
         self.provider = provider
-        
+
         # Initialize AWS session
         session_kwargs = {}
         if self.provider.aws_access_key_id and self.provider.aws_secret_access_key:
             session_kwargs["aws_access_key_id"] = self.provider.aws_access_key_id
-            session_kwargs["aws_secret_access_key"] = self.provider.aws_secret_access_key
-            
+            session_kwargs[
+                "aws_secret_access_key"
+            ] = self.provider.aws_secret_access_key
+
         if self.provider.aws_session_token:
             session_kwargs["aws_session_token"] = self.provider.aws_session_token
-            
+
         if self.provider.aws_profile:
             session_kwargs["profile_name"] = self.provider.aws_profile
-            
+
         self.aws_session = boto3.Session(
-            region_name=self.provider.region,
-            **session_kwargs
+            region_name=self.provider.region, **session_kwargs
         )
-        
+
         # Initialize clients
-        self.ecs_client = self.aws_session.client('ecs')
-        self.ec2_client = self.aws_session.client('ec2')
-        self.iam_client = self.aws_session.client('iam')
-        
+        self.ecs_client = self.aws_session.client("ecs")
+        self.ec2_client = self.aws_session.client("ec2")
+        self.iam_client = self.aws_session.client("iam")
+
         # Track resources for cleanup
         self.clusters = set()
         self.task_definitions = set()
         self.role_names = set()
         self.jobs = {}
-        
+
         # Initialize ECS cluster if needed
         self.cluster_name = self._get_or_create_cluster()
-    
+
     def _get_or_create_cluster(self) -> str:
         """Get or create an ECS cluster.
-        
+
         Returns
         -------
         str
@@ -86,46 +84,46 @@ class ECSManager:
         """
         # Generate cluster name based on workflow ID
         cluster_name = f"{TAG_PREFIX}-cluster-{self.provider.workflow_id}"
-        
+
         try:
             # Check if cluster already exists
-            response = self.ecs_client.describe_clusters(
-                clusters=[cluster_name]
-            )
-            
-            if response['clusters'] and response['clusters'][0]['status'] == 'ACTIVE':
+            response = self.ecs_client.describe_clusters(clusters=[cluster_name])
+
+            if response["clusters"] and response["clusters"][0]["status"] == "ACTIVE":
                 logger.info(f"Using existing ECS cluster: {cluster_name}")
                 self.clusters.add(cluster_name)
                 return cluster_name
-            
+
             # Create cluster
             response = self.ecs_client.create_cluster(
                 clusterName=cluster_name,
-                capacityProviders=['FARGATE', 'FARGATE_SPOT'],
+                capacityProviders=["FARGATE", "FARGATE_SPOT"],
                 defaultCapacityProviderStrategy=[
                     {
-                        'capacityProvider': 'FARGATE_SPOT' if self.provider.use_spot_instances else 'FARGATE',
-                        'weight': 1,
-                        'base': 0
+                        "capacityProvider": "FARGATE_SPOT"
+                        if self.provider.use_spot_instances
+                        else "FARGATE",
+                        "weight": 1,
+                        "base": 0,
                     }
                 ],
                 tags=[
-                    {'key': TAG_NAME, 'value': 'true'},
-                    {'key': TAG_WORKFLOW_ID, 'value': self.provider.workflow_id}
-                ]
+                    {"key": TAG_NAME, "value": "true"},
+                    {"key": TAG_WORKFLOW_ID, "value": self.provider.workflow_id},
+                ],
             )
-            
+
             logger.info(f"Created ECS cluster: {cluster_name}")
             self.clusters.add(cluster_name)
             return cluster_name
-            
+
         except Exception as e:
             logger.error(f"Error creating ECS cluster: {e}")
             raise ResourceCreationError(f"Failed to create ECS cluster: {e}")
-    
+
     def _create_task_execution_role(self) -> str:
         """Create an IAM role for ECS task execution.
-        
+
         Returns
         -------
         str
@@ -133,7 +131,7 @@ class ECSManager:
         """
         # Generate a unique role name
         role_name = f"{TAG_PREFIX}-ecs-role-{self.provider.workflow_id}"
-        
+
         try:
             # Create role
             assume_role_policy = {
@@ -142,52 +140,54 @@ class ECSManager:
                     {
                         "Effect": "Allow",
                         "Principal": {"Service": "ecs-tasks.amazonaws.com"},
-                        "Action": "sts:AssumeRole"
+                        "Action": "sts:AssumeRole",
                     }
-                ]
+                ],
             }
-            
+
             response = self.iam_client.create_role(
                 RoleName=role_name,
                 AssumeRolePolicyDocument=json.dumps(assume_role_policy),
                 Description=f"Execution role for Parsl ECS tasks ({self.provider.workflow_id})",
                 Tags=[
-                    {'Key': TAG_NAME, 'Value': 'true'},
-                    {'Key': TAG_WORKFLOW_ID, 'Value': self.provider.workflow_id}
-                ]
+                    {"Key": TAG_NAME, "Value": "true"},
+                    {"Key": TAG_WORKFLOW_ID, "Value": self.provider.workflow_id},
+                ],
             )
-            
-            role_arn = response['Role']['Arn']
+
+            role_arn = response["Role"]["Arn"]
             logger.info(f"Created ECS task execution role: {role_name}")
-            
+
             # Attach policies
             self.iam_client.attach_role_policy(
                 RoleName=role_name,
-                PolicyArn="arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
+                PolicyArn="arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy",
             )
-            
+
             # Track role for cleanup
             self.role_names.add(role_name)
-            
+
             # Wait for role to be ready (IAM changes can take time to propagate)
             time.sleep(10)
-            
+
             return role_arn
-            
+
         except ClientError as e:
             logger.error(f"Error creating ECS task execution role: {e}")
-            raise ResourceCreationError(f"Failed to create ECS task execution role: {e}")
-    
+            raise ResourceCreationError(
+                f"Failed to create ECS task execution role: {e}"
+            )
+
     def _register_task_definition(self, job_id: str, command: str) -> str:
         """Register an ECS task definition.
-        
+
         Parameters
         ----------
         job_id : str
             ID of the job
         command : str
             Command to execute
-            
+
         Returns
         -------
         str
@@ -195,63 +195,63 @@ class ECSManager:
         """
         # Generate a unique family name
         family = f"{TAG_PREFIX}-task-{self.provider.workflow_id}-{job_id[:8]}"
-        
+
         try:
             # Create execution role if needed
             execution_role_arn = self._create_task_execution_role()
-            
+
             # Prepare container definition
             container_name = f"{TAG_PREFIX}-container-{job_id[:8]}"
-            
+
             container_def = {
-                'name': container_name,
-                'image': self.provider.ecs_container_image or 'python:3.12-slim',
-                'cpu': self.provider.ecs_task_cpu,
-                'memory': self.provider.ecs_task_memory,
-                'essential': True,
-                'command': ['/bin/sh', '-c', command],
-                'logConfiguration': {
-                    'logDriver': 'awslogs',
-                    'options': {
-                        'awslogs-group': f"/ecs/{family}",
-                        'awslogs-region': self.provider.region,
-                        'awslogs-stream-prefix': 'parsl'
-                    }
-                }
+                "name": container_name,
+                "image": self.provider.ecs_container_image or "python:3.12-slim",
+                "cpu": self.provider.ecs_task_cpu,
+                "memory": self.provider.ecs_task_memory,
+                "essential": True,
+                "command": ["/bin/sh", "-c", command],
+                "logConfiguration": {
+                    "logDriver": "awslogs",
+                    "options": {
+                        "awslogs-group": f"/ecs/{family}",
+                        "awslogs-region": self.provider.region,
+                        "awslogs-stream-prefix": "parsl",
+                    },
+                },
             }
-            
+
             # Register task definition
             response = self.ecs_client.register_task_definition(
                 family=family,
                 executionRoleArn=execution_role_arn,
                 taskRoleArn=execution_role_arn,
-                networkMode='awsvpc',
+                networkMode="awsvpc",
                 containerDefinitions=[container_def],
-                requiresCompatibilities=['FARGATE'],
+                requiresCompatibilities=["FARGATE"],
                 cpu=str(self.provider.ecs_task_cpu),
                 memory=str(self.provider.ecs_task_memory),
                 tags=[
-                    {'key': TAG_NAME, 'value': 'true'},
-                    {'key': TAG_WORKFLOW_ID, 'value': self.provider.workflow_id},
-                    {'key': TAG_JOB_ID, 'value': job_id}
-                ]
+                    {"key": TAG_NAME, "value": "true"},
+                    {"key": TAG_WORKFLOW_ID, "value": self.provider.workflow_id},
+                    {"key": TAG_JOB_ID, "value": job_id},
+                ],
             )
-            
-            task_definition_arn = response['taskDefinition']['taskDefinitionArn']
+
+            task_definition_arn = response["taskDefinition"]["taskDefinitionArn"]
             logger.info(f"Registered ECS task definition: {task_definition_arn}")
-            
+
             # Track task definition for cleanup
             self.task_definitions.add(family)
-            
+
             return task_definition_arn
-            
+
         except ClientError as e:
             logger.error(f"Error registering ECS task definition: {e}")
             raise ResourceCreationError(f"Failed to register ECS task definition: {e}")
-    
+
     def _get_or_create_network_resources(self) -> Dict[str, str]:
         """Get or create network resources for ECS tasks.
-        
+
         Returns
         -------
         Dict[str, str]
@@ -261,41 +261,37 @@ class ECSManager:
         try:
             # Get default VPC
             vpc_response = self.ec2_client.describe_vpcs(
-                Filters=[
-                    {'Name': 'isDefault', 'Values': ['true']}
-                ]
+                Filters=[{"Name": "isDefault", "Values": ["true"]}]
             )
-            
-            if not vpc_response['Vpcs']:
+
+            if not vpc_response["Vpcs"]:
                 raise ResourceCreationError("No default VPC found")
-                
-            vpc_id = vpc_response['Vpcs'][0]['VpcId']
-            
+
+            vpc_id = vpc_response["Vpcs"][0]["VpcId"]
+
             # Get subnets in the default VPC
             subnet_response = self.ec2_client.describe_subnets(
-                Filters=[
-                    {'Name': 'vpc-id', 'Values': [vpc_id]}
-                ]
+                Filters=[{"Name": "vpc-id", "Values": [vpc_id]}]
             )
-            
-            if not subnet_response['Subnets']:
+
+            if not subnet_response["Subnets"]:
                 raise ResourceCreationError("No subnets found in default VPC")
-                
-            subnet_ids = [subnet['SubnetId'] for subnet in subnet_response['Subnets']]
-            
+
+            subnet_ids = [subnet["SubnetId"] for subnet in subnet_response["Subnets"]]
+
             # Get or create security group
             sg_name = f"{TAG_PREFIX}-ecs-sg-{self.provider.workflow_id}"
-            
+
             # Check if security group already exists
             sg_response = self.ec2_client.describe_security_groups(
                 Filters=[
-                    {'Name': 'group-name', 'Values': [sg_name]},
-                    {'Name': 'vpc-id', 'Values': [vpc_id]}
+                    {"Name": "group-name", "Values": [sg_name]},
+                    {"Name": "vpc-id", "Values": [vpc_id]},
                 ]
             )
-            
-            if sg_response['SecurityGroups']:
-                security_group_id = sg_response['SecurityGroups'][0]['GroupId']
+
+            if sg_response["SecurityGroups"]:
+                security_group_id = sg_response["SecurityGroups"][0]["GroupId"]
             else:
                 # Create security group
                 sg_create_response = self.ec2_client.create_security_group(
@@ -304,43 +300,50 @@ class ECSManager:
                     VpcId=vpc_id,
                     TagSpecifications=[
                         {
-                            'ResourceType': 'security-group',
-                            'Tags': [
-                                {'Key': TAG_NAME, 'Value': 'true'},
-                                {'Key': TAG_WORKFLOW_ID, 'Value': self.provider.workflow_id}
-                            ]
+                            "ResourceType": "security-group",
+                            "Tags": [
+                                {"Key": TAG_NAME, "Value": "true"},
+                                {
+                                    "Key": TAG_WORKFLOW_ID,
+                                    "Value": self.provider.workflow_id,
+                                },
+                            ],
                         }
-                    ]
+                    ],
                 )
-                
-                security_group_id = sg_create_response['GroupId']
-                
+
+                security_group_id = sg_create_response["GroupId"]
+
                 # Add outbound rule (allow all outbound traffic)
                 self.ec2_client.authorize_security_group_egress(
                     GroupId=security_group_id,
                     IpPermissions=[
                         {
-                            'IpProtocol': '-1',
-                            'FromPort': -1,
-                            'ToPort': -1,
-                            'IpRanges': [{'CidrIp': '0.0.0.0/0'}]
+                            "IpProtocol": "-1",
+                            "FromPort": -1,
+                            "ToPort": -1,
+                            "IpRanges": [{"CidrIp": "0.0.0.0/0"}],
                         }
-                    ]
+                    ],
                 )
-            
+
             return {
-                'vpc_id': vpc_id,
-                'subnet_ids': subnet_ids,
-                'security_group_id': security_group_id
+                "vpc_id": vpc_id,
+                "subnet_ids": subnet_ids,
+                "security_group_id": security_group_id,
             }
-            
+
         except ClientError as e:
             logger.error(f"Error getting or creating network resources: {e}")
-            raise ResourceCreationError(f"Failed to get or create network resources: {e}")
-    
-    def submit_job(self, job_id: str, command: str, tasks_per_node: int) -> Dict[str, Any]:
+            raise ResourceCreationError(
+                f"Failed to get or create network resources: {e}"
+            )
+
+    def submit_job(
+        self, job_id: str, command: str, tasks_per_node: int
+    ) -> Dict[str, Any]:
         """Submit a job for execution.
-        
+
         Parameters
         ----------
         job_id : str
@@ -349,7 +352,7 @@ class ECSManager:
             Command to execute
         tasks_per_node : int
             Number of tasks per node
-            
+
         Returns
         -------
         Dict[str, Any]
@@ -358,71 +361,75 @@ class ECSManager:
         try:
             # Register task definition
             task_definition_arn = self._register_task_definition(job_id, command)
-            
+
             # Get network configuration
             network = self._get_or_create_network_resources()
-            
+
             # Launch the task
             response = self.ecs_client.run_task(
                 cluster=self.cluster_name,
                 taskDefinition=task_definition_arn,
                 count=max(1, tasks_per_node),  # Ensure at least one task
-                launchType='FARGATE',
+                launchType="FARGATE",
                 networkConfiguration={
-                    'awsvpcConfiguration': {
-                        'subnets': [network['subnet_ids'][0]],  # Use first subnet
-                        'securityGroups': [network['security_group_id']],
-                        'assignPublicIp': 'ENABLED' if self.provider.use_public_ips else 'DISABLED'
+                    "awsvpcConfiguration": {
+                        "subnets": [network["subnet_ids"][0]],  # Use first subnet
+                        "securityGroups": [network["security_group_id"]],
+                        "assignPublicIp": "ENABLED"
+                        if self.provider.use_public_ips
+                        else "DISABLED",
                     }
                 },
                 tags=[
-                    {'key': TAG_NAME, 'value': 'true'},
-                    {'key': TAG_WORKFLOW_ID, 'value': self.provider.workflow_id},
-                    {'key': TAG_JOB_ID, 'value': job_id}
-                ]
+                    {"key": TAG_NAME, "value": "true"},
+                    {"key": TAG_WORKFLOW_ID, "value": self.provider.workflow_id},
+                    {"key": TAG_JOB_ID, "value": job_id},
+                ],
             )
-            
+
             # Extract task ARNs
-            task_arns = [task['taskArn'] for task in response['tasks']]
-            task_ids = [arn.split('/')[-1] for arn in task_arns]
-            
+            task_arns = [task["taskArn"] for task in response["tasks"]]
+            task_ids = [arn.split("/")[-1] for arn in task_arns]
+
             # Record job information
             self.jobs[job_id] = {
-                'id': job_id,
-                'cluster': self.cluster_name,
-                'task_definition': task_definition_arn,
-                'task_arns': task_arns,
-                'task_ids': task_ids,
-                'command': command,
-                'status': STATUS_PENDING,
-                'submitted_at': time.time()
+                "id": job_id,
+                "cluster": self.cluster_name,
+                "task_definition": task_definition_arn,
+                "task_arns": task_arns,
+                "task_ids": task_ids,
+                "command": command,
+                "status": STATUS_PENDING,
+                "submitted_at": time.time(),
             }
-            
+
             primary_task_id = task_ids[0] if task_ids else None
-            
-            logger.info(f"Submitted job {job_id} to ECS cluster {self.cluster_name} with {len(task_ids)} tasks")
-            
+
+            logger.info(
+                f"Submitted job {job_id} to ECS cluster {self.cluster_name} with {len(task_ids)} tasks"
+            )
+
             return {
-                'job_id': job_id,
-                'cluster': self.cluster_name,
-                'task_id': primary_task_id,
-                'task_count': len(task_ids)
+                "job_id": job_id,
+                "cluster": self.cluster_name,
+                "task_id": primary_task_id,
+                "task_count": len(task_ids),
             }
-            
+
         except Exception as e:
             logger.error(f"Error submitting job: {e}")
             raise JobSubmissionError(f"Failed to submit job: {e}")
-    
+
     def get_job_status(self, cluster: str, task_id: str) -> str:
         """Get the status of a job.
-        
+
         Parameters
         ----------
         cluster : str
             Name of the ECS cluster
         task_id : str
             ID of the ECS task
-            
+
         Returns
         -------
         str
@@ -432,44 +439,41 @@ class ECSManager:
             # Find the job
             job = None
             for j in self.jobs.values():
-                if j.get('cluster') == cluster and task_id in j.get('task_ids', []):
+                if j.get("cluster") == cluster and task_id in j.get("task_ids", []):
                     job = j
                     break
-            
+
             if not job:
                 return "UNKNOWN"
-            
+
             # If the job already has a terminal status, return it
-            if job['status'] in [STATUS_SUCCEEDED, STATUS_FAILED, STATUS_CANCELLED]:
-                return job['status']
-            
+            if job["status"] in [STATUS_SUCCEEDED, STATUS_FAILED, STATUS_CANCELLED]:
+                return job["status"]
+
             # Get task status
-            response = self.ecs_client.describe_tasks(
-                cluster=cluster,
-                tasks=[task_id]
-            )
-            
-            if not response['tasks']:
+            response = self.ecs_client.describe_tasks(cluster=cluster, tasks=[task_id])
+
+            if not response["tasks"]:
                 # Task not found, it might have completed and been removed
                 return "UNKNOWN"
-                
-            task = response['tasks'][0]
-            last_status = task['lastStatus']
-            
+
+            task = response["tasks"][0]
+            last_status = task["lastStatus"]
+
             # Map ECS status to Parsl status
-            if last_status == 'PENDING':
+            if last_status == "PENDING":
                 status = STATUS_PENDING
-            elif last_status == 'RUNNING':
+            elif last_status == "RUNNING":
                 status = STATUS_RUNNING
-            elif last_status == 'STOPPED':
+            elif last_status == "STOPPED":
                 # Check stop reason to determine final status
-                if task.get('stoppedReason') == 'Task failed to start':
+                if task.get("stoppedReason") == "Task failed to start":
                     status = STATUS_FAILED
                 else:
                     # Check exit code of the container
-                    for container in task.get('containers', []):
-                        if container.get('exitCode') is not None:
-                            if container.get('exitCode') == 0:
+                    for container in task.get("containers", []):
+                        if container.get("exitCode") is not None:
+                            if container.get("exitCode") == 0:
                                 status = STATUS_SUCCEEDED
                             else:
                                 status = STATUS_FAILED
@@ -480,19 +484,19 @@ class ECSManager:
             else:
                 # For any other status, default to running
                 status = STATUS_RUNNING
-            
+
             # Update job status
-            job['status'] = status
-            
+            job["status"] = status
+
             return status
-            
+
         except Exception as e:
             logger.error(f"Error getting job status: {e}")
             return "UNKNOWN"
-    
+
     def cancel_job(self, cluster: str, task_id: str) -> None:
         """Cancel a job.
-        
+
         Parameters
         ----------
         cluster : str
@@ -503,56 +507,51 @@ class ECSManager:
         try:
             # Stop the task
             self.ecs_client.stop_task(
-                cluster=cluster,
-                task=task_id,
-                reason='Cancelled by user'
+                cluster=cluster, task=task_id, reason="Cancelled by user"
             )
-            
+
             # Find the job and update its status
             for job in self.jobs.values():
-                if job.get('cluster') == cluster and task_id in job.get('task_ids', []):
-                    job['status'] = STATUS_CANCELLED
+                if job.get("cluster") == cluster and task_id in job.get("task_ids", []):
+                    job["status"] = STATUS_CANCELLED
                     break
-                    
+
             logger.info(f"Cancelled task {task_id} in cluster {cluster}")
-            
+
         except Exception as e:
             logger.error(f"Error cancelling job: {e}")
             raise
-    
+
     def cleanup_all_resources(self) -> None:
         """Clean up all AWS resources created by this manager."""
         try:
             # Stop all running tasks
             for job in self.jobs.values():
-                cluster = job.get('cluster')
-                task_ids = job.get('task_ids', [])
-                
+                cluster = job.get("cluster")
+                task_ids = job.get("task_ids", [])
+
                 if cluster and task_ids:
                     for task_id in task_ids:
                         try:
                             self.ecs_client.stop_task(
                                 cluster=cluster,
                                 task=task_id,
-                                reason='Cleaning up resources'
+                                reason="Cleaning up resources",
                             )
                         except Exception as e:
                             logger.error(f"Error stopping task {task_id}: {e}")
-            
+
             # Deregister task definitions
             for family in list(self.task_definitions):
                 try:
                     # Get the latest task definition
                     response = self.ecs_client.list_task_definitions(
-                        familyPrefix=family,
-                        status='ACTIVE',
-                        sort='DESC',
-                        maxResults=1
+                        familyPrefix=family, status="ACTIVE", sort="DESC", maxResults=1
                     )
-                    
-                    if response['taskDefinitionArns']:
-                        task_def_arn = response['taskDefinitionArns'][0]
-                        
+
+                    if response["taskDefinitionArns"]:
+                        task_def_arn = response["taskDefinitionArns"][0]
+
                         # Deregister it
                         self.ecs_client.deregister_task_definition(
                             taskDefinition=task_def_arn
@@ -560,18 +559,16 @@ class ECSManager:
                         logger.info(f"Deregistered task definition: {task_def_arn}")
                 except Exception as e:
                     logger.error(f"Error deregistering task definition {family}: {e}")
-            
+
             # Delete clusters
             for cluster_name in list(self.clusters):
                 try:
-                    self.ecs_client.delete_cluster(
-                        cluster=cluster_name
-                    )
+                    self.ecs_client.delete_cluster(cluster=cluster_name)
                     logger.info(f"Deleted ECS cluster: {cluster_name}")
                     self.clusters.remove(cluster_name)
                 except Exception as e:
                     logger.error(f"Error deleting ECS cluster {cluster_name}: {e}")
-            
+
             # Detach and delete IAM roles
             for role_name in list(self.role_names):
                 try:
@@ -579,18 +576,20 @@ class ECSManager:
                     try:
                         self.iam_client.detach_role_policy(
                             RoleName=role_name,
-                            PolicyArn="arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
+                            PolicyArn="arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy",
                         )
                     except Exception as e:
-                        logger.error(f"Error detaching policy from role {role_name}: {e}")
-                    
+                        logger.error(
+                            f"Error detaching policy from role {role_name}: {e}"
+                        )
+
                     # Delete role
                     self.iam_client.delete_role(RoleName=role_name)
                     logger.info(f"Deleted IAM role: {role_name}")
                     self.role_names.remove(role_name)
                 except Exception as e:
                     logger.error(f"Error deleting IAM role {role_name}: {e}")
-            
+
         except Exception as e:
             logger.error(f"Error cleaning up resources: {e}")
             raise ResourceCleanupError(f"Failed to clean up resources: {e}")

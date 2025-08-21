@@ -6,7 +6,6 @@ SPDX-FileCopyrightText: 2025 Scott Friedman and Project Contributors
 """
 
 import logging
-import time
 from typing import Any, Dict, List, Optional, Union
 
 import boto3
@@ -71,14 +70,14 @@ def create_session(
             aws_secret_access_key=aws_secret_access_key,
             aws_session_token=aws_session_token,
         )
-        
+
         # Verify that the session is valid by calling a simple operation
         sts = session.client("sts", endpoint_url=endpoint_url)
         sts.get_caller_identity()
-        
+
         logger.debug(f"Created AWS session for region {session.region_name}")
         return session
-    
+
     except ClientError as e:
         if "InvalidClientTokenId" in str(e) or "AccessDenied" in str(e):
             logger.error(f"AWS authentication failed: {e}")
@@ -147,17 +146,17 @@ def wait_for_resource(
     try:
         logger.debug(f"Waiting for {resource_name} {resource_id} ({waiter_name})")
         waiter = service_client.get_waiter(waiter_name)
-        
+
         config = {
             "WaiterConfig": {
                 "Delay": 5,  # Seconds between attempts
-                "MaxAttempts": 60  # Maximum number of attempts (5 minutes)
+                "MaxAttempts": 60,  # Maximum number of attempts (5 minutes)
             }
         }
-        
+
         if waiter_config:
             config["WaiterConfig"].update(waiter_config)
-        
+
         if waiter_name in ["instance_running", "instance_status_ok"]:
             waiter.wait(InstanceIds=[resource_id], **config)
         elif waiter_name in ["vpc_available", "vpc_exists"]:
@@ -176,9 +175,11 @@ def wait_for_resource(
             # Generic wait for resources without specific waiter support
             logger.debug(f"Using generic wait for {resource_name} {resource_id}")
             waiter.wait(Id=resource_id, **config)
-        
-        logger.debug(f"{resource_name.capitalize()} {resource_id} reached desired state")
-    
+
+        logger.debug(
+            f"{resource_name.capitalize()} {resource_id} reached desired state"
+        )
+
     except Exception as e:
         logger.error(f"Error waiting for {resource_name} {resource_id}: {e}")
         raise ResourceCreationError(
@@ -212,18 +213,18 @@ def create_tags(
     """
     if not isinstance(resource_ids, list):
         resource_ids = [resource_ids]
-    
+
     if not resource_ids:
         logger.debug("No resources to tag")
         return
-    
+
     if not tags:
         logger.debug("No tags to apply")
         return
-    
+
     # Convert tags dictionary to AWS Tags format
     aws_tags = [{"Key": key, "Value": value} for key, value in tags.items()]
-    
+
     try:
         ec2 = session.client("ec2", region_name=region)
         ec2.create_tags(Resources=resource_ids, Tags=aws_tags)
@@ -265,27 +266,26 @@ def get_resources_by_tags(
     """
     # Convert tags dictionary to AWS filter format
     filters = [{"Name": f"tag:{key}", "Values": [value]} for key, value in tags.items()]
-    
+
     if resource_type:
         filters.append({"Name": "resource-type", "Values": [resource_type]})
-    
+
     try:
         ec2 = session.client("ec2", region_name=region)
         response = ec2.describe_tags(Filters=filters)
-        
+
         # Get unique resource IDs
         resource_ids = list(set(tag["ResourceId"] for tag in response["Tags"]))
-        
+
         # Get resource details
         resources = []
-        
+
         if resource_ids:
             if not resource_type or resource_type == "instance":
                 try:
                     instance_response = ec2.describe_instances(
                         InstanceIds=[
-                            rid for rid in resource_ids 
-                            if rid.startswith("i-")
+                            rid for rid in resource_ids if rid.startswith("i-")
                         ]
                     )
                     for reservation in instance_response.get("Reservations", []):
@@ -293,45 +293,38 @@ def get_resources_by_tags(
                 except ClientError:
                     # Some resource IDs might not be instances
                     pass
-            
+
             if not resource_type or resource_type == "vpc":
                 try:
                     vpc_response = ec2.describe_vpcs(
-                        VpcIds=[
-                            rid for rid in resource_ids 
-                            if rid.startswith("vpc-")
-                        ]
+                        VpcIds=[rid for rid in resource_ids if rid.startswith("vpc-")]
                     )
                     resources.extend(vpc_response.get("Vpcs", []))
                 except ClientError:
                     pass
-            
+
             if not resource_type or resource_type == "subnet":
                 try:
                     subnet_response = ec2.describe_subnets(
                         SubnetIds=[
-                            rid for rid in resource_ids 
-                            if rid.startswith("subnet-")
+                            rid for rid in resource_ids if rid.startswith("subnet-")
                         ]
                     )
                     resources.extend(subnet_response.get("Subnets", []))
                 except ClientError:
                     pass
-            
+
             if not resource_type or resource_type == "security-group":
                 try:
                     sg_response = ec2.describe_security_groups(
-                        GroupIds=[
-                            rid for rid in resource_ids 
-                            if rid.startswith("sg-")
-                        ]
+                        GroupIds=[rid for rid in resource_ids if rid.startswith("sg-")]
                     )
                     resources.extend(sg_response.get("SecurityGroups", []))
                 except ClientError:
                     pass
-        
+
         return resources
-    
+
     except Exception as e:
         logger.error(f"Failed to get resources by tags: {e}")
         raise AWSConnectionError(f"Failed to get resources by tags: {e}") from e
@@ -377,10 +370,10 @@ def delete_resource(
             ec2.terminate_instances(InstanceIds=[resource_id])
             logger.debug(f"Terminated EC2 instance {resource_id}")
             return True
-        
+
         elif resource_type == "vpc":
             ec2 = session.client("ec2", region_name=region)
-            
+
             # Delete all resources within the VPC
             if force:
                 # Get all subnets in the VPC
@@ -391,7 +384,7 @@ def delete_resource(
                     delete_resource(
                         subnet["SubnetId"], session, "subnet", region, force
                     )
-                
+
                 # Get all security groups in the VPC
                 security_groups = ec2.describe_security_groups(
                     Filters=[{"Name": "vpc-id", "Values": [resource_id]}]
@@ -401,55 +394,58 @@ def delete_resource(
                         delete_resource(
                             sg["GroupId"], session, "security-group", region, force
                         )
-                
+
                 # Get internet gateways attached to the VPC
                 igws = ec2.describe_internet_gateways(
                     Filters=[{"Name": "attachment.vpc-id", "Values": [resource_id]}]
                 )
                 for igw in igws.get("InternetGateways", []):
                     ec2.detach_internet_gateway(
-                        InternetGatewayId=igw["InternetGatewayId"],
-                        VpcId=resource_id
+                        InternetGatewayId=igw["InternetGatewayId"], VpcId=resource_id
                     )
                     delete_resource(
-                        igw["InternetGatewayId"], session, "internet-gateway", region, force
+                        igw["InternetGatewayId"],
+                        session,
+                        "internet-gateway",
+                        region,
+                        force,
                     )
-            
+
             # Delete the VPC
             ec2.delete_vpc(VpcId=resource_id)
             logger.debug(f"Deleted VPC {resource_id}")
             return True
-        
+
         elif resource_type == "subnet":
             ec2 = session.client("ec2", region_name=region)
             ec2.delete_subnet(SubnetId=resource_id)
             logger.debug(f"Deleted subnet {resource_id}")
             return True
-        
+
         elif resource_type == "security-group":
             ec2 = session.client("ec2", region_name=region)
             ec2.delete_security_group(GroupId=resource_id)
             logger.debug(f"Deleted security group {resource_id}")
             return True
-        
+
         elif resource_type == "internet-gateway":
             ec2 = session.client("ec2", region_name=region)
             ec2.delete_internet_gateway(InternetGatewayId=resource_id)
             logger.debug(f"Deleted internet gateway {resource_id}")
             return True
-        
+
         elif resource_type == "function":
             lambda_client = session.client("lambda", region_name=region)
             lambda_client.delete_function(FunctionName=resource_id)
             logger.debug(f"Deleted Lambda function {resource_id}")
             return True
-        
+
         elif resource_type == "task":
             ecs = session.client("ecs", region_name=region)
             ecs.stop_task(task=resource_id, cluster="default")
             logger.debug(f"Stopped ECS task {resource_id}")
             return True
-        
+
         elif resource_type == "cloudformation-stack":
             cfn = session.client("cloudformation", region_name=region)
             cfn.delete_stack(StackName=resource_id)
@@ -458,26 +454,29 @@ def delete_resource(
             logger.debug(f"Waiting for stack {resource_id} to be deleted...")
             waiter = cfn.get_waiter("stack_delete_complete")
             waiter.wait(
-                StackName=resource_id,
-                WaiterConfig={
-                    "Delay": 10,
-                    "MaxAttempts": 30
-                }
+                StackName=resource_id, WaiterConfig={"Delay": 10, "MaxAttempts": 30}
             )
             logger.debug(f"Deleted CloudFormation stack {resource_id}")
             return True
-        
+
         else:
             logger.warning(f"Unsupported resource type: {resource_type}")
             return False
-    
+
     except ClientError as e:
         error_code = e.response.get("Error", {}).get("Code", "")
-        
-        if any(code in error_code for code in ["NotFound", "InvalidSubnetID.NotFound", 
-                                              "InvalidVpcID.NotFound", "InvalidGroup.NotFound",
-                                              "InvalidInternetGatewayID.NotFound",
-                                              "ResourceNotFoundException"]):
+
+        if any(
+            code in error_code
+            for code in [
+                "NotFound",
+                "InvalidSubnetID.NotFound",
+                "InvalidVpcID.NotFound",
+                "InvalidGroup.NotFound",
+                "InvalidInternetGatewayID.NotFound",
+                "ResourceNotFoundException",
+            ]
+        ):
             logger.debug(f"Resource {resource_id} not found or already deleted")
             raise ResourceNotFoundError(
                 f"Resource {resource_id} not found or already deleted"
@@ -487,9 +486,60 @@ def delete_resource(
             raise ResourceDeletionError(
                 f"Failed to delete {resource_type} {resource_id}: {e}"
             ) from e
-    
+
     except Exception as e:
         logger.error(f"Failed to delete {resource_type} {resource_id}: {e}")
         raise ResourceDeletionError(
             f"Failed to delete {resource_type} {resource_id}: {e}"
         ) from e
+
+
+def get_cf_template(template_name: str) -> str:
+    """
+    Load a CloudFormation template from the templates directory.
+
+    Parameters
+    ----------
+    template_name : str
+        Name of the template file (e.g., 'bastion.yml')
+
+    Returns
+    -------
+    str
+        CloudFormation template content
+
+    Raises
+    ------
+    FileNotFoundError
+        If template file is not found
+    """
+    import os
+    import pkg_resources
+
+    try:
+        # Try to load from package resources
+        template_path = f"templates/cloudformation/{template_name}"
+        template_content = pkg_resources.resource_string(
+            "parsl_ephemeral_aws", template_path
+        ).decode("utf-8")
+        return template_content
+    except (FileNotFoundError, ModuleNotFoundError):
+        # Fallback to file system
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        template_path = os.path.join(
+            current_dir, "..", "templates", "cloudformation", template_name
+        )
+
+        if os.path.exists(template_path):
+            with open(template_path, "r") as f:
+                return f.read()
+        else:
+            # Return a basic template as fallback
+            logger.warning(f"Template {template_name} not found, using basic template")
+            return """
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Basic template placeholder'
+Resources:
+  PlaceholderResource:
+    Type: AWS::CloudFormation::WaitConditionHandle
+"""

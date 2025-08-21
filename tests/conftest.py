@@ -8,27 +8,34 @@ import os
 import pytest
 import boto3
 import logging
+import requests
 from unittest.mock import MagicMock
+from typing import Generator
 
 # Configure logging for tests
 logging.basicConfig(level=logging.INFO)
+
+# Test configuration
+LOCALSTACK_URL = os.environ.get("LOCALSTACK_URL", "http://localhost:4566")
+AWS_TEST_REGION = os.environ.get("AWS_TEST_REGION", "us-west-2")
+AWS_TEST_PROFILE = os.environ.get("AWS_TEST_PROFILE", "aws")
 
 
 @pytest.fixture
 def aws_credentials():
     """Mocked AWS Credentials for boto3."""
-    os.environ['AWS_ACCESS_KEY_ID'] = 'testing'
-    os.environ['AWS_SECRET_ACCESS_KEY'] = 'testing'
-    os.environ['AWS_SECURITY_TOKEN'] = 'testing'
-    os.environ['AWS_SESSION_TOKEN'] = 'testing'
-    os.environ['AWS_DEFAULT_REGION'] = 'us-east-1'
+    os.environ["AWS_ACCESS_KEY_ID"] = "testing"
+    os.environ["AWS_SECRET_ACCESS_KEY"] = "testing"
+    os.environ["AWS_SECURITY_TOKEN"] = "testing"
+    os.environ["AWS_SESSION_TOKEN"] = "testing"
+    os.environ["AWS_DEFAULT_REGION"] = "us-east-1"
     yield
     # Clean up
-    del os.environ['AWS_ACCESS_KEY_ID']
-    del os.environ['AWS_SECRET_ACCESS_KEY']
-    del os.environ['AWS_SECURITY_TOKEN']
-    del os.environ['AWS_SESSION_TOKEN']
-    del os.environ['AWS_DEFAULT_REGION']
+    del os.environ["AWS_ACCESS_KEY_ID"]
+    del os.environ["AWS_SECRET_ACCESS_KEY"]
+    del os.environ["AWS_SECURITY_TOKEN"]
+    del os.environ["AWS_SESSION_TOKEN"]
+    del os.environ["AWS_DEFAULT_REGION"]
 
 
 @pytest.fixture
@@ -54,59 +61,57 @@ def mock_provider():
 def mock_ec2_client():
     """Create a mock EC2 client."""
     client = MagicMock()
-    
+
     # Mock run_instances
     client.run_instances.return_value = {
-        'Instances': [
+        "Instances": [
             {
-                'InstanceId': 'i-12345678',
-                'State': {'Name': 'pending'},
-                'PrivateIpAddress': '10.0.0.1',
-                'PublicIpAddress': '54.123.456.789'
+                "InstanceId": "i-12345678",
+                "State": {"Name": "pending"},
+                "PrivateIpAddress": "10.0.0.1",
+                "PublicIpAddress": "54.123.456.789",
             }
         ]
     }
-    
+
     # Mock describe_instances
     client.describe_instances.return_value = {
-        'Reservations': [
+        "Reservations": [
             {
-                'Instances': [
+                "Instances": [
                     {
-                        'InstanceId': 'i-12345678',
-                        'State': {'Name': 'running'},
-                        'PrivateIpAddress': '10.0.0.1',
-                        'PublicIpAddress': '54.123.456.789'
+                        "InstanceId": "i-12345678",
+                        "State": {"Name": "running"},
+                        "PrivateIpAddress": "10.0.0.1",
+                        "PublicIpAddress": "54.123.456.789",
                     }
                 ]
             }
         ]
     }
-    
+
     # Mock create_vpc
     client.create_vpc.return_value = {
-        'Vpc': {
-            'VpcId': 'vpc-12345678',
-            'CidrBlock': '10.0.0.0/16',
-            'State': 'available'
+        "Vpc": {
+            "VpcId": "vpc-12345678",
+            "CidrBlock": "10.0.0.0/16",
+            "State": "available",
         }
     }
-    
+
     # Mock create_subnet
     client.create_subnet.return_value = {
-        'Subnet': {
-            'SubnetId': 'subnet-12345678',
-            'VpcId': 'vpc-12345678',
-            'CidrBlock': '10.0.0.0/24',
-            'State': 'available'
+        "Subnet": {
+            "SubnetId": "subnet-12345678",
+            "VpcId": "vpc-12345678",
+            "CidrBlock": "10.0.0.0/24",
+            "State": "available",
         }
     }
-    
+
     # Mock create_security_group
-    client.create_security_group.return_value = {
-        'GroupId': 'sg-12345678'
-    }
-    
+    client.create_security_group.return_value = {"GroupId": "sg-12345678"}
+
     return client
 
 
@@ -114,14 +119,12 @@ def mock_ec2_client():
 def mock_s3_client():
     """Create a mock S3 client."""
     client = MagicMock()
-    
+
     # Mock get_object
     client.get_object.return_value = {
-        'Body': MagicMock(
-            read=lambda: b'{"key": "value"}'
-        )
+        "Body": MagicMock(read=lambda: b'{"key": "value"}')
     }
-    
+
     return client
 
 
@@ -129,16 +132,16 @@ def mock_s3_client():
 def mock_ssm_client():
     """Create a mock SSM client."""
     client = MagicMock()
-    
+
     # Mock get_parameter
     client.get_parameter.return_value = {
-        'Parameter': {
-            'Name': '/parsl/workflows/test',
-            'Value': '{"key": "value"}',
-            'Version': 1
+        "Parameter": {
+            "Name": "/parsl/workflows/test",
+            "Value": '{"key": "value"}',
+            "Version": 1,
         }
     }
-    
+
     return client
 
 
@@ -146,21 +149,19 @@ def mock_ssm_client():
 def mock_lambda_client():
     """Create a mock Lambda client."""
     client = MagicMock()
-    
+
     # Mock create_function
     client.create_function.return_value = {
-        'FunctionName': 'test-function',
-        'FunctionArn': 'arn:aws:lambda:us-east-1:123456789012:function:test-function'
+        "FunctionName": "test-function",
+        "FunctionArn": "arn:aws:lambda:us-east-1:123456789012:function:test-function",
     }
-    
+
     # Mock invoke
     client.invoke.return_value = {
-        'StatusCode': 200,
-        'Payload': MagicMock(
-            read=lambda: b'{"statusCode": 200, "body": "Success"}'
-        )
+        "StatusCode": 200,
+        "Payload": MagicMock(read=lambda: b'{"statusCode": 200, "body": "Success"}'),
     }
-    
+
     return client
 
 
@@ -168,62 +169,69 @@ def mock_lambda_client():
 def mock_ecs_client():
     """Create a mock ECS client."""
     client = MagicMock()
-    
+
     # Mock create_cluster
     client.create_cluster.return_value = {
-        'cluster': {
-            'clusterName': 'test-cluster',
-            'clusterArn': 'arn:aws:ecs:us-east-1:123456789012:cluster/test-cluster'
+        "cluster": {
+            "clusterName": "test-cluster",
+            "clusterArn": "arn:aws:ecs:us-east-1:123456789012:cluster/test-cluster",
         }
     }
-    
+
     # Mock register_task_definition
     client.register_task_definition.return_value = {
-        'taskDefinition': {
-            'taskDefinitionArn': 'arn:aws:ecs:us-east-1:123456789012:task-definition/test-task:1',
-            'family': 'test-task',
-            'revision': 1
+        "taskDefinition": {
+            "taskDefinitionArn": "arn:aws:ecs:us-east-1:123456789012:task-definition/test-task:1",
+            "family": "test-task",
+            "revision": 1,
         }
     }
-    
+
     # Mock run_task
     client.run_task.return_value = {
-        'tasks': [
+        "tasks": [
             {
-                'taskArn': 'arn:aws:ecs:us-east-1:123456789012:task/test-cluster/abcdef12345',
-                'lastStatus': 'PENDING'
+                "taskArn": "arn:aws:ecs:us-east-1:123456789012:task/test-cluster/abcdef12345",
+                "lastStatus": "PENDING",
             }
         ]
     }
-    
+
     return client
 
 
 @pytest.fixture
-def mock_boto3_session(aws_credentials, mock_ec2_client, mock_s3_client, mock_ssm_client, mock_lambda_client, mock_ecs_client):
+def mock_boto3_session(
+    aws_credentials,
+    mock_ec2_client,
+    mock_s3_client,
+    mock_ssm_client,
+    mock_lambda_client,
+    mock_ecs_client,
+):
     """Create a mock boto3 session with all needed clients."""
     session = MagicMock()
-    
+
     # Configure clients
     def get_client(service_name, **kwargs):
-        if service_name == 'ec2':
+        if service_name == "ec2":
             return mock_ec2_client
-        elif service_name == 's3':
+        elif service_name == "s3":
             return mock_s3_client
-        elif service_name == 'ssm':
+        elif service_name == "ssm":
             return mock_ssm_client
-        elif service_name == 'lambda':
+        elif service_name == "lambda":
             return mock_lambda_client
-        elif service_name == 'ecs':
+        elif service_name == "ecs":
             return mock_ecs_client
         else:
             return MagicMock()
-    
+
     session.client = get_client
-    
+
     # Configure resources
     session.resource = MagicMock(return_value=MagicMock())
-    
+
     return session
 
 
@@ -232,11 +240,11 @@ def localstack_endpoint():
     """Get the LocalStack endpoint URL."""
     # Default LocalStack endpoint
     endpoint = "http://localhost:4566"
-    
+
     # Override with environment variable if specified
-    if 'LOCALSTACK_ENDPOINT' in os.environ:
-        endpoint = os.environ['LOCALSTACK_ENDPOINT']
-    
+    if "LOCALSTACK_ENDPOINT" in os.environ:
+        endpoint = os.environ["LOCALSTACK_ENDPOINT"]
+
     return endpoint
 
 
@@ -246,6 +254,7 @@ def is_localstack_running(localstack_endpoint):
     try:
         # Try to connect to the health endpoint
         import requests
+
         response = requests.get(f"{localstack_endpoint}/health", timeout=1)
         return response.status_code == 200
     except Exception:
@@ -253,14 +262,106 @@ def is_localstack_running(localstack_endpoint):
 
 
 @pytest.fixture
-def boto3_localstack_session(aws_credentials, localstack_endpoint, is_localstack_running):
+def boto3_localstack_session(
+    aws_credentials, localstack_endpoint, is_localstack_running
+):
     """Create a boto3 session that connects to LocalStack."""
     if not is_localstack_running:
         pytest.skip("LocalStack is not running")
-    
+
     # Return session configured for LocalStack
     return boto3.Session(
+        aws_access_key_id="test", aws_secret_access_key="test", region_name="us-east-1"
+    )
+
+
+@pytest.fixture(scope="session")
+def localstack_available() -> bool:
+    """Check if LocalStack is available and ready."""
+    try:
+        response = requests.get(f"{LOCALSTACK_URL}/health", timeout=5)
+        if response.status_code == 200:
+            health = response.json()
+            # Check that core services are available
+            required_services = ["ec2", "lambda", "s3", "ssm"]
+            return all(
+                health.get("services", {}).get(service) == "available"
+                for service in required_services
+            )
+    except Exception as e:
+        logging.warning(f"LocalStack health check failed: {e}")
+    return False
+
+
+@pytest.fixture
+def localstack_session(localstack_available) -> Generator[boto3.Session, None, None]:
+    """Boto3 session configured for LocalStack."""
+    if not localstack_available:
+        pytest.skip("LocalStack not available - start with 'make localstack-up'")
+
+    session = boto3.Session(
         aws_access_key_id="test",
         aws_secret_access_key="test",
-        region_name="us-east-1"
+        region_name=AWS_TEST_REGION,
     )
+
+    # Configure endpoint URLs for LocalStack
+    original_client = session.client
+
+    def localstack_client(service_name, **kwargs):
+        kwargs.setdefault("endpoint_url", LOCALSTACK_URL)
+        return original_client(service_name, **kwargs)
+
+    session.client = localstack_client
+    yield session
+
+
+@pytest.fixture
+def aws_session() -> Generator[boto3.Session, None, None]:
+    """Boto3 session configured for real AWS with 'aws' profile."""
+    try:
+        session = boto3.Session(
+            profile_name=AWS_TEST_PROFILE, region_name=AWS_TEST_REGION
+        )
+        # Test that the session works
+        sts = session.client("sts")
+        sts.get_caller_identity()
+        yield session
+    except Exception as e:
+        pytest.skip(
+            f"AWS profile '{AWS_TEST_PROFILE}' not available or not configured: {e}"
+        )
+
+
+@pytest.fixture
+def test_session(request, localstack_session, aws_session) -> boto3.Session:
+    """
+    Smart session fixture that chooses LocalStack or AWS based on test markers.
+
+    Use @pytest.mark.aws to force real AWS testing.
+    Use @pytest.mark.localstack to force LocalStack testing.
+    Default is LocalStack if available, otherwise skip.
+    """
+    # Check test markers
+    if request.node.get_closest_marker("aws"):
+        return aws_session
+    elif request.node.get_closest_marker("localstack"):
+        return localstack_session
+    else:
+        # Default to LocalStack for safety
+        return localstack_session
+
+
+@pytest.fixture
+def ephemeral_provider_config():
+    """Base configuration for EphemeralAWSProvider testing."""
+    return {
+        "image_id": "ami-0abcdef1234567890",  # Amazon Linux 2 AMI (example)
+        "instance_type": "t3.micro",
+        "region": AWS_TEST_REGION,
+        "min_blocks": 0,
+        "max_blocks": 2,
+        "debug": True,
+        "auto_shutdown": True,
+        "max_idle_time": 60,  # 1 minute for faster tests
+    }

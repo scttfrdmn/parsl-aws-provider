@@ -70,20 +70,20 @@ def resource(*args, **kwargs):
 class MockClient:
     def __init__(self):
         pass
-        
+
     def describe_instances(self, **kwargs):
         return {'Reservations': [{'Instances': [{'InstanceId': 'i-0123456789abcdef0', 'State': {'Name': 'running'}}]}]}
-        
+
     def run_instances(self, **kwargs):
         return {'Instances': [{'InstanceId': 'i-0123456789abcdef0'}]}
-        
+
     def create_tags(self, **kwargs):
         return {}
 
 class MockResource:
     def __init__(self):
         pass
-        
+
     def Instance(self, instance_id):
         return MockInstance(instance_id)
 
@@ -130,17 +130,17 @@ command_exists() {
 # Test if the environment has the necessary tools
 check_required_tools() {
   local missing_tools=()
-  
+
   for tool in aws python3 jq curl; do
     if ! command_exists "$tool"; then
       missing_tools+=("$tool")
     fi
   done
-  
+
   if [ ${#missing_tools[@]} -gt 0 ]; then
     echo "Missing required tools: ${missing_tools[*]}" >&2
     return 1
   fi
-  
+
   return 0
 }

@@ -7,11 +7,11 @@ SPDX-FileCopyrightText: 2025 Scott Friedman and Project Contributors
 
 import abc
 import logging
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional
 
 import boto3
 
-from parsl_ephemeral_aws.exceptions import OperatingModeError, ResourceCreationError
+from parsl_ephemeral_aws.exceptions import OperatingModeError
 from parsl_ephemeral_aws.state.base import StateStore
 
 
@@ -20,11 +20,11 @@ logger = logging.getLogger(__name__)
 
 class OperatingMode(abc.ABC):
     """Abstract base class for provider operating modes.
-    
+
     An operating mode defines how the provider interacts with AWS resources
     to execute jobs. Different modes have different trade-offs in terms of
     cost, performance, and capabilities.
-    
+
     Attributes
     ----------
     provider_id : str
@@ -106,7 +106,7 @@ class OperatingMode(abc.ABC):
         **kwargs: Any,
     ) -> None:
         """Initialize the operating mode.
-        
+
         Parameters
         ----------
         provider_id : str
@@ -183,24 +183,24 @@ class OperatingMode(abc.ABC):
         self.custom_ami = custom_ami
         self.debug = debug
         self.kwargs = kwargs
-        
+
         # Set up logging
         if debug:
             logger.setLevel(logging.DEBUG)
-            
+
         # Initialize state
         self.resources: Dict[str, Dict[str, Any]] = {}
         self.initialized = False
-        
+
         logger.debug(f"Initialized {self.__class__.__name__}")
 
     @abc.abstractmethod
     def initialize(self) -> None:
         """Initialize mode-specific resources.
-        
+
         This method should create any resources needed for the mode to operate,
         such as VPC, subnets, security groups, etc.
-        
+
         Raises
         ------
         ResourceCreationError
@@ -210,10 +210,14 @@ class OperatingMode(abc.ABC):
 
     @abc.abstractmethod
     def submit_job(
-        self, job_id: str, command: str, tasks_per_node: int, job_name: Optional[str] = None
+        self,
+        job_id: str,
+        command: str,
+        tasks_per_node: int,
+        job_name: Optional[str] = None,
     ) -> str:
         """Submit a job for execution.
-        
+
         Parameters
         ----------
         job_id : str
@@ -224,12 +228,12 @@ class OperatingMode(abc.ABC):
             Number of tasks to run per node
         job_name : Optional[str], optional
             Human-readable name for the job, by default None
-        
+
         Returns
         -------
         str
             Resource ID for tracking the job
-        
+
         Raises
         ------
         OperatingModeError
@@ -240,12 +244,12 @@ class OperatingMode(abc.ABC):
     @abc.abstractmethod
     def get_job_status(self, resource_ids: List[str]) -> Dict[str, str]:
         """Get the status of jobs.
-        
+
         Parameters
         ----------
         resource_ids : List[str]
             List of resource IDs to check
-        
+
         Returns
         -------
         Dict[str, str]
@@ -256,12 +260,12 @@ class OperatingMode(abc.ABC):
     @abc.abstractmethod
     def cancel_jobs(self, resource_ids: List[str]) -> Dict[str, str]:
         """Cancel jobs.
-        
+
         Parameters
         ----------
         resource_ids : List[str]
             List of resource IDs to cancel
-        
+
         Returns
         -------
         Dict[str, str]
@@ -272,7 +276,7 @@ class OperatingMode(abc.ABC):
     @abc.abstractmethod
     def cleanup_resources(self, resource_ids: List[str]) -> None:
         """Clean up resources.
-        
+
         Parameters
         ----------
         resource_ids : List[str]
@@ -283,7 +287,7 @@ class OperatingMode(abc.ABC):
     @abc.abstractmethod
     def cleanup_infrastructure(self) -> None:
         """Clean up infrastructure created by this mode.
-        
+
         This should clean up any VPC, subnets, security groups, etc. created
         by the mode.
         """
@@ -292,7 +296,7 @@ class OperatingMode(abc.ABC):
     @abc.abstractmethod
     def list_resources(self) -> Dict[str, List[Dict[str, Any]]]:
         """List all resources created by this mode.
-        
+
         Returns
         -------
         Dict[str, List[Dict[str, Any]]]
@@ -304,10 +308,10 @@ class OperatingMode(abc.ABC):
     def cleanup_all(self) -> None:
         """Clean up all resources created by this mode."""
         pass
-        
+
     def ensure_initialized(self) -> None:
         """Ensure the mode is initialized.
-        
+
         Raises
         ------
         OperatingModeError
@@ -320,7 +324,7 @@ class OperatingMode(abc.ABC):
             except Exception as e:
                 logger.error(f"Initialization failed: {e}")
                 raise OperatingModeError(f"Initialization failed: {e}") from e
-                
+
     def save_state(self) -> None:
         """Save the current state to the state store."""
         state = {
@@ -332,15 +336,15 @@ class OperatingMode(abc.ABC):
             "security_group_id": self.security_group_id,
             "initialized": self.initialized,
         }
-        
+
         try:
             self.state_store.save_state(state)
         except Exception as e:
             logger.error(f"Failed to save state: {e}")
-            
+
     def load_state(self) -> bool:
         """Load state from the state store.
-        
+
         Returns
         -------
         bool
@@ -352,11 +356,13 @@ class OperatingMode(abc.ABC):
                 self.resources = state.get("resources", {})
                 self.vpc_id = state.get("vpc_id", self.vpc_id)
                 self.subnet_id = state.get("subnet_id", self.subnet_id)
-                self.security_group_id = state.get("security_group_id", self.security_group_id)
+                self.security_group_id = state.get(
+                    "security_group_id", self.security_group_id
+                )
                 self.initialized = state.get("initialized", False)
                 logger.debug(f"Loaded state with {len(self.resources)} resources")
                 return True
         except Exception as e:
             logger.error(f"Failed to load state: {e}")
-        
+
         return False

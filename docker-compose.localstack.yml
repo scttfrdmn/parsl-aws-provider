@@ -1,0 +1,49 @@
+version: '3.8'
+
+services:
+  localstack:
+    image: localstack/localstack:latest
+    container_name: parsl-localstack
+    ports:
+      - "4566:4566"        # LocalStack main endpoint
+      - "4510-4559:4510-4559"  # External service ports
+    environment:
+      # Core LocalStack configuration
+      - SERVICES=ec2,ecs,lambda,s3,ssm,sts,iam,cloudformation,logs,events
+      - DEBUG=1
+      - DATA_DIR=/tmp/localstack/data
+      - PERSISTENCE=1
+
+      # Lambda configuration for better testing
+      - LAMBDA_EXECUTOR=local
+      - LAMBDA_STAY_OPEN_MODE=1
+
+      # Network configuration
+      - HOSTNAME=localhost
+      - HOSTNAME_EXTERNAL=localhost
+
+      # Provider configuration
+      - PROVIDER_OVERRIDE_EC2=asf
+      - PROVIDER_OVERRIDE_LAMBDA=asf
+      - PROVIDER_OVERRIDE_ECS=asf
+
+    volumes:
+      - "/tmp/localstack:/tmp/localstack"
+      - "/var/run/docker.sock:/var/run/docker.sock"
+
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:4566/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+    networks:
+      - parsl-test
+
+networks:
+  parsl-test:
+    driver: bridge
+
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2025 Scott Friedman and Project Contributors

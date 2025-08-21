@@ -35,7 +35,7 @@ You can enable spot instances with minimal configuration:
        # Basic configuration
        region='us-west-2',
        instance_type='m5.large',
-       
+
        # Enable spot instances
        use_spot_instances=True,
        spot_max_price_percentage=80,  # 80% of on-demand price
@@ -49,12 +49,12 @@ But for better reliability and advanced features, consider a more comprehensive 
        # Basic configuration
        region='us-west-2',
        instance_type='m5.large',
-       
+
        # Spot configuration
        use_spot_instances=True,
        spot_max_price_percentage=80,
        spot_interruption_behavior='terminate',  # 'terminate', 'stop', or 'hibernate'
-       
+
        # Spot Fleet for better availability
        use_spot_fleet=True,
        instance_types=[
@@ -65,11 +65,11 @@ But for better reliability and advanced features, consider a more comprehensive 
            'r5.large'
        ],
        allocation_strategy='capacityOptimized',
-       
+
        # Enable state persistence for recovery
        state_store='parameter_store',
        state_prefix='/parsl/spot-workflow',
-       
+
        # Enable interruption detection
        spot_interruption_detection=True,
        spot_interruption_handler='terminate_and_replace',
@@ -191,25 +191,25 @@ For maximum spot instance availability, we recommend:
    provider = EphemeralAWSProvider(
        # Basic configuration
        region='us-west-2',
-       
+
        # Enable Spot Fleet
        use_spot_instances=True,
        use_spot_fleet=True,
-       
+
        # Diversify instance types
        instance_types=[
            # Multiple instance families
            'm5.large', 'm5a.large', 'm5n.large',   # General purpose
            'c5.large', 'c5a.large', 'c5n.large',   # Compute optimized
            'r5.large', 'r5a.large', 'r5n.large',   # Memory optimized
-           
+
            # Multiple sizes within families
            'm5.large', 'm5.xlarge', 'm5.2xlarge',
        ],
-       
+
        # Optimize for availability
        allocation_strategy='capacityOptimized',
-       
+
        # Use multiple availability zones
        availability_zones=['us-west-2a', 'us-west-2b', 'us-west-2c'],
    )
@@ -232,12 +232,12 @@ For spot-intensive workflows, we recommend using Parameter Store or S3:
        # Basic spot configuration
        use_spot_instances=True,
        use_spot_fleet=True,
-       
+
        # State persistence for recovery
        state_store='parameter_store',  # or 's3' for larger state
        state_prefix='/parsl/spot-workflow',
        state_cleanup='success',  # Only clean up on successful completion
-       
+
        # Checkpoint configuration
        checkpoint_mode='task',  # 'task', 'block', or 'workflow'
        checkpoint_interval=300,  # seconds between checkpoints
@@ -271,46 +271,46 @@ You can implement task-level spot handling for greater control:
        import os
        import json
        import pickle
-       
+
        # Get the checkpoint ID (if any)
        checkpoint_id = os.environ.get('PARSL_CHECKPOINT_ID')
-       
+
        # Initialize state
        state = {
            'progress': 0,
            'result': None,
            'last_processed': 0
        }
-       
+
        # Load checkpoint if available
        if checkpoint_id:
            checkpoint_path = f"/tmp/checkpoint_{checkpoint_id}.pkl"
            if os.path.exists(checkpoint_path):
                with open(checkpoint_path, 'rb') as f:
                    state = pickle.load(f)
-       
+
        # Process data from last checkpoint
        for i in range(state['last_processed'], len(data)):
            # Do some processing
            result = process_item(data[i])
-           
+
            # Update state
            state['progress'] = (i + 1) / len(data) * 100
            state['last_processed'] = i + 1
            state['result'] = result
-           
+
            # Create checkpoint periodically
            if i % 10 == 0:
                with open(f"/tmp/checkpoint_{os.getpid()}.pkl", 'wb') as f:
                    pickle.dump(state, f)
-           
+
            # Check for spot interruption
            if check_spot_interruption():
                # Final checkpoint before interruption
                with open(f"/tmp/checkpoint_{os.getpid()}.pkl", 'wb') as f:
                    pickle.dump(state, f)
                break
-       
+
        return state['result']
 
 Spot Instance Monitoring
@@ -334,12 +334,12 @@ You can access this information programmatically:
 
    # Get spot instance metrics
    spot_metrics = provider.get_spot_metrics()
-   
+
    # Print interruption statistics
    print(f"Total interruptions: {spot_metrics['total_interruptions']}")
    print(f"Interruption rate: {spot_metrics['interruption_rate']:.2f}%")
    print(f"Cost savings: {spot_metrics['cost_savings']:.2f}%")
-   
+
    # Get interruption history by instance type
    history = provider.get_interruption_history()
    for instance_type, data in history.items():
@@ -391,14 +391,14 @@ For workloads with critical and non-critical components:
        instance_types=['c5.large', 'c5a.large', 'c5n.large'],
        allocation_strategy='capacityOptimized',
    )
-   
+
    # On-demand for critical tasks
    ondemand_provider = EphemeralAWSProvider(
        region='us-west-2',
        instance_type='m5.large',
        use_spot_instances=False,  # Explicit on-demand
    )
-   
+
    config = Config(
        executors=[
            HighThroughputExecutor(
@@ -411,13 +411,13 @@ For workloads with critical and non-critical components:
            )
        ]
    )
-   
+
    # Use appropriate executor for each task type
    @parsl.python_app(executors=['spot_executor'])
    def non_critical_task():
        # This task can be interrupted
        pass
-   
+
    @parsl.python_app(executors=['ondemand_executor'])
    def critical_task():
        # This task needs guaranteed resources
@@ -434,12 +434,12 @@ For workloads with predictable duration, consider AWS Spot Blocks (spot instance
        # Basic configuration
        region='us-west-2',
        instance_type='m5.large',
-       
+
        # Spot Block configuration
        use_spot_instances=True,
        use_spot_blocks=True,
        spot_block_duration=2,  # Hours (1-6)
-       
+
        # State persistence still recommended
        state_store='parameter_store',
    )
@@ -454,17 +454,17 @@ The provider can dynamically adjust to spot market conditions:
    provider = EphemeralAWSProvider(
        # Basic configuration
        region='us-west-2',
-       
+
        # Dynamic market adaptation
        use_spot_instances=True,
        spot_market_monitoring=True,
        spot_pricing_update_interval=300,  # Seconds
-       
+
        # Use multiple instance types
        instance_types=[
            'm5.large', 'm5a.large', 'c5.large', 'r5.large'
        ],
-       
+
        # Select instance type dynamically based on market
        spot_selection_strategy='lowest_interruption_probability',  # or 'lowest_price'
    )
@@ -481,12 +481,12 @@ Here's a comprehensive example of a spot-resilient workflow:
    from parsl.config import Config
    from parsl.executors import HighThroughputExecutor
    from parsl_ephemeral_aws import EphemeralAWSProvider
-   
+
    # Configure the provider for optimal spot usage
    provider = EphemeralAWSProvider(
        # Region and basic configuration
        region='us-west-2',
-       
+
        # Spot configuration
        use_spot_instances=True,
        use_spot_fleet=True,
@@ -495,20 +495,20 @@ Here's a comprehensive example of a spot-resilient workflow:
        ],
        allocation_strategy='capacityOptimized',
        spot_max_price_percentage=90,
-       
+
        # Block parameters
        init_blocks=1,
        min_blocks=0,
        max_blocks=10,
-       
+
        # State persistence
        state_store='parameter_store',
        state_prefix='/parsl/spot-demo',
-       
+
        # Interruption handling
        spot_interruption_detection=True,
        spot_interruption_handler='checkpoint_and_terminate',
-       
+
        # Worker initialization
        worker_init='''
            # Install dependencies
@@ -518,7 +518,7 @@ Here's a comprehensive example of a spot-resilient workflow:
            python3 -m pip install numpy pandas scikit-learn
        ''',
    )
-   
+
    # Parsl configuration
    config = Config(
        executors=[
@@ -528,9 +528,9 @@ Here's a comprehensive example of a spot-resilient workflow:
            )
        ]
    )
-   
+
    parsl.load(config)
-   
+
    # Define a checkpointable task
    @parsl.python_app(checkpointable=True)
    def process_chunk(chunk_id, data_size=1000, checkpoint_interval=10):
@@ -539,14 +539,14 @@ Here's a comprehensive example of a spot-resilient workflow:
        import os
        import json
        import random
-       
+
        # Simulated data
        np.random.seed(chunk_id)
        data = np.random.rand(data_size, 100)
-       
+
        # Initialize or load state
        checkpoint_file = f"/tmp/checkpoint_chunk_{chunk_id}.json"
-       
+
        if os.path.exists(checkpoint_file):
            with open(checkpoint_file, 'r') as f:
                state = json.load(f)
@@ -556,23 +556,23 @@ Here's a comprehensive example of a spot-resilient workflow:
                "iteration": 0,
                "result": 0.0
            }
-       
+
        # Process data with checkpoints
        for i in range(state["iteration"], data_size):
            # Simulate processing
            row_result = np.mean(data[i]) * np.sum(data[i])
            state["result"] += row_result
            state["iteration"] = i + 1
-           
+
            # Create checkpoint at intervals
            if (i + 1) % checkpoint_interval == 0:
                with open(checkpoint_file, 'w') as f:
                    json.dump(state, f)
                print(f"Created checkpoint at iteration {state['iteration']}")
-           
+
            # Simulate work
            time.sleep(0.1)
-           
+
            # Randomly simulate spot interruption (1% chance)
            if random.random() < 0.01:
                print(f"Simulating spot interruption at iteration {i+1}")
@@ -581,26 +581,26 @@ Here's a comprehensive example of a spot-resilient workflow:
                    json.dump(state, f)
                # Raise exception to simulate failure
                raise Exception("Spot instance interrupted!")
-       
+
        # Final result
        return {
            "chunk_id": chunk_id,
            "iterations_completed": state["iteration"],
            "result": state["result"]
        }
-   
+
    # Submit multiple tasks
    results = []
    for i in range(20):
        results.append(process_chunk(i))
-   
+
    # Monitor results with interruption awareness
    successful = 0
    retries = 0
-   
+
    while results and successful + retries < 20:
        time.sleep(5)
-       
+
        # Check each future
        completed = []
        for i, r in enumerate(results):
@@ -617,13 +617,13 @@ Here's a comprehensive example of a spot-resilient workflow:
                        retries += 1
                    else:
                        print(f"Task {i} failed with error: {e}")
-       
+
        # Remove completed futures
        for i in sorted(completed, reverse=True):
            del results[i]
-   
+
    print(f"All tasks completed. Successful: {successful}, Retries due to interruption: {retries}")
-   
+
    # Clean up
    parsl.dfk().cleanup()
 

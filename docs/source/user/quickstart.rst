@@ -180,11 +180,11 @@ Here's a complete example of a simple workflow:
        import numpy as np
        import time
        import socket
-       
+
        # Simulate computation
        time.sleep(2)
        result = np.square(x) + np.sqrt(abs(x))
-       
+
        # Return result with host information
        return {
            'input': x,
@@ -208,15 +208,15 @@ Here's a complete example of a simple workflow:
 
    # Submit 10 compute tasks
    futures = [compute(i) for i in range(-5, 5)]
-   
+
    # Wait for all compute tasks to complete
    compute_results = [f.result() for f in futures]
-   
+
    # Combine results
    final = combine(compute_results).result()
-   
+
    end = time.time()
-   
+
    # Print results
    print(f"Workflow completed in {end - start:.2f} seconds")
    print(f"Total result: {final['total']}")

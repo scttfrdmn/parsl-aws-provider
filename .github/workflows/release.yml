@@ -23,7 +23,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install build twine setuptools wheel
           pip install -e ".[dev,test]"
-      
+
       - name: Run tests
         run: |
           pytest tests/unit
@@ -31,7 +31,7 @@ jobs:
       - name: Build package
         run: |
           python -m build
-      
+
       - name: Create Release
         id: create_release
         uses: actions/create-release@v1
@@ -42,7 +42,7 @@ jobs:
           release_name: Release ${{ github.ref }}
           draft: false
           prerelease: false
-      
+
       - name: Upload Release Asset
         uses: actions/upload-release-asset@v1
         env:
@@ -52,14 +52,14 @@ jobs:
           asset_path: ./dist/*.tar.gz
           asset_name: parsl-ephemeral-aws-${{ github.ref_name }}.tar.gz
           asset_content_type: application/gzip
-      
+
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           user: __token__
           password: ${{ secrets.PYPI_API_TOKEN }}
           skip_existing: true
-      
+
       - name: Build and push documentation
         if: success()
         run: |
@@ -67,7 +67,7 @@ jobs:
             pip install -e ".[dev,docs]"
             cd docs
             make html
-            
+
             # Deploy to GitHub Pages or ReadTheDocs
             # This is a placeholder - configure based on your documentation hosting
           else
