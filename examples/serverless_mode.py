@@ -67,7 +67,7 @@ def serverless_task(task_type="processing", data_size=10, cpu_intensive=False):
         import socket
 
         hostname = socket.gethostname()
-    except:
+    except Exception:
         hostname = f"serverless-{str(uuid.uuid4())[:8]}"
 
     # Get AWS Lambda specific environment variables if available
@@ -150,7 +150,7 @@ def serverless_task(task_type="processing", data_size=10, cpu_intensive=False):
 
     # Return execution information
     return {
-        "task_id": str(uuid.uuid4()),
+        "execution_id": str(uuid.uuid4()),
         "task_type": task_type,
         "data_size_mb": data_size,
         "cpu_intensive": cpu_intensive,
@@ -161,7 +161,7 @@ def serverless_task(task_type="processing", data_size=10, cpu_intensive=False):
         "function_name": aws_lambda_function_name,
         "function_version": aws_lambda_function_version,
         "region": aws_region,
-        "task_id": task_id if task_id != "not-ecs" else None,
+        "ecs_task_id": task_id if task_id != "not-ecs" else None,
         "container_id": container_id if container_id != "not-ecs" else None,
         "platform": platform.platform(),
         "python_version": platform.python_version(),

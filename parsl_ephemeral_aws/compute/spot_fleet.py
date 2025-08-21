@@ -675,7 +675,7 @@ class SpotFleetManager:
 
                 # Create a Spot Fleet request for the block
                 fleet_request_id = self._create_spot_fleet_request(
-                    block_id, network, self.provider.nodes_per_block
+                    block_id, network, self.provider.nodes_per_block, fleet_role_arn
                 )
 
                 # Record block information
@@ -706,7 +706,7 @@ class SpotFleetManager:
             raise ResourceCreationError(f"Failed to create blocks: {e}")
 
     def _create_spot_fleet_request(
-        self, block_id: str, network: Dict[str, str], target_capacity: int
+        self, block_id: str, network: Dict[str, str], target_capacity: int, fleet_role_arn: str
     ) -> str:
         """Create a Spot Fleet request.
 

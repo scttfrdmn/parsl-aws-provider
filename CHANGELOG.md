@@ -52,5 +52,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-**SPDX-License-Identifier: Apache-2.0**
+---
+
+**SPDX-License-Identifier: Apache-2.0**  
 **SPDX-FileCopyrightText: 2025 Scott Friedman and Project Contributors**

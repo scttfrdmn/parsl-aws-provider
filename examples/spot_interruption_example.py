@@ -15,6 +15,7 @@ from parsl.executors import HighThroughputExecutor
 from parsl_ephemeral_aws import EphemeralAWSProvider
 from parsl_ephemeral_aws.compute.spot_interruption import checkpointable
 import os
+import time
 import logging
 import boto3
 
@@ -127,7 +128,7 @@ if __name__ == "__main__":
     try:
         s3_client.head_bucket(Bucket=bucket_name)
         print(f"Using existing checkpoint bucket: {bucket_name}")
-    except:
+    except Exception:
         print(f"Creating checkpoint bucket: {bucket_name}")
         if region == "us-east-1":
             s3_client.create_bucket(Bucket=bucket_name)

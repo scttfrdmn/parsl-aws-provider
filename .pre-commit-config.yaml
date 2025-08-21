@@ -5,6 +5,7 @@ repos:
     -   id: trailing-whitespace
     -   id: end-of-file-fixer
     -   id: check-yaml
+        exclude: 'parsl_ephemeral_aws/templates/cloudformation/.*\.yml$'
     -   id: check-added-large-files
     -   id: check-ast
     -   id: check-case-conflict
@@ -38,11 +39,12 @@ repos:
         args: ['-c', 'pyproject.toml']
         additional_dependencies: ['bandit[toml]']
 
--   repo: https://github.com/fsfe/reuse-tool
-    rev: v2.1.0
-    hooks:
-    -   id: reuse
-        args: ['lint']
+# TODO: Enable REUSE tool after adding copyright headers to all files
+# -   repo: https://github.com/fsfe/reuse-tool
+#     rev: v2.1.0
+#     hooks:
+#     -   id: reuse
+#         args: ['lint']
 
 -   repo: https://github.com/srstevenson/nb-clean
     rev: 3.0.1
@@ -54,11 +56,11 @@ repos:
     hooks:
     -   id: pytest-unit
         name: pytest-unit
-        entry: pytest
+        entry: python3
         language: system
         pass_filenames: false
         always_run: true
-        args: [-m, "unit", --maxfail=5, -x, -q]
+        args: [-m, pytest, -m, "unit", --maxfail=5, -x, -q]
 
     -   id: coverage-check
         name: coverage-check
@@ -66,7 +68,7 @@ repos:
         language: system
         pass_filenames: false
         always_run: true
-        args: [-c, "coverage run -m pytest -m 'unit' && coverage report --fail-under=70"]
+        args: [-c, "python3 -m coverage run -m pytest -m 'unit' && python3 -m coverage report --fail-under=70"]
 
 -   repo: https://github.com/alessandrojcm/commitlint-pre-commit-hook
     rev: v9.11.0

@@ -226,32 +226,32 @@ def main(event, context):
         )
 
         # Prepare response
-        response = {{
+        response = {
             'statusCode': 200 if result.returncode == 0 else 500,
             'command': command,
             'stdout': result.stdout,
             'stderr': result.stderr,
             'returncode': result.returncode
-        }}
+        }
 
         # Log results
-        print(f"Command completed with return code: {{result.returncode}}")
-        print(f"STDOUT: {{result.stdout[:1000]}}{'...' if len(result.stdout) > 1000 else ''}}")
-        print(f"STDERR: {{result.stderr[:1000]}}{'...' if len(result.stderr) > 1000 else ''}}")
+        print(f"Command completed with return code: {result.returncode}")
+        print(f"STDOUT: {result.stdout[:1000]}{'...' if len(result.stdout) > 1000 else ''}")
+        print(f"STDERR: {result.stderr[:1000]}{'...' if len(result.stderr) > 1000 else ''}")
 
         return response
 
     except Exception as e:
         # Log the exception
-        print(f"Error executing command: {{e}}")
+        print(f"Error executing command: {e}")
         traceback.print_exc()
 
         # Return error response
-        return {{
+        return {
             'statusCode': 500,
             'error': str(e),
             'traceback': traceback.format_exc()
-        }}
+        }
 """
 
         # Create a ZIP file in memory

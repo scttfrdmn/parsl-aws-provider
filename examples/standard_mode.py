@@ -14,6 +14,7 @@ Key features of Standard Mode:
 - Quick startup and immediate resource release
 """
 
+import os
 import time
 import logging
 import parsl

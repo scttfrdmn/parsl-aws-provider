@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2025 Scott Friedman and Project Contributors
+
 # Makefile for Parsl Ephemeral AWS Provider
 
 .PHONY: clean test lint type-check test-unit test-integration test-bats docs build install install-dev help

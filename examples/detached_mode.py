@@ -19,6 +19,7 @@ Key features of Detached Mode:
 - Supports workflow reconnection after disconnection
 """
 
+import os
 import time
 import logging
 import parsl
