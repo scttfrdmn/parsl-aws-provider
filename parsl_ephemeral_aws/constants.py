@@ -28,11 +28,13 @@ DEFAULT_MAX_IDLE_TIME = 300  # 5 minutes in seconds
 
 # Networking defaults
 DEFAULT_VPC_CIDR = "10.0.0.0/16"
+DEFAULT_SUBNET_CIDR = "10.0.1.0/24"  # Alias for compatibility
 DEFAULT_PUBLIC_SUBNET_CIDR = "10.0.0.0/24"
 DEFAULT_PRIVATE_SUBNET_CIDR = "10.0.1.0/24"
 
 # Security group defaults
 DEFAULT_SECURITY_GROUP_NAME = "parsl-ephemeral-sg"
+DEFAULT_SG_NAME = DEFAULT_SECURITY_GROUP_NAME  # Alias for compatibility
 DEFAULT_SECURITY_GROUP_DESCRIPTION = "Security group for Parsl ephemeral resources"
 
 # Default inbound rules for security groups

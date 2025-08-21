@@ -103,6 +103,7 @@ class OperatingMode(abc.ABC):
         use_public_ips: bool = True,
         custom_ami: bool = False,
         debug: bool = False,
+        region: Optional[str] = None,
         **kwargs: Any,
     ) -> None:
         """Initialize the operating mode.
@@ -182,6 +183,7 @@ class OperatingMode(abc.ABC):
         self.use_public_ips = use_public_ips
         self.custom_ami = custom_ami
         self.debug = debug
+        self.region = region or getattr(session, "region_name", "us-east-1")
         self.kwargs = kwargs
 
         # Set up logging
