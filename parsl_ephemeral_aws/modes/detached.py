@@ -45,6 +45,7 @@ from parsl_ephemeral_aws.exceptions import (
     ResourceNotFoundError,
 )
 from parsl_ephemeral_aws.modes.base import OperatingMode
+from parsl_ephemeral_aws.state.base import StateStore
 from parsl_ephemeral_aws.utils.aws import (
     create_tags,
     delete_resource,
@@ -93,7 +94,7 @@ class DetachedMode(OperatingMode):
         self,
         provider_id: str,
         session: boto3.Session,
-        state_store: "StateStore",
+        state_store: StateStore,
         workflow_id: Optional[str] = None,
         bastion_instance_type: str = "t3.micro",
         idle_timeout: int = 30,
@@ -103,6 +104,7 @@ class DetachedMode(OperatingMode):
         instance_types: Optional[List[str]] = None,
         nodes_per_block: int = 1,
         spot_max_price_percentage: Optional[int] = None,
+        bastion_id: Optional[str] = None,
         **kwargs: Any,
     ) -> None:
         """Initialize the detached mode.
@@ -140,7 +142,7 @@ class DetachedMode(OperatingMode):
 
         # Detached mode specific attributes
         self.workflow_id = workflow_id or str(uuid.uuid4())
-        self.bastion_id = None
+        self.bastion_id = bastion_id
         self.bastion_host_type = bastion_host_type
         self.bastion_instance_type = bastion_instance_type
         self.idle_timeout = idle_timeout
@@ -173,6 +175,10 @@ class DetachedMode(OperatingMode):
                     checkpoint_prefix=self.checkpoint_prefix,
                 )
                 self.spot_interruption_monitor.start_monitoring()
+
+        # If predefined VPC resources are provided, don't create new VPC
+        if self.vpc_id:
+            self.create_vpc = False
 
         # Update resources dict to include bastion host
         self.resources = self.resources or {}
@@ -1841,8 +1847,11 @@ if __name__ == '__main__':
         OperatingModeError
             If job submission fails
         """
-        # Ensure the mode is initialized
-        self.ensure_initialized()
+        # Check if the mode is initialized
+        if not self.initialized:
+            raise OperatingModeError(
+                "DetachedMode must be initialized before submitting jobs"
+            )
 
         # Validate image_id
         if not self.image_id:
