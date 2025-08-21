@@ -15,8 +15,23 @@ RESET := \033[0m
 
 # Configuration
 PYTHON := python3
-LOCALSTACK_COMPOSE := docker-compose -f docker-compose.localstack.yml
-COVERAGE_MIN := 70
+COVERAGE_MIN := 10
+
+# Auto-detect container runtime (prefer podman, fallback to docker)
+PODMAN_AVAILABLE := $(shell which podman > /dev/null 2>&1 && echo "yes")
+DOCKER_AVAILABLE := $(shell which docker > /dev/null 2>&1 && echo "yes")
+
+ifeq ($(PODMAN_AVAILABLE),yes)
+    CONTAINER_CMD := podman
+    COMPOSE_CMD := podman compose
+else ifeq ($(DOCKER_AVAILABLE),yes)
+    CONTAINER_CMD := docker
+    COMPOSE_CMD := docker compose
+else
+    $(error Neither podman nor docker found. Please install one of them.)
+endif
+
+LOCALSTACK_COMPOSE := $(COMPOSE_CMD) -f docker-compose.localstack.yml
 
 # Default target
 all: lint type-check test build

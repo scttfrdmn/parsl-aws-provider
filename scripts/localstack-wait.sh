@@ -13,17 +13,17 @@ RETRY_INTERVAL=${RETRY_INTERVAL:-2}
 echo "Waiting for LocalStack at ${LOCALSTACK_URL}..."
 
 for i in $(seq 1 $MAX_RETRIES); do
-    if curl -s "${LOCALSTACK_URL}/health" > /dev/null 2>&1; then
+    if curl -s "${LOCALSTACK_URL}/_localstack/health" > /dev/null 2>&1; then
         echo "LocalStack is ready!"
 
         # Check that required services are available
-        health_check=$(curl -s "${LOCALSTACK_URL}/health")
+        health_check=$(curl -s "${LOCALSTACK_URL}/_localstack/health")
         echo "LocalStack health status: ${health_check}"
 
         # Verify critical services are running
-        if echo "$health_check" | grep -q '"ec2": "available"' && \
-           echo "$health_check" | grep -q '"lambda": "available"' && \
-           echo "$health_check" | grep -q '"s3": "available"'; then
+        if echo "$health_check" | grep -q '"lambda": "available"' && \
+           echo "$health_check" | grep -q '"s3": "running"' && \
+           echo "$health_check" | grep -q '"iam": "available"'; then
             echo "All required AWS services are available in LocalStack"
             exit 0
         else
