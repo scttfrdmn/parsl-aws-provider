@@ -2347,7 +2347,10 @@ if __name__ == '__main__':
 
         # Add EC2 worker instances
         for resource_id, resource in self.resources.items():
-            if resource.get("type") == RESOURCE_TYPE_EC2:
+            # Treat job resources (with job_id but no explicit type) as EC2 instances
+            if resource.get("type") == RESOURCE_TYPE_EC2 or (
+                resource.get("job_id") and not resource.get("type")
+            ):
                 result["ec2_instances"].append(
                     {
                         "id": resource_id,
