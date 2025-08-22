@@ -5,11 +5,9 @@ SPDX-FileCopyrightText: 2025 Scott Friedman and Project Contributors
 """
 
 import logging
-import uuid
 import json
-import base64
 import time
-from typing import Dict, List, Optional, Any, Union
+from typing import Dict, Any, Set
 
 import boto3
 from botocore.exceptions import ClientError
@@ -25,7 +23,7 @@ from ..constants import (
     STATUS_PENDING,
     STATUS_RUNNING,
     STATUS_SUCCEEDED,
-    STATUS_FAILED
+    STATUS_FAILED,
 )
 
 
@@ -49,7 +47,9 @@ class LambdaManager:
         session_kwargs = {}
         if self.provider.aws_access_key_id and self.provider.aws_secret_access_key:
             session_kwargs["aws_access_key_id"] = self.provider.aws_access_key_id
-            session_kwargs["aws_secret_access_key"] = self.provider.aws_secret_access_key
+            session_kwargs[
+                "aws_secret_access_key"
+            ] = self.provider.aws_secret_access_key
 
         if self.provider.aws_session_token:
             session_kwargs["aws_session_token"] = self.provider.aws_session_token
@@ -58,18 +58,17 @@ class LambdaManager:
             session_kwargs["profile_name"] = self.provider.aws_profile
 
         self.aws_session = boto3.Session(
-            region_name=self.provider.region,
-            **session_kwargs
+            region_name=self.provider.region, **session_kwargs
         )
 
         # Initialize clients
-        self.lambda_client = self.aws_session.client('lambda')
-        self.iam_client = self.aws_session.client('iam')
+        self.lambda_client = self.aws_session.client("lambda")
+        self.iam_client = self.aws_session.client("iam")
 
         # Track resources for cleanup
-        self.function_names = set()
-        self.role_names = set()
-        self.jobs = {}
+        self.function_names: Set[str] = set()
+        self.role_names: Set[str] = set()
+        self.jobs: Dict[str, Any] = {}
 
     def _create_lambda_execution_role(self) -> str:
         """Create an IAM role for Lambda execution.
@@ -90,9 +89,9 @@ class LambdaManager:
                     {
                         "Effect": "Allow",
                         "Principal": {"Service": "lambda.amazonaws.com"},
-                        "Action": "sts:AssumeRole"
+                        "Action": "sts:AssumeRole",
                     }
-                ]
+                ],
             }
 
             response = self.iam_client.create_role(
@@ -100,18 +99,18 @@ class LambdaManager:
                 AssumeRolePolicyDocument=json.dumps(assume_role_policy),
                 Description=f"Execution role for Parsl Lambda functions ({self.provider.workflow_id})",
                 Tags=[
-                    {'Key': TAG_NAME, 'Value': 'true'},
-                    {'Key': TAG_WORKFLOW_ID, 'Value': self.provider.workflow_id}
-                ]
+                    {"Key": TAG_NAME, "Value": "true"},
+                    {"Key": TAG_WORKFLOW_ID, "Value": self.provider.workflow_id},
+                ],
             )
 
-            role_arn = response['Role']['Arn']
+            role_arn = response["Role"]["Arn"]
             logger.info(f"Created Lambda execution role: {role_name}")
 
             # Attach policies
             self.iam_client.attach_role_policy(
                 RoleName=role_name,
-                PolicyArn="arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+                PolicyArn="arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole",
             )
 
             # Track role for cleanup
@@ -157,17 +156,17 @@ class LambdaManager:
                 Runtime=DEFAULT_LAMBDA_RUNTIME,
                 Role=role_arn,
                 Handler=DEFAULT_LAMBDA_HANDLER,
-                Code={
-                    'ZipFile': zip_file
-                },
+                Code={"ZipFile": zip_file},
                 Description=f"Parsl job {job_id} for workflow {self.provider.workflow_id}",
-                Timeout=min(self.provider.lambda_timeout, 900),  # Lambda max is 900s (15 min)
+                Timeout=min(
+                    self.provider.lambda_timeout, 900
+                ),  # Lambda max is 900s (15 min)
                 MemorySize=self.provider.lambda_memory,
                 Tags={
-                    TAG_NAME: 'true',
+                    TAG_NAME: "true",
                     TAG_WORKFLOW_ID: self.provider.workflow_id,
-                    TAG_JOB_ID: job_id
-                }
+                    TAG_JOB_ID: job_id,
+                },
             )
 
             # Track function for cleanup
@@ -256,8 +255,8 @@ def main(event, context):
 
         # Create a ZIP file in memory
         zip_buffer = io.BytesIO()
-        with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
-            zip_file.writestr('handler.py', handler_code)
+        with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
+            zip_file.writestr("handler.py", handler_code)
 
         return zip_buffer.getvalue()
 
@@ -283,32 +282,29 @@ def main(event, context):
             # Invoke function asynchronously
             response = self.lambda_client.invoke(
                 FunctionName=function_name,
-                InvocationType='Event',  # Asynchronous invocation
-                Payload=json.dumps({
-                    'command': command,
-                    'job_id': job_id
-                })
+                InvocationType="Event",  # Asynchronous invocation
+                Payload=json.dumps({"command": command, "job_id": job_id}),
             )
 
             # Get request ID from response
-            request_id = response.get('ResponseMetadata', {}).get('RequestId')
+            request_id = response.get("ResponseMetadata", {}).get("RequestId")
 
             # Record job information
             self.jobs[job_id] = {
-                'id': job_id,
-                'function_name': function_name,
-                'command': command,
-                'request_id': request_id,
-                'status': STATUS_PENDING,
-                'submitted_at': time.time()
+                "id": job_id,
+                "function_name": function_name,
+                "command": command,
+                "request_id": request_id,
+                "status": STATUS_PENDING,
+                "submitted_at": time.time(),
             }
 
             logger.info(f"Submitted job {job_id} to Lambda function {function_name}")
 
             return {
-                'job_id': job_id,
-                'function_name': function_name,
-                'request_id': request_id
+                "job_id": job_id,
+                "function_name": function_name,
+                "request_id": request_id,
             }
 
         except Exception as e:
@@ -343,7 +339,10 @@ def main(event, context):
             # Find the job
             job = None
             for j in self.jobs.values():
-                if j.get('function_name') == function_name and j.get('request_id') == request_id:
+                if (
+                    j.get("function_name") == function_name
+                    and j.get("request_id") == request_id
+                ):
                     job = j
                     break
 
@@ -351,11 +350,11 @@ def main(event, context):
                 return "UNKNOWN"
 
             # If the job already has a terminal status, return it
-            if job['status'] in [STATUS_SUCCEEDED, STATUS_FAILED]:
-                return job['status']
+            if job["status"] in [STATUS_SUCCEEDED, STATUS_FAILED]:
+                return job["status"]
 
             # Otherwise, simulate status based on time elapsed
-            elapsed = time.time() - job['submitted_at']
+            elapsed = time.time() - job["submitted_at"]
 
             if elapsed < 5:
                 status = STATUS_PENDING
@@ -365,10 +364,11 @@ def main(event, context):
                 # After timeout, we assume the job completed
                 # In 95% of cases, assume success; 5% failure
                 import random
-                status = STATUS_SUCCEEDED if random.random() < 0.95 else STATUS_FAILED
+
+                status = STATUS_SUCCEEDED if random.random() < 0.95 else STATUS_FAILED  # nosec B311
 
             # Update job status
-            job['status'] = status
+            job["status"] = status
 
             return status
 
@@ -395,10 +395,12 @@ def main(event, context):
                     try:
                         self.iam_client.detach_role_policy(
                             RoleName=role_name,
-                            PolicyArn="arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+                            PolicyArn="arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole",
                         )
                     except Exception as e:
-                        logger.error(f"Error detaching policy from role {role_name}: {e}")
+                        logger.error(
+                            f"Error detaching policy from role {role_name}: {e}"
+                        )
 
                     # Delete role
                     self.iam_client.delete_role(RoleName=role_name)

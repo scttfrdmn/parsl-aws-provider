@@ -89,9 +89,9 @@ class SpotFleetManager:
         self.subnet_id = None
         self.security_group_id = None
         self.iam_fleet_role_arn = None
-        self.fleet_requests = {}
-        self.instances = {}
-        self.blocks = {}
+        self.fleet_requests: Dict[str, Any] = {}
+        self.instances: Dict[str, Any] = {}
+        self.blocks: Dict[str, Any] = {}
 
     def _setup_network_resources(self) -> Dict[str, str]:
         """Set up VPC, subnet, and security group for Spot Fleet instances.
@@ -706,7 +706,11 @@ class SpotFleetManager:
             raise ResourceCreationError(f"Failed to create blocks: {e}")
 
     def _create_spot_fleet_request(
-        self, block_id: str, network: Dict[str, str], target_capacity: int, fleet_role_arn: str
+        self,
+        block_id: str,
+        network: Dict[str, str],
+        target_capacity: int,
+        fleet_role_arn: str,
     ) -> str:
         """Create a Spot Fleet request.
 

@@ -7,7 +7,7 @@ SPDX-FileCopyrightText: 2025 Scott Friedman and Project Contributors
 import logging
 import json
 import time
-from typing import Dict, Any
+from typing import Dict, Any, Set
 
 import boto3
 from botocore.exceptions import ClientError
@@ -66,10 +66,10 @@ class ECSManager:
         self.iam_client = self.aws_session.client("iam")
 
         # Track resources for cleanup
-        self.clusters = set()
-        self.task_definitions = set()
-        self.role_names = set()
-        self.jobs = {}
+        self.clusters: Set[str] = set()
+        self.task_definitions: Set[str] = set()
+        self.role_names: Set[str] = set()
+        self.jobs: Dict[str, Any] = {}
 
         # Initialize ECS cluster if needed
         self.cluster_name = self._get_or_create_cluster()

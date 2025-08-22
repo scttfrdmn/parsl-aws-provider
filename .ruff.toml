@@ -1,0 +1,13 @@
+# Ruff configuration for Parsl Ephemeral AWS Provider
+
+[lint]
+extend-ignore = [
+    # F821: Undefined name - ignore in template strings where variables are defined in generated code
+    "F821",
+    # F841: Local variable assigned but never used - ignore unused variables in certain contexts
+    "F841",
+]
+
+[per-file-ignores]
+# Allow F821 errors in compute modules that generate dynamic code templates
+"parsl_ephemeral_aws/compute/*.py" = ["F821", "F841"]
