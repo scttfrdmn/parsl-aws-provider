@@ -234,6 +234,9 @@ class DetachedMode(OperatingMode):
                 f"security_group_id={self.security_group_id}, "
                 f"bastion_id={self.bastion_id}"
             )
+
+            # Mark as initialized
+            self.initialized = True
         except Exception as e:
             logger.error(f"Failed to initialize detached mode infrastructure: {e}")
             # Try to clean up any resources we created
