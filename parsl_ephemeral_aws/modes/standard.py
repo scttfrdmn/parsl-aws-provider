@@ -234,6 +234,10 @@ class StandardMode(OperatingMode):
                 )
                 self.spot_interruption_monitor.start_monitoring()
 
+        # If predefined VPC resources are provided, don't create new VPC
+        if self.vpc_id:
+            self.create_vpc = False
+
     def save_state(self) -> None:
         """Save the current state to the state store."""
         # Default state
@@ -419,6 +423,9 @@ class StandardMode(OperatingMode):
                 f"vpc_id={self.vpc_id}, subnet_id={self.subnet_id}, "
                 f"security_group_id={self.security_group_id}"
             )
+
+            # Mark as initialized
+            self.initialized = True
         except Exception as e:
             logger.error(f"Failed to initialize standard mode infrastructure: {e}")
             # Try to clean up any resources we created
@@ -779,8 +786,11 @@ class StandardMode(OperatingMode):
         OperatingModeError
             If job submission fails
         """
-        # Ensure the mode is initialized
-        self.ensure_initialized()
+        # Check if the mode is initialized
+        if not self.initialized:
+            raise OperatingModeError(
+                "StandardMode must be initialized before submitting jobs"
+            )
 
         # Validate image_id
         if not self.image_id:
