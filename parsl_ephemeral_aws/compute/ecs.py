@@ -23,7 +23,9 @@ from ..constants import (
     STATUS_SUCCEEDED,
     STATUS_FAILED,
     STATUS_CANCELLED,
+    DEFAULT_VPC_CIDR,
 )
+from ..config import SecurityConfig
 
 
 logger = logging.getLogger(__name__)
@@ -71,8 +73,44 @@ class ECSManager:
         self.role_names: Set[str] = set()
         self.jobs: Dict[str, Any] = {}
 
+        # Initialize security configuration
+        self._setup_security_config()
+
         # Initialize ECS cluster if needed
         self.cluster_name = self._get_or_create_cluster()
+
+    def _setup_security_config(self) -> None:
+        """Set up security configuration from provider settings."""
+        # Get security settings from provider if available
+        security_env = getattr(self.provider, "security_environment", "dev")
+        vpc_cidr = getattr(self.provider, "vpc_cidr", DEFAULT_VPC_CIDR)
+        admin_cidrs = getattr(self.provider, "admin_cidr_blocks", None)
+        strict_mode = getattr(self.provider, "strict_security_mode", None)
+
+        # Create security configuration
+        if security_env == "prod" and admin_cidrs:
+            self.security_config = SecurityConfig.create_production_config(
+                vpc_cidr=vpc_cidr, admin_cidrs=admin_cidrs
+            )
+        else:
+            # Default to development configuration
+            self.security_config = SecurityConfig.create_development_config(
+                vpc_cidr=vpc_cidr
+            )
+            if strict_mode is not None:
+                self.security_config.strict_mode = strict_mode
+
+        logger.info(
+            f"ECS Security configuration: environment={self.security_config.environment.value}, "
+            f"strict_mode={self.security_config.strict_mode}"
+        )
+
+        # Analyze security posture
+        analysis = self.security_config.analyze_security_posture()
+        for warning in analysis.get("warnings", []):
+            logger.warning(f"ECS Security warning: {warning}")
+        for rec in analysis.get("recommendations", []):
+            logger.info(f"ECS Security recommendation: {rec}")
 
     def _get_or_create_cluster(self) -> str:
         """Get or create an ECS cluster.

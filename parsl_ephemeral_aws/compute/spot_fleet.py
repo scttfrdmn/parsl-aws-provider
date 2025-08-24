@@ -36,7 +36,9 @@ from ..constants import (
     STATUS_FAILED,
     STATUS_CANCELLED,
     STATUS_UNKNOWN,
+    DEFAULT_VPC_CIDR,
 )
+from ..config import SecurityConfig
 
 
 logger = logging.getLogger(__name__)
@@ -92,6 +94,42 @@ class SpotFleetManager:
         self.fleet_requests: Dict[str, Any] = {}
         self.instances: Dict[str, Any] = {}
         self.blocks: Dict[str, Any] = {}
+
+        # Initialize security configuration
+        self._setup_security_config()
+
+    def _setup_security_config(self) -> None:
+        """Set up security configuration from provider settings."""
+        # Get security settings from provider if available
+        security_env = getattr(self.provider, "security_environment", "dev")
+        vpc_cidr = getattr(self.provider, "vpc_cidr", DEFAULT_VPC_CIDR)
+        admin_cidrs = getattr(self.provider, "admin_cidr_blocks", None)
+        strict_mode = getattr(self.provider, "strict_security_mode", None)
+
+        # Create security configuration
+        if security_env == "prod" and admin_cidrs:
+            self.security_config = SecurityConfig.create_production_config(
+                vpc_cidr=vpc_cidr, admin_cidrs=admin_cidrs
+            )
+        else:
+            # Default to development configuration
+            self.security_config = SecurityConfig.create_development_config(
+                vpc_cidr=vpc_cidr
+            )
+            if strict_mode is not None:
+                self.security_config.strict_mode = strict_mode
+
+        logger.info(
+            f"Spot Fleet Security configuration: environment={self.security_config.environment.value}, "
+            f"strict_mode={self.security_config.strict_mode}"
+        )
+
+        # Analyze security posture
+        analysis = self.security_config.analyze_security_posture()
+        for warning in analysis.get("warnings", []):
+            logger.warning(f"Spot Fleet Security warning: {warning}")
+        for rec in analysis.get("recommendations", []):
+            logger.info(f"Spot Fleet Security recommendation: {rec}")
 
     def _setup_network_resources(self) -> Dict[str, str]:
         """Set up VPC, subnet, and security group for Spot Fleet instances.
@@ -172,9 +210,9 @@ class SpotFleetManager:
             VPC ID
         """
         try:
-            # Create VPC
+            # Create VPC with configured CIDR
             response = self.ec2_client.create_vpc(
-                CidrBlock="10.0.0.0/16",
+                CidrBlock=self.security_config.vpc_cidr,
                 TagSpecifications=[
                     {
                         "ResourceType": "vpc",
@@ -254,9 +292,17 @@ class SpotFleetManager:
             az_response = self.ec2_client.describe_availability_zones()
             first_az = az_response["AvailabilityZones"][0]["ZoneName"]
 
+            # Create subnet using CIDR manager
+            from ..security.cidr_manager import CIDRManager
+
+            cidr_manager = CIDRManager()
+            subnet_cidrs = cidr_manager.get_subnet_cidrs(
+                self.security_config.vpc_cidr, 1
+            )
+
             response = self.ec2_client.create_subnet(
                 VpcId=self.vpc_id,
-                CidrBlock="10.0.0.0/24",
+                CidrBlock=subnet_cidrs[0],
                 AvailabilityZone=first_az,
                 TagSpecifications=[
                     {
@@ -374,31 +420,60 @@ class SpotFleetManager:
             security_group_id = response["GroupId"]
             logger.info(f"Created security group: {security_group_id}")
 
-            # Add inbound rules
-            self.ec2_client.authorize_security_group_ingress(
-                GroupId=security_group_id,
-                IpPermissions=[
-                    # SSH access for debugging
-                    {
-                        "IpProtocol": "tcp",
-                        "FromPort": 22,
-                        "ToPort": 22,
-                        "IpRanges": [{"CidrIp": "0.0.0.0/0"}],
-                    },
-                    # Parsl's default port range
-                    {
-                        "IpProtocol": "tcp",
-                        "FromPort": 54000,
-                        "ToPort": 55000,
-                        "IpRanges": [{"CidrIp": "0.0.0.0/0"}],
-                    },
-                    # Allow all traffic within the security group
-                    {
-                        "IpProtocol": "-1",
-                        "UserIdGroupPairs": [{"GroupId": security_group_id}],
-                    },
-                ],
+            # Add inbound rules using security configuration
+            security_rules = self.security_config.get_security_group_rules(
+                "compute_worker"
             )
+
+            # Convert to EC2 IpPermissions format
+            ip_permissions = []
+            for rule in security_rules:
+                ip_permission = {
+                    "IpProtocol": rule["IpProtocol"],
+                    "FromPort": rule["FromPort"],
+                    "ToPort": rule["ToPort"],
+                    "IpRanges": rule["IpRanges"],
+                }
+                if "Description" in rule:
+                    # Note: Description goes in IpRanges for ingress rules
+                    for ip_range in ip_permission["IpRanges"]:
+                        ip_range["Description"] = rule["Description"]
+
+                ip_permissions.append(ip_permission)
+
+            # Add self-referencing rule for internal communication
+            ip_permissions.append(
+                {
+                    "IpProtocol": "-1",
+                    "UserIdGroupPairs": [
+                        {
+                            "GroupId": security_group_id,
+                            "Description": "Allow all traffic within security group",
+                        }
+                    ],
+                }
+            )
+
+            if ip_permissions:
+                self.ec2_client.authorize_security_group_ingress(
+                    GroupId=security_group_id, IpPermissions=ip_permissions
+                )
+                logger.info(
+                    f"Configured Spot Fleet security group rules: {security_group_id} "
+                    f"({len(ip_permissions)} rules)"
+                )
+
+                # Log security rule summary
+                for rule in security_rules:
+                    logger.debug(
+                        f"Applied Spot Fleet security rule: {rule['IpProtocol']}:"
+                        f"{rule['FromPort']}-{rule['ToPort']} from "
+                        f"{[r['CidrIp'] for r in rule['IpRanges']]}"
+                    )
+            else:
+                logger.warning(
+                    "No Spot Fleet security rules configured - instances may be unreachable"
+                )
 
             # Add outbound rule
             self.ec2_client.authorize_security_group_egress(

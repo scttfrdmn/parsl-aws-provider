@@ -37,37 +37,44 @@ DEFAULT_SECURITY_GROUP_NAME = "parsl-ephemeral-sg"
 DEFAULT_SG_NAME = DEFAULT_SECURITY_GROUP_NAME  # Alias for compatibility
 DEFAULT_SECURITY_GROUP_DESCRIPTION = "Security group for Parsl ephemeral resources"
 
-# Default inbound rules for security groups
-DEFAULT_INBOUND_RULES = [
+# SECURITY WARNING: Legacy insecure rules - DO NOT USE IN PRODUCTION
+# These rules are maintained for backward compatibility only.
+# Use NetworkSecurityPolicy from parsl_ephemeral_aws.security instead.
+LEGACY_INSECURE_INBOUND_RULES = [
     {
         "IpProtocol": "tcp",
         "FromPort": 22,
         "ToPort": 22,
         "IpRanges": [{"CidrIp": "0.0.0.0/0"}],
+        "Description": "INSECURE: SSH from anywhere - DO NOT USE",
     },
     {
         "IpProtocol": "tcp",
         "FromPort": 53,
         "ToPort": 53,
         "IpRanges": [{"CidrIp": "0.0.0.0/0"}],
+        "Description": "INSECURE: DNS TCP from anywhere - DO NOT USE",
     },
     {
         "IpProtocol": "udp",
         "FromPort": 53,
         "ToPort": 53,
         "IpRanges": [{"CidrIp": "0.0.0.0/0"}],
+        "Description": "INSECURE: DNS UDP from anywhere - DO NOT USE",
     },
     {
         "IpProtocol": "tcp",
         "FromPort": 80,
         "ToPort": 80,
         "IpRanges": [{"CidrIp": "0.0.0.0/0"}],
+        "Description": "INSECURE: HTTP from anywhere - DO NOT USE",
     },
     {
         "IpProtocol": "tcp",
         "FromPort": 443,
         "ToPort": 443,
         "IpRanges": [{"CidrIp": "0.0.0.0/0"}],
+        "Description": "INSECURE: HTTPS from anywhere - DO NOT USE",
     },
     # Parsl communication
     {
@@ -75,16 +82,28 @@ DEFAULT_INBOUND_RULES = [
         "FromPort": 54000,
         "ToPort": 55000,
         "IpRanges": [{"CidrIp": "0.0.0.0/0"}],
+        "Description": "INSECURE: Parsl from anywhere - DO NOT USE",
     },
 ]
 
-# Default outbound rules (allow all)
+# Secure default inbound rules using VPC-internal communication
+# These rules should be used with a properly configured NetworkSecurityPolicy
+DEFAULT_INBOUND_RULES = []  # Empty by default - use NetworkSecurityPolicy instead
+
+# Security framework constants
+DEFAULT_SECURITY_ENVIRONMENT = "dev"  # Options: "dev", "staging", "prod"
+DEFAULT_STRICT_SECURITY_MODE = False  # Set to True for production environments
+DEFAULT_ADMIN_CIDR_BLOCKS = ["10.0.0.0/8"]  # Administrative access networks
+DEFAULT_ALLOW_VPC_INTERNAL = True  # Allow communication within VPC
+
+# Default outbound rules (allow all - commonly acceptable)
 DEFAULT_OUTBOUND_RULES = [
     {
         "IpProtocol": "-1",  # All protocols
         "FromPort": -1,  # All ports
         "ToPort": -1,  # All ports
         "IpRanges": [{"CidrIp": "0.0.0.0/0"}],
+        "Description": "Allow all outbound traffic",
     }
 ]
 

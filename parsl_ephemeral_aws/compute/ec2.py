@@ -13,7 +13,14 @@ import boto3
 from botocore.exceptions import ClientError
 
 from ..exceptions import ResourceCreationError, ResourceCleanupError
-from ..constants import TAG_PREFIX, TAG_NAME, TAG_WORKFLOW_ID, TAG_BLOCK_ID
+from ..constants import (
+    TAG_PREFIX,
+    TAG_NAME,
+    TAG_WORKFLOW_ID,
+    TAG_BLOCK_ID,
+    DEFAULT_VPC_CIDR,
+)
+from ..config import SecurityConfig
 
 
 logger = logging.getLogger(__name__)
@@ -60,8 +67,44 @@ class EC2Manager:
         self.security_group_id = None
         self.key_pair_name = None
         self.instances = {}
+
+        # Initialize security configuration
+        self._setup_security_config()
         self.blocks = {}
         self.spot_requests = {}
+
+    def _setup_security_config(self) -> None:
+        """Set up security configuration from provider settings."""
+        # Get security settings from provider if available
+        security_env = getattr(self.provider, "security_environment", "dev")
+        vpc_cidr = getattr(self.provider, "vpc_cidr", DEFAULT_VPC_CIDR)
+        admin_cidrs = getattr(self.provider, "admin_cidr_blocks", None)
+        strict_mode = getattr(self.provider, "strict_security_mode", None)
+
+        # Create security configuration
+        if security_env == "prod" and admin_cidrs:
+            self.security_config = SecurityConfig.create_production_config(
+                vpc_cidr=vpc_cidr, admin_cidrs=admin_cidrs
+            )
+        else:
+            # Default to development configuration
+            self.security_config = SecurityConfig.create_development_config(
+                vpc_cidr=vpc_cidr
+            )
+            if strict_mode is not None:
+                self.security_config.strict_mode = strict_mode
+
+        logger.info(
+            f"Security configuration: environment={self.security_config.environment.value}, "
+            f"strict_mode={self.security_config.strict_mode}"
+        )
+
+        # Analyze security posture
+        analysis = self.security_config.analyze_security_posture()
+        for warning in analysis.get("warnings", []):
+            logger.warning(f"Security warning: {warning}")
+        for rec in analysis.get("recommendations", []):
+            logger.info(f"Security recommendation: {rec}")
 
     def _setup_network_resources(self) -> Dict[str, str]:
         """Set up VPC, subnet, and security group for EC2 instances.
@@ -80,9 +123,9 @@ class EC2Manager:
             }
 
         try:
-            # Create VPC
+            # Create VPC with configured CIDR
             vpc_response = self.ec2_client.create_vpc(
-                CidrBlock="10.0.0.0/16",
+                CidrBlock=self.security_config.vpc_cidr,
                 TagSpecifications=[
                     {
                         "ResourceType": "vpc",
@@ -111,10 +154,17 @@ class EC2Manager:
                 VpcId=self.vpc_id, EnableDnsHostnames={"Value": True}
             )
 
-            # Create subnet
+            # Create subnet using CIDR manager
+            from ..security.cidr_manager import CIDRManager
+
+            cidr_manager = CIDRManager()
+            subnet_cidrs = cidr_manager.get_subnet_cidrs(
+                self.security_config.vpc_cidr, 1
+            )
+
             subnet_response = self.ec2_client.create_subnet(
                 VpcId=self.vpc_id,
-                CidrBlock="10.0.0.0/24",
+                CidrBlock=subnet_cidrs[0],
                 TagSpecifications=[
                     {
                         "ResourceType": "subnet",
@@ -221,32 +271,60 @@ class EC2Manager:
             self.security_group_id = sg_response["GroupId"]
             logger.info(f"Created security group: {self.security_group_id}")
 
-            # Add inbound rules
-            self.ec2_client.authorize_security_group_ingress(
-                GroupId=self.security_group_id,
-                IpPermissions=[
-                    # SSH access
-                    {
-                        "IpProtocol": "tcp",
-                        "FromPort": 22,
-                        "ToPort": 22,
-                        "IpRanges": [{"CidrIp": "0.0.0.0/0"}],
-                    },
-                    # Parsl's default port range
-                    {
-                        "IpProtocol": "tcp",
-                        "FromPort": 54000,
-                        "ToPort": 55000,
-                        "IpRanges": [{"CidrIp": "0.0.0.0/0"}],
-                    },
-                    # Allow all traffic within security group
-                    {
-                        "IpProtocol": "-1",
-                        "UserIdGroupPairs": [{"GroupId": self.security_group_id}],
-                    },
-                ],
+            # Add inbound rules using security configuration
+            security_rules = self.security_config.get_security_group_rules(
+                "compute_worker"
             )
-            logger.info(f"Configured security group rules: {self.security_group_id}")
+
+            # Convert to EC2 IpPermissions format
+            ip_permissions = []
+            for rule in security_rules:
+                ip_permission = {
+                    "IpProtocol": rule["IpProtocol"],
+                    "FromPort": rule["FromPort"],
+                    "ToPort": rule["ToPort"],
+                    "IpRanges": rule["IpRanges"],
+                }
+                if "Description" in rule:
+                    # Note: Description goes in IpRanges for ingress rules
+                    for ip_range in ip_permission["IpRanges"]:
+                        ip_range["Description"] = rule["Description"]
+
+                ip_permissions.append(ip_permission)
+
+            # Add self-referencing rule for internal communication
+            ip_permissions.append(
+                {
+                    "IpProtocol": "-1",
+                    "UserIdGroupPairs": [
+                        {
+                            "GroupId": self.security_group_id,
+                            "Description": "Allow all traffic within security group",
+                        }
+                    ],
+                }
+            )
+
+            if ip_permissions:
+                self.ec2_client.authorize_security_group_ingress(
+                    GroupId=self.security_group_id, IpPermissions=ip_permissions
+                )
+                logger.info(
+                    f"Configured security group rules: {self.security_group_id} "
+                    f"({len(ip_permissions)} rules)"
+                )
+
+                # Log security rule summary
+                for rule in security_rules:
+                    logger.debug(
+                        f"Applied security rule: {rule['IpProtocol']}:"
+                        f"{rule['FromPort']}-{rule['ToPort']} from "
+                        f"{[r['CidrIp'] for r in rule['IpRanges']]}"
+                    )
+            else:
+                logger.warning(
+                    "No security rules configured - instance may be unreachable"
+                )
 
             # Enable public IP assignment for the subnet if requested
             if self.provider.use_public_ips:

@@ -11,7 +11,8 @@ import boto3
 from botocore.exceptions import ClientError
 
 from ..exceptions import ResourceCreationError, ResourceCleanupError
-from ..constants import TAG_NAME, TAG_WORKFLOW_ID, DEFAULT_SG_NAME
+from ..constants import TAG_NAME, TAG_WORKFLOW_ID, DEFAULT_SG_NAME, DEFAULT_VPC_CIDR
+from ..config import SecurityConfig
 
 
 logger = logging.getLogger(__name__)
@@ -53,6 +54,42 @@ class SecurityGroupManager:
 
         # Track resources for cleanup
         self.security_groups = {}  # type: Dict[str, Dict[str, Any]]
+
+        # Initialize security configuration
+        self._setup_security_config()
+
+    def _setup_security_config(self) -> None:
+        """Set up security configuration from provider settings."""
+        # Get security settings from provider if available
+        security_env = getattr(self.provider, "security_environment", "dev")
+        vpc_cidr = getattr(self.provider, "vpc_cidr", DEFAULT_VPC_CIDR)
+        admin_cidrs = getattr(self.provider, "admin_cidr_blocks", None)
+        strict_mode = getattr(self.provider, "strict_security_mode", None)
+
+        # Create security configuration
+        if security_env == "prod" and admin_cidrs:
+            self.security_config = SecurityConfig.create_production_config(
+                vpc_cidr=vpc_cidr, admin_cidrs=admin_cidrs
+            )
+        else:
+            # Default to development configuration
+            self.security_config = SecurityConfig.create_development_config(
+                vpc_cidr=vpc_cidr
+            )
+            if strict_mode is not None:
+                self.security_config.strict_mode = strict_mode
+
+        logger.info(
+            f"Security Group Manager configuration: environment={self.security_config.environment.value}, "
+            f"strict_mode={self.security_config.strict_mode}"
+        )
+
+        # Analyze security posture
+        analysis = self.security_config.analyze_security_posture()
+        for warning in analysis.get("warnings", []):
+            logger.warning(f"Security Group Manager warning: {warning}")
+        for rec in analysis.get("recommendations", []):
+            logger.info(f"Security Group Manager recommendation: {rec}")
 
     def create_security_group(
         self, vpc_id: str, name: Optional[str] = None, description: Optional[str] = None
@@ -312,47 +349,37 @@ class SecurityGroupManager:
     def configure_default_rules(
         self,
         security_group_id: str,
-        allow_ssh: bool = True,
-        allow_parsl_ports: bool = True,
-        allow_all_outbound: bool = True,
+        group_type: str = "compute_worker",
         allow_self_traffic: bool = True,
+        allow_all_outbound: bool = True,
     ) -> None:
-        """Configure default rules for a security group.
+        """Configure security rules using the security framework.
 
         Parameters
         ----------
         security_group_id : str
             ID of the security group
-        allow_ssh : bool, optional
-            Whether to allow SSH access, by default True
-        allow_parsl_ports : bool, optional
-            Whether to allow Parsl's default port range, by default True
-        allow_all_outbound : bool, optional
-            Whether to allow all outbound traffic, by default True
+        group_type : str, optional
+            Type of security group ("compute_worker", "bastion", "public_access"),
+            by default "compute_worker"
         allow_self_traffic : bool, optional
             Whether to allow all traffic within the security group, by default True
+        allow_all_outbound : bool, optional
+            Whether to allow all outbound traffic, by default True
         """
         try:
-            # Allow SSH access
-            if allow_ssh:
-                self.add_ingress_rule(
-                    security_group_id=security_group_id,
-                    ip_protocol="tcp",
-                    from_port=22,
-                    to_port=22,
-                    cidr_blocks=["0.0.0.0/0"],
-                    description="SSH access",
-                )
+            # Get security rules from configuration
+            security_rules = self.security_config.get_security_group_rules(group_type)
 
-            # Allow Parsl's default port range
-            if allow_parsl_ports:
+            # Apply each rule
+            for rule in security_rules:
                 self.add_ingress_rule(
                     security_group_id=security_group_id,
-                    ip_protocol="tcp",
-                    from_port=54000,
-                    to_port=55000,
-                    cidr_blocks=["0.0.0.0/0"],
-                    description="Parsl communication ports",
+                    ip_protocol=rule["IpProtocol"],
+                    from_port=rule["FromPort"],
+                    to_port=rule["ToPort"],
+                    cidr_blocks=[ip_range["CidrIp"] for ip_range in rule["IpRanges"]],
+                    description=rule.get("Description", f"{group_type} rule"),
                 )
 
             # Allow all traffic within security group
@@ -380,7 +407,8 @@ class SecurityGroupManager:
                 )
 
             logger.info(
-                f"Configured default rules for security group {security_group_id}"
+                f"Configured {len(security_rules)} {group_type} rules for security group {security_group_id} "
+                f"(environment: {self.security_config.environment.value})"
             )
 
         except Exception as e:
