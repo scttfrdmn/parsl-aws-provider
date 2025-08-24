@@ -6,10 +6,22 @@ SPDX-FileCopyrightText: 2025 Scott Friedman and Project Contributors
 
 from .network_policy import NetworkSecurityPolicy, SecurityEnvironment
 from .cidr_manager import CIDRManager, CIDRValidationError
+from .credential_manager import (
+    CredentialManager, 
+    CredentialConfiguration, 
+    CredentialInfo, 
+    CredentialSanitizer,
+    SanitizingLogHandler
+)
 
 __all__ = [
     "NetworkSecurityPolicy",
     "SecurityEnvironment",
     "CIDRManager",
     "CIDRValidationError",
+    "CredentialManager",
+    "CredentialConfiguration", 
+    "CredentialInfo",
+    "CredentialSanitizer",
+    "SanitizingLogHandler",
 ]

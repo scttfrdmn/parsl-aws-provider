@@ -11,7 +11,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Any, Union
 
-from ..security import NetworkSecurityPolicy, SecurityEnvironment
+from ..security import NetworkSecurityPolicy, SecurityEnvironment, CredentialConfiguration
 from ..constants import (
     DEFAULT_VPC_CIDR,
     DEFAULT_SECURITY_ENVIRONMENT,
@@ -49,6 +49,10 @@ class SecurityConfig:
     # Security group templates
     use_security_templates: bool = True
     custom_security_rules: Optional[Dict[str, List[Dict[str, Any]]]] = None
+    
+    # Credential management settings
+    credential_config: Optional[CredentialConfiguration] = None
+    enable_credential_sanitization: bool = True
 
     def __post_init__(self):
         """Validate and normalize configuration."""
@@ -194,11 +198,53 @@ class SecurityConfig:
         if len(self.admin_cidr_blocks) == 1 and "0.0.0.0/0" in self.admin_cidr_blocks:
             analysis["warnings"].append("Admin access allows global internet access")
 
+        # Credential management analysis
+        analysis["credential_sanitization"] = self.enable_credential_sanitization
+        analysis["has_credential_config"] = self.credential_config is not None
+        
+        if self.credential_config:
+            if self.credential_config.role_arn:
+                analysis["recommendations"].append("Using IAM role-based authentication (recommended)")
+            elif self.environment == SecurityEnvironment.PRODUCTION:
+                analysis["warnings"].append("Consider using IAM role-based authentication for production")
+        elif self.environment == SecurityEnvironment.PRODUCTION:
+            analysis["warnings"].append("No credential configuration specified for production")
+
         return analysis
+    
+    def get_credential_configuration(self) -> CredentialConfiguration:
+        """Get credential configuration for this security profile.
+        
+        Returns
+        -------
+        CredentialConfiguration
+            Credential configuration
+        """
+        if self.credential_config:
+            return self.credential_config
+        
+        # Create default configuration based on environment
+        config = CredentialConfiguration(
+            enable_sanitization=self.enable_credential_sanitization,
+            sanitize_logs=True,
+            auto_refresh_tokens=True,
+        )
+        
+        if self.environment == SecurityEnvironment.PRODUCTION:
+            # Production: Prefer IAM roles, disable fallbacks
+            config.use_environment_variables = False
+            config.use_profile = None
+            config.require_mfa = False  # Could be enabled based on requirements
+        elif self.environment == SecurityEnvironment.DEVELOPMENT:
+            # Development: Allow fallbacks for convenience
+            config.use_environment_variables = True
+            config.use_profile = "aws"
+        
+        return config
 
     @classmethod
     def create_development_config(
-        cls, vpc_cidr: str = DEFAULT_VPC_CIDR
+        cls, vpc_cidr: str = DEFAULT_VPC_CIDR, role_arn: Optional[str] = None
     ) -> "SecurityConfig":
         """Create a development environment security configuration.
 
@@ -206,23 +252,38 @@ class SecurityConfig:
         ----------
         vpc_cidr : str
             VPC CIDR block
+        role_arn : Optional[str]
+            IAM role ARN for credential management
 
         Returns
         -------
         SecurityConfig
             Development security configuration
         """
+        # Create credential configuration for development
+        credential_config = CredentialConfiguration(
+            role_arn=role_arn,
+            enable_sanitization=True,
+            sanitize_logs=True,
+            use_environment_variables=True,
+            use_profile="aws",
+            auto_refresh_tokens=True,
+        )
+        
         return cls(
             environment=SecurityEnvironment.DEVELOPMENT,
             vpc_cidr=vpc_cidr,
             admin_cidr_blocks=["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"],
             public_access_ports=[80, 443],  # Allowed in dev
             strict_mode=False,
+            credential_config=credential_config,
+            enable_credential_sanitization=True,
         )
 
     @classmethod
     def create_production_config(
-        cls, vpc_cidr: str = DEFAULT_VPC_CIDR, admin_cidrs: List[str] = None
+        cls, vpc_cidr: str = DEFAULT_VPC_CIDR, admin_cidrs: List[str] = None,
+        role_arn: Optional[str] = None, require_mfa: bool = False
     ) -> "SecurityConfig":
         """Create a production environment security configuration.
 
@@ -232,6 +293,10 @@ class SecurityConfig:
             VPC CIDR block
         admin_cidrs : List[str]
             Administrative access CIDR blocks
+        role_arn : Optional[str]
+            IAM role ARN for credential management (recommended for production)
+        require_mfa : bool
+            Whether to require MFA for role assumption
 
         Returns
         -------
@@ -241,6 +306,19 @@ class SecurityConfig:
         if admin_cidrs is None:
             raise ValueError("admin_cidrs must be specified for production")
 
+        # Create credential configuration for production
+        credential_config = CredentialConfiguration(
+            role_arn=role_arn,
+            enable_sanitization=True,
+            sanitize_logs=True,
+            use_environment_variables=False,  # Disable in production
+            use_instance_profile=True,  # Allow instance profiles
+            use_profile=None,  # No profile fallback
+            auto_refresh_tokens=True,
+            require_mfa=require_mfa,
+            session_duration=3600,  # 1 hour sessions
+        )
+        
         return cls(
             environment=SecurityEnvironment.PRODUCTION,
             vpc_cidr=vpc_cidr,
@@ -248,6 +326,8 @@ class SecurityConfig:
             ssh_allowed_cidrs=admin_cidrs,
             public_access_ports=[],  # No public access by default
             strict_mode=True,
+            credential_config=credential_config,
+            enable_credential_sanitization=True,
         )
 
     def to_dict(self) -> Dict[str, Any]:

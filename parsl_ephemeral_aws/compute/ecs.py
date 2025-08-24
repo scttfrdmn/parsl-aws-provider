@@ -10,7 +10,7 @@ import time
 from typing import Dict, Any, Set
 
 import boto3
-from botocore.exceptions import ClientError
+from botocore.exceptions import ClientError, NoCredentialsError
 
 from ..exceptions import ResourceCreationError, ResourceCleanupError, JobSubmissionError
 from ..constants import (
@@ -26,6 +26,7 @@ from ..constants import (
     DEFAULT_VPC_CIDR,
 )
 from ..config import SecurityConfig
+from ..security import CredentialManager, CredentialConfiguration
 
 
 logger = logging.getLogger(__name__)
@@ -44,23 +45,32 @@ class ECSManager:
         """
         self.provider = provider
 
-        # Initialize AWS session
-        session_kwargs = {}
-        if self.provider.aws_access_key_id and self.provider.aws_secret_access_key:
-            session_kwargs["aws_access_key_id"] = self.provider.aws_access_key_id
-            session_kwargs[
-                "aws_secret_access_key"
-            ] = self.provider.aws_secret_access_key
+        # Initialize security configuration and credential management
+        self._setup_security_config()
+        
+        # Initialize credential manager
+        credential_config = self.security_config.get_credential_configuration()
+        
+        # Override credential config with provider-specific settings if provided
+        if hasattr(provider, 'aws_access_key_id') or hasattr(provider, 'aws_profile'):
+            # Legacy credential handling - create credential config from provider settings
+            credential_config = self._create_credential_config_from_provider()
+        
+        try:
+            self.credential_manager = CredentialManager(credential_config)
+            logger.info("Credential manager initialized successfully")
+        except Exception as e:
+            logger.error(f"Failed to initialize credential manager: {e}")
+            raise ResourceCreationError(f"Credential initialization failed: {e}")
 
-        if self.provider.aws_session_token:
-            session_kwargs["aws_session_token"] = self.provider.aws_session_token
-
-        if self.provider.aws_profile:
-            session_kwargs["profile_name"] = self.provider.aws_profile
-
-        self.aws_session = boto3.Session(
-            region_name=self.provider.region, **session_kwargs
-        )
+        # Initialize AWS session using credential manager
+        try:
+            self.aws_session = self.credential_manager.create_boto3_session(
+                region=self.provider.region
+            )
+        except NoCredentialsError as e:
+            logger.error(f"No valid AWS credentials found: {e}")
+            raise ResourceCreationError(f"AWS credential error: {e}")
 
         # Initialize clients
         self.ecs_client = self.aws_session.client("ecs")
@@ -72,9 +82,6 @@ class ECSManager:
         self.task_definitions: Set[str] = set()
         self.role_names: Set[str] = set()
         self.jobs: Dict[str, Any] = {}
-
-        # Initialize security configuration
-        self._setup_security_config()
 
         # Initialize ECS cluster if needed
         self.cluster_name = self._get_or_create_cluster()
@@ -111,6 +118,43 @@ class ECSManager:
             logger.warning(f"ECS Security warning: {warning}")
         for rec in analysis.get("recommendations", []):
             logger.info(f"ECS Security recommendation: {rec}")
+
+    def _create_credential_config_from_provider(self) -> CredentialConfiguration:
+        """Create credential configuration from provider settings.
+        
+        Returns
+        -------
+        CredentialConfiguration
+            Credential configuration based on provider settings
+        """
+        # Extract credential settings from provider
+        role_arn = getattr(self.provider, 'role_arn', None)
+        aws_profile = getattr(self.provider, 'aws_profile', None)
+        use_env_vars = (
+            hasattr(self.provider, 'aws_access_key_id') and 
+            self.provider.aws_access_key_id is not None
+        )
+        
+        # Create credential configuration
+        config = CredentialConfiguration(
+            role_arn=role_arn,
+            enable_sanitization=True,
+            sanitize_logs=True,
+            use_environment_variables=use_env_vars,
+            use_profile=aws_profile,
+            auto_refresh_tokens=True,
+        )
+        
+        # Set security-based defaults
+        if self.security_config.environment.value == "production":
+            config.use_environment_variables = False
+            config.use_profile = None
+            config.require_mfa = False
+        
+        logger.info(f"ECS Created credential config: role_arn={bool(role_arn)}, "
+                   f"profile={aws_profile}, use_env={use_env_vars}")
+        
+        return config
 
     def _get_or_create_cluster(self) -> str:
         """Get or create an ECS cluster.
