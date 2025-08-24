@@ -9,7 +9,6 @@ import json
 import time
 from typing import Dict, Any, Set
 
-import boto3
 from botocore.exceptions import ClientError, NoCredentialsError
 
 from ..exceptions import ResourceCreationError, ResourceCleanupError, JobSubmissionError
@@ -27,6 +26,12 @@ from ..constants import (
 )
 from ..config import SecurityConfig
 from ..security import CredentialManager, CredentialConfiguration
+from ..error_handling import (
+    RobustErrorHandler,
+    ErrorContext,
+    retry_with_backoff,
+    RetryConfig
+)
 
 
 logger = logging.getLogger(__name__)
@@ -45,17 +50,28 @@ class ECSManager:
         """
         self.provider = provider
 
+        # Initialize error handling
+        self.error_handler = RobustErrorHandler(
+            retry_config=RetryConfig(
+                max_attempts=5,
+                base_delay=2.0,
+                exponential_backoff=True,
+                jitter=True
+            )
+        )
+        logger.info("Error handler initialized for ECS operations")
+
         # Initialize security configuration and credential management
         self._setup_security_config()
-        
+
         # Initialize credential manager
         credential_config = self.security_config.get_credential_configuration()
-        
+
         # Override credential config with provider-specific settings if provided
-        if hasattr(provider, 'aws_access_key_id') or hasattr(provider, 'aws_profile'):
+        if hasattr(provider, "aws_access_key_id") or hasattr(provider, "aws_profile"):
             # Legacy credential handling - create credential config from provider settings
             credential_config = self._create_credential_config_from_provider()
-        
+
         try:
             self.credential_manager = CredentialManager(credential_config)
             logger.info("Credential manager initialized successfully")
@@ -121,20 +137,20 @@ class ECSManager:
 
     def _create_credential_config_from_provider(self) -> CredentialConfiguration:
         """Create credential configuration from provider settings.
-        
+
         Returns
         -------
         CredentialConfiguration
             Credential configuration based on provider settings
         """
         # Extract credential settings from provider
-        role_arn = getattr(self.provider, 'role_arn', None)
-        aws_profile = getattr(self.provider, 'aws_profile', None)
+        role_arn = getattr(self.provider, "role_arn", None)
+        aws_profile = getattr(self.provider, "aws_profile", None)
         use_env_vars = (
-            hasattr(self.provider, 'aws_access_key_id') and 
-            self.provider.aws_access_key_id is not None
+            hasattr(self.provider, "aws_access_key_id")
+            and self.provider.aws_access_key_id is not None
         )
-        
+
         # Create credential configuration
         config = CredentialConfiguration(
             role_arn=role_arn,
@@ -144,16 +160,18 @@ class ECSManager:
             use_profile=aws_profile,
             auto_refresh_tokens=True,
         )
-        
+
         # Set security-based defaults
         if self.security_config.environment.value == "production":
             config.use_environment_variables = False
             config.use_profile = None
             config.require_mfa = False
-        
-        logger.info(f"ECS Created credential config: role_arn={bool(role_arn)}, "
-                   f"profile={aws_profile}, use_env={use_env_vars}")
-        
+
+        logger.info(
+            f"ECS Created credential config: role_arn={bool(role_arn)}, "
+            f"profile={aws_profile}, use_env={use_env_vars}"
+        )
+
         return config
 
     def _get_or_create_cluster(self) -> str:

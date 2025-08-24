@@ -14,7 +14,6 @@ import json
 import base64
 from typing import Dict, List, Optional, Any
 
-import boto3
 from botocore.exceptions import ClientError, NoCredentialsError
 
 from ..exceptions import (
@@ -40,6 +39,12 @@ from ..constants import (
 )
 from ..config import SecurityConfig
 from ..security import CredentialManager, CredentialConfiguration
+from ..error_handling import (
+    RobustErrorHandler,
+    ErrorContext,
+    retry_with_backoff,
+    RetryConfig
+)
 
 
 logger = logging.getLogger(__name__)
@@ -65,17 +70,29 @@ class SpotFleetManager:
         """
         self.provider = provider
 
+        # Initialize error handling for spot fleet operations
+        self.error_handler = RobustErrorHandler(
+            retry_config=RetryConfig(
+                max_attempts=6,  # Extra attempts for spot fleet due to market conditions
+                base_delay=3.0,  # Longer delay for spot fleet operations
+                exponential_backoff=True,
+                jitter=True,
+                max_delay=60.0  # Cap at 1 minute for spot fleet
+            )
+        )
+        logger.info("Error handler initialized for Spot Fleet operations")
+
         # Initialize security configuration and credential management
         self._setup_security_config()
-        
+
         # Initialize credential manager
         credential_config = self.security_config.get_credential_configuration()
-        
+
         # Override credential config with provider-specific settings if provided
-        if hasattr(provider, 'aws_access_key_id') or hasattr(provider, 'aws_profile'):
+        if hasattr(provider, "aws_access_key_id") or hasattr(provider, "aws_profile"):
             # Legacy credential handling - create credential config from provider settings
             credential_config = self._create_credential_config_from_provider()
-        
+
         try:
             self.credential_manager = CredentialManager(credential_config)
             logger.info("Spot Fleet credential manager initialized successfully")
@@ -140,20 +157,20 @@ class SpotFleetManager:
 
     def _create_credential_config_from_provider(self) -> CredentialConfiguration:
         """Create credential configuration from provider settings.
-        
+
         Returns
         -------
         CredentialConfiguration
             Credential configuration based on provider settings
         """
         # Extract credential settings from provider
-        role_arn = getattr(self.provider, 'role_arn', None)
-        aws_profile = getattr(self.provider, 'aws_profile', None)
+        role_arn = getattr(self.provider, "role_arn", None)
+        aws_profile = getattr(self.provider, "aws_profile", None)
         use_env_vars = (
-            hasattr(self.provider, 'aws_access_key_id') and 
-            self.provider.aws_access_key_id is not None
+            hasattr(self.provider, "aws_access_key_id")
+            and self.provider.aws_access_key_id is not None
         )
-        
+
         # Create credential configuration
         config = CredentialConfiguration(
             role_arn=role_arn,
@@ -163,18 +180,21 @@ class SpotFleetManager:
             use_profile=aws_profile,
             auto_refresh_tokens=True,
         )
-        
+
         # Set security-based defaults
         if self.security_config.environment.value == "production":
             config.use_environment_variables = False
             config.use_profile = None
             config.require_mfa = False
-        
-        logger.info(f"Spot Fleet Created credential config: role_arn={bool(role_arn)}, "
-                   f"profile={aws_profile}, use_env={use_env_vars}")
-        
+
+        logger.info(
+            f"Spot Fleet Created credential config: role_arn={bool(role_arn)}, "
+            f"profile={aws_profile}, use_env={use_env_vars}"
+        )
+
         return config
 
+    @retry_with_backoff()
     def _setup_network_resources(self) -> Dict[str, str]:
         """Set up VPC, subnet, and security group for Spot Fleet instances.
 
@@ -192,6 +212,13 @@ class SpotFleetManager:
                 "subnet_id": self.subnet_id,
                 "security_group_id": self.security_group_id,
             }
+
+        context = ErrorContext(
+            operation="setup_network_resources",
+            resource_type="spot_fleet_network",
+            resource_id=f"workflow-{self.provider.workflow_id}",
+            region=self.provider.region
+        )
 
         try:
             # Use existing network resources from provider if available
@@ -237,7 +264,9 @@ class SpotFleetManager:
                 "security_group_id": self.security_group_id,
             }
 
-        except ClientError as e:
+        except Exception as e:
+            # Record error for analysis
+            error_record = self.error_handler.handle_error(e, context)
             logger.error(f"Error setting up network resources: {e}")
 
             # Attempt to clean up any created resources
@@ -766,6 +795,45 @@ class SpotFleetManager:
 
         return user_data
 
+    def _create_spot_fleet_with_retry(self, fleet_config: Dict[str, Any], context: ErrorContext) -> Dict[str, Any]:
+        """Create spot fleet request with error handling and retry logic.
+        
+        Parameters
+        ----------
+        fleet_config : Dict[str, Any]
+            Spot fleet configuration
+        context : ErrorContext
+            Error context for tracking
+            
+        Returns
+        -------
+        Dict[str, Any]
+            Spot fleet request response
+        """
+        try:
+            response = self.ec2_client.request_spot_fleet(**fleet_config)
+            return response
+        except ClientError as e:
+            error_code = e.response["Error"]["Code"]
+            
+            # Handle specific spot fleet errors
+            if error_code in ["SpotFleetLaunchTemplateConfig.NotFound", "InvalidLaunchTemplateName.NotFound"]:
+                raise SpotFleetRequestError(f"Launch template configuration error: {e}")
+            elif error_code in ["InsufficientInstanceCapacity", "InsufficientReservedInstanceCapacity"]:
+                raise SpotFleetError(f"Insufficient instance capacity: {e}")
+            elif error_code in ["SpotFleetRequestConfig.InvalidLaunchSpecification"]:
+                raise SpotFleetRequestError(f"Invalid launch specification: {e}")
+            elif error_code in ["Throttling", "RequestLimitExceeded"]:
+                raise SpotFleetThrottlingError(f"API throttling error: {e}")
+            else:
+                # Record error for analysis
+                error_record = self.error_handler.handle_error(e, context)
+                raise SpotFleetError(f"Failed to create spot fleet request: {e}")
+        except Exception as e:
+            error_record = self.error_handler.handle_error(e, context)
+            raise SpotFleetError(f"Failed to create spot fleet request: {e}")
+
+    @retry_with_backoff()
     def create_blocks(self, count: int) -> Dict[str, Dict[str, Any]]:
         """Create compute blocks using Spot Fleet.
 

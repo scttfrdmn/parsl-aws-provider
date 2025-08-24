@@ -9,7 +9,6 @@ import uuid
 import time
 from typing import Dict, Any
 
-import boto3
 from botocore.exceptions import ClientError, NoCredentialsError
 
 from ..exceptions import ResourceCreationError, ResourceCleanupError
@@ -22,6 +21,12 @@ from ..constants import (
 )
 from ..config import SecurityConfig
 from ..security import CredentialManager, CredentialConfiguration
+from ..error_handling import (
+    RobustErrorHandler,
+    ErrorContext,
+    retry_with_backoff,
+    RetryConfig
+)
 
 
 logger = logging.getLogger(__name__)
@@ -40,17 +45,28 @@ class EC2Manager:
         """
         self.provider = provider
 
+        # Initialize error handling
+        self.error_handler = RobustErrorHandler(
+            retry_config=RetryConfig(
+                max_attempts=5,
+                base_delay=2.0,
+                exponential_backoff=True,
+                jitter=True
+            )
+        )
+        logger.info("Error handler initialized for EC2 operations")
+
         # Initialize security configuration and credential management
         self._setup_security_config()
-        
+
         # Initialize credential manager
         credential_config = self.security_config.get_credential_configuration()
-        
+
         # Override credential config with provider-specific settings if provided
-        if hasattr(provider, 'aws_access_key_id') or hasattr(provider, 'aws_profile'):
+        if hasattr(provider, "aws_access_key_id") or hasattr(provider, "aws_profile"):
             # Legacy credential handling - create credential config from provider settings
             credential_config = self._create_credential_config_from_provider()
-        
+
         try:
             self.credential_manager = CredentialManager(credential_config)
             logger.info("Credential manager initialized successfully")
@@ -115,20 +131,20 @@ class EC2Manager:
 
     def _create_credential_config_from_provider(self) -> CredentialConfiguration:
         """Create credential configuration from provider settings.
-        
+
         Returns
         -------
         CredentialConfiguration
             Credential configuration based on provider settings
         """
         # Extract credential settings from provider
-        role_arn = getattr(self.provider, 'role_arn', None)
-        aws_profile = getattr(self.provider, 'aws_profile', None)
+        role_arn = getattr(self.provider, "role_arn", None)
+        aws_profile = getattr(self.provider, "aws_profile", None)
         use_env_vars = (
-            hasattr(self.provider, 'aws_access_key_id') and 
-            self.provider.aws_access_key_id is not None
+            hasattr(self.provider, "aws_access_key_id")
+            and self.provider.aws_access_key_id is not None
         )
-        
+
         # Create credential configuration
         config = CredentialConfiguration(
             role_arn=role_arn,
@@ -138,36 +154,34 @@ class EC2Manager:
             use_profile=aws_profile,
             auto_refresh_tokens=True,
         )
-        
+
         # Set security-based defaults
         if self.security_config.environment.value == "production":
             config.use_environment_variables = False
             config.use_profile = None
             config.require_mfa = False
-        
-        logger.info(f"Created credential config: role_arn={bool(role_arn)}, "
-                   f"profile={aws_profile}, use_env={use_env_vars}")
-        
+
+        logger.info(
+            f"Created credential config: role_arn={bool(role_arn)}, "
+            f"profile={aws_profile}, use_env={use_env_vars}"
+        )
+
         return config
 
-    def _setup_network_resources(self) -> Dict[str, str]:
-        """Set up VPC, subnet, and security group for EC2 instances.
-
+    def _create_vpc_with_retry(self, context: ErrorContext) -> Dict[str, Any]:
+        """Create VPC with error handling and retry logic.
+        
+        Parameters
+        ----------
+        context : ErrorContext
+            Error context for tracking
+            
         Returns
         -------
-        Dict[str, str]
-            Dictionary containing VPC ID, subnet ID, and security group ID
+        Dict[str, Any]
+            VPC creation response
         """
-        # Check if we already have network resources
-        if self.vpc_id and self.subnet_id and self.security_group_id:
-            return {
-                "vpc_id": self.vpc_id,
-                "subnet_id": self.subnet_id,
-                "security_group_id": self.security_group_id,
-            }
-
         try:
-            # Create VPC with configured CIDR
             vpc_response = self.ec2_client.create_vpc(
                 CidrBlock=self.security_config.vpc_cidr,
                 TagSpecifications=[
@@ -187,6 +201,60 @@ class EC2Manager:
                     }
                 ],
             )
+            return vpc_response
+        except Exception as e:
+            error_record = self.error_handler.handle_error(e, context)
+            raise ResourceCreationError(f"Failed to create VPC: {e}")
+
+    def _setup_instance_with_retry(self, instance_config: Dict[str, Any], context: ErrorContext) -> Dict[str, Any]:
+        """Create EC2 instance with error handling and retry logic.
+        
+        Parameters
+        ----------
+        instance_config : Dict[str, Any]
+            Instance configuration
+        context : ErrorContext
+            Error context for tracking
+            
+        Returns
+        -------
+        Dict[str, Any]
+            Instance creation response
+        """
+        try:
+            response = self.ec2_client.run_instances(**instance_config)
+            return response
+        except Exception as e:
+            error_record = self.error_handler.handle_error(e, context)
+            raise ResourceCreationError(f"Failed to create instance: {e}")
+
+    @retry_with_backoff()
+    def _setup_network_resources(self) -> Dict[str, str]:
+        """Set up VPC, subnet, and security group for EC2 instances.
+
+        Returns
+        -------
+        Dict[str, str]
+            Dictionary containing VPC ID, subnet ID, and security group ID
+        """
+        # Check if we already have network resources
+        if self.vpc_id and self.subnet_id and self.security_group_id:
+            return {
+                "vpc_id": self.vpc_id,
+                "subnet_id": self.subnet_id,
+                "security_group_id": self.security_group_id,
+            }
+
+        context = ErrorContext(
+            operation="setup_network_resources",
+            resource_type="vpc",
+            resource_id=f"workflow-{self.provider.workflow_id}",
+            region=self.provider.region
+        )
+
+        try:
+            # Create VPC with configured CIDR
+            vpc_response = self._create_vpc_with_retry(context)
             self.vpc_id = vpc_response["Vpc"]["VpcId"]
             logger.info(f"Created VPC: {self.vpc_id}")
 
@@ -385,7 +453,9 @@ class EC2Manager:
                 "security_group_id": self.security_group_id,
             }
 
-        except ClientError as e:
+        except Exception as e:
+            # Record error for analysis
+            error_record = self.error_handler.handle_error(e, context)
             logger.error(f"Error setting up network resources: {e}")
 
             # Attempt to clean up any created resources

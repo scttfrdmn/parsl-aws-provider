@@ -11,7 +11,12 @@ import logging
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Any, Union
 
-from ..security import NetworkSecurityPolicy, SecurityEnvironment, CredentialConfiguration
+from ..security import (
+    NetworkSecurityPolicy,
+    SecurityEnvironment,
+    CredentialConfiguration,
+    EncryptionConfiguration,
+)
 from ..constants import (
     DEFAULT_VPC_CIDR,
     DEFAULT_SECURITY_ENVIRONMENT,
@@ -49,10 +54,14 @@ class SecurityConfig:
     # Security group templates
     use_security_templates: bool = True
     custom_security_rules: Optional[Dict[str, List[Dict[str, Any]]]] = None
-    
+
     # Credential management settings
     credential_config: Optional[CredentialConfiguration] = None
     enable_credential_sanitization: bool = True
+    
+    # State encryption settings
+    encryption_config: Optional[EncryptionConfiguration] = None
+    enable_state_encryption: bool = True
 
     def __post_init__(self):
         """Validate and normalize configuration."""
@@ -201,20 +210,48 @@ class SecurityConfig:
         # Credential management analysis
         analysis["credential_sanitization"] = self.enable_credential_sanitization
         analysis["has_credential_config"] = self.credential_config is not None
-        
+
         if self.credential_config:
             if self.credential_config.role_arn:
-                analysis["recommendations"].append("Using IAM role-based authentication (recommended)")
+                analysis["recommendations"].append(
+                    "Using IAM role-based authentication (recommended)"
+                )
             elif self.environment == SecurityEnvironment.PRODUCTION:
-                analysis["warnings"].append("Consider using IAM role-based authentication for production")
+                analysis["warnings"].append(
+                    "Consider using IAM role-based authentication for production"
+                )
         elif self.environment == SecurityEnvironment.PRODUCTION:
-            analysis["warnings"].append("No credential configuration specified for production")
+            analysis["warnings"].append(
+                "No credential configuration specified for production"
+            )
+        
+        # State encryption analysis
+        analysis["state_encryption"] = self.enable_state_encryption
+        analysis["has_encryption_config"] = self.encryption_config is not None
+        
+        if self.enable_state_encryption:
+            if not self.encryption_config:
+                analysis["recommendations"].append(
+                    "Consider configuring encryption settings for enhanced security"
+                )
+            elif self.encryption_config.master_key_source == "env":
+                analysis["recommendations"].append(
+                    "Environment variable key source configured - ensure key is properly secured"
+                )
+            elif self.encryption_config.master_key_source == "aws_kms":
+                analysis["recommendations"].append(
+                    "AWS KMS encryption configured (recommended for production)"
+                )
+        elif self.environment == SecurityEnvironment.PRODUCTION:
+            analysis["warnings"].append(
+                "State encryption disabled in production - consider enabling for sensitive data"
+            )
 
         return analysis
-    
+
     def get_credential_configuration(self) -> CredentialConfiguration:
         """Get credential configuration for this security profile.
-        
+
         Returns
         -------
         CredentialConfiguration
@@ -222,14 +259,14 @@ class SecurityConfig:
         """
         if self.credential_config:
             return self.credential_config
-        
+
         # Create default configuration based on environment
         config = CredentialConfiguration(
             enable_sanitization=self.enable_credential_sanitization,
             sanitize_logs=True,
             auto_refresh_tokens=True,
         )
-        
+
         if self.environment == SecurityEnvironment.PRODUCTION:
             # Production: Prefer IAM roles, disable fallbacks
             config.use_environment_variables = False
@@ -239,12 +276,46 @@ class SecurityConfig:
             # Development: Allow fallbacks for convenience
             config.use_environment_variables = True
             config.use_profile = "aws"
+
+        return config
+
+    def get_encryption_configuration(self) -> EncryptionConfiguration:
+        """Get encryption configuration for this security profile.
+        
+        Returns
+        -------
+        EncryptionConfiguration
+            Encryption configuration
+        """
+        if self.encryption_config:
+            return self.encryption_config
+        
+        # Create default configuration based on environment
+        if self.environment == SecurityEnvironment.PRODUCTION:
+            # Production: Use AWS KMS if available, otherwise environment variables
+            config = EncryptionConfiguration(
+                algorithm="aes-gcm",
+                master_key_source="env",  # Could be "aws_kms" if KMS key ID provided
+                enable_key_rotation=True,
+                key_rotation_days=30,  # More frequent rotation in production
+                iterations=200000,  # Higher iterations for production
+            )
+        else:
+            # Development: Use environment variables with reasonable defaults
+            config = EncryptionConfiguration(
+                algorithm="fernet",
+                master_key_source="env",
+                enable_key_rotation=False,  # Disabled for development convenience
+                key_rotation_days=90,
+                iterations=100000,
+            )
         
         return config
 
     @classmethod
     def create_development_config(
-        cls, vpc_cidr: str = DEFAULT_VPC_CIDR, role_arn: Optional[str] = None
+        cls, vpc_cidr: str = DEFAULT_VPC_CIDR, role_arn: Optional[str] = None,
+        enable_encryption: bool = True
     ) -> "SecurityConfig":
         """Create a development environment security configuration.
 
@@ -254,6 +325,8 @@ class SecurityConfig:
             VPC CIDR block
         role_arn : Optional[str]
             IAM role ARN for credential management
+        enable_encryption : bool
+            Whether to enable state encryption
 
         Returns
         -------
@@ -270,6 +343,16 @@ class SecurityConfig:
             auto_refresh_tokens=True,
         )
         
+        # Create encryption configuration for development
+        encryption_config = None
+        if enable_encryption:
+            encryption_config = EncryptionConfiguration(
+                algorithm="fernet",
+                master_key_source="env",
+                enable_key_rotation=False,
+                key_rotation_days=90,
+            )
+
         return cls(
             environment=SecurityEnvironment.DEVELOPMENT,
             vpc_cidr=vpc_cidr,
@@ -278,12 +361,18 @@ class SecurityConfig:
             strict_mode=False,
             credential_config=credential_config,
             enable_credential_sanitization=True,
+            encryption_config=encryption_config,
+            enable_state_encryption=enable_encryption,
         )
 
     @classmethod
     def create_production_config(
-        cls, vpc_cidr: str = DEFAULT_VPC_CIDR, admin_cidrs: List[str] = None,
-        role_arn: Optional[str] = None, require_mfa: bool = False
+        cls,
+        vpc_cidr: str = DEFAULT_VPC_CIDR,
+        admin_cidrs: List[str] = None,
+        role_arn: Optional[str] = None,
+        require_mfa: bool = False,
+        kms_key_id: Optional[str] = None,
     ) -> "SecurityConfig":
         """Create a production environment security configuration.
 
@@ -297,6 +386,8 @@ class SecurityConfig:
             IAM role ARN for credential management (recommended for production)
         require_mfa : bool
             Whether to require MFA for role assumption
+        kms_key_id : Optional[str]
+            AWS KMS key ID for encryption (recommended for production)
 
         Returns
         -------
@@ -319,6 +410,16 @@ class SecurityConfig:
             session_duration=3600,  # 1 hour sessions
         )
         
+        # Create encryption configuration for production
+        encryption_config = EncryptionConfiguration(
+            algorithm="aes-gcm",
+            master_key_source="aws_kms" if kms_key_id else "env",
+            kms_key_id=kms_key_id,
+            enable_key_rotation=True,
+            key_rotation_days=30,  # More frequent rotation in production
+            iterations=200000,  # Higher security
+        )
+
         return cls(
             environment=SecurityEnvironment.PRODUCTION,
             vpc_cidr=vpc_cidr,
@@ -328,6 +429,8 @@ class SecurityConfig:
             strict_mode=True,
             credential_config=credential_config,
             enable_credential_sanitization=True,
+            encryption_config=encryption_config,
+            enable_state_encryption=True,
         )
 
     def to_dict(self) -> Dict[str, Any]:

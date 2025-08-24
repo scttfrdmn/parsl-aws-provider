@@ -6,7 +6,7 @@ SPDX-FileCopyrightText: 2025 Scott Friedman and Project Contributors
 
 import pytest
 import logging
-from unittest.mock import Mock, patch, MagicMock
+from unittest.mock import Mock, patch
 from datetime import datetime, timedelta
 from botocore.exceptions import ClientError, NoCredentialsError
 
@@ -15,7 +15,7 @@ from parsl_ephemeral_aws.security.credential_manager import (
     CredentialSanitizer,
     SanitizingLogHandler,
     CredentialInfo,
-    CredentialManager
+    CredentialManager,
 )
 
 
@@ -25,7 +25,7 @@ class TestCredentialConfiguration:
     def test_default_configuration(self):
         """Test default credential configuration values."""
         config = CredentialConfiguration()
-        
+
         assert config.role_arn is None
         assert config.session_duration == 3600
         assert config.auto_refresh_tokens is True
@@ -41,8 +41,7 @@ class TestCredentialConfiguration:
 
         # Should not raise error when MFA serial number provided
         config = CredentialConfiguration(
-            require_mfa=True,
-            mfa_serial_number="arn:aws:iam::123456789012:mfa/user"
+            require_mfa=True, mfa_serial_number="arn:aws:iam::123456789012:mfa/user"
         )
         assert config.require_mfa is True
         assert config.mfa_serial_number is not None
@@ -81,14 +80,11 @@ class TestCredentialSanitizer:
             "aws_secret_access_key": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
             "aws_session_token": "FwoGZXIvYXdzEAcaDG" + "A" * 200,
             "regular_key": "regular_value",
-            "nested": {
-                "secret": "my_secret",
-                "normal": "normal_value"
-            }
+            "nested": {"secret": "my_secret", "normal": "normal_value"},
         }
 
         sanitized = CredentialSanitizer.sanitize_dict(data)
-        
+
         assert sanitized["aws_access_key_id"] == "***SANITIZED***"
         assert sanitized["aws_secret_access_key"] == "***SANITIZED***"
         assert sanitized["aws_session_token"] == "***SANITIZED***"
@@ -112,7 +108,7 @@ class TestCredentialSanitizer:
             lineno=1,
             msg="Access key: AKIAIOSFODNN7EXAMPLE",
             args=(),
-            exc_info=None
+            exc_info=None,
         )
 
         sanitized = CredentialSanitizer.sanitize_logs(record)
@@ -128,7 +124,7 @@ class TestCredentialSanitizer:
             lineno=1,
             msg="Credentials: %s, %s",
             args=("AKIAIOSFODNN7EXAMPLE", {"secret": "my_secret"}),
-            exc_info=None
+            exc_info=None,
         )
 
         sanitized = CredentialSanitizer.sanitize_logs(record)
@@ -147,7 +143,7 @@ class TestSanitizingLogHandler:
         mock_handler.formatter = None
 
         sanitizer = SanitizingLogHandler(mock_handler)
-        
+
         assert sanitizer.handler == mock_handler
         assert sanitizer.level == logging.INFO
 
@@ -167,7 +163,7 @@ class TestSanitizingLogHandler:
             lineno=1,
             msg="Access key: AKIAIOSFODNN7EXAMPLE",
             args=(),
-            exc_info=None
+            exc_info=None,
         )
 
         sanitizer.emit(record)
@@ -191,7 +187,7 @@ class TestCredentialInfo:
             session_token="session_token",
             expiry_time=expiry,
             source="test",
-            role_arn="arn:aws:iam::123456789012:role/test"
+            role_arn="arn:aws:iam::123456789012:role/test",
         )
 
         assert creds.access_key == "AKIAIOSFODNN7EXAMPLE"
@@ -204,7 +200,7 @@ class TestCredentialInfo:
         creds = CredentialInfo(
             access_key="AKIAIOSFODNN7EXAMPLE",
             secret_key="wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
-            session_token="session_token"
+            session_token="session_token",
         )
 
         repr_str = repr(creds)
@@ -249,24 +245,24 @@ class TestCredentialInfo:
         creds = CredentialInfo(
             access_key="AKIAIOSFODNN7EXAMPLE",
             secret_key="wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
-            session_token="session_token"
+            session_token="session_token",
         )
 
         kwargs = creds.to_boto3_session_kwargs()
         expected = {
-            'aws_access_key_id': 'AKIAIOSFODNN7EXAMPLE',
-            'aws_secret_access_key': 'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY',
-            'aws_session_token': 'session_token'
+            "aws_access_key_id": "AKIAIOSFODNN7EXAMPLE",
+            "aws_secret_access_key": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+            "aws_session_token": "session_token",
         }
         assert kwargs == expected
 
         # Test without session token
         creds = CredentialInfo(
             access_key="AKIAIOSFODNN7EXAMPLE",
-            secret_key="wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+            secret_key="wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
         )
         kwargs = creds.to_boto3_session_kwargs()
-        assert 'aws_session_token' not in kwargs
+        assert "aws_session_token" not in kwargs
 
 
 class TestCredentialManager:
@@ -276,11 +272,11 @@ class TestCredentialManager:
         """Test credential manager initialization."""
         config = CredentialConfiguration()
         manager = CredentialManager(config)
-        
+
         assert manager.config == config
         assert manager.current_credentials is None
 
-    @patch('parsl_ephemeral_aws.security.credential_manager.logging.getLogger')
+    @patch("parsl_ephemeral_aws.security.credential_manager.logging.getLogger")
     def test_log_sanitization_setup(self, mock_get_logger):
         """Test log sanitization setup."""
         # Mock root logger and handler
@@ -296,54 +292,59 @@ class TestCredentialManager:
         mock_root_logger.removeHandler.assert_called_once_with(mock_handler)
         mock_root_logger.addHandler.assert_called_once()
 
-    @patch.dict('os.environ', {
-        'AWS_ACCESS_KEY_ID': 'AKIAIOSFODNN7EXAMPLE',
-        'AWS_SECRET_ACCESS_KEY': 'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY',
-        'AWS_SESSION_TOKEN': 'session_token'
-    })
+    @patch.dict(
+        "os.environ",
+        {
+            "AWS_ACCESS_KEY_ID": "AKIAIOSFODNN7EXAMPLE",
+            "AWS_SECRET_ACCESS_KEY": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+            "AWS_SESSION_TOKEN": "session_token",
+        },
+    )
     def test_get_environment_credentials(self):
         """Test getting credentials from environment variables."""
         config = CredentialConfiguration(use_environment_variables=True)
         manager = CredentialManager(config)
-        
-        creds = manager._get_environment_credentials()
-        
-        assert creds.access_key == 'AKIAIOSFODNN7EXAMPLE'
-        assert creds.secret_key == 'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY'
-        assert creds.session_token == 'session_token'
-        assert creds.source == 'environment'
 
-    @patch.dict('os.environ', {}, clear=True)
+        creds = manager._get_environment_credentials()
+
+        assert creds.access_key == "AKIAIOSFODNN7EXAMPLE"
+        assert creds.secret_key == "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+        assert creds.session_token == "session_token"
+        assert creds.source == "environment"
+
+    @patch.dict("os.environ", {}, clear=True)
     def test_get_environment_credentials_missing(self):
         """Test error when environment credentials are missing."""
         config = CredentialConfiguration()
         manager = CredentialManager(config)
-        
-        with pytest.raises(NoCredentialsError, match="Environment credentials not available"):
+
+        with pytest.raises(
+            NoCredentialsError, match="Environment credentials not available"
+        ):
             manager._get_environment_credentials()
 
-    @patch('parsl_ephemeral_aws.security.credential_manager.boto3.Session')
+    @patch("parsl_ephemeral_aws.security.credential_manager.boto3.Session")
     def test_get_instance_profile_credentials(self, mock_session_class):
         """Test getting credentials from instance profile."""
         # Mock session and credentials
         mock_credentials = Mock()
-        mock_credentials.access_key = 'AKIAIOSFODNN7EXAMPLE'
-        mock_credentials.secret_key = 'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY'
-        mock_credentials.token = 'session_token'
-        
+        mock_credentials.access_key = "AKIAIOSFODNN7EXAMPLE"
+        mock_credentials.secret_key = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+        mock_credentials.token = "session_token"
+
         mock_session = Mock()
         mock_session.get_credentials.return_value = mock_credentials
         mock_session_class.return_value = mock_session
 
         config = CredentialConfiguration()
         manager = CredentialManager(config)
-        
-        creds = manager._get_instance_profile_credentials()
-        
-        assert creds.access_key == 'AKIAIOSFODNN7EXAMPLE'
-        assert creds.source == 'instance_profile'
 
-    @patch('parsl_ephemeral_aws.security.credential_manager.boto3.Session')
+        creds = manager._get_instance_profile_credentials()
+
+        assert creds.access_key == "AKIAIOSFODNN7EXAMPLE"
+        assert creds.source == "instance_profile"
+
+    @patch("parsl_ephemeral_aws.security.credential_manager.boto3.Session")
     def test_get_instance_profile_credentials_missing(self, mock_session_class):
         """Test error when instance profile credentials are missing."""
         mock_session = Mock()
@@ -352,58 +353,60 @@ class TestCredentialManager:
 
         config = CredentialConfiguration()
         manager = CredentialManager(config)
-        
-        with pytest.raises(NoCredentialsError, match="No instance profile credentials available"):
+
+        with pytest.raises(
+            NoCredentialsError, match="No instance profile credentials available"
+        ):
             manager._get_instance_profile_credentials()
 
-    @patch('parsl_ephemeral_aws.security.credential_manager.boto3.client')
+    @patch("parsl_ephemeral_aws.security.credential_manager.boto3.client")
     def test_assume_role(self, mock_boto3_client):
         """Test IAM role assumption."""
         # Mock STS client response
         mock_sts_client = Mock()
         mock_response = {
-            'Credentials': {
-                'AccessKeyId': 'ASIAIOSFODNN7EXAMPLE',
-                'SecretAccessKey': 'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY',
-                'SessionToken': 'session_token',
-                'Expiration': datetime.utcnow() + timedelta(hours=1)
+            "Credentials": {
+                "AccessKeyId": "ASIAIOSFODNN7EXAMPLE",
+                "SecretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+                "SessionToken": "session_token",
+                "Expiration": datetime.utcnow() + timedelta(hours=1),
             }
         }
         mock_sts_client.assume_role.return_value = mock_response
         mock_boto3_client.return_value = mock_sts_client
 
         config = CredentialConfiguration(
-            role_arn='arn:aws:iam::123456789012:role/test',
-            role_session_name='test-session'
+            role_arn="arn:aws:iam::123456789012:role/test",
+            role_session_name="test-session",
         )
         manager = CredentialManager(config)
-        
+
         creds = manager._assume_role()
-        
-        assert creds.access_key == 'ASIAIOSFODNN7EXAMPLE'
-        assert creds.source == 'iam_role'
-        assert creds.role_arn == 'arn:aws:iam::123456789012:role/test'
-        
+
+        assert creds.access_key == "ASIAIOSFODNN7EXAMPLE"
+        assert creds.source == "iam_role"
+        assert creds.role_arn == "arn:aws:iam::123456789012:role/test"
+
         # Verify assume_role was called with correct parameters
         mock_sts_client.assume_role.assert_called_once_with(
-            RoleArn='arn:aws:iam::123456789012:role/test',
-            RoleSessionName='test-session',
-            DurationSeconds=3600
+            RoleArn="arn:aws:iam::123456789012:role/test",
+            RoleSessionName="test-session",
+            DurationSeconds=3600,
         )
 
-    @patch('parsl_ephemeral_aws.security.credential_manager.boto3.client')
+    @patch("parsl_ephemeral_aws.security.credential_manager.boto3.client")
     def test_assume_role_failure(self, mock_boto3_client):
         """Test IAM role assumption failure."""
         mock_sts_client = Mock()
         mock_sts_client.assume_role.side_effect = ClientError(
-            {'Error': {'Code': 'AccessDenied', 'Message': 'Access denied'}},
-            'AssumeRole'
+            {"Error": {"Code": "AccessDenied", "Message": "Access denied"}},
+            "AssumeRole",
         )
         mock_boto3_client.return_value = mock_sts_client
 
-        config = CredentialConfiguration(role_arn='arn:aws:iam::123456789012:role/test')
+        config = CredentialConfiguration(role_arn="arn:aws:iam::123456789012:role/test")
         manager = CredentialManager(config)
-        
+
         with pytest.raises(NoCredentialsError, match="Role assumption failed"):
             manager._assume_role()
 
@@ -411,82 +414,86 @@ class TestCredentialManager:
         """Test getting credentials with valid cached credentials."""
         config = CredentialConfiguration()
         manager = CredentialManager(config)
-        
+
         # Set up cached credentials that are still valid
         future_expiry = datetime.utcnow() + timedelta(hours=1)
         cached_creds = CredentialInfo(
             access_key="AKIAIOSFODNN7EXAMPLE",
             secret_key="wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
             expiry_time=future_expiry,
-            source="cached"
+            source="cached",
         )
         manager.current_credentials = cached_creds
-        
+
         creds = manager.get_credentials()
-        
+
         # Should return the cached credentials
         assert creds == cached_creds
 
-    @patch('parsl_ephemeral_aws.security.credential_manager.CredentialManager._obtain_credentials')
+    @patch(
+        "parsl_ephemeral_aws.security.credential_manager.CredentialManager._obtain_credentials"
+    )
     def test_get_credentials_refresh_needed(self, mock_obtain):
         """Test getting credentials when refresh is needed."""
         config = CredentialConfiguration(auto_refresh_tokens=True)
         manager = CredentialManager(config)
-        
+
         # Set up cached credentials that need refresh
-        soon_expiry = datetime.utcnow() + timedelta(minutes=2)  # Less than 5 min threshold
+        soon_expiry = datetime.utcnow() + timedelta(
+            minutes=2
+        )  # Less than 5 min threshold
         cached_creds = CredentialInfo(
             access_key="AKIAIOSFODNN7EXAMPLE",
             secret_key="wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
             expiry_time=soon_expiry,
-            source="cached"
+            source="cached",
         )
         manager.current_credentials = cached_creds
-        
+
         # Mock new credentials
         new_creds = CredentialInfo(
             access_key="ASIAIOSFODNN7EXAMPLE",
             secret_key="newSecret",
-            source="refreshed"
+            source="refreshed",
         )
         mock_obtain.return_value = new_creds
-        
+
         creds = manager.get_credentials()
-        
+
         # Should return new credentials
         assert creds == new_creds
         assert manager.current_credentials == new_creds
         mock_obtain.assert_called_once()
 
-    @patch('parsl_ephemeral_aws.security.credential_manager.boto3.Session')
+    @patch("parsl_ephemeral_aws.security.credential_manager.boto3.Session")
     def test_create_boto3_session(self, mock_session_class):
         """Test creating boto3 session with credentials."""
         config = CredentialConfiguration()
         manager = CredentialManager(config)
-        
+
         # Mock credentials
         creds = CredentialInfo(
             access_key="AKIAIOSFODNN7EXAMPLE",
             secret_key="wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
-            session_token="session_token"
+            session_token="session_token",
         )
         manager.current_credentials = creds
-        
-        session = manager.create_boto3_session(region='us-west-2')
-        
+
+        session = manager.create_boto3_session(region="us-west-2")
+
         # Verify session was created with correct parameters
         mock_session_class.assert_called_once_with(
-            aws_access_key_id='AKIAIOSFODNN7EXAMPLE',
-            aws_secret_access_key='wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY',
-            aws_session_token='session_token',
-            region_name='us-west-2'
+            aws_access_key_id="AKIAIOSFODNN7EXAMPLE",
+            aws_secret_access_key="wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+            aws_session_token="session_token",
+            region_name="us-west-2",
         )
 
     def test_get_credential_info_no_credentials(self):
         """Test getting credential info with no credentials."""
         config = CredentialConfiguration()
         manager = CredentialManager(config)
-        
+
         info = manager.get_credential_info()
         assert info == {"status": "no_credentials"}
 
@@ -494,7 +501,7 @@ class TestCredentialManager:
         """Test getting credential info with credentials."""
         config = CredentialConfiguration()
         manager = CredentialManager(config)
-        
+
         # Set up credentials
         expiry = datetime.utcnow() + timedelta(hours=1)
         creds = CredentialInfo(
@@ -503,12 +510,12 @@ class TestCredentialManager:
             session_token="session_token",
             expiry_time=expiry,
             source="test",
-            role_arn="arn:aws:iam::123456789012:role/test"
+            role_arn="arn:aws:iam::123456789012:role/test",
         )
         manager.current_credentials = creds
-        
+
         info = manager.get_credential_info()
-        
+
         assert info["source"] == "test"
         assert info["has_session_token"] is True
         assert info["role_arn"] == "arn:aws:iam::123456789012:role/test"
@@ -516,22 +523,24 @@ class TestCredentialManager:
         assert "expires_at" in info
         assert "expires_in_seconds" in info
 
-    @patch('parsl_ephemeral_aws.security.credential_manager.CredentialManager._obtain_credentials')
+    @patch(
+        "parsl_ephemeral_aws.security.credential_manager.CredentialManager._obtain_credentials"
+    )
     def test_refresh_credentials(self, mock_obtain):
         """Test forcing credential refresh."""
         config = CredentialConfiguration()
         manager = CredentialManager(config)
-        
+
         # Set up existing credentials
         old_creds = CredentialInfo("old_key", "old_secret", source="old")
         manager.current_credentials = old_creds
-        
+
         # Mock new credentials
         new_creds = CredentialInfo("new_key", "new_secret", source="new")
         mock_obtain.return_value = new_creds
-        
+
         result = manager.refresh_credentials()
-        
+
         assert result == new_creds
         assert manager.current_credentials == new_creds
         mock_obtain.assert_called_once()
