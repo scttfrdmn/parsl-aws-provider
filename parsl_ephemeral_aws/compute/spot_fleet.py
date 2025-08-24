@@ -43,7 +43,7 @@ from ..error_handling import (
     RobustErrorHandler,
     ErrorContext,
     retry_with_backoff,
-    RetryConfig
+    RetryConfig,
 )
 
 
@@ -77,7 +77,7 @@ class SpotFleetManager:
                 base_delay=3.0,  # Longer delay for spot fleet operations
                 exponential_backoff=True,
                 jitter=True,
-                max_delay=60.0  # Cap at 1 minute for spot fleet
+                max_delay=60.0,  # Cap at 1 minute for spot fleet
             )
         )
         logger.info("Error handler initialized for Spot Fleet operations")
@@ -217,7 +217,7 @@ class SpotFleetManager:
             operation="setup_network_resources",
             resource_type="spot_fleet_network",
             resource_id=f"workflow-{self.provider.workflow_id}",
-            region=self.provider.region
+            region=self.provider.region,
         )
 
         try:
@@ -795,16 +795,18 @@ class SpotFleetManager:
 
         return user_data
 
-    def _create_spot_fleet_with_retry(self, fleet_config: Dict[str, Any], context: ErrorContext) -> Dict[str, Any]:
+    def _create_spot_fleet_with_retry(
+        self, fleet_config: Dict[str, Any], context: ErrorContext
+    ) -> Dict[str, Any]:
         """Create spot fleet request with error handling and retry logic.
-        
+
         Parameters
         ----------
         fleet_config : Dict[str, Any]
             Spot fleet configuration
         context : ErrorContext
             Error context for tracking
-            
+
         Returns
         -------
         Dict[str, Any]
@@ -815,11 +817,17 @@ class SpotFleetManager:
             return response
         except ClientError as e:
             error_code = e.response["Error"]["Code"]
-            
+
             # Handle specific spot fleet errors
-            if error_code in ["SpotFleetLaunchTemplateConfig.NotFound", "InvalidLaunchTemplateName.NotFound"]:
+            if error_code in [
+                "SpotFleetLaunchTemplateConfig.NotFound",
+                "InvalidLaunchTemplateName.NotFound",
+            ]:
                 raise SpotFleetRequestError(f"Launch template configuration error: {e}")
-            elif error_code in ["InsufficientInstanceCapacity", "InsufficientReservedInstanceCapacity"]:
+            elif error_code in [
+                "InsufficientInstanceCapacity",
+                "InsufficientReservedInstanceCapacity",
+            ]:
                 raise SpotFleetError(f"Insufficient instance capacity: {e}")
             elif error_code in ["SpotFleetRequestConfig.InvalidLaunchSpecification"]:
                 raise SpotFleetRequestError(f"Invalid launch specification: {e}")

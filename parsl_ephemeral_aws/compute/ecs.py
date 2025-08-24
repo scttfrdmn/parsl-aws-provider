@@ -26,12 +26,7 @@ from ..constants import (
 )
 from ..config import SecurityConfig
 from ..security import CredentialManager, CredentialConfiguration
-from ..error_handling import (
-    RobustErrorHandler,
-    ErrorContext,
-    retry_with_backoff,
-    RetryConfig
-)
+from ..error_handling import RobustErrorHandler, RetryConfig
 
 
 logger = logging.getLogger(__name__)
@@ -53,10 +48,7 @@ class ECSManager:
         # Initialize error handling
         self.error_handler = RobustErrorHandler(
             retry_config=RetryConfig(
-                max_attempts=5,
-                base_delay=2.0,
-                exponential_backoff=True,
-                jitter=True
+                max_attempts=5, base_delay=2.0, exponential_backoff=True, jitter=True
             )
         )
         logger.info("Error handler initialized for ECS operations")

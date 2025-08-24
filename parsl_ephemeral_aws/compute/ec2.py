@@ -25,7 +25,7 @@ from ..error_handling import (
     RobustErrorHandler,
     ErrorContext,
     retry_with_backoff,
-    RetryConfig
+    RetryConfig,
 )
 
 
@@ -48,10 +48,7 @@ class EC2Manager:
         # Initialize error handling
         self.error_handler = RobustErrorHandler(
             retry_config=RetryConfig(
-                max_attempts=5,
-                base_delay=2.0,
-                exponential_backoff=True,
-                jitter=True
+                max_attempts=5, base_delay=2.0, exponential_backoff=True, jitter=True
             )
         )
         logger.info("Error handler initialized for EC2 operations")
@@ -170,12 +167,12 @@ class EC2Manager:
 
     def _create_vpc_with_retry(self, context: ErrorContext) -> Dict[str, Any]:
         """Create VPC with error handling and retry logic.
-        
+
         Parameters
         ----------
         context : ErrorContext
             Error context for tracking
-            
+
         Returns
         -------
         Dict[str, Any]
@@ -206,16 +203,18 @@ class EC2Manager:
             error_record = self.error_handler.handle_error(e, context)
             raise ResourceCreationError(f"Failed to create VPC: {e}")
 
-    def _setup_instance_with_retry(self, instance_config: Dict[str, Any], context: ErrorContext) -> Dict[str, Any]:
+    def _setup_instance_with_retry(
+        self, instance_config: Dict[str, Any], context: ErrorContext
+    ) -> Dict[str, Any]:
         """Create EC2 instance with error handling and retry logic.
-        
+
         Parameters
         ----------
         instance_config : Dict[str, Any]
             Instance configuration
         context : ErrorContext
             Error context for tracking
-            
+
         Returns
         -------
         Dict[str, Any]
@@ -249,7 +248,7 @@ class EC2Manager:
             operation="setup_network_resources",
             resource_type="vpc",
             resource_id=f"workflow-{self.provider.workflow_id}",
-            region=self.provider.region
+            region=self.provider.region,
         )
 
         try:

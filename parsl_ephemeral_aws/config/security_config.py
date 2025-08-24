@@ -58,7 +58,7 @@ class SecurityConfig:
     # Credential management settings
     credential_config: Optional[CredentialConfiguration] = None
     enable_credential_sanitization: bool = True
-    
+
     # State encryption settings
     encryption_config: Optional[EncryptionConfiguration] = None
     enable_state_encryption: bool = True
@@ -224,11 +224,11 @@ class SecurityConfig:
             analysis["warnings"].append(
                 "No credential configuration specified for production"
             )
-        
+
         # State encryption analysis
         analysis["state_encryption"] = self.enable_state_encryption
         analysis["has_encryption_config"] = self.encryption_config is not None
-        
+
         if self.enable_state_encryption:
             if not self.encryption_config:
                 analysis["recommendations"].append(
@@ -281,7 +281,7 @@ class SecurityConfig:
 
     def get_encryption_configuration(self) -> EncryptionConfiguration:
         """Get encryption configuration for this security profile.
-        
+
         Returns
         -------
         EncryptionConfiguration
@@ -289,7 +289,7 @@ class SecurityConfig:
         """
         if self.encryption_config:
             return self.encryption_config
-        
+
         # Create default configuration based on environment
         if self.environment == SecurityEnvironment.PRODUCTION:
             # Production: Use AWS KMS if available, otherwise environment variables
@@ -309,13 +309,15 @@ class SecurityConfig:
                 key_rotation_days=90,
                 iterations=100000,
             )
-        
+
         return config
 
     @classmethod
     def create_development_config(
-        cls, vpc_cidr: str = DEFAULT_VPC_CIDR, role_arn: Optional[str] = None,
-        enable_encryption: bool = True
+        cls,
+        vpc_cidr: str = DEFAULT_VPC_CIDR,
+        role_arn: Optional[str] = None,
+        enable_encryption: bool = True,
     ) -> "SecurityConfig":
         """Create a development environment security configuration.
 
@@ -342,7 +344,7 @@ class SecurityConfig:
             use_profile="aws",
             auto_refresh_tokens=True,
         )
-        
+
         # Create encryption configuration for development
         encryption_config = None
         if enable_encryption:
@@ -409,7 +411,7 @@ class SecurityConfig:
             require_mfa=require_mfa,
             session_duration=3600,  # 1 hour sessions
         )
-        
+
         # Create encryption configuration for production
         encryption_config = EncryptionConfiguration(
             algorithm="aes-gcm",
