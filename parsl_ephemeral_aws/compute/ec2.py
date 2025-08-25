@@ -20,7 +20,14 @@ from ..constants import (
     DEFAULT_VPC_CIDR,
 )
 from ..config import SecurityConfig
-from ..security import CredentialManager, CredentialConfiguration
+from ..security import (
+    CredentialManager, 
+    CredentialConfiguration,
+    AuditLogger,
+    SecurityEventType,
+    SecurityEventSeverity,
+    SecurityEvent,
+)
 from ..error_handling import (
     RobustErrorHandler,
     ErrorContext,
@@ -56,6 +63,19 @@ class EC2Manager:
         # Initialize security configuration and credential management
         self._setup_security_config()
 
+        # Initialize audit logging
+        self.audit_logger = self.security_config.get_audit_logger()
+        if self.audit_logger:
+            self.audit_logger.log_event(SecurityEvent(
+                event_type=SecurityEventType.CONFIG_CHANGE,
+                severity=SecurityEventSeverity.INFO,
+                message="EC2Manager initialized",
+                resource_type="ec2_manager",
+                workflow_id=self.provider.workflow_id,
+                metadata={"provider_region": self.provider.region}
+            ))
+            logger.info("Audit logging enabled for EC2 operations")
+
         # Initialize credential manager
         credential_config = self.security_config.get_credential_configuration()
 
@@ -67,8 +87,28 @@ class EC2Manager:
         try:
             self.credential_manager = CredentialManager(credential_config)
             logger.info("Credential manager initialized successfully")
+            
+            # Log successful credential initialization
+            if self.audit_logger:
+                self.audit_logger.log_credential_access(
+                    access_type="credential_init",
+                    identity=credential_config.role_arn or "default",
+                    success=True,
+                    workflow_id=self.provider.workflow_id
+                )
         except Exception as e:
             logger.error(f"Failed to initialize credential manager: {e}")
+            
+            # Log failed credential initialization
+            if self.audit_logger:
+                self.audit_logger.log_credential_access(
+                    access_type="credential_init",
+                    identity="unknown",
+                    success=False,
+                    error=str(e),
+                    workflow_id=self.provider.workflow_id
+                )
+            
             raise ResourceCreationError(f"Credential initialization failed: {e}")
 
         # Initialize AWS session using credential manager
@@ -198,8 +238,30 @@ class EC2Manager:
                     }
                 ],
             )
+            # Log successful VPC creation
+            if self.audit_logger:
+                self.audit_logger.log_resource_operation(
+                    operation="create",
+                    resource_type="vpc",
+                    resource_id=vpc_response["Vpc"]["VpcId"],
+                    success=True,
+                    workflow_id=self.provider.workflow_id,
+                    cidr_block=self.security_config.vpc_cidr
+                )
+            
             return vpc_response
         except Exception as e:
+            # Log failed VPC creation
+            if self.audit_logger:
+                self.audit_logger.log_resource_operation(
+                    operation="create",
+                    resource_type="vpc", 
+                    resource_id="unknown",
+                    success=False,
+                    workflow_id=self.provider.workflow_id,
+                    error=str(e)
+                )
+            
             error_record = self.error_handler.handle_error(e, context)
             raise ResourceCreationError(f"Failed to create VPC: {e}")
 

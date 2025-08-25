@@ -19,6 +19,14 @@ from .encryption import (
     StateEncryptor,
     SecureStateManager,
 )
+from .audit import (
+    SecurityEventType,
+    SecurityEventSeverity,
+    SecurityEvent,
+    SecurityMonitor,
+    AuditLogger,
+    ComplianceFramework,
+)
 
 __all__ = [
     "NetworkSecurityPolicy",
@@ -34,4 +42,10 @@ __all__ = [
     "EncryptionKeyManager",
     "StateEncryptor",
     "SecureStateManager",
+    "SecurityEventType",
+    "SecurityEventSeverity",
+    "SecurityEvent",
+    "SecurityMonitor",
+    "AuditLogger",
+    "ComplianceFramework",
 ]

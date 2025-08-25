@@ -16,6 +16,8 @@ from ..security import (
     SecurityEnvironment,
     CredentialConfiguration,
     EncryptionConfiguration,
+    AuditLogger,
+    ComplianceFramework,
 )
 from ..constants import (
     DEFAULT_VPC_CIDR,
@@ -62,6 +64,11 @@ class SecurityConfig:
     # State encryption settings
     encryption_config: Optional[EncryptionConfiguration] = None
     enable_state_encryption: bool = True
+
+    # Audit and monitoring settings
+    enable_audit_logging: bool = True
+    audit_log_file: Optional[str] = None
+    enable_compliance_monitoring: bool = True
 
     def __post_init__(self):
         """Validate and normalize configuration."""
@@ -311,6 +318,57 @@ class SecurityConfig:
             )
 
         return config
+
+    def get_audit_logger(self) -> Optional[AuditLogger]:
+        """Get audit logger for this security profile.
+
+        Returns
+        -------
+        Optional[AuditLogger]
+            Configured audit logger, None if disabled
+        """
+        if not self.enable_audit_logging:
+            return None
+
+        return AuditLogger(
+            log_file=self.audit_log_file,
+            enable_console=True  # Always enable console for development
+        )
+
+    def run_compliance_check(self, framework: str = "aws_security") -> Dict[str, Any]:
+        """Run compliance check for this configuration.
+
+        Parameters
+        ----------
+        framework : str
+            Compliance framework to check against
+
+        Returns
+        -------
+        Dict[str, Any]
+            Compliance check results
+        """
+        if not self.enable_compliance_monitoring:
+            return {
+                "framework": framework,
+                "compliance_monitoring": "disabled",
+                "message": "Compliance monitoring is disabled"
+            }
+
+        compliance_framework = ComplianceFramework()
+        config_dict = self.to_dict()
+        
+        # Add additional config for compliance checking
+        config_dict.update({
+            "enable_state_encryption": self.enable_state_encryption,
+            "credential_config": self.credential_config.to_dict() if self.credential_config else None,
+            "encryption_config": {
+                "algorithm": self.encryption_config.algorithm if self.encryption_config else None,
+                "master_key_source": self.encryption_config.master_key_source if self.encryption_config else None
+            } if self.encryption_config else None
+        })
+
+        return compliance_framework.run_compliance_check(framework, config_dict)
 
     @classmethod
     def create_development_config(
