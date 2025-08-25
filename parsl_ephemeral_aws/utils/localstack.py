@@ -288,6 +288,40 @@ def setup_localstack_vpc() -> Dict[str, str]:
     }
 
 
+def is_localstack_available() -> bool:
+    """Check if LocalStack is available and running.
+    
+    This function combines endpoint availability check with a basic health check.
+    
+    Returns
+    -------
+    bool
+        True if LocalStack is available, False otherwise
+    """
+    try:
+        return is_localstack_running()
+    except Exception:
+        return False
+
+
+def get_localstack_session(region: str = "us-east-1") -> boto3.Session:
+    """Get a boto3 session configured for LocalStack.
+    
+    This is an alias for create_localstack_session for backwards compatibility.
+    
+    Parameters
+    ----------
+    region : str, optional
+        The AWS region to use, by default 'us-east-1'
+        
+    Returns
+    -------
+    boto3.Session
+        A boto3 session configured to use LocalStack
+    """
+    return create_localstack_session(region)
+
+
 def cleanup_localstack_vpc(vpc_id: str) -> None:
     """Clean up a VPC and all associated resources in LocalStack.
 

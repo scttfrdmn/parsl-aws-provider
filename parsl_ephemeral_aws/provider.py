@@ -213,8 +213,18 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
             s3_bucket=s3_bucket,
         )
 
-        # Set basic attributes
-        self.image_id = image_id
+        # Set basic attributes - resolve image_id if not provided
+        if image_id is None and mode.lower() in ['standard', 'detached'] and compute_type.lower() == 'ec2':
+            # Auto-detect default AMI for the region
+            from parsl_ephemeral_aws.utils.aws import get_default_ami
+            try:
+                self.image_id = get_default_ami(region)
+                logger.info(f"Auto-detected AMI {self.image_id} for region {region}")
+            except Exception as e:
+                logger.warning(f"Failed to auto-detect AMI: {e}. Will need to be set later.")
+                self.image_id = None
+        else:
+            self.image_id = image_id
         self.instance_type = instance_type
         self.region = region
         self.mode_type = OperatingModeType(mode.lower())
@@ -234,6 +244,10 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
         self.use_spot = use_spot
         self.spot_max_price = spot_max_price
         self.spot_allocation_strategy = spot_allocation_strategy
+        self.spot_interruption_handling = spot_interruption_handling
+        self.checkpoint_bucket = checkpoint_bucket
+        self.checkpoint_prefix = checkpoint_prefix
+        self.checkpoint_interval = checkpoint_interval
         self.additional_tags = additional_tags or {}
         self.auto_shutdown = auto_shutdown
         self.max_idle_time = max_idle_time
@@ -296,12 +310,7 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
                 f"{', '.join([m.value for m in OperatingModeType])}"
             )
 
-        # Validate image_id for EC2-based modes
-        if mode_type in [OperatingModeType.STANDARD, OperatingModeType.DETACHED]:
-            if compute_type.lower() == ComputeType.EC2 and not image_id:
-                raise ProviderConfigurationError(
-                    "image_id is required when using EC2 instances"
-                )
+        # Note: image_id validation removed - it will be auto-detected if not provided
 
         # Validate state store type
         try:
