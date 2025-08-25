@@ -10,9 +10,19 @@ import time
 from typing import Dict, Any, Set
 
 import boto3
-from botocore.exceptions import ClientError
+from botocore.exceptions import ClientError, NoCredentialsError
 
 from ..exceptions import ResourceCreationError, ResourceCleanupError, JobSubmissionError
+from ..config import SecurityConfig
+from ..security import (
+    CredentialManager, 
+    CredentialConfiguration,
+    AuditLogger,
+    SecurityEventType,
+    SecurityEventSeverity,
+    SecurityEvent,
+)
+from ..error_handling import RobustErrorHandler, RetryConfig
 from ..constants import (
     TAG_PREFIX,
     TAG_NAME,
@@ -43,7 +53,75 @@ class LambdaManager:
         """
         self.provider = provider
 
-        # Initialize AWS session
+        # Initialize error handling
+        self.error_handler = RobustErrorHandler(
+            retry_config=RetryConfig(
+                max_attempts=5, base_delay=2.0, exponential_backoff=True, jitter=True
+            )
+        )
+        logger.info("Error handler initialized for Lambda operations")
+
+        # Initialize security configuration and credential management
+        self._setup_security_config()
+
+        # Initialize audit logging
+        self.audit_logger = self.security_config.get_audit_logger()
+        if self.audit_logger:
+            self.audit_logger.log_event(SecurityEvent(
+                event_type=SecurityEventType.CONFIG_CHANGE,
+                severity=SecurityEventSeverity.INFO,
+                message="LambdaManager initialized",
+                resource_type="lambda_manager",
+                workflow_id=self.provider.workflow_id,
+                metadata={"provider_region": self.provider.region}
+            ))
+            logger.info("Audit logging enabled for Lambda operations")
+
+        # Initialize credential manager
+        credential_config = self.security_config.get_credential_configuration()
+
+        # Override credential config with provider-specific settings if provided
+        if hasattr(provider, "aws_access_key_id") or hasattr(provider, "aws_profile"):
+            # Legacy credential handling - create credential config from provider settings
+            credential_config = self._create_credential_config_from_provider()
+
+        try:
+            self.credential_manager = CredentialManager(credential_config)
+            logger.info("Credential manager initialized successfully")
+            
+            # Log successful credential initialization
+            if self.audit_logger:
+                self.audit_logger.log_credential_access(
+                    access_type="credential_init",
+                    identity=credential_config.role_arn or "default",
+                    success=True,
+                    workflow_id=self.provider.workflow_id
+                )
+        except Exception as e:
+            logger.error(f"Failed to initialize credential manager: {e}")
+            
+            # Log failed credential initialization
+            if self.audit_logger:
+                self.audit_logger.log_credential_access(
+                    access_type="credential_init",
+                    identity="unknown",
+                    success=False,
+                    error=str(e),
+                    workflow_id=self.provider.workflow_id
+                )
+            
+            raise ResourceCreationError(f"Credential initialization failed: {e}")
+
+        # Initialize AWS session using credential manager
+        try:
+            self.aws_session = self.credential_manager.create_boto3_session(
+                region=self.provider.region
+            )
+        except NoCredentialsError as e:
+            logger.error(f"No valid AWS credentials found: {e}")
+            raise ResourceCreationError(f"AWS credential error: {e}")
+
+        # Initialize AWS session (legacy fallback)
         session_kwargs = {}
         if self.provider.aws_access_key_id and self.provider.aws_secret_access_key:
             session_kwargs["aws_access_key_id"] = self.provider.aws_access_key_id
@@ -57,9 +135,11 @@ class LambdaManager:
         if self.provider.aws_profile:
             session_kwargs["profile_name"] = self.provider.aws_profile
 
-        self.aws_session = boto3.Session(
-            region_name=self.provider.region, **session_kwargs
-        )
+        # Fallback session creation if credential manager fails
+        if not self.aws_session:
+            self.aws_session = boto3.Session(
+                region_name=self.provider.region, **session_kwargs
+            )
 
         # Initialize clients
         self.lambda_client = self.aws_session.client("lambda")
@@ -69,6 +149,38 @@ class LambdaManager:
         self.function_names: Set[str] = set()
         self.role_names: Set[str] = set()
         self.jobs: Dict[str, Any] = {}
+
+    def _setup_security_config(self) -> None:
+        """Set up security configuration from provider settings."""
+        # Get security settings from provider if available
+        security_env = getattr(self.provider, "security_environment", "dev")
+        vpc_cidr = getattr(self.provider, "vpc_cidr", None)
+        admin_cidrs = getattr(self.provider, "admin_cidr_blocks", None)
+        
+        # Use provider's security config if available, otherwise create default
+        if hasattr(self.provider, "security_config") and self.provider.security_config:
+            self.security_config = self.provider.security_config
+        else:
+            if security_env.lower() == "production":
+                self.security_config = SecurityConfig.create_production_config(
+                    vpc_cidr=vpc_cidr or "10.0.0.0/16",
+                    admin_cidrs=admin_cidrs or ["10.0.0.0/8"]
+                )
+            else:
+                self.security_config = SecurityConfig.create_development_config(
+                    vpc_cidr=vpc_cidr or "10.0.0.0/16"
+                )
+
+    def _create_credential_config_from_provider(self) -> CredentialConfiguration:
+        """Create credential configuration from provider settings."""
+        return CredentialConfiguration(
+            aws_access_key_id=getattr(self.provider, "aws_access_key_id", None),
+            aws_secret_access_key=getattr(self.provider, "aws_secret_access_key", None),
+            aws_session_token=getattr(self.provider, "aws_session_token", None),
+            use_profile=getattr(self.provider, "aws_profile", "aws"),
+            enable_sanitization=True,
+            sanitize_logs=True
+        )
 
     def _create_lambda_execution_role(self) -> str:
         """Create an IAM role for Lambda execution.
@@ -173,11 +285,38 @@ class LambdaManager:
             self.function_names.add(function_name)
 
             logger.info(f"Created Lambda function: {function_name}")
+            
+            # Log successful Lambda function creation
+            if self.audit_logger:
+                self.audit_logger.log_resource_operation(
+                    operation="create",
+                    resource_type="lambda_function",
+                    resource_id=function_name,
+                    success=True,
+                    workflow_id=self.provider.workflow_id,
+                    job_id=job_id,
+                    runtime=DEFAULT_LAMBDA_RUNTIME,
+                    timeout=min(self.provider.lambda_timeout, 900),
+                    memory=self.provider.lambda_memory
+                )
 
             return function_name
 
         except ClientError as e:
             logger.error(f"Error creating Lambda function: {e}")
+            
+            # Log failed Lambda function creation
+            if self.audit_logger:
+                self.audit_logger.log_resource_operation(
+                    operation="create",
+                    resource_type="lambda_function",
+                    resource_id=function_name,
+                    success=False,
+                    workflow_id=self.provider.workflow_id,
+                    job_id=job_id,
+                    error=str(e)
+                )
+            
             raise ResourceCreationError(f"Failed to create Lambda function: {e}")
 
     def _generate_lambda_code(self, command: str) -> bytes:

@@ -38,7 +38,14 @@ from ..constants import (
     DEFAULT_VPC_CIDR,
 )
 from ..config import SecurityConfig
-from ..security import CredentialManager, CredentialConfiguration
+from ..security import (
+    CredentialManager, 
+    CredentialConfiguration,
+    AuditLogger,
+    SecurityEventType,
+    SecurityEventSeverity,
+    SecurityEvent,
+)
 from ..error_handling import (
     RobustErrorHandler,
     ErrorContext,
@@ -85,6 +92,19 @@ class SpotFleetManager:
         # Initialize security configuration and credential management
         self._setup_security_config()
 
+        # Initialize audit logging
+        self.audit_logger = self.security_config.get_audit_logger()
+        if self.audit_logger:
+            self.audit_logger.log_event(SecurityEvent(
+                event_type=SecurityEventType.CONFIG_CHANGE,
+                severity=SecurityEventSeverity.INFO,
+                message="SpotFleetManager initialized",
+                resource_type="spot_fleet_manager",
+                workflow_id=self.provider.workflow_id,
+                metadata={"provider_region": self.provider.region}
+            ))
+            logger.info("Audit logging enabled for Spot Fleet operations")
+
         # Initialize credential manager
         credential_config = self.security_config.get_credential_configuration()
 
@@ -96,8 +116,28 @@ class SpotFleetManager:
         try:
             self.credential_manager = CredentialManager(credential_config)
             logger.info("Spot Fleet credential manager initialized successfully")
+            
+            # Log successful credential initialization
+            if self.audit_logger:
+                self.audit_logger.log_credential_access(
+                    access_type="credential_init",
+                    identity=credential_config.role_arn or "default",
+                    success=True,
+                    workflow_id=self.provider.workflow_id
+                )
         except Exception as e:
             logger.error(f"Failed to initialize credential manager: {e}")
+            
+            # Log failed credential initialization
+            if self.audit_logger:
+                self.audit_logger.log_credential_access(
+                    access_type="credential_init",
+                    identity="unknown",
+                    success=False,
+                    error=str(e),
+                    workflow_id=self.provider.workflow_id
+                )
+            
             raise ResourceCreationError(f"Credential initialization failed: {e}")
 
         # Initialize AWS session using credential manager
@@ -1059,6 +1099,19 @@ class SpotFleetManager:
                 "instance_ids": [],
                 "created_at": time.time(),
             }
+            
+            # Log successful spot fleet creation
+            if self.audit_logger:
+                self.audit_logger.log_resource_operation(
+                    operation="create",
+                    resource_type="spot_fleet",
+                    resource_id=fleet_request_id,
+                    success=True,
+                    workflow_id=self.provider.workflow_id,
+                    block_id=block_id,
+                    target_capacity=target_capacity,
+                    instance_types=instance_types
+                )
 
             return fleet_request_id
 
@@ -1068,6 +1121,18 @@ class SpotFleetManager:
             logger.error(
                 f"Error creating Spot Fleet request: {error_code} - {error_msg}"
             )
+            
+            # Log failed spot fleet creation
+            if self.audit_logger:
+                self.audit_logger.log_resource_operation(
+                    operation="create",
+                    resource_type="spot_fleet",
+                    resource_id=f"{block_id}-failed",
+                    success=False,
+                    workflow_id=self.provider.workflow_id,
+                    block_id=block_id,
+                    error=f"{error_code}: {error_msg}"
+                )
 
             # Handle specific error cases
             if error_code == "RequestLimitExceeded":

@@ -13,6 +13,7 @@ from botocore.exceptions import ClientError
 
 from ..exceptions import StateError
 from .base import StateStore
+from ..security import SecurityEventType, SecurityEventSeverity, SecurityEvent
 
 
 logger = logging.getLogger(__name__)
@@ -62,6 +63,9 @@ class ParameterStoreState(StateStore):
 
         # Initialize clients
         self.ssm_client = self.aws_session.client("ssm")
+        
+        # TODO: Integrate audit logging for state operations
+        # self.audit_logger = provider.security_config.get_audit_logger() if hasattr(provider, 'security_config') else None
 
     def _get_parameter_name(self, state_key: str) -> str:
         """Get the full parameter name.

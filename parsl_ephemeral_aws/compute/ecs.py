@@ -25,7 +25,14 @@ from ..constants import (
     DEFAULT_VPC_CIDR,
 )
 from ..config import SecurityConfig
-from ..security import CredentialManager, CredentialConfiguration
+from ..security import (
+    CredentialManager, 
+    CredentialConfiguration,
+    AuditLogger,
+    SecurityEventType,
+    SecurityEventSeverity,
+    SecurityEvent,
+)
 from ..error_handling import RobustErrorHandler, RetryConfig
 
 
@@ -56,6 +63,19 @@ class ECSManager:
         # Initialize security configuration and credential management
         self._setup_security_config()
 
+        # Initialize audit logging
+        self.audit_logger = self.security_config.get_audit_logger()
+        if self.audit_logger:
+            self.audit_logger.log_event(SecurityEvent(
+                event_type=SecurityEventType.CONFIG_CHANGE,
+                severity=SecurityEventSeverity.INFO,
+                message="ECSManager initialized",
+                resource_type="ecs_manager",
+                workflow_id=self.provider.workflow_id,
+                metadata={"provider_region": self.provider.region}
+            ))
+            logger.info("Audit logging enabled for ECS operations")
+
         # Initialize credential manager
         credential_config = self.security_config.get_credential_configuration()
 
@@ -67,8 +87,28 @@ class ECSManager:
         try:
             self.credential_manager = CredentialManager(credential_config)
             logger.info("Credential manager initialized successfully")
+            
+            # Log successful credential initialization
+            if self.audit_logger:
+                self.audit_logger.log_credential_access(
+                    access_type="credential_init",
+                    identity=credential_config.role_arn or "default",
+                    success=True,
+                    workflow_id=self.provider.workflow_id
+                )
         except Exception as e:
             logger.error(f"Failed to initialize credential manager: {e}")
+            
+            # Log failed credential initialization
+            if self.audit_logger:
+                self.audit_logger.log_credential_access(
+                    access_type="credential_init",
+                    identity="unknown",
+                    success=False,
+                    error=str(e),
+                    workflow_id=self.provider.workflow_id
+                )
+            
             raise ResourceCreationError(f"Credential initialization failed: {e}")
 
         # Initialize AWS session using credential manager
@@ -184,6 +224,17 @@ class ECSManager:
             if response["clusters"] and response["clusters"][0]["status"] == "ACTIVE":
                 logger.info(f"Using existing ECS cluster: {cluster_name}")
                 self.clusters.add(cluster_name)
+                
+                # Log cluster access
+                if self.audit_logger:
+                    self.audit_logger.log_resource_operation(
+                        operation="access",
+                        resource_type="ecs_cluster",
+                        resource_id=cluster_name,
+                        success=True,
+                        workflow_id=self.provider.workflow_id
+                    )
+                
                 return cluster_name
 
             # Create cluster
@@ -207,10 +258,34 @@ class ECSManager:
 
             logger.info(f"Created ECS cluster: {cluster_name}")
             self.clusters.add(cluster_name)
+            
+            # Log successful cluster creation
+            if self.audit_logger:
+                self.audit_logger.log_resource_operation(
+                    operation="create",
+                    resource_type="ecs_cluster",
+                    resource_id=cluster_name,
+                    success=True,
+                    workflow_id=self.provider.workflow_id,
+                    capacity_providers=["FARGATE", "FARGATE_SPOT"]
+                )
+            
             return cluster_name
 
         except Exception as e:
             logger.error(f"Error creating ECS cluster: {e}")
+            
+            # Log failed cluster creation
+            if self.audit_logger:
+                self.audit_logger.log_resource_operation(
+                    operation="create",
+                    resource_type="ecs_cluster",
+                    resource_id=cluster_name,
+                    success=False,
+                    workflow_id=self.provider.workflow_id,
+                    error=str(e)
+                )
+            
             raise ResourceCreationError(f"Failed to create ECS cluster: {e}")
 
     def _create_task_execution_role(self) -> str:
@@ -500,6 +575,19 @@ class ECSManager:
             logger.info(
                 f"Submitted job {job_id} to ECS cluster {self.cluster_name} with {len(task_ids)} tasks"
             )
+            
+            # Log successful job submission
+            if self.audit_logger:
+                self.audit_logger.log_resource_operation(
+                    operation="create",
+                    resource_type="ecs_task",
+                    resource_id=primary_task_id or job_id,
+                    success=True,
+                    workflow_id=self.provider.workflow_id,
+                    job_id=job_id,
+                    task_count=len(task_ids),
+                    cluster=self.cluster_name
+                )
 
             return {
                 "job_id": job_id,
@@ -510,6 +598,19 @@ class ECSManager:
 
         except Exception as e:
             logger.error(f"Error submitting job: {e}")
+            
+            # Log failed job submission
+            if self.audit_logger:
+                self.audit_logger.log_resource_operation(
+                    operation="create",
+                    resource_type="ecs_task",
+                    resource_id=job_id,
+                    success=False,
+                    workflow_id=self.provider.workflow_id,
+                    job_id=job_id,
+                    error=str(e)
+                )
+            
             raise JobSubmissionError(f"Failed to submit job: {e}")
 
     def get_job_status(self, cluster: str, task_id: str) -> str:
