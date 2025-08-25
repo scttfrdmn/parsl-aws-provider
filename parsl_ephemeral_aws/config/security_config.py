@@ -332,7 +332,7 @@ class SecurityConfig:
 
         return AuditLogger(
             log_file=self.audit_log_file,
-            enable_console=True  # Always enable console for development
+            enable_console=True,  # Always enable console for development
         )
 
     def run_compliance_check(self, framework: str = "aws_security") -> Dict[str, Any]:
@@ -352,21 +352,31 @@ class SecurityConfig:
             return {
                 "framework": framework,
                 "compliance_monitoring": "disabled",
-                "message": "Compliance monitoring is disabled"
+                "message": "Compliance monitoring is disabled",
             }
 
         compliance_framework = ComplianceFramework()
         config_dict = self.to_dict()
-        
+
         # Add additional config for compliance checking
-        config_dict.update({
-            "enable_state_encryption": self.enable_state_encryption,
-            "credential_config": self.credential_config.to_dict() if self.credential_config else None,
-            "encryption_config": {
-                "algorithm": self.encryption_config.algorithm if self.encryption_config else None,
-                "master_key_source": self.encryption_config.master_key_source if self.encryption_config else None
-            } if self.encryption_config else None
-        })
+        config_dict.update(
+            {
+                "enable_state_encryption": self.enable_state_encryption,
+                "credential_config": self.credential_config.to_dict()
+                if self.credential_config
+                else None,
+                "encryption_config": {
+                    "algorithm": self.encryption_config.algorithm
+                    if self.encryption_config
+                    else None,
+                    "master_key_source": self.encryption_config.master_key_source
+                    if self.encryption_config
+                    else None,
+                }
+                if self.encryption_config
+                else None,
+            }
+        )
 
         return compliance_framework.run_compliance_check(framework, config_dict)
 

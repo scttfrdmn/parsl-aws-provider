@@ -1,5 +1,7 @@
 """
-Constants and default values for the EphemeralAWSProvider.
+Clean constants for the EphemeralAWSProvider.
+
+No legacy garbage, just what's actually needed.
 
 SPDX-License-Identifier: Apache-2.0
 SPDX-FileCopyrightText: 2025 Scott Friedman and Project Contributors
@@ -37,58 +39,8 @@ DEFAULT_SECURITY_GROUP_NAME = "parsl-ephemeral-sg"
 DEFAULT_SG_NAME = DEFAULT_SECURITY_GROUP_NAME  # Alias for compatibility
 DEFAULT_SECURITY_GROUP_DESCRIPTION = "Security group for Parsl ephemeral resources"
 
-# SECURITY WARNING: Legacy insecure rules - DO NOT USE IN PRODUCTION
-# These rules are maintained for backward compatibility only.
-# Use NetworkSecurityPolicy from parsl_ephemeral_aws.security instead.
-LEGACY_INSECURE_INBOUND_RULES = [
-    {
-        "IpProtocol": "tcp",
-        "FromPort": 22,
-        "ToPort": 22,
-        "IpRanges": [{"CidrIp": "0.0.0.0/0"}],
-        "Description": "INSECURE: SSH from anywhere - DO NOT USE",
-    },
-    {
-        "IpProtocol": "tcp",
-        "FromPort": 53,
-        "ToPort": 53,
-        "IpRanges": [{"CidrIp": "0.0.0.0/0"}],
-        "Description": "INSECURE: DNS TCP from anywhere - DO NOT USE",
-    },
-    {
-        "IpProtocol": "udp",
-        "FromPort": 53,
-        "ToPort": 53,
-        "IpRanges": [{"CidrIp": "0.0.0.0/0"}],
-        "Description": "INSECURE: DNS UDP from anywhere - DO NOT USE",
-    },
-    {
-        "IpProtocol": "tcp",
-        "FromPort": 80,
-        "ToPort": 80,
-        "IpRanges": [{"CidrIp": "0.0.0.0/0"}],
-        "Description": "INSECURE: HTTP from anywhere - DO NOT USE",
-    },
-    {
-        "IpProtocol": "tcp",
-        "FromPort": 443,
-        "ToPort": 443,
-        "IpRanges": [{"CidrIp": "0.0.0.0/0"}],
-        "Description": "INSECURE: HTTPS from anywhere - DO NOT USE",
-    },
-    # Parsl communication
-    {
-        "IpProtocol": "tcp",
-        "FromPort": 54000,
-        "ToPort": 55000,
-        "IpRanges": [{"CidrIp": "0.0.0.0/0"}],
-        "Description": "INSECURE: Parsl from anywhere - DO NOT USE",
-    },
-]
-
-# Secure default inbound rules using VPC-internal communication
-# These rules should be used with a properly configured NetworkSecurityPolicy
-DEFAULT_INBOUND_RULES = []  # Empty by default - use NetworkSecurityPolicy instead
+# Clean, simple security rules - no broken legacy stuff
+DEFAULT_INBOUND_RULES = []  # Empty by default - will be set programmatically
 
 # Security framework constants
 DEFAULT_SECURITY_ENVIRONMENT = "dev"  # Options: "dev", "staging", "prod"
@@ -99,136 +51,14 @@ DEFAULT_ALLOW_VPC_INTERNAL = True  # Allow communication within VPC
 # Default outbound rules (allow all - commonly acceptable)
 DEFAULT_OUTBOUND_RULES = [
     {
-        "IpProtocol": "-1",  # All protocols
-        "FromPort": -1,  # All ports
-        "ToPort": -1,  # All ports
+        "IpProtocol": "-1",
+        "FromPort": -1,
+        "ToPort": -1,
         "IpRanges": [{"CidrIp": "0.0.0.0/0"}],
-        "Description": "Allow all outbound traffic",
     }
 ]
 
-# Lambda defaults
-DEFAULT_LAMBDA_MEMORY_SIZE = 1024  # MB
-DEFAULT_LAMBDA_MEMORY = DEFAULT_LAMBDA_MEMORY_SIZE  # Alias for compatibility
-DEFAULT_LAMBDA_TIMEOUT = 300  # seconds
-DEFAULT_LAMBDA_RUNTIME = "python3.9"
-DEFAULT_LAMBDA_HANDLER = "handler.lambda_handler"
-
-# ECS defaults
-DEFAULT_ECS_TASK_CPU = 1024  # CPU units
-DEFAULT_ECS_TASK_MEMORY = 2048  # MB
-DEFAULT_ECS_CLUSTER_NAME = "parsl-ephemeral-cluster"
-# Aliases for compatibility
-DEFAULT_ECS_CPU = DEFAULT_ECS_TASK_CPU
-DEFAULT_ECS_MEMORY = DEFAULT_ECS_TASK_MEMORY
-DEFAULT_ECS_CONTAINER_IMAGE = "public.ecr.aws/lambda/python:3.9"
-
-# Spot instance defaults
-DEFAULT_SPOT_ALLOCATION_STRATEGY = "capacity-optimized"
-DEFAULT_SPOT_INSTANCE_INTERRUPTION_BEHAVIOR = "terminate"
-DEFAULT_SPOT_INTERRUPTION_CHECK_INTERVAL = (
-    30  # seconds - how often to check for interruption notices
-)
-DEFAULT_SPOT_INTERRUPTION_LEAD_TIME = (
-    120  # seconds - minimum lead time for recovery before termination
-)
-DEFAULT_SPOT_CHECKPOINT_INTERVAL = (
-    60  # seconds - how often to checkpoint long-running tasks
-)
-DEFAULT_SPOT_MAX_RECOVERY_ATTEMPTS = 3  # maximum number of recovery attempts for a task
-
-# Tag defaults
-DEFAULT_TAG_PREFIX = "parsl-ephemeral"
-TAG_PREFIX = DEFAULT_TAG_PREFIX  # Alias for compatibility
-TAG_NAME = "Name"
-TAG_WORKFLOW_ID = "WorkflowId"
-TAG_JOB_ID = "JobId"
-TAG_BLOCK_ID = "BlockId"
-DEFAULT_REQUIRED_TAGS = {
-    "Name": "parsl-ephemeral",
-    "CreatedBy": "ParslEphemeralAWSProvider",
-    "AutoCleanup": "true",
-}
-
-# CloudFormation defaults
-DEFAULT_CLOUDFORMATION_STACK_NAME_PREFIX = "parsl-ephemeral"
-
-# Timeout defaults (in seconds)
-DEFAULT_RESOURCE_CREATION_TIMEOUT = 300
-DEFAULT_RESOURCE_DELETION_TIMEOUT = 300
-DEFAULT_CONNECTION_TIMEOUT = 120
-DEFAULT_COMMAND_TIMEOUT = 60
-
-# Status constants
-STATUS_PENDING = "PENDING"
-STATUS_RUNNING = "RUNNING"
-STATUS_COMPLETED = "COMPLETED"
-STATUS_FAILED = "FAILED"
-STATUS_CANCELED = "CANCELED"
-STATUS_CANCELLED = "CANCELED"  # British spelling alias
-STATUS_UNKNOWN = "UNKNOWN"
-STATUS_SUCCEEDED = "COMPLETED"  # Alias for compatibility
-
-# Parsl status mapping
-# Maps provider-specific statuses to Parsl's standard statuses
-EC2_STATUS_MAPPING = {
-    "pending": STATUS_PENDING,
-    "running": STATUS_RUNNING,
-    "shutting-down": STATUS_CANCELED,
-    "terminated": STATUS_COMPLETED,
-    "stopping": STATUS_CANCELED,
-    "stopped": STATUS_CANCELED,
-}
-
-LAMBDA_STATUS_MAPPING = {
-    "Pending": STATUS_PENDING,
-    "Active": STATUS_RUNNING,
-    "Inactive": STATUS_COMPLETED,
-    "Failed": STATUS_FAILED,
-}
-
-ECS_STATUS_MAPPING = {
-    "PROVISIONING": STATUS_PENDING,
-    "PENDING": STATUS_PENDING,
-    "ACTIVATING": STATUS_PENDING,
-    "RUNNING": STATUS_RUNNING,
-    "DEACTIVATING": STATUS_CANCELED,
-    "STOPPING": STATUS_CANCELED,
-    "DEPROVISIONING": STATUS_CANCELED,
-    "STOPPED": STATUS_COMPLETED,
-}
-
-# Resource type constants
-RESOURCE_TYPE_EC2 = "ec2_instance"
-RESOURCE_TYPE_LAMBDA = "lambda_function"
-RESOURCE_TYPE_LAMBDA_FUNCTION = "lambda_function"  # Alias for compatibility
-RESOURCE_TYPE_ECS_TASK = "ecs_task"
-RESOURCE_TYPE_VPC = "vpc"
-RESOURCE_TYPE_SUBNET = "subnet"
-RESOURCE_TYPE_SECURITY_GROUP = "security_group"
-RESOURCE_TYPE_INTERNET_GATEWAY = "internet_gateway"
-RESOURCE_TYPE_ROUTE_TABLE = "route_table"
-RESOURCE_TYPE_BASTION = "bastion_host"
-RESOURCE_TYPE_CLUSTER = "ecs_cluster"
-RESOURCE_TYPE_CLOUDFORMATION_STACK = "cloudformation_stack"
-RESOURCE_TYPE_CLOUDFORMATION = "cloudformation_stack"  # Alias for compatibility
-RESOURCE_TYPE_SPOT_FLEET = "spot_fleet"
-
-# Worker type constants
-WORKER_TYPE_LAMBDA = "lambda"
-WORKER_TYPE_ECS = "ecs"
-WORKER_TYPE_AUTO = "auto"
-
-# Parsl worker environment variables
-WORKER_ENV_VARS = {
-    "PARSL_WORKER_ID": "%(worker_id)s",
-    "PARSL_PROVIDER_ID": "%(provider_id)s",
-    "PARSL_JOB_ID": "%(job_id)s",
-    "PARSL_INSTANCE_ID": "%(instance_id)s",
-}
-
-# Default AMI lookup by region
-# Latest Amazon Linux 2023 AMIs as of date of implementation
+# AMI mappings for different regions (Amazon Linux 2023)
 DEFAULT_AMI_MAPPING = {
     "us-east-1": "ami-080e1f13689e07408",  # N. Virginia
     "us-east-2": "ami-03d21eed81858c120",  # Ohio
@@ -250,5 +80,94 @@ DEFAULT_AMI_MAPPING = {
     "eu-north-1": "ami-03df6dab118053bcb",  # Stockholm
     "eu-south-1": "ami-079fed56921cf99b9",  # Milan
     "me-south-1": "ami-03509ba459e8172c7",  # Bahrain
-    "sa-east-1": "ami-0f8fd9992b25a9090",  # São Paulo
+    "sa-east-1": "ami-0a4cf2f3770eb3f5e",  # São Paulo
 }
+
+# EC2 status mapping to Parsl job states
+EC2_STATUS_MAPPING = {
+    "pending": "PENDING",
+    "running": "RUNNING",
+    "shutting-down": "COMPLETED",
+    "terminated": "COMPLETED",
+    "stopping": "COMPLETED",
+    "stopped": "COMPLETED",
+}
+
+# Resource type constants
+RESOURCE_TYPE_VPC = "vpc"
+RESOURCE_TYPE_SUBNET = "subnet"
+RESOURCE_TYPE_SECURITY_GROUP = "security-group"
+RESOURCE_TYPE_EC2 = "ec2-instance"
+RESOURCE_TYPE_SPOT_FLEET = "spot-fleet"
+RESOURCE_TYPE_BASTION = "bastion"
+RESOURCE_TYPE_CLOUDFORMATION = "cloudformation"
+RESOURCE_TYPE_LAMBDA_FUNCTION = "lambda_function"
+RESOURCE_TYPE_ECS_TASK = "ecs_task"
+
+# Spot fleet constants
+SPOT_FLEET_TARGET_CAPACITY_TYPE = "TargetCapacity"
+SPOT_FLEET_FULFILLED_CAPACITY_TYPE = "FulfilledCapacity"
+SPOT_FLEET_DEFAULT_ALLOCATION_STRATEGY = "capacity-optimized"
+
+# Cleanup constants
+CLEANUP_BATCH_SIZE = 10
+MAX_CLEANUP_RETRIES = 3
+CLEANUP_RETRY_DELAY = 5  # seconds
+
+# Spot instance defaults
+DEFAULT_SPOT_ALLOCATION_STRATEGY = "capacity-optimized"
+DEFAULT_SPOT_INSTANCE_INTERRUPTION_BEHAVIOR = "terminate"
+DEFAULT_SPOT_INTERRUPTION_CHECK_INTERVAL = 30  # seconds
+DEFAULT_SPOT_INTERRUPTION_LEAD_TIME = 120  # seconds
+DEFAULT_SPOT_CHECKPOINT_INTERVAL = 60  # seconds
+DEFAULT_SPOT_MAX_RECOVERY_ATTEMPTS = 3
+
+# Tag defaults
+DEFAULT_TAG_PREFIX = "parsl-ephemeral"
+TAG_PREFIX = DEFAULT_TAG_PREFIX  # Alias for compatibility
+TAG_NAME = "Name"
+TAG_WORKFLOW_ID = "WorkflowId"
+TAG_JOB_ID = "JobId"
+TAG_BLOCK_ID = "BlockId"
+DEFAULT_REQUIRED_TAGS = {
+    "Name": "parsl-ephemeral",
+    "CreatedBy": "ParslEphemeralAWSProvider",
+    "AutoCleanup": "true",
+}
+
+# Security group aliases for compatibility
+DEFAULT_SG_NAME = DEFAULT_SECURITY_GROUP_NAME
+
+# Worker type constants (minimal for import compatibility)
+WORKER_TYPE_LAMBDA = "lambda"
+WORKER_TYPE_ECS = "ecs"
+WORKER_TYPE_AUTO = "auto"
+
+# Status constants
+STATUS_PENDING = "PENDING"
+STATUS_RUNNING = "RUNNING"
+STATUS_COMPLETED = "COMPLETED"
+STATUS_FAILED = "FAILED"
+STATUS_CANCELED = "CANCELED"
+STATUS_CANCELLED = "CANCELED"  # British spelling alias
+STATUS_UNKNOWN = "UNKNOWN"
+STATUS_SUCCEEDED = "COMPLETED"  # Alias for compatibility
+
+# Lambda defaults (minimal for imports)
+DEFAULT_LAMBDA_TIMEOUT = 300
+DEFAULT_LAMBDA_RUNTIME = "python3.9"
+DEFAULT_LAMBDA_HANDLER = "handler.lambda_handler"
+DEFAULT_LAMBDA_MEMORY = 1024
+
+# ECS defaults (minimal for imports)
+DEFAULT_ECS_TASK_CPU = 1024
+DEFAULT_ECS_TASK_MEMORY = 2048
+DEFAULT_ECS_CPU = 1024  # Alias
+DEFAULT_ECS_MEMORY = 2048  # Alias
+DEFAULT_ECS_CONTAINER_IMAGE = "public.ecr.aws/lambda/python:3.9"
+DEFAULT_ECS_CLUSTER_NAME = "parsl-ephemeral-cluster"
+
+# Timeout constants (in seconds)
+DEFAULT_RESOURCE_CREATION_TIMEOUT = 300  # 5 minutes
+DEFAULT_RESOURCE_DELETION_TIMEOUT = 180  # 3 minutes
+DEFAULT_INSTANCE_BOOT_TIMEOUT = 600  # 10 minutes

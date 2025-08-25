@@ -1,6 +1,17 @@
 # Parsl Ephemeral AWS Provider
 
-A modern, flexible AWS provider for the Parsl parallel scripting library that leverages ephemeral resources for cost-effective, scalable scientific computation.
+An AWS provider for Parsl that creates and manages ephemeral cloud resources with comprehensive error handling and proper AWS integration.
+
+## Status: Phase 1 Complete
+
+**Phase 1 (Basic Provider)** is complete:
+- Real AWS EC2 instance management with proper waiters
+- Comprehensive error handling with detailed error messages
+- Complete resource lifecycle management (create → monitor → cleanup)
+- Production logging and validation
+- Multi-run operation with full resource cleanup
+
+**Next**: Phase 1.5 - Pre-baked AMI optimization for faster startup times.
 
 [![PyPI version](https://badge.fury.io/py/parsl-ephemeral-aws.svg)](https://badge.fury.io/py/parsl-ephemeral-aws)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
@@ -10,17 +21,60 @@ A modern, flexible AWS provider for the Parsl parallel scripting library that le
 [![codecov](https://codecov.io/gh/scttfrdmn/parsl-aws-provider/branch/main/graph/badge.svg)](https://codecov.io/gh/scttfrdmn/parsl-aws-provider)
 [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.placeholder.svg)](https://doi.org/10.5281/zenodo.placeholder)
 
+## Quick Start (Phase 1)
+
+Get started with the Phase 1 provider:
+
+```bash
+# Clone and setup
+git clone <repository-url>
+cd parsl-aws-provider
+python -m venv .venv
+source .venv/bin/activate  # or `.venv\Scripts\activate` on Windows
+pip install parsl boto3
+
+# Configure AWS credentials
+aws configure
+
+# Test the provider
+python tools/phase1.py
+```
+
+**Expected output**: Real AWS instance launched → Job runs → Resources cleaned up
+
+## Documentation
+
+- **[Phase 1 Guide](README_PHASE1.md)** - Complete setup and usage for Phase 1 provider
+- **[Success Proof](PHASE1_SUCCESS_PROOF.md)** - Evidence that Phase 1 works correctly
+- **[Tools Directory](tools/README.md)** - Utilities for development and testing
+
+## Current Capabilities (Phase 1)
+
+**Core Features**:
+- **Real AWS Integration**: Launches actual EC2 instances with proper waiters
+- **Comprehensive Validation**: Every AWS operation confirmed before proceeding
+- **Error Handling**: Detailed error messages, no silent failures
+- **Resource Management**: Automatic tagging, tracking, and cleanup
+- **Production Logging**: Complete operation tracking
+- **Multi-run Reliability**: Consistent behavior across multiple executions
+
+## Future Phases
+
+**Phase 1.5**: Pre-baked AMI optimization for faster startup
+**Phase 2**: Spot instance support for cost optimization
+**Phase 3**: Detached mode with bastion host
+**Phase 4**: Serverless compute (Lambda/ECS)
+**Phase 5**: Advanced features (MPI, hibernation, custom VPCs)
+
 ## Overview
 
-The Parsl Ephemeral AWS Provider enables seamless execution of Parsl workflows on dynamically provisioned AWS resources with true ephemerality - resources are created when needed and destroyed when not, minimizing costs while maximizing scalability.
+This project provides an AWS provider for Parsl with ephemeral resource management - resources are created when needed and destroyed when not, minimizing costs while maximizing scalability.
 
-Unlike the standard Parsl AWS provider, this implementation:
-
-- **Truly ephemeral**: All resources (including VPC, security groups, etc.) are cleaned up automatically
-- **Flexible compute options**: Supports EC2, Spot instances, Lambda, and ECS/Fargate
-- **Modern AWS integration**: Uses EC2 Fleet, Spot Fleet, auto-scaling groups, and other advanced AWS features
-- **Resilient execution**: Intelligently handles spot interruptions with state persistence
-- **Multi-mode operation**: Choose between standard, detached, or serverless execution modes
+**Future capabilities** (not yet implemented):
+- **Flexible compute options**: EC2, Spot instances, Lambda, and ECS/Fargate
+- **Modern AWS integration**: EC2 Fleet, Spot Fleet, auto-scaling groups
+- **Resilient execution**: Intelligent spot interruption handling with state persistence
+- **Multi-mode operation**: Standard, detached, and serverless execution modes
 
 ## Development
 

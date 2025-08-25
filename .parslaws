@@ -1,0 +1,20 @@
+# Parsl AWS Provider Configuration
+# This file contains default settings for the AWS provider
+
+[aws]
+profile = aws
+region = us-east-1
+instance_type = t3.micro
+
+[provider]
+label = parsl-aws
+max_blocks = 10
+min_blocks = 0
+init_blocks = 1
+
+# Optional: Custom AMI per region
+[amis]
+us-east-1 = ami-080e1f13689e07408
+us-east-2 = ami-03d21eed81858c120
+us-west-1 = ami-0d5b7dce3973d8817
+us-west-2 = ami-0473ec1595e64e666
