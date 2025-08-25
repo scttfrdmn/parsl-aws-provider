@@ -1,0 +1,41 @@
+{
+  "summary": {
+    "workflow_id": "security-test-8d652063",
+    "timestamp": "2025-08-24T17:51:19.737865",
+    "total_tests": 3,
+    "passed": 3,
+    "failed": 0,
+    "success_rate": 100.0,
+    "duration_seconds": 0.4680030345916748
+  },
+  "test_results": {
+    "credential_management": {
+      "status": "PASS",
+      "details": {
+        "profile": "aws",
+        "credential_source": "instance_profile",
+        "regions_accessible": 17,
+        "session_created": true
+      }
+    },
+    "audit_logging": {
+      "status": "PASS",
+      "details": {
+        "audit_file": "/var/folders/x5/_jwxtjjx347635h39vn8hcxm0000gn/T/tmphiri9qau/security_audit_security-test-8d652063.log",
+        "events_logged": 0,
+        "summary_status": "active"
+      }
+    },
+    "compliance_framework": {
+      "status": "PASS",
+      "details": {
+        "aws_security_score": 60.0,
+        "aws_passed_checks": 3,
+        "soc2_score": 75.0,
+        "soc2_passed_checks": 3,
+        "nist_score": 80.0,
+        "nist_passed_checks": 4
+      }
+    }
+  }
+}
