@@ -1,0 +1,172 @@
+# Parsl AWS Provider Configuration
+# This file contains all configurable parameters to avoid hardcoded values
+
+# AWS Region Configuration
+aws:
+  regions:
+    # Base AMIs per region (Amazon Linux 2023)
+    base_amis:
+      us-east-1: "ami-080e1f13689e07408"
+      us-east-2: "ami-03d21eed81858c120"
+      us-west-1: "ami-0d5b7dce3973d8817"
+      us-west-2: "ami-0473ec1595e64e666"
+
+    # Default region if not specified
+    default_region: "us-east-1"
+
+# Instance Configuration
+instance:
+  # Default instance type
+  default_type: "t3.micro"
+
+  # Instance types suitable for different workloads
+  types:
+    micro: "t3.micro"      # Testing/minimal workloads
+    small: "t3.small"      # Light computation
+    medium: "t3.medium"    # Standard workloads
+    large: "t3.large"      # Heavy computation
+    compute: "c5.large"    # CPU-intensive tasks
+
+# Networking Configuration
+networking:
+  # Security group configuration
+  security_group:
+    name_prefix: "aws-enhanced"
+    description: "Parsl AWS Provider Enhanced Security Group"
+
+    # Inbound rules
+    ingress_rules:
+      - from_port: 22
+        to_port: 22
+        protocol: "tcp"
+        cidr_blocks: ["0.0.0.0/0"]
+        description: "SSH access"
+
+      - from_port: 54000
+        to_port: 56000
+        protocol: "tcp"
+        cidr_blocks: ["0.0.0.0/0"]
+        description: "Parsl worker communication"
+
+  # Port ranges
+  port_ranges:
+    worker_ports: [54000, 55000]
+    interchange_ports: [55000, 56000]
+    tunnel_ports: [50000, 60000]
+
+# SSM Configuration
+ssm:
+  # Tunnel configuration
+  tunneling:
+    enabled: true
+    timeout_seconds: 300
+    health_check_interval: 30
+
+  # IAM role configuration for SSM
+  iam:
+    # Available instance profiles by account/region
+    instance_profiles:
+      default: "AmazonSSMRoleForInstancesQuickSetup"
+      fallback: "ParslWorkerInstanceProfile"  # Fallback if default not found
+
+    role_name: "ParslWorkerRole"
+    policy_arns:
+      - "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+
+# AMI Configuration
+ami:
+  # Optimized AMI discovery settings
+  discovery:
+    enabled: true
+    max_age_days: 30
+    required_tags:
+      CreatedBy: "ParslAWSProvider"
+      Version: "1.5"
+    preferred_features:
+      - "Parsl"
+      - "SSMAgent"
+      - "ProcessWorkerPool"
+
+  # AMI building configuration
+  build:
+    base_name_prefix: "parsl-aws-provider"
+    description_template: "Parsl AMI with {parsl_version} built on {build_date}"
+    required_packages:
+      - "python3-pip"
+      - "parsl"
+
+    # Installation verification commands
+    validation_commands:
+      - 'python3 -c "import parsl; print(f\"Parsl version: {parsl.__version__}\")"'
+      - "ls -la /usr/local/bin/process_worker_pool.py"
+      - "systemctl is-active amazon-ssm-agent"
+
+# Provider Configuration
+provider:
+  # Scaling configuration
+  scaling:
+    min_blocks: 0
+    max_blocks: 10
+    init_blocks: 1
+
+  # Default labels and prefixes
+  labels:
+    default: "aws_phase15_enhanced"
+
+  # Timeout configurations (seconds)
+  timeouts:
+    instance_startup: 300
+    ssm_agent_ready: 400
+    worker_connection: 120
+    ami_creation: 1800
+
+# Logging Configuration
+logging:
+  level: "INFO"
+
+  # Log message templates
+  templates:
+    provider_ready: "Phase 1.5 Enhanced AWSProvider ready: {provider_id}"
+    instance_launch: "Launching instance for job {job_id}: {instance_type}"
+    tunnel_created: "Tunnel created successfully for job {job_id}: localhost:{local_port} -> {instance_id}:{remote_port}"
+    ami_selected: "Using {ami_type} AMI: {ami_id} ({description})"
+
+# Worker Configuration
+worker:
+  # Default worker initialization script
+  init_script: |
+    #!/bin/bash
+    set -e
+    export HOME=/root
+    export USER=root
+    export PATH="/usr/local/bin:/usr/bin:/bin:$PATH"
+
+    # Create log directory
+    mkdir -p /tmp/parsl_logs
+
+  # Required worker arguments that are often missing
+  required_args:
+    cert_dir: "/tmp"
+    cpu_affinity: "none"
+
+  # Process execution
+  execution:
+    use_nohup: true
+    log_path: "/tmp/parsl_logs/worker.log"
+
+# Development and Testing Configuration
+development:
+  # Test configuration
+  test:
+    timeout_seconds: 300
+    max_retries: 3
+
+    # Test instance configuration
+    instance_type: "t3.micro"
+    terminate_on_completion: true
+
+  # Debug settings
+  debug:
+    enabled: false
+    verbose_logging: false
+    keep_failed_instances: false

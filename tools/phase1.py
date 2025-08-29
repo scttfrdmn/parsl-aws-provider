@@ -9,11 +9,13 @@ No silent failures - comprehensive error handling throughout.
 import logging
 import time
 import uuid
+from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
 import boto3
 from botocore.exceptions import ClientError, NoCredentialsError
 from parsl.providers.base import ExecutionProvider
+from parsl.jobs.states import JobStatus, JobState
 
 logger = logging.getLogger(__name__)
 
@@ -94,6 +96,7 @@ class AWSProvider(ExecutionProvider):
         init_blocks: int = 1,
         worker_init: str = "",
         label: str = "aws_phase1",
+        prefer_optimized_ami: bool = True,  # Phase 1.5 feature
     ):
         """Initialize AWS provider."""
 
@@ -109,9 +112,13 @@ class AWSProvider(ExecutionProvider):
         # AWS configuration
         self.region = region
         self.instance_type = instance_type
-        self.ami_id = ami_id or self._get_default_ami()
         self.key_name = key_name
         self.worker_init = worker_init
+        self.prefer_optimized_ami = prefer_optimized_ami
+
+        # AMI selection (will be set during AWS initialization)
+        self.ami_id = ami_id
+        self.is_optimized_ami = False
 
         # Internal state
         self.provider_id = f"aws-provider-{uuid.uuid4().hex[:8]}"
@@ -123,8 +130,81 @@ class AWSProvider(ExecutionProvider):
 
         logger.info(f"AWSProvider ready: {self.provider_id}")
 
-    def _get_default_ami(self) -> str:
-        """Get default AMI for region."""
+    def _select_ami(self):
+        """Select best available AMI (Phase 1.5 with optimized AMI discovery)."""
+
+        # If user specified AMI, use it
+        if self.ami_id:
+            logger.info(f"Using user-specified AMI: {self.ami_id}")
+            return
+
+        # Try to find optimized AMI first (Phase 1.5)
+        if self.prefer_optimized_ami:
+            optimized_ami = self._find_optimized_ami()
+            if optimized_ami:
+                self.ami_id = optimized_ami
+                self.is_optimized_ami = True
+                logger.info(
+                    f"Using optimized AMI: {self.ami_id} (Phase 1.5 - fast startup)"
+                )
+                return
+            else:
+                logger.info(
+                    "No compatible optimized AMI found, using base AMI (Phase 1 behavior)"
+                )
+
+        # Fallback to base AMI (Phase 1 behavior)
+        self.ami_id = self._get_base_ami()
+        self.is_optimized_ami = False
+        logger.info(f"Using base AMI: {self.ami_id} (Phase 1 - installing packages)")
+
+    def _find_optimized_ami(self) -> Optional[str]:
+        """Find compatible optimized AMI (Phase 1.5)."""
+        try:
+            response = self.ec2.describe_images(
+                Owners=["self"],
+                Filters=[
+                    {"Name": "tag:CreatedBy", "Values": ["ParslAWSProvider"]},
+                    {"Name": "tag:Version", "Values": ["1.5"]},
+                    {"Name": "state", "Values": ["available"]},
+                ],
+            )
+
+            compatible_amis = []
+            for ami in response["Images"]:
+                if self._is_compatible_ami(ami):
+                    compatible_amis.append(ami)
+
+            # Return newest compatible AMI
+            if compatible_amis:
+                newest = max(compatible_amis, key=lambda x: x["CreationDate"])
+                return newest["ImageId"]
+
+        except Exception as e:
+            logger.debug(f"Optimized AMI discovery failed: {e}")
+
+        return None
+
+    def _is_compatible_ami(self, ami: Dict) -> bool:
+        """Check if AMI is compatible with current requirements."""
+        tags = {tag["Key"]: tag["Value"] for tag in ami.get("Tags", [])}
+
+        # Check age (don't use AMIs older than 30 days for freshness)
+        try:
+            creation_date = datetime.fromisoformat(
+                ami["CreationDate"].replace("Z", "+00:00")
+            )
+            age_days = (datetime.now(timezone.utc) - creation_date).days
+            if age_days > 30:
+                logger.debug(f"AMI {ami['ImageId']} too old: {age_days} days")
+                return False
+        except Exception:
+            pass  # If we can't parse date, assume it's compatible
+
+        return True
+
+    def _get_base_ami(self) -> str:
+        """Get base AMI for region (Phase 1 fallback)."""
         ami_map = {
             "us-east-1": "ami-080e1f13689e07408",  # Amazon Linux 2023
             "us-east-2": "ami-03d21eed81858c120",
@@ -155,7 +235,8 @@ class AWSProvider(ExecutionProvider):
         except Exception as e:
             raise Exception(f"AWS credentials invalid: {e}")
 
-        # Validate AMI
+        # Select and validate AMI (Phase 1.5 optimized AMI discovery)
+        self._select_ami()
         self._validate_ami()
 
         # Setup security group with waiter
@@ -318,29 +399,8 @@ class AWSProvider(ExecutionProvider):
         # Pre-flight validation
         self._validate_ready_for_submit()
 
-        # Create user data
-        user_data = f"""#!/bin/bash
-exec > >(tee /var/log/user-data.log) 2>&1
-
-echo "=== PHASE 1 JOB START ==="
-echo "Job ID: {job_id}"
-echo "Started: $(date)"
-
-# Install Python and Parsl
-yum update -y
-yum install -y python3 python3-pip
-pip3 install parsl
-
-# User initialization
-{self.worker_init}
-
-# Execute command
-echo "Executing: {command}"
-{command}
-
-echo "Job completed: $(date)"
-echo "=== PHASE 1 JOB END ==="
-"""
+        # Create user data (optimized for Phase 1.5 if using optimized AMI)
+        user_data = self._create_user_data(job_id, command)
 
         # Launch instance
         logger.info(f"Launching instance for job {job_id}...")
@@ -412,7 +472,7 @@ echo "=== PHASE 1 JOB END ==="
         except Exception as e:
             raise Exception(f"AMI validation failed: {e}")
 
-    def status(self, job_ids: List[str]) -> List[Dict[str, str]]:
+    def status(self, job_ids: List[str]) -> List[JobStatus]:
         """Get job status with comprehensive error handling."""
 
         statuses = []
@@ -420,38 +480,45 @@ echo "=== PHASE 1 JOB END ==="
         for job_id in job_ids:
             try:
                 if job_id not in self.instances:
-                    statuses.append({"job_id": job_id, "status": "UNKNOWN"})
+                    statuses.append(
+                        JobStatus(JobState.UNKNOWN, message=f"Job {job_id} not found")
+                    )
                     continue
 
                 instance_id = self.instances[job_id]
                 response = self.ec2.describe_instances(InstanceIds=[instance_id])
 
                 if not response["Reservations"]:
-                    statuses.append({"job_id": job_id, "status": "COMPLETED"})
+                    statuses.append(
+                        JobStatus(JobState.COMPLETED, message="Instance terminated")
+                    )
                     continue
 
                 instance = response["Reservations"][0]["Instances"][0]
                 ec2_state = instance["State"]["Name"]
 
+                # Map EC2 states to Parsl JobStates
                 state_mapping = {
-                    "pending": "PENDING",
-                    "running": "RUNNING",
-                    "stopped": "COMPLETED",
-                    "terminated": "COMPLETED",
-                    "stopping": "COMPLETED",
-                    "shutting-down": "COMPLETED",
+                    "pending": JobState.PENDING,
+                    "running": JobState.RUNNING,
+                    "stopped": JobState.COMPLETED,
+                    "terminated": JobState.COMPLETED,
+                    "stopping": JobState.COMPLETED,
+                    "shutting-down": JobState.COMPLETED,
                 }
 
-                parsl_state = state_mapping.get(ec2_state, "UNKNOWN")
-                statuses.append({"job_id": job_id, "status": parsl_state})
+                parsl_state = state_mapping.get(ec2_state, JobState.UNKNOWN)
+                statuses.append(
+                    JobStatus(parsl_state, message=f"EC2 state: {ec2_state}")
+                )
 
             except Exception as e:
                 logger.error(f"Failed to get status for {job_id}: {e}")
-                statuses.append({"job_id": job_id, "status": "FAILED"})
+                statuses.append(JobStatus(JobState.FAILED, message=str(e)))
 
         return statuses
 
-    def cancel(self, job_ids: List[str]) -> List[Dict[str, str]]:
+    def cancel(self, job_ids: List[str]) -> List[bool]:
         """Cancel jobs with comprehensive error handling."""
 
         results = []
@@ -462,13 +529,14 @@ echo "=== PHASE 1 JOB END ==="
                     instance_id = self.instances[job_id]
                     self.ec2.terminate_instances(InstanceIds=[instance_id])
                     logger.info(f"Terminated instance {instance_id} for job {job_id}")
-                    results.append({"job_id": job_id, "status": "CANCELLED"})
+                    results.append(True)
                 else:
-                    results.append({"job_id": job_id, "status": "UNKNOWN"})
+                    logger.warning(f"Job {job_id} not found for cancellation")
+                    results.append(False)
 
             except Exception as e:
                 logger.error(f"Failed to cancel job {job_id}: {e}")
-                results.append({"job_id": job_id, "status": "FAILED"})
+                results.append(False)
 
         return results
 
@@ -539,6 +607,60 @@ echo "=== PHASE 1 JOB END ==="
 
     def scale_in(self, blocks: int) -> List[str]:
         return []
+
+    def _create_user_data(self, job_id: str, command: str) -> str:
+        """Create user data script, optimized for Phase 1.5 AMIs."""
+
+        if self.is_optimized_ami:
+            # Phase 1.5: Minimal user data for optimized AMI
+            return f"""#!/bin/bash
+exec > >(tee /var/log/user-data.log) 2>&1
+
+echo "=== PHASE 1.5 JOB START (OPTIMIZED) ==="
+echo "Job ID: {job_id}"
+echo "Started: $(date)"
+echo "AMI: {self.ami_id} (optimized)"
+
+# Verify Parsl is available
+echo "Verifying Parsl installation..."
+python3 -c "import parsl; print('Parsl version:', parsl.__version__)" || echo "WARNING: Parsl not found"
+
+# User initialization
+{self.worker_init}
+
+# Execute command
+echo "Executing: {command}"
+{command}
+
+echo "Job completed: $(date)"
+echo "=== PHASE 1.5 JOB END ==="
+"""
+        else:
+            # Phase 1: Full installation for base AMI
+            return f"""#!/bin/bash
+exec > >(tee /var/log/user-data.log) 2>&1
+
+echo "=== PHASE 1 JOB START (BASE AMI) ==="
+echo "Job ID: {job_id}"
+echo "Started: $(date)"
+echo "AMI: {self.ami_id} (base - installing packages)"
+
+# Install Python and Parsl
+echo "Installing packages..."
+yum update -y
+yum install -y python3 python3-pip
+pip3 install parsl
+
+# User initialization
+{self.worker_init}
+
+# Execute command
+echo "Executing: {command}"
+{command}
+
+echo "Job completed: $(date)"
+echo "=== PHASE 1 JOB END ==="
+"""
 
 
 # Test the provider
