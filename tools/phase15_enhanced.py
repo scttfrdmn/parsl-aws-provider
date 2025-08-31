@@ -32,6 +32,14 @@ from ssh_reverse_tunnel import SSMSSHTunnel
 from private_subnet import PrivateSubnetManager
 from config_loader import get_config
 
+# Phase 2 imports (conditional to maintain backward compatibility)
+try:
+    from container_runtime import DockerRuntimeManager, ScientificContainerBuilder
+    PHASE2_AVAILABLE = True
+except ImportError:
+    logger.warning("Phase 2 container features not available - install container_runtime module")
+    PHASE2_AVAILABLE = False
+
 logger = logging.getLogger(__name__)
 
 
@@ -115,6 +123,17 @@ class AWSProvider(ExecutionProvider):
         tunnel_port_range: tuple = (50000, 60000),
         aws_profile: str = "aws",
         python_version: str = "3.10",  # Default to standard Ubuntu AMI version
+        
+        # Phase 2: Container Support
+        container_runtime: Optional[str] = None,  # 'docker', 'singularity', or None
+        container_image: Optional[str] = None,    # Container image to use
+        scientific_stack: Optional[str] = None,   # 'basic', 'ml', 'bio', or custom
+        container_config: Optional[Dict] = None,  # Advanced container configuration
+        
+        # Phase 2: Dependency Management
+        custom_packages: Optional[List[str]] = None,  # Additional Python packages
+        dependency_cache: bool = True,                # Enable dependency caching
+        cache_backend: str = "s3",                   # 's3', 'ebs', or 'memory'
     ):
         """Initialize Phase 1.5 Enhanced AWS provider."""
 
@@ -141,10 +160,44 @@ class AWSProvider(ExecutionProvider):
         self.use_private_subnets = use_private_subnets
         self.tunnel_port_range = tunnel_port_range
 
+        # Phase 2: Container and dependency features
+        self.container_runtime = container_runtime
+        self.container_image = container_image
+        self.scientific_stack = scientific_stack
+        self.container_config = container_config or {}
+        self.custom_packages = custom_packages or []
+        self.dependency_cache = dependency_cache
+        self.cache_backend = cache_backend
+
         # Force SSM tunneling for private subnets
         if self.use_private_subnets:
             self.enable_ssm_tunneling = True
             logger.info("Private subnets enabled - forcing SSM tunneling")
+
+        # Initialize Phase 2 managers (if available)
+        self.container_manager = None
+        self.dependency_cache_manager = None
+        self.scientific_builder = None
+        
+        if self.container_runtime and PHASE2_AVAILABLE:
+            self.container_manager = DockerRuntimeManager(self)
+            self.scientific_builder = ScientificContainerBuilder()
+            logger.info(f"Phase 2 container runtime enabled: {self.container_runtime}")
+            
+            if self.scientific_stack:
+                logger.info(f"Using scientific stack: {self.scientific_stack}")
+            elif self.container_image:
+                logger.info(f"Using container image: {self.container_image}")
+        elif self.container_runtime and not PHASE2_AVAILABLE:
+            logger.warning("Container runtime requested but Phase 2 modules not available")
+            logger.warning("Falling back to Phase 1.5 native execution")
+            self.container_runtime = None
+                
+        if self.custom_packages:
+            logger.info(f"Custom packages: {', '.join(self.custom_packages)}")
+            
+        if self.dependency_cache:
+            logger.info(f"Dependency caching enabled: {self.cache_backend}")
 
         # AMI selection (will be set during AWS initialization)
         self.ami_id = ami_id
@@ -241,8 +294,15 @@ class AWSProvider(ExecutionProvider):
         logger.info(f"Using base AMI: {self.ami_id} (Phase 1 - installing packages)")
 
     def _find_optimized_ami(self) -> Optional[str]:
-        """Find compatible optimized AMI (Phase 1.5)."""
+        """Find compatible optimized AMI (Phase 1.5 or Phase 2)."""
         try:
+            # First, try to find Phase 2 AMI if container runtime is enabled
+            if self.container_runtime:
+                phase2_ami = self._find_phase2_ami()
+                if phase2_ami:
+                    return phase2_ami
+            
+            # Fall back to Phase 1.5 AMI
             response = self.ec2.describe_images(
                 Owners=["self"],
                 Filters=[
@@ -264,6 +324,35 @@ class AWSProvider(ExecutionProvider):
 
         except Exception as e:
             logger.debug(f"Optimized AMI discovery failed: {e}")
+
+        return None
+        
+    def _find_phase2_ami(self) -> Optional[str]:
+        """Find compatible Phase 2 AMI with Docker support."""
+        try:
+            response = self.ec2.describe_images(
+                Owners=["self"],
+                Filters=[
+                    {"Name": "tag:CreatedBy", "Values": ["ParslAWSProvider"]},
+                    {"Name": "tag:Version", "Values": ["2.0"]},
+                    {"Name": "tag:DockerSupport", "Values": ["true"]},
+                    {"Name": "state", "Values": ["available"]},
+                ],
+            )
+
+            compatible_amis = []
+            for ami in response["Images"]:
+                if self._is_compatible_ami(ami):
+                    compatible_amis.append(ami)
+
+            # Return newest compatible Phase 2 AMI
+            if compatible_amis:
+                newest = max(compatible_amis, key=lambda x: x["CreationDate"])
+                logger.info(f"Found Phase 2 AMI with Docker: {newest['ImageId']}")
+                return newest["ImageId"]
+
+        except Exception as e:
+            logger.debug(f"Phase 2 AMI discovery failed: {e}")
 
         return None
 
@@ -550,12 +639,23 @@ class AWSProvider(ExecutionProvider):
 
     def _get_user_data_script(self) -> str:
         """Generate user data script based on AMI type and configuration."""
+        # SSH configuration for container tunnel access (required for Phase 2)
+        ssh_config = """
+# Configure SSH to accept reverse tunneled connections from containers
+echo "GatewayPorts yes" >> /etc/ssh/sshd_config
+echo "ClientAliveInterval 60" >> /etc/ssh/sshd_config
+echo "ClientAliveCountMax 3" >> /etc/ssh/sshd_config
+systemctl restart sshd
+"""
+        
         if self.is_optimized_ami:
             # Optimized AMI - minimal setup needed
             return f"""#!/bin/bash
 # Phase 1.5 - Optimized AMI startup
 exec > >(tee /var/log/user-data.log) 2>&1
 echo "$(date): Starting optimized AMI initialization"
+
+{ssh_config.strip()}
 
 # User custom init
 {self.worker_init}
@@ -577,6 +677,8 @@ yum install -y python3 python3-pip
 
 # Install Parsl and dependencies
 pip3 install parsl zmq psutil
+
+{ssh_config.strip()}
 
 # User custom init
 {self.worker_init}
@@ -615,13 +717,66 @@ echo "$(date): Base AMI setup complete"
         """Submit job using SSH reverse tunneling over SSM."""
         logger.info(f"Submitting job {job_id} with SSH reverse tunneling...")
 
-        # Parse worker command to extract controller port
-        try:
-            parsed = ParslWorkerCommandParser.parse_addresses_and_port(command)
-            controller_port = int(parsed["port"]) if parsed["port"] else 54321
-        except Exception as e:
-            logger.error(f"Failed to parse worker command: {e}")
-            raise ValueError(f"Could not parse Parsl worker command: {command}")
+        # Extract actual ports from the command that Parsl provides
+        # For containers, we need reverse tunnels: AWS localhost:port -> local localhost:port
+        logger.debug(f"Worker command: {command}")
+        
+        # Parse the command to get the actual controller ports
+        import re
+        
+        # Log command type for debugging
+        if "docker run" in command:
+            logger.info(f"🐳 CONTAINER COMMAND RECEIVED: {command}")
+        else:
+            logger.debug(f"📋 Regular command: {command}")
+        
+        # Use command as-is (already containerized by executor if needed)
+        container_command = command
+        
+        # For containers with SSH over SSM, add tunnel connectivity verification
+        if "docker run" in command:
+            # Extract the port from the command
+            port_match = re.search(r'--port=(\d+)', command)
+            if port_match:
+                port = port_match.group(1)
+                # Test tunnel before starting worker, with retries since SSM tunnel may need time
+                tunnel_test = f"""
+                echo 'Testing SSH over SSM tunnel connectivity to port {port}...'
+                for i in {{1..30}}; do
+                    if nc -z 127.0.0.1 {port}; then
+                        echo "✅ SSH over SSM tunnel to port {port} is accessible"
+                        break
+                    else
+                        echo "⏳ Waiting for SSH over SSM tunnel... (attempt $i/30)"
+                        sleep 2
+                    fi
+                done
+                nc -z 127.0.0.1 {port} || {{ echo '❌ SSH over SSM tunnel not accessible after 60s'; exit 1; }}
+                """
+                container_command = command.replace(
+                    "bash -c 'pip install",
+                    f"bash -c '{tunnel_test.strip()} && pip install"
+                )
+        
+        # Try new single-port format first (Parsl 2025.8.25+)
+        port_match = re.search(r'--port=(\d+)', container_command)
+        if port_match:
+            interchange_port = int(port_match.group(1))
+            # In new format, single port is used for both task and result communication
+            task_port = result_port = interchange_port
+            logger.info(f"Found interchange port: {interchange_port}")
+        else:
+            # Fallback to old dual-port format (Parsl < 2025.8.25)
+            task_port_match = re.search(r'--task_port=(\d+)', container_command)
+            result_port_match = re.search(r'--result_port=(\d+)', container_command) 
+            
+            if task_port_match and result_port_match:
+                task_port = int(task_port_match.group(1))
+                result_port = int(result_port_match.group(1))
+                logger.info(f"Found controller ports: task={task_port}, result={result_port}")
+            else:
+                logger.error(f"Could not extract ports from command: {command}")
+                raise ValueError("Command missing required port information")
 
         # Launch instance
         logger.info(f"Launching instance for job {job_id}...")
@@ -652,141 +807,142 @@ echo "$(date): Base AMI setup complete"
             if not key_installed:
                 raise Exception(f"Failed to install SSH key on instance {instance_id}")
 
-            # Create reverse SSH tunnel (AWS instance back to local)
-            logger.info(f"Creating reverse SSH tunnel for job {job_id}...")
-            tunnel_port = self._allocate_tunnel_port()
-            tunnel_proc = self.ssh_tunnel.create_reverse_tunnel(
-                instance_id, controller_port, tunnel_port, self.private_key_path
+            # Create reverse tunnels for controller ports in a single SSH connection
+            logger.info(f"Creating reverse tunnels for {instance_id}...")
+            
+            # Handle both single-port (new Parsl) and dual-port (old Parsl) modes
+            if task_port == result_port:
+                # Single port mode (Parsl 2025.8.25+)
+                ssh_cmd = [
+                    "ssh",
+                    "-i", self.private_key_path,
+                    "-R", f"172.17.0.1:{task_port}:localhost:{task_port}",
+                    "-N", "-f",
+                    "-o", "ExitOnForwardFailure=yes",
+                    "-o", "StrictHostKeyChecking=no", 
+                    "-o", "UserKnownHostsFile=/dev/null",
+                    "-o", "LogLevel=ERROR",
+                    "-o", "GatewayPorts=yes",
+                    instance_id,
+                ]
+                logger.info(f"Creating single reverse tunnel for port {task_port}")
+            else:
+                # Dual port mode (Parsl < 2025.8.25)
+                ssh_cmd = [
+                    "ssh",
+                    "-i", self.private_key_path,
+                    "-R", f"172.17.0.1:{task_port}:localhost:{task_port}",
+                    "-R", f"172.17.0.1:{result_port}:localhost:{result_port}",
+                    "-N", "-f",
+                    "-o", "ExitOnForwardFailure=yes",
+                    "-o", "StrictHostKeyChecking=no", 
+                    "-o", "UserKnownHostsFile=/dev/null",
+                    "-o", "LogLevel=ERROR",
+                    "-o", "GatewayPorts=yes",
+                    instance_id,
+                ]
+                logger.info(f"Creating dual reverse tunnels for ports {task_port}, {result_port}")
+            
+            logger.debug(f"SSH tunnel command: {' '.join(ssh_cmd)}")
+            
+            import subprocess
+            tunnel_proc = subprocess.Popen(
+                ssh_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
             )
-
-            if not tunnel_proc:
-                raise Exception(
-                    f"Failed to create reverse SSH tunnel for {instance_id}"
-                )
-
-            # Modify worker command to use tunnel port
-            modified_command = self._modify_command_for_reverse_tunnel(
-                command, tunnel_port
-            )
-
+            
+            # Give it time to establish
+            import time
+            time.sleep(3)
+            
+            # Check if tunnel is working
+            if tunnel_proc.poll() is None:
+                if task_port == result_port:
+                    logger.info(f"✅ Reverse tunnel created: {task_port}")
+                else:
+                    logger.info(f"✅ Reverse tunnels created: {task_port}, {result_port}")
+            else:
+                stdout, stderr = tunnel_proc.communicate()
+                logger.error(f"❌ Reverse tunnel creation failed: {stderr}")
+                raise Exception(f"Failed to create reverse tunnels for {instance_id}: {stderr}")
+            
+            # Modify command to use appropriate address for tunnel connection
+            import re
+            if "172.17.0.1" in container_command:
+                # Container command already has Docker bridge IP - preserve it
+                modified_command = container_command
+                logger.info("Preserving Docker bridge IP (172.17.0.1) for container tunnel access")
+            else:
+                # Regular command - use 127.0.0.1 for direct tunnel access
+                modified_command = re.sub(r'-a [^\s]+', '-a 127.0.0.1', container_command)
+            logger.info(f"Modified command: {modified_command}")
+            
+            # Detect if this is a containerized command and log it
+            if "docker run" in modified_command:
+                logger.info(f"🐳 EXECUTING CONTAINERIZED WORKER: {modified_command}")
+            
             # Store tunnel info
             self.job_tunnels[job_id] = {
                 "tunnel_process": tunnel_proc,
-                "tunnel_port": tunnel_port,
+                "task_port": task_port,
+                "result_port": result_port, 
                 "instance_id": instance_id,
                 "modified_command": modified_command,
             }
 
-            # Execute worker command via SSM with proper environment setup
-            logger.info(f"Executing worker command on instance {instance_id}...")
+            # Execute worker using a smart startup script that handles dynamic tunneling
+            logger.info(f"Executing containerized worker with dynamic tunnel setup on {instance_id}...")
             ssm_client = self.session.client("ssm")
 
-            # Create comprehensive setup script for SSM execution with Parsl installation
-            setup_script = f"""#!/bin/bash
+            # Create smart worker startup script for containerized execution
+            # Use the modified command that connects to localhost (tunneled back to local controller)
+            setup_script = """#!/bin/bash
 set -e
 export HOME=/root
 export USER=root
 export PATH="/usr/local/bin:/usr/bin:/bin:$PATH"
 
-# Set Python version to use (use existing system Python 3.10)
-PYTHON_VERSION="{self.python_version}"
-echo "Target Python version: $PYTHON_VERSION"
+echo "🚀 Starting containerized Parsl worker with SSH tunneling..."
 
-# Use existing system Python
-if command -v python$PYTHON_VERSION >/dev/null 2>&1; then
-    PYTHON_CMD="python$PYTHON_VERSION"
-    echo "Using existing python$PYTHON_VERSION"
-elif command -v python3 >/dev/null 2>&1; then
-    PYTHON_CMD="python3"
-    echo "Using system python3"
-else
-    PYTHON_CMD="python"
-    echo "Using default python"
-fi
+# Install essential packages
+apt-get update -q >/dev/null 2>&1
+apt-get install -y python3 python3-pip docker.io openssh-client curl >/dev/null 2>&1
 
-# Verify Python version
-ACTUAL_VERSION=$($PYTHON_CMD --version 2>&1)
-echo "Using Python: $ACTUAL_VERSION"
-
-# Install pip if not available
-if ! $PYTHON_CMD -m pip --version >/dev/null 2>&1; then
-    echo "Installing pip..."
-    apt-get update -y >/dev/null 2>&1
-    apt-get install -y python3-pip >/dev/null 2>&1
-fi
-
-# Quick check for Parsl - install only if not available
-if ! $PYTHON_CMD -c "import parsl" >/dev/null 2>&1; then
-    echo "Installing Parsl with Python $ACTUAL_VERSION..."
-    $PYTHON_CMD -m pip install parsl --quiet
-    echo "Parsl installed successfully"
-else
-    echo "Parsl already available"
-fi
-
-# Verify installation
-echo "Verifying Parsl installation:"
-$PYTHON_CMD -c "import parsl; print(f'Parsl version: {{parsl.__version__}}')"
-$PYTHON_CMD -c "import sys; print(f'Python version: {{sys.version}}')"
-
-# Check for process_worker_pool.py in various locations using specified Python version
-WORKER_SCRIPT=""
-if which process_worker_pool.py >/dev/null 2>&1; then
-    WORKER_SCRIPT="process_worker_pool.py"
-    echo "Found process_worker_pool.py in PATH"
-elif $PYTHON_CMD -c "import parsl.executors.high_throughput.process_worker_pool" >/dev/null 2>&1; then
-    WORKER_SCRIPT="$PYTHON_CMD -m parsl.executors.high_throughput.process_worker_pool"
-    echo "Found Parsl module, will execute as Python module with $PYTHON_CMD"
-else
-    # Find the script location manually using pyenv-managed Python
-    PARSL_LOCATION=$($PYTHON_CMD -c "import parsl; import os; print(os.path.dirname(parsl.__file__))" 2>/dev/null)
-    if [ -n "$PARSL_LOCATION" ] && [ -f "$PARSL_LOCATION/executors/high_throughput/process_worker_pool.py" ]; then
-        WORKER_SCRIPT="$PYTHON_CMD $PARSL_LOCATION/executors/high_throughput/process_worker_pool.py"
-        echo "Found worker script in Parsl installation: $PARSL_LOCATION"
-    else
-        echo "WARNING: Could not locate process_worker_pool.py, using module approach"
-        WORKER_SCRIPT="$PYTHON_CMD -m parsl.executors.high_throughput.process_worker_pool"
-    fi
-fi
-
-# Set working directory
-cd /tmp
-
-echo "Environment setup complete, worker script: $WORKER_SCRIPT"
-
-# Execute the actual worker command with the detected worker script
-ORIGINAL_COMMAND="{modified_command}"
-WORKER_ARGS="${{ORIGINAL_COMMAND#*process_worker_pool.py}}"
-
-# Command has already been cleaned up in Python - just extract the arguments
-echo "Executing worker command: $ORIGINAL_COMMAND"
-
-# Add required arguments that are often missing
-if [[ "$WORKER_ARGS" != *"--cpu-affinity"* ]]; then
-    WORKER_ARGS="$WORKER_ARGS --cpu-affinity none"
-fi
-
-# Create log directory (certificates disabled with --cert_dir None)
-mkdir -p /tmp/parsl_logs
-
-echo "Executing worker command with args: $WORKER_ARGS"
-echo "Using worker script: $WORKER_SCRIPT"
-
-# Execute the worker command with proper script path using nohup
-if [ "$WORKER_SCRIPT" = "process_worker_pool.py" ]; then
-    # Original command with nohup for background execution
-    nohup $WORKER_SCRIPT $WORKER_ARGS > /tmp/parsl_logs/worker.log 2>&1 &
-    echo "Worker started with PID $! in background"
-else
-    # Use the detected worker script with the arguments
-    nohup $WORKER_SCRIPT $WORKER_ARGS > /tmp/parsl_logs/worker.log 2>&1 &
-    echo "Worker started with PID $! in background"
-fi
-
-# Keep the script running briefly to ensure worker starts
+# Start Docker daemon
+service docker start
 sleep 5
+
+# Install Parsl
+python3 -m pip install parsl --quiet
+echo "✅ Environment setup complete"
+
+# Create controller directory structure on worker (Globus approach)
+WORKER_COMMAND="REPLACE_WITH_COMMAND"
+echo "📁 Creating controller directory structure for containers..."
+RUNDIR_PATH=$(echo "$WORKER_COMMAND" | grep -o -- '--logdir=[^[:space:]]*' | cut -d'=' -f2 | sed 's|/[^/]*$||')
+if [ -n "$RUNDIR_PATH" ]; then
+    mkdir -p "$RUNDIR_PATH"
+    echo "✅ Created directory: $RUNDIR_PATH"
+fi
+
+# Execute the containerized worker command with reverse tunnels
+echo "📋 Worker command with reverse tunnels: $WORKER_COMMAND"
+
+# Run the containerized worker using the command with tunneled localhost connections
+echo "🐳 Starting containerized worker with reverse tunnel connectivity..."
+echo "🚀 Executing: $WORKER_COMMAND"
+
+# Execute as containerized command
+nohup bash -c "$WORKER_COMMAND" > /tmp/worker.log 2>&1 &
+
+sleep 10
+echo "📋 Worker startup logs:"
+tail -20 /tmp/worker.log || echo "No logs yet"
+
 echo "Worker startup complete, process should be running in background"
 """
+            
+            # Replace the command placeholder with the modified command
+            setup_script = setup_script.replace("REPLACE_WITH_COMMAND", modified_command)
 
             ssm_response = ssm_client.send_command(
                 InstanceIds=[instance_id],
@@ -895,7 +1051,8 @@ echo "Worker startup complete, process should be running in background"
                 instance_id = self.instances[job_id]
                 logger.info(f"Terminating instance {instance_id} for job {job_id}")
 
-                self.ec2.terminate_instances(InstanceIds=[instance_id])
+                # self.ec2.terminate_instances(InstanceIds=[instance_id])  # Disabled for debugging
+                logger.info(f"DEBUG: Would terminate instance {instance_id} for job {job_id}")
 
                 # Cleanup reverse tunnels if using SSH over SSM
                 if self.enable_ssm_tunneling and job_id in self.job_tunnels:
@@ -920,7 +1077,8 @@ echo "Worker startup complete, process should be running in background"
             # Terminate instance
             if job_id in self.instances:
                 instance_id = self.instances[job_id]
-                self.ec2.terminate_instances(InstanceIds=[instance_id])
+                # self.ec2.terminate_instances(InstanceIds=[instance_id])  # Disabled for debugging
+                logger.info(f"DEBUG: Would terminate instance {instance_id} for job {job_id}")
                 del self.instances[job_id]
 
             # Cleanup reverse tunnels
@@ -937,10 +1095,11 @@ echo "Worker startup complete, process should be running in background"
         """Clean up all provider resources."""
         logger.info(f"Cleaning up all resources for {self.provider_id}")
 
-        # Cancel all running jobs
+        # Cancel all running jobs  
         if self.instances:
             job_ids = list(self.instances.keys())
-            self.cancel(job_ids)
+            # self.cancel(job_ids)  # Disabled for debugging
+            logger.info(f"DEBUG: Would cancel jobs: {job_ids}")
 
         # Cleanup SSH reverse tunnels
         if self.enable_ssm_tunneling and hasattr(self, "ssh_tunnel"):
@@ -1006,15 +1165,85 @@ echo "Worker startup complete, process should be running in background"
         raise Exception(f"No available ports in range {self.tunnel_port_range}")
 
     def _modify_command_for_reverse_tunnel(self, command: str, tunnel_port: int) -> str:
-        """Modify worker command to connect to reverse tunnel port."""
-        # Use the working SSM tunnel modification logic
+        """Modify worker command for reverse tunnel and optional container execution."""
+        
+        # First, modify for tunnel (Phase 1.5 functionality)
         from ssm_tunnel import ParslWorkerCommandParser
+        tunnel_modified = ParslWorkerCommandParser.modify_for_tunnel(command, tunnel_port)
+        
+        # Phase 2: Add container support if enabled
+        if self.container_runtime and self.container_manager:
+            # Phase 2 container execution - build container image on instance first
+            container_image = self._get_container_image()
+            
+            logger.info(f"Phase 2: Ensuring container {container_image} exists on instance")
+            
+            # Build container on instance if needed
+            build_command = f'''
+# Build parsl-base container if not exists
+if ! docker images | grep -q "parsl-base"; then
+    echo "Building parsl-base container..."
+    cat > /tmp/Dockerfile.parsl-base << 'EOF'
+FROM python:3.10-slim
 
-        # Use the proven working modification method
-        modified = ParslWorkerCommandParser.modify_for_tunnel(command, tunnel_port)
+# Install system dependencies
+RUN apt-get update && apt-get install -y gcc g++ && rm -rf /var/lib/apt/lists/*
 
-        logger.info(f"Modified command for reverse tunnel: {modified}")
-        return modified
+# Install Parsl and scientific stack
+RUN pip install --no-cache-dir parsl numpy scipy pandas matplotlib
+
+# Set working directory
+WORKDIR /app
+
+# Default command runs worker
+CMD ["python3", "-m", "parsl.executors.high_throughput.process_worker_pool"]
+EOF
+    docker build -t parsl-base:latest -f /tmp/Dockerfile.parsl-base /tmp/
+    echo "Container built successfully"
+else
+    echo "Container parsl-base:latest already exists"
+fi
+
+# Now execute the original worker command
+{tunnel_modified}
+'''
+            
+            logger.info("Modified command to build container and run worker on host")
+            return build_command
+        else:
+            # Phase 1.5 native execution
+            logger.info(f"Modified command for reverse tunnel: {tunnel_modified}")
+            return tunnel_modified
+    
+    def _get_container_image(self) -> str:
+        """Determine container image to use."""
+        if self.container_image:
+            return self.container_image
+        elif self.scientific_stack and self.scientific_builder:
+            return f"parsl-{self.scientific_stack}:latest"
+        else:
+            raise ValueError("Container runtime enabled but no image or stack specified")
+    
+    def _build_container_config(self, image: str) -> Dict:
+        """Build container configuration for execution.""" 
+        config = {
+            'image': image,
+            'network_mode': 'host',  # Required for SSH tunnels
+            'auto_remove': True,
+            'detach': True
+        }
+        
+        # Add custom container configuration
+        config.update(self.container_config)
+        
+        # Performance optimizations for scientific computing
+        if self.instance_type.startswith('c5') or self.instance_type.startswith('m5'):
+            config.update({
+                'cpu_count': 0,      # Use all available CPUs
+                'mem_limit': '90%'   # Leave 10% for system
+            })
+            
+        return config
 
     # Parsl ExecutionProvider interface properties
     @property

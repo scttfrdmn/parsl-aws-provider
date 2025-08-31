@@ -1,8 +1,8 @@
-# Phase 1.5 Enhanced AWS Provider 🚀
+# Phase 1.5 Enhanced AWS Provider + Phase 2 Container Execution 🚀
 
-**Status: ✅ PRODUCTION READY** - Successfully validated with real computational workloads
+**Status: ✅ PRODUCTION READY** - Successfully validated with containerized workloads on ephemeral AWS infrastructure
 
-Revolutionary networking solution that enables Parsl deployment from any network environment using SSH reverse tunneling over AWS SSM.
+Revolutionary networking solution that enables Parsl deployment from any network environment using SSH reverse tunneling over AWS SSM, now with full container execution support.
 
 ## 🌟 Key Features
 
@@ -10,16 +10,19 @@ Revolutionary networking solution that enables Parsl deployment from any network
 - **Works from anywhere**: Home NAT, corporate firewalls, restrictive networks
 - **SSH reverse tunneling**: Bidirectional connectivity through AWS SSM backbone
 - **Zero local configuration**: No port forwarding or firewall rules needed
-- **Real compute validation**: Tested with CPU-intensive, Fibonacci, and data processing workloads
+- **Container execution**: Docker containers on ephemeral AWS instances with tunnel connectivity
+- **Real compute validation**: Tested with CPU-intensive, Fibonacci, and containerized workloads
 
 ### Enterprise Security
 - **Private subnet deployment**: Workers with zero internet access
 - **VPC endpoint communication**: All AWS API calls stay within AWS backbone
 - **Encrypted tunnels**: TLS encryption for all worker communication
+- **Container isolation**: Docker containers for secure, reproducible execution
 - **Cost optimized**: Eliminates NAT Gateway requirements (~$45/month savings)
 
 ### Cloud-Native Architecture
 - **Ephemeral resources**: Appear when needed, disappear when done
+- **Container execution**: Docker support with scientific computing stacks
 - **Optimized AMI discovery**: Fast startup with pre-configured environments
 - **Intelligent error handling**: Comprehensive retry logic and graceful degradation
 - **Real-time monitoring**: Health checks and performance metrics
@@ -29,18 +32,23 @@ Revolutionary networking solution that enables Parsl deployment from any network
 ```
 Local Machine (Any Network)        AWS SSM + SSH               AWS EC2 Instance
 ┌─────────────────────────┐       ┌─────────────────┐         ┌─────────────────┐
-│ Parsl Interchange       │◄──────│ SSH Reverse     │◄────────│ Parsl Worker    │
-│ Behind NAT/Firewall     │       │ Tunnel via SSM  │         │ ubuntu@i-xyz    │
-│ Local port: 54XXX       │       │ ProxyCommand    │         │ Remote port: 54XXX │
-└─────────────────────────┘       └─────────────────┘         └─────────────────┘
+│ Parsl Interchange       │◄──────│ SSH Reverse     │◄────────│ ubuntu@i-xyz    │
+│ Behind NAT/Firewall     │       │ Tunnel via SSM  │         │ GatewayPorts=yes│
+│ Local port: 54XXX       │       │ Docker Bridge   │         │                 │
+└─────────────────────────┘       │ 172.17.0.1:54XXX│         │ ┌─────────────┐ │
+                                  └─────────────────┘         │ │ Docker      │ │
+                                                              │ │ Container   │ │
+                                   SSH Key: ~/.ssh/parsl_ssm_rsa│ │             │ │
+                                   Config: ~/.ssh/config     │ │ Parsl Worker│ │
+                                                              │ │             │ │
+                                                              │ └─────────────┘ │
+                                                              └─────────────────┘
                                                                         │
-                                   SSH Key: ~/.ssh/parsl_ssm_rsa       │
-                                   Config: ~/.ssh/config               │
                                                                         ▼
-                                                               Real Computation
-                                                               • 2M+ ops/sec
-                                                               • Fibonacci(50)
-                                                               • 164K records/sec
+                                                               Containerized Computation
+                                                               • Isolated execution
+                                                               • Scientific stacks
+                                                               • Reproducible results
 ```
 
 ## 🚀 Quick Start
@@ -99,6 +107,47 @@ def hello_from_cloud():
 future = hello_from_cloud()
 print(future.result())  # "Hello from ip-10-0-1-123!"
 parsl.clear()  # Always cleanup
+```
+
+### Phase 2: Container Execution ✅ **NEW**
+```python
+from phase15_enhanced import AWSProvider
+from container_executor import ContainerHighThroughputExecutor
+import parsl
+
+# Container executor with scientific computing stack
+container_executor = ContainerHighThroughputExecutor(
+    label="container_compute",
+    provider=AWSProvider(
+        enable_ssm_tunneling=True,
+        init_blocks=1,
+        max_blocks=2
+    ),
+    container_image="python:3.10-slim",
+    container_runtime="docker",
+    container_options="--rm --network host"
+)
+
+config = Config(executors=[container_executor])
+parsl.load(config)
+
+@parsl.python_app
+def containerized_task():
+    import os
+    import socket
+    in_container = os.path.exists("/.dockerenv")
+    return {
+        "in_container": in_container,
+        "hostname": socket.gethostname(),
+        "message": "Hello from containerized execution!"
+    }
+
+# Execute in Docker container on AWS
+result = containerized_task().result()
+print(f"Container execution: {result}")
+# Output: {'in_container': True, 'hostname': 'ip-172-31-47-127', 'message': 'Hello from containerized execution!'}
+
+parsl.clear()
 ```
 
 ### Maximum Security (Private Subnets)
