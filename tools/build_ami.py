@@ -40,6 +40,118 @@ class AMIBuilder:
         # Ensure SSM instance profile exists
         self._ensure_ssm_instance_profile()
 
+    def build_phase2_ami(self, parsl_version: str = "latest") -> str:
+        """
+        Build Phase 2 AMI with Parsl + Docker + Podman + Apptainer pre-installed.
+        
+        Args:
+            parsl_version: Version of Parsl to install ('latest' or specific version)
+            
+        Returns:
+            AMI ID of the created Phase 2 AMI
+        """
+        logger.info("Building Phase 2 AMI with container runtimes...")
+        
+        # Phase 2 setup script with all container runtimes
+        setup_script = f'''#!/bin/bash
+set -e
+exec > >(tee /var/log/user-data.log) 2>&1
+
+echo "$(date): Starting Phase 2 AMI build..."
+
+# Update system
+apt-get update -y
+
+# Install Python 3.10 and pip
+apt-get install -y python3.10 python3.10-venv python3-pip
+
+# Install container runtimes
+echo "$(date): Installing Docker..."
+apt-get install -y docker.io
+systemctl start docker
+systemctl enable docker
+usermod -a -G docker ubuntu
+echo "✅ Docker installed"
+
+echo "$(date): Installing Podman..."
+apt-get install -y podman
+echo "✅ Podman installed"
+
+echo "$(date): Installing Apptainer..."
+apt-get install -y software-properties-common
+add-apt-repository -y ppa:apptainer/ppa
+apt-get update -y
+apt-get install -y apptainer
+echo "✅ Apptainer installed"
+
+# Install Parsl
+echo "$(date): Installing Parsl {parsl_version}..."
+if [ "{parsl_version}" = "latest" ]; then
+    python3 -m pip install parsl
+else
+    python3 -m pip install parsl=={parsl_version}
+fi
+
+# Install additional scientific packages
+python3 -m pip install psutil zmq numpy scipy
+
+# Verify installations
+echo "$(date): Verifying installations..."
+parsl_version=$(python3 -c "import parsl; print(parsl.__version__)")
+docker_version=$(docker --version)
+podman_version=$(podman --version)
+apptainer_version=$(apptainer --version)
+
+echo "✅ Parsl version: $parsl_version"
+echo "✅ Docker version: $docker_version" 
+echo "✅ Podman version: $podman_version"
+echo "✅ Apptainer version: $apptainer_version"
+
+# Configure SSH for container tunnel access
+echo "GatewayPorts yes" >> /etc/ssh/sshd_config
+echo "ClientAliveInterval 60" >> /etc/ssh/sshd_config
+echo "ClientAliveCountMax 3" >> /etc/ssh/sshd_config
+systemctl restart sshd
+echo "✅ SSH configured for container tunnels"
+
+echo "$(date): Phase 2 AMI setup complete!"
+'''
+        
+        build_id = f"phase2-ami-build-{uuid.uuid4().hex[:8]}"
+        logger.info(f"Starting Phase 2 AMI build: {build_id}")
+
+        try:
+            # 1. Launch build instance
+            base_ami = self._get_base_ami()
+            instance_id = self._launch_build_instance(base_ami, build_id)
+            logger.info(f"Build instance launched: {instance_id}")
+
+            # 2. Wait for instance to be ready and SSM agent available
+            self._wait_for_instance_running(instance_id)
+            self._wait_for_ssm_ready(instance_id)
+
+            # 3. Execute Phase 2 setup script via SSM
+            self._execute_setup_script(instance_id, setup_script)
+
+            # 4. Create AMI from the configured instance
+            ami_id = self._create_phase2_ami_from_instance(
+                instance_id, parsl_version, build_id
+            )
+            logger.info(f"Phase 2 AMI creation initiated: {ami_id}")
+
+            # 5. Wait for AMI to be available
+            self._wait_for_ami_available(ami_id)
+
+            # 6. Clean up build instance
+            self._cleanup_build_instance(instance_id)
+
+            logger.info(f"Phase 2 AMI build completed successfully: {ami_id}")
+            return ami_id
+
+        except Exception as e:
+            logger.error(f"Phase 2 AMI build failed: {e}")
+            raise
+
     def build_ami(self, parsl_version: str = "latest") -> str:
         """
         Build optimized AMI with Parsl pre-installed.
@@ -168,41 +280,103 @@ echo "=== BOOTSTRAP END ==="
 
         raise Exception("SSM agent did not become ready within timeout")
 
+    def _execute_setup_script(self, instance_id: str, setup_script: str):
+        """Execute Phase 2 setup script via SSM with live output."""
+        logger.info("Executing Phase 2 setup script via SSM...")
+
+        ssm = self.session.client("ssm", region_name=self.region)
+
+        # Send setup script via SSM
+        try:
+            response = ssm.send_command(
+                InstanceIds=[instance_id],
+                DocumentName="AWS-RunShellScript",
+                Parameters={"commands": [setup_script]},
+                CloudWatchOutputConfig={
+                    "CloudWatchLogGroupName": "/aws/ssm/parsl-phase2-build",
+                    "CloudWatchOutputEnabled": True,
+                },
+            )
+
+            command_id = response["Command"]["CommandId"]
+            logger.info(f"Phase 2 setup SSM command sent: {command_id}")
+
+            # Monitor command execution with live output
+            self._monitor_ssm_command(ssm, instance_id, command_id)
+
+        except ClientError as e:
+            raise Exception(f"Failed to send Phase 2 setup SSM command: {e}")
+
     def _install_software_via_ssm(self, instance_id: str, parsl_version: str):
         """Install Parsl and dependencies via SSM with live output."""
         logger.info("Installing Parsl and dependencies via SSM...")
 
         ssm = self.session.client("ssm", region_name=self.region)
 
-        # Create installation script
+        # Create installation script (Ubuntu-compatible)
         install_commands = [
             "echo '=== PARSL AMI BUILD START ==='",
             "echo 'Build started:' $(date)",
             "",
-            "echo 'Updating system packages...'",
-            "yum update -y",
-            "",
-            "echo 'Installing Python and development tools...'",
-            "yum install -y python3 python3-pip gcc git",
+            "echo 'Detecting OS...'",
+            "if command -v apt-get &> /dev/null; then",
+            "    echo 'Using Ubuntu/Debian commands'",
+            "    export DEBIAN_FRONTEND=noninteractive",
+            "    echo 'Updating system packages...'",
+            "    apt-get update -y",
+            "    echo 'Installing Python and development tools...'", 
+            "    apt-get install -y python3 python3-pip gcc git build-essential",
+            "    echo 'Installing Docker (Phase 2 support)...'",
+            "    apt-get install -y docker.io",
+            "    systemctl enable docker",
+            "    systemctl start docker",
+            "    usermod -aG docker ubuntu",
+            "elif command -v yum &> /dev/null; then",
+            "    echo 'Using Amazon Linux/RHEL commands'",
+            "    echo 'Updating system packages...'",
+            "    yum update -y",
+            "    echo 'Installing Python and development tools...'",
+            "    yum install -y python3 python3-pip gcc git",
+            "    echo 'Installing Docker (Phase 2 support)...'",
+            "    yum install -y docker",
+            "    systemctl enable docker",
+            "    systemctl start docker",
+            "    usermod -aG docker ec2-user",
+            "    usermod -aG docker ubuntu",
+            "else",
+            "    echo 'Unsupported OS'",
+            "    exit 1",
+            "fi",
             "",
             "echo 'Installing Parsl and dependencies...'",
-            "pip3 install parsl boto3 botocore",
+            "python3 -m pip install --upgrade pip",
+            "python3 -m pip install parsl boto3 botocore PyYAML",
             "",
             "echo 'Installing common scientific packages...'",
-            "pip3 install numpy",
+            "python3 -m pip install numpy",
             "",
-            "echo 'Verifying Parsl installation...'",
+            "echo 'Verifying installations...'",
             "python3 -c 'import parsl; print(\"Parsl version:\", parsl.__version__)'",
+            "docker --version",
+            "echo 'Docker service status:'",
+            "systemctl is-active docker",
             "",
             "echo 'Optimizing system...'",
-            "yum clean all",
-            "rm -rf /var/cache/yum /tmp/* /var/tmp/*",
+            "if command -v apt-get &> /dev/null; then",
+            "    apt-get clean",
+            "    rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*",
+            "elif command -v yum &> /dev/null; then", 
+            "    yum clean all",
+            "    rm -rf /var/cache/yum /tmp/* /var/tmp/*",
+            "fi",
             "",
             "echo 'Creating AMI metadata...'",
             "cat > /opt/parsl-ami-info.txt << 'EOF'",
             "AMI built: $(date)",
-            "Parsl version: $(pip3 show parsl | grep Version || echo 'unknown')",
+            "Parsl version: $(python3 -m pip show parsl | grep Version || echo 'unknown')",
             "Python version: $(python3 --version)",
+            "Docker version: $(docker --version)",
+            "Phase 2 features: Container support enabled",
             "Build completed via SSM",
             "EOF",
             "",
@@ -314,7 +488,7 @@ echo "=== BOOTSTRAP END ==="
     ) -> str:
         """Create AMI from the build instance."""
 
-        ami_name = f"parsl-aws-provider-{parsl_version}-{self.region}-{datetime.now().strftime('%Y%m%d-%H%M')}"
+        ami_name = f"parsl-aws-provider-phase1.5-{parsl_version}-{self.region}-{datetime.now().strftime('%Y%m%d-%H%M')}"
 
         logger.info(f"Creating AMI: {ami_name}")
 
@@ -322,7 +496,7 @@ echo "=== BOOTSTRAP END ==="
             response = self.ec2.create_image(
                 InstanceId=instance_id,
                 Name=ami_name,
-                Description=f"Optimized AMI for Parsl AWS Provider with Parsl {parsl_version} pre-installed",
+                Description=f"Optimized Phase 1.5 AMI for Parsl AWS Provider with Parsl {parsl_version} pre-installed",
                 NoReboot=True,  # Create AMI without rebooting
                 TagSpecifications=[
                     {
@@ -331,6 +505,7 @@ echo "=== BOOTSTRAP END ==="
                             {"Key": "Name", "Value": ami_name},
                             {"Key": "CreatedBy", "Value": "ParslAWSProvider"},
                             {"Key": "Version", "Value": "1.5"},
+                            {"Key": "Phase", "Value": "Phase1.5"},
                             {"Key": "ParslVersion", "Value": parsl_version},
                             {"Key": "BaseAMI", "Value": self._get_base_ami()},
                             {"Key": "Region", "Value": self.region},
@@ -345,6 +520,47 @@ echo "=== BOOTSTRAP END ==="
 
         except ClientError as e:
             raise Exception(f"Failed to create AMI: {e}")
+
+    def _create_phase2_ami_from_instance(
+        self, instance_id: str, parsl_version: str, build_id: str
+    ) -> str:
+        """Create Phase 2 AMI from the build instance."""
+
+        ami_name = f"parsl-aws-provider-phase2-{parsl_version}-{self.region}-{datetime.now().strftime('%Y%m%d-%H%M')}"
+
+        logger.info(f"Creating Phase 2 AMI: {ami_name}")
+
+        try:
+            response = self.ec2.create_image(
+                InstanceId=instance_id,
+                Name=ami_name,
+                Description=f"Optimized Phase 2 AMI for Parsl AWS Provider with Parsl {parsl_version} and container runtimes pre-installed",
+                NoReboot=True,  # Create AMI without rebooting
+                TagSpecifications=[
+                    {
+                        "ResourceType": "image",
+                        "Tags": [
+                            {"Key": "Name", "Value": ami_name},
+                            {"Key": "CreatedBy", "Value": "ParslAWSProvider"},
+                            {"Key": "Version", "Value": "2.0"},
+                            {"Key": "Phase", "Value": "Phase2"},
+                            {"Key": "ParslVersion", "Value": parsl_version},
+                            {"Key": "DockerSupport", "Value": "true"},
+                            {"Key": "PodmanSupport", "Value": "true"},
+                            {"Key": "ApptainerSupport", "Value": "true"},
+                            {"Key": "BaseAMI", "Value": self._get_base_ami()},
+                            {"Key": "Region", "Value": self.region},
+                            {"Key": "Created", "Value": datetime.now().isoformat()},
+                            {"Key": "BuildId", "Value": build_id},
+                        ],
+                    }
+                ],
+            )
+
+            return response["ImageId"]
+
+        except ClientError as e:
+            raise Exception(f"Failed to create Phase 2 AMI: {e}")
 
     def _wait_for_ami_available(self, ami_id: str, max_attempts: int = 120):
         """Wait for AMI to become available."""
@@ -515,6 +731,9 @@ def main():
         "--parsl-version", default="latest", help="Parsl version to install"
     )
     parser.add_argument(
+        "--phase2", action="store_true", help="Build Phase 2 AMI with container runtimes"
+    )
+    parser.add_argument(
         "--list", action="store_true", help="List existing optimized AMIs"
     )
     parser.add_argument("--verbose", "-v", action="store_true", help="Verbose logging")
@@ -548,11 +767,17 @@ def main():
             return
 
         # Build new AMI
-        print(f"\nBuilding optimized AMI in {args.region}...")
-        print(f"Parsl version: {args.parsl_version}")
-        print("-" * 60)
-
-        ami_id = builder.build_ami(parsl_version=args.parsl_version)
+        if args.phase2:
+            print(f"\nBuilding Phase 2 AMI with container support in {args.region}...")
+            print(f"Parsl version: {args.parsl_version}")
+            print("Container runtimes: Docker, Podman, Apptainer")
+            print("-" * 60)
+            ami_id = builder.build_phase2_ami(parsl_version=args.parsl_version)
+        else:
+            print(f"\nBuilding Phase 1.5 AMI in {args.region}...")
+            print(f"Parsl version: {args.parsl_version}")
+            print("-" * 60)
+            ami_id = builder.build_ami(parsl_version=args.parsl_version)
 
         print("-" * 60)
         print("SUCCESS: AMI built successfully!")

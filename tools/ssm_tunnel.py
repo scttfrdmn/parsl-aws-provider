@@ -291,6 +291,11 @@ class ParslWorkerCommandParser:
     @staticmethod
     def modify_for_tunnel(command: str, tunnel_port: int) -> str:
         """Replace controller addresses and port with localhost tunnel."""
+        
+        # CRITICAL: For container commands, don't modify - they handle tunneling internally
+        if "docker run" in command or "podman run" in command or "singularity run" in command:
+            logger.info(f"🐳 PRESERVING CONTAINER COMMAND (no tunnel modification): {command[:100]}...")
+            return command
 
         parsed = ParslWorkerCommandParser.parse_addresses_and_port(command)
 

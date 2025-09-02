@@ -18,15 +18,16 @@ container_executor = ContainerHighThroughputExecutor(
         enable_ssm_tunneling=True,
         max_blocks=1,
         init_blocks=1,  # Force resource creation
-        min_blocks=1
+        min_blocks=1,
     ),
     container_image="python:3.10-slim",
     container_runtime="docker",
-    container_options="--rm --network host"
+    container_options="--rm --network host",
 )
 
 # Parsl configuration
 config = Config(executors=[container_executor])
+
 
 # Test function to detect container environment
 @parsl.python_app
@@ -34,43 +35,44 @@ def check_container_environment():
     """Simple function to check if we're in a container."""
     import os
     import platform
-    
+
     # Check common container indicators
     in_container = (
-        os.path.exists("/.dockerenv") or 
-        os.path.exists("/run/.containerenv") or
-        "container" in os.environ.get("container", "").lower()
+        os.path.exists("/.dockerenv")
+        or os.path.exists("/run/.containerenv")
+        or "container" in os.environ.get("container", "").lower()
     )
-    
+
     return {
         "in_container": in_container,
         "hostname": platform.node(),
         "platform": platform.platform(),
-        "python_version": platform.python_version()
+        "python_version": platform.python_version(),
     }
+
 
 if __name__ == "__main__":
     print("🧪 Quick container execution test")
-    
+
     # Initialize Parsl
     parsl.load(config)
-    
+
     try:
         # Execute test function
         print("📦 Executing container task...")
         future = check_container_environment()
-        
+
         # Wait for result with 90 second timeout
         result = future.result(timeout=90)
-        
-        print(f"✅ Task completed!")
+
+        print("✅ Task completed!")
         print(f"Result: {result}")
-        
+
         if result.get("in_container"):
             print("🎉 SUCCESS: Container execution confirmed!")
         else:
             print("❌ FAILURE: Not executing in container")
-            
+
     except Exception as e:
         print(f"❌ Test failed: {e}")
     finally:

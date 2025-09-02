@@ -1,0 +1,14 @@
+{
+    "vpcID": "vpc-002a64a1bfaeb5a04",
+    "sgID": "sg-0e14efb31e4198497",
+    "snIDs": [
+        "subnet-0202f4202743cb95b",
+        "subnet-0e5bd70f3e847766e",
+        "subnet-06fb749e2c5c92b47",
+        "subnet-0810f182ae5d15299",
+        "subnet-0891332d0a20369c0",
+        "subnet-0aea10aa9558964c9"
+    ],
+    "instances": [],
+    "instanceState": {}
+}

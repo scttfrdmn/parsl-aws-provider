@@ -89,9 +89,10 @@ Host i-* mi-*
 
         return str(private_key_path), str(public_key_path)
 
-    def _wait_for_ssm_agent(self, instance_id: str, max_attempts: int = 30) -> bool:
-        """Wait for SSM agent to be ready on instance."""
+    def _wait_for_ssm_agent(self, instance_id: str, max_attempts: int = 24) -> bool:
+        """Wait for SSM agent to be ready with robust retry logic."""
         ssm_client = self.session.client("ssm")
+        logger.info(f"⏳ Waiting for SSM agent on {instance_id} (up to {max_attempts * 10} seconds)...")
 
         for attempt in range(max_attempts):
             try:
@@ -105,23 +106,37 @@ Host i-* mi-*
                     ping_status = instance_info.get("PingStatus", "Unknown")
 
                     if ping_status == "Online":
-                        logger.info(f"SSM agent ready on {instance_id}")
-                        return True
+                        logger.info(f"✅ SSM agent ready on {instance_id} after {(attempt + 1) * 10} seconds")
+                        
+                        # Additional verification: test actual session connectivity
+                        try:
+                            test_response = ssm_client.start_session(
+                                Target=instance_id,
+                                DocumentName="AWS-StartSSHSession",
+                                Parameters={"portNumber": ["22"]}
+                            )
+                            # Immediately terminate the test session
+                            ssm_client.terminate_session(SessionId=test_response['SessionId'])
+                            logger.info(f"✅ SSM session connectivity verified for {instance_id}")
+                            return True
+                        except Exception as e:
+                            logger.warning(f"⚠️ SSM agent online but session test failed: {e}, retrying...")
+                            time.sleep(5)
+                            continue
                     else:
-                        logger.debug(
-                            f"SSM agent status: {ping_status} (attempt {attempt + 1}/{max_attempts})"
-                        )
+                        if attempt % 6 == 0:  # Log every minute
+                            logger.info(f"⏳ SSM agent status: {ping_status} (attempt {attempt + 1}/{max_attempts})")
                 else:
-                    logger.debug(
-                        f"Instance {instance_id} not yet managed by SSM (attempt {attempt + 1}/{max_attempts})"
-                    )
+                    if attempt % 6 == 0:  # Log every minute  
+                        logger.info(f"⏳ Instance {instance_id} not yet managed by SSM (attempt {attempt + 1}/{max_attempts})")
 
             except Exception as e:
-                logger.debug(f"Error checking SSM agent status: {e}")
+                if attempt % 6 == 0:  # Log every minute
+                    logger.info(f"⏳ SSM check error (attempt {attempt + 1}/{max_attempts}): {e}")
 
             time.sleep(10)  # Wait 10 seconds between checks
 
-        logger.error(f"SSM agent not ready after {max_attempts * 10} seconds")
+        logger.error(f"❌ SSM agent not ready after {max_attempts * 10} seconds")
         return False
 
     def install_ssh_key_on_instance(

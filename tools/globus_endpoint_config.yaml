@@ -1,0 +1,21 @@
+# Globus Compute endpoint configuration using our ephemeral AWS provider
+display_name: Parsl Ephemeral AWS Endpoint
+engine:
+  type: GlobusComputeEngine
+  container_type: docker
+  container_uri: python:3.10-slim
+  container_cmd_options: --network host -v /tmp:/tmp
+  max_workers_per_node: 1
+  worker_debug: true
+  provider:
+    # Use our custom ephemeral AWS provider
+    type: phase15_enhanced.AWSProvider
+    label: "globus-ephemeral"
+    region: "us-east-1"
+    instance_type: "t3.small"
+    init_blocks: 1
+    max_blocks: 2
+    min_blocks: 0
+    # Enable container support
+    container_runtime: "docker" 
+    container_image: "python:3.10-slim"
