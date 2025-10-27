@@ -155,7 +155,7 @@ jobs:
           fi
       - name: Upload documentation
         if: success() && hashFiles('docs/_build/html') != ''
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v5
         with:
           name: documentation
           path: docs/_build/html/
