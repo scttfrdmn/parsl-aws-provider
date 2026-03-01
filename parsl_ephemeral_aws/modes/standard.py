@@ -196,9 +196,6 @@ class StandardMode(OperatingMode):
                 {
                     "workflow_id": self.provider_id,
                     "region": self.session.region_name,
-                    "aws_access_key_id": session._session.get_credentials().access_key,
-                    "aws_secret_access_key": session._session.get_credentials().secret_key,
-                    "aws_session_token": session._session.get_credentials().token,
                     "aws_profile": None,
                     "vpc_id": self.vpc_id,
                     "subnet_id": self.subnet_id,
