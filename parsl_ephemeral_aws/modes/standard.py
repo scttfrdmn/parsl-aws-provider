@@ -1360,46 +1360,39 @@ class StandardMode(OperatingMode):
             elif resource.get("type") == RESOURCE_TYPE_SPOT_FLEET:
                 spot_fleet_blocks.append(resource_id)
 
-        # Terminate EC2 instances
+        # Terminate EC2 instances — only remove from tracking on confirmed success
+        # or when the instance is already gone (InvalidInstanceID.NotFound).
+        # On any other error, keep the entry so the next cleanup cycle can retry.
         if ec2_instances:
             try:
                 ec2.terminate_instances(InstanceIds=ec2_instances)
                 logger.info(f"Terminated {len(ec2_instances)} EC2 instances")
-
-                # Remove resources from tracking
                 for instance_id in ec2_instances:
-                    if instance_id in self.resources:
-                        del self.resources[instance_id]
+                    self.resources.pop(instance_id, None)
             except ClientError as e:
-                # If the instances are already terminated or don't exist, that's fine
-                if "InvalidInstanceID.NotFound" not in str(e):
+                if "InvalidInstanceID.NotFound" in str(e):
+                    # Instances already gone — safe to remove from tracking
+                    for instance_id in ec2_instances:
+                        self.resources.pop(instance_id, None)
+                else:
                     logger.error(f"Failed to terminate EC2 instances: {e}")
-
-                # Still remove resources from tracking
-                for instance_id in ec2_instances:
-                    if instance_id in self.resources:
-                        del self.resources[instance_id]
+                    # Do NOT remove — will be retried on next cleanup cycle
             except Exception as e:
                 logger.error(f"Unexpected error terminating EC2 instances: {e}")
+                # Do NOT remove — will be retried on next cleanup cycle
 
-        # Terminate Spot Fleet blocks
+        # Terminate Spot Fleet blocks — same conservative removal policy
         if spot_fleet_blocks and self.use_spot_fleet and self.spot_fleet_manager:
             for block_id in spot_fleet_blocks:
                 try:
                     self.spot_fleet_manager.terminate_block(block_id)
                     logger.info(f"Terminated Spot Fleet block {block_id}")
-
-                    # Remove resource from tracking
-                    if block_id in self.resources:
-                        del self.resources[block_id]
+                    self.resources.pop(block_id, None)
                 except Exception as e:
                     logger.error(
                         f"Failed to terminate Spot Fleet block {block_id}: {e}"
                     )
-
-                    # Still remove resource from tracking
-                    if block_id in self.resources:
-                        del self.resources[block_id]
+                    # Do NOT remove — will be retried on next cleanup cycle
 
         # Save state with updated resources
         self.save_state()
