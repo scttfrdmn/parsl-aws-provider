@@ -8,51 +8,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- Initial implementation of Parsl Ephemeral AWS Provider
-- Support for three operating modes:
-  - **Standard Mode**: Direct client-to-worker communication via EC2 instances
-  - **Detached Mode**: Persistent infrastructure with bastion host for long-running workflows
-  - **Serverless Mode**: AWS Lambda and ECS/Fargate execution without EC2 instances
-- Comprehensive state persistence mechanisms:
-  - File-based state storage
-  - AWS Parameter Store integration
-  - S3-based state management
-- Advanced spot instance management:
-  - EC2 Spot Fleet integration with automated failover
-  - Spot interruption handling with task recovery
-  - Hibernation support for cost optimization
-- Network infrastructure management:
-  - Automatic VPC, subnet, and security group creation
-  - Configurable network isolation and connectivity
-- Comprehensive testing framework:
-  - Unit tests with moto AWS mocking
-  - Integration tests with LocalStack support
-  - Real AWS testing capabilities
-- Development tooling:
-  - Pre-commit hooks with comprehensive linting
-  - Code coverage reporting and enforcement
-  - Semantic versioning with changelog automation
+- Audit findings tracked as GitHub issues (v0.1.0 through v0.3.0 milestones)
 
-### Changed
-- Standardized on Python 3.9+ for broader compatibility
-- Set pragmatic test coverage threshold at 70% focusing on functional testing
-- Configured flexible testing approach supporting both LocalStack and real AWS
-
-### Fixed
-- Fixed pyproject.toml syntax errors in black configuration
-- Resolved Python version inconsistencies between README and package configuration
-
-## [0.1.0] - TBD
+## [0.1.0] - Unreleased
 
 ### Added
-- Initial alpha release targeting core functionality completion
-- Full Parsl ExecutionProvider interface implementation
-- Production-ready architecture with proper error handling
-- Comprehensive documentation and examples
+- Initial implementation of `EphemeralAWSProvider` implementing Parsl `ExecutionProvider` interface
+- Three operating modes: Standard (EC2), Detached (bastion host + SSH tunnel), Serverless (Lambda/ECS)
+- Three state persistence backends: file-based, AWS Parameter Store, S3
+- EC2 instance lifecycle management with on-demand and spot instance support
+- Spot Fleet request management with capacity optimization
+- Spot interruption monitoring and task recovery framework
+- VPC, subnet, and security group provisioning
+- Lambda function execution backend
+- ECS/Fargate task execution backend
+- Robust error handling framework with exponential backoff and jitter (`RetryConfig`, `RobustErrorHandler`)
+- Security audit logging, credential management, and encryption modules
+- Multi-region AMI support (Amazon Linux 2023, 23 regions)
+- Resource tagging for cost tracking and cleanup
+- Auto-shutdown with configurable idle time
+- Unit tests with moto AWS mocking
+- Integration tests with LocalStack support
+- Pre-commit hooks, ruff/black/mypy linting
+- Sphinx documentation and usage examples
 
----
-
----
-
-**SPDX-License-Identifier: Apache-2.0**  
-**SPDX-FileCopyrightText: 2025 Scott Friedman and Project Contributors**
+[Unreleased]: https://github.com/scttfrdmn/parsl-aws-provider/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/scttfrdmn/parsl-aws-provider/releases/tag/v0.1.0

@@ -2,6 +2,43 @@
 
 This document provides guidance on effectively using Claude Code to develop the Parsl Ephemeral AWS Provider project. Claude Code's capabilities are particularly well-suited for this type of infrastructure-as-code development.
 
+## Project Management — REQUIRED PRACTICES
+
+All work tracking for this project uses GitHub. **Do not create standalone planning documents, roadmap files, or status reports.** Use these instead:
+
+### Issue Tracking
+- All bugs, features, technical debt, and test gaps are tracked as **GitHub issues** at https://github.com/scttfrdmn/parsl-aws-provider/issues
+- Every issue must have:
+  - A `severity:` label (`critical`, `high`, `medium`, `low`)
+  - A `type:` label (`bug`, `security`, `testing`, `refactor`, `docs`, `performance`)
+  - A `component:` label (`provider`, `modes`, `compute`, `state`, `network`, `security`, `infra`)
+  - A milestone assignment (`v0.1.0`, `v0.2.0`, or `v0.3.0`)
+- Reference issues in commit messages: `fix: correct spot fleet instance type generation (closes #N)`
+
+### Milestones
+- **v0.1.0** — Critical bugs and broken functionality; minimum viable provider
+- **v0.2.0** — Stability: race conditions, resource leaks, error handling, core test coverage
+- **v0.3.0** — Feature completeness: production hardening, comprehensive E2E tests
+
+### GitHub Project
+- The project board is at https://github.com/users/scttfrdmn/projects/29
+- New issues should be added to the project board
+
+### Changelog
+- `CHANGELOG.md` follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) format exactly
+- Versions follow [Semantic Versioning 2.0.0](https://semver.org/spec/v2.0.0.html)
+- Always update `[Unreleased]` when making changes; never edit released version sections
+- Categories: `Added`, `Changed`, `Deprecated`, `Removed`, `Fixed`, `Security`
+- The footer must contain comparison links for every version
+
+### Versioning Rules (semver2)
+- **MAJOR** (1.x.x) — breaking changes to the `EphemeralAWSProvider` public interface or config schema
+- **MINOR** (x.1.x) — new features, new operating modes, new state backends (backwards-compatible)
+- **PATCH** (x.x.1) — bug fixes, security patches, documentation (no interface changes)
+- Current version: `0.1.0` (alpha — anything may change)
+
+---
+
 ## Overview
 
 Claude Code can assist with:
