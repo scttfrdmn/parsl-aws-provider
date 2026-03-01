@@ -5,7 +5,6 @@ SPDX-FileCopyrightText: 2025 Scott Friedman and Project Contributors
 """
 
 import logging
-import json
 import time
 from typing import Dict, Any, Set
 
@@ -33,6 +32,7 @@ from ..security import (
     SecurityEvent,
 )
 from ..error_handling import RobustErrorHandler, RetryConfig
+from ..utils.aws import get_or_create_iam_role
 
 
 logger = logging.getLogger(__name__)
@@ -291,61 +291,53 @@ class ECSManager:
             raise ResourceCreationError(f"Failed to create ECS cluster: {e}")
 
     def _create_task_execution_role(self) -> str:
-        """Create an IAM role for ECS task execution.
+        """Get or create an IAM role for ECS task execution (idempotent).
 
         Returns
         -------
         str
             ARN of the IAM role
         """
-        # Generate a unique role name
         role_name = f"{TAG_PREFIX}-ecs-role-{self.provider.workflow_id}"
 
+        assume_role_policy = {
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Effect": "Allow",
+                    "Principal": {"Service": "ecs-tasks.amazonaws.com"},
+                    "Action": "sts:AssumeRole",
+                }
+            ],
+        }
+
+        role_arn = get_or_create_iam_role(
+            iam_client=self.iam_client,
+            role_name=role_name,
+            assume_role_policy=assume_role_policy,
+            policy_arns=[
+                "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
+            ],
+            tags=[
+                {"Key": TAG_NAME, "Value": "true"},
+                {"Key": TAG_WORKFLOW_ID, "Value": self.provider.workflow_id},
+            ],
+            description=f"Execution role for Parsl ECS tasks ({self.provider.workflow_id})",
+        )
+
+        # Track role for cleanup
+        self.role_names.add(role_name)
+
+        # Wait for IAM propagation using role_exists waiter
         try:
-            # Create role
-            assume_role_policy = {
-                "Version": "2012-10-17",
-                "Statement": [
-                    {
-                        "Effect": "Allow",
-                        "Principal": {"Service": "ecs-tasks.amazonaws.com"},
-                        "Action": "sts:AssumeRole",
-                    }
-                ],
-            }
-
-            response = self.iam_client.create_role(
-                RoleName=role_name,
-                AssumeRolePolicyDocument=json.dumps(assume_role_policy),
-                Description=f"Execution role for Parsl ECS tasks ({self.provider.workflow_id})",
-                Tags=[
-                    {"Key": TAG_NAME, "Value": "true"},
-                    {"Key": TAG_WORKFLOW_ID, "Value": self.provider.workflow_id},
-                ],
+            waiter = self.iam_client.get_waiter("role_exists")
+            waiter.wait(RoleName=role_name, WaiterConfig={"MaxAttempts": 10})
+        except Exception:
+            logger.debug(
+                "IAM waiter not available; proceeding without propagation wait"
             )
 
-            role_arn = response["Role"]["Arn"]
-            logger.info(f"Created ECS task execution role: {role_name}")
-
-            # Attach policies
-            self.iam_client.attach_role_policy(
-                RoleName=role_name,
-                PolicyArn="arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy",
-            )
-
-            # Track role for cleanup
-            self.role_names.add(role_name)
-
-            # Wait for role to be ready (IAM changes can take time to propagate)
-            time.sleep(10)
-
-            return role_arn
-
-        except ClientError as e:
-            logger.error(f"Error creating ECS task execution role: {e}")
-            raise ResourceCreationError(
-                f"Failed to create ECS task execution role: {e}"
-            )
+        return role_arn
 
     def _register_task_definition(self, job_id: str, command: str) -> str:
         """Register an ECS task definition.
@@ -443,25 +435,52 @@ class ECSManager:
         Dict[str, str]
             Dictionary containing subnet IDs and security group ID
         """
-        # For simplicity, we'll use the default VPC and subnets
         try:
-            # Get default VPC
-            vpc_response = self.ec2_client.describe_vpcs(
-                Filters=[{"Name": "isDefault", "Values": ["true"]}]
+            # Prefer an explicit vpc_id from the provider; fall back to the default VPC
+            explicit_vpc_id = getattr(self.provider, "vpc_id", None)
+
+            if explicit_vpc_id:
+                vpc_id = explicit_vpc_id
+                logger.debug(f"ECS using provider-specified VPC: {vpc_id}")
+            else:
+                # Fall back to the account's default VPC
+                vpc_response = self.ec2_client.describe_vpcs(
+                    Filters=[{"Name": "isDefault", "Values": ["true"]}]
+                )
+
+                if not vpc_response["Vpcs"]:
+                    raise ResourceCreationError(
+                        "No default VPC found and no vpc_id was provided. "
+                        "Pass vpc_id to EphemeralAWSProvider or create a default VPC."
+                    )
+
+                vpc_id = vpc_response["Vpcs"][0]["VpcId"]
+                logger.debug(f"ECS using default VPC: {vpc_id}")
+
+            # Use explicit subnet_ids if provided; otherwise discover from VPC
+            explicit_subnet_ids = getattr(self.provider, "subnet_ids", None) or (
+                [getattr(self.provider, "subnet_id", None)]
+                if getattr(self.provider, "subnet_id", None)
+                else None
             )
 
-            if not vpc_response["Vpcs"]:
-                raise ResourceCreationError("No default VPC found")
+            if explicit_subnet_ids:
+                subnet_ids = explicit_subnet_ids
+                logger.debug(f"ECS using provider-specified subnets: {subnet_ids}")
+            else:
+                subnet_response = self.ec2_client.describe_subnets(
+                    Filters=[{"Name": "vpc-id", "Values": [vpc_id]}]
+                )
 
-            vpc_id = vpc_response["Vpcs"][0]["VpcId"]
+                if not subnet_response["Subnets"]:
+                    raise ResourceCreationError(
+                        f"No subnets found in VPC {vpc_id}. "
+                        "Create subnets or pass subnet_id to EphemeralAWSProvider."
+                    )
 
-            # Get subnets in the default VPC
-            subnet_response = self.ec2_client.describe_subnets(
-                Filters=[{"Name": "vpc-id", "Values": [vpc_id]}]
-            )
-
-            if not subnet_response["Subnets"]:
-                raise ResourceCreationError("No subnets found in default VPC")
+                subnet_ids = [
+                    subnet["SubnetId"] for subnet in subnet_response["Subnets"]
+                ]
 
             subnet_ids = [subnet["SubnetId"] for subnet in subnet_response["Subnets"]]
 

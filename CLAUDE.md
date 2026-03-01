@@ -39,6 +39,24 @@ All work tracking for this project uses GitHub. **Do not create standalone plann
 
 ---
 
+## AWS Credentials
+
+All real-AWS operations use `AWS_PROFILE=aws`. Tests marked `@pytest.mark.aws` and
+LocalStack health checks require this profile to be configured in `~/.aws/credentials`.
+
+```bash
+export AWS_PROFILE=aws
+```
+
+When running integration tests against real AWS:
+```bash
+AWS_PROFILE=aws pytest tests/integration/ -m aws
+```
+
+LocalStack tests do not require a real AWS profile — they use synthetic credentials.
+
+---
+
 ## Overview
 
 Claude Code can assist with:

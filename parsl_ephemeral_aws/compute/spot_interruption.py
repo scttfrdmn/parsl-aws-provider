@@ -298,7 +298,8 @@ class SpotInterruptionMonitor:
 
                 if event[0] == "instance":
                     _, instance_id, event_details = event
-                    handler = self.instance_handlers.get(instance_id)
+                    with self._lock:
+                        handler = self.instance_handlers.get(instance_id)
                     if handler:
                         try:
                             handler(instance_id, event_details)
@@ -309,7 +310,8 @@ class SpotInterruptionMonitor:
 
                 elif event[0] == "fleet":
                     _, fleet_id, instance_ids, event_details = event
-                    handler = self.fleet_handlers.get(fleet_id)
+                    with self._lock:
+                        handler = self.fleet_handlers.get(fleet_id)
                     if handler:
                         try:
                             handler(fleet_id, instance_ids, event_details)
@@ -425,6 +427,7 @@ class SpotInterruptionHandler:
                 Bucket=self.checkpoint_bucket,
                 Key=key,
                 Body=json.dumps(data),
+                ServerSideEncryption="AES256",
                 Metadata={
                     "Priority": str(priority),
                     "Timestamp": str(int(time.time())),

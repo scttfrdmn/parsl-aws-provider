@@ -7,6 +7,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Optional `iam_instance_profile_arn` and `auto_create_instance_profile` parameters
+  on `EphemeralAWSProvider`; EC2 instances and bastion host now receive an IAM
+  instance profile for SSM access when configured (closes #19)
+- `get_or_create_iam_role()` shared utility in `utils/aws.py` for idempotent
+  IAM role creation with `EntityAlreadyExists` race handling
+- ECS task execution role creation is now idempotent using the shared utility;
+  IAM propagation waiter replaces 10-second sleep (closes #23)
+- Lambda execution role creation is now idempotent using the shared utility;
+  IAM propagation waiter replaces 10-second sleep (closes #20)
+- `mock_iam_client` pytest fixture in `tests/conftest.py`; `mock_boto3_session`
+  now routes `iam` service calls to the mock
+- Unit tests for AWS quota, instance-type, and capacity errors in
+  `TestEC2ManagerQuotaErrors` (closes #43, #44)
+- Integration tests for full provider restart and state recovery in
+  `tests/integration/test_provider_restart.py` (closes #45)
+- Concurrent-submission stress tests (50 threads) and simultaneous submit+status
+  tests in `test_provider_interface.py` (closes #46)
+- Partial-infrastructure failure tests verifying VPC cleanup on subnet/SG
+  creation failure in `test_standard_mode.py` (closes #47)
+
+### Fixed
+- VPC force-delete now removes non-main route table associations and tables
+  before calling `delete_vpc`, preventing cleanup failures on custom route
+  tables (closes #26)
+- SpotFleet IAM role is now deleted by `cleanup_infrastructure()` via
+  `cleanup_all_resources()` on normal provider shutdown (closes #24)
+- SpotFleet instance-level interruption monitoring confirmed correct via
+  fleet-level handler registration; no additional code change required (closes #25)
+- Spot interruption handler lookups for both `instance_handlers` and
+  `fleet_handlers` are now protected by `with self._lock:` to eliminate
+  TOCTOU race (closes #28)
+- S3 checkpoint `put_object` call now sets `ServerSideEncryption="AES256"`
+  for at-rest encryption (closes #29)
+- `FileStateStore` read and write operations are now protected by `fcntl.flock`
+  (`LOCK_SH` read, `LOCK_EX` write) to prevent concurrent state corruption;
+  no-op on platforms without `fcntl` (closes #30)
+- `S3StateStore` bucket creation no longer passes the deprecated `ACL="private"`
+  parameter; `put_public_access_block` is called instead to block all public
+  access (closes #31)
+- ECS `_get_or_create_network_resources` now prefers an explicit `provider.vpc_id`
+  attribute; falls back to the default VPC with a clear error if neither exists
+  (closes #32, #33)
+- Spot Fleet max bid price now uses `describe_spot_price_history` (3× current
+  spot as on-demand proxy) instead of hardcoded $0.10; falls back to $1.00
+  on API failure (closes #34)
+- Lambda `get_job_status` now returns deterministic `COMPLETED` status after
+  the configured timeout instead of a random value (closes #27)
+
 ## [0.1.0] - 2026-02-28
 
 ### Added
