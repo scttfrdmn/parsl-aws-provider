@@ -12,24 +12,24 @@
 
 ## 🚀 What This Enables
 
-✅ **Universal Connectivity**: Deploy from behind any firewall or NAT  
-✅ **Container Execution**: Full Docker support with reproducible environments  
-✅ **Real Scientific Computing**: 2M+ operations/second validated performance  
-✅ **Zero Configuration**: No local network changes required  
-✅ **Production Ready**: End-to-end containerized execution verified  
+✅ **Universal Connectivity**: Deploy from behind any firewall or NAT
+✅ **Container Execution**: Full Docker support with reproducible environments
+✅ **Real Scientific Computing**: 2M+ operations/second validated performance
+✅ **Zero Configuration**: No local network changes required
+✅ **Production Ready**: End-to-end containerized execution verified
 
 ## 🌐 Network Environment Support
 
 **Confirmed Working From:**
 - Corporate networks with restrictive firewalls
-- University campuses with complex network policies  
+- University campuses with complex network policies
 - Home networks behind NAT routers
 - Hotel/conference WiFi with heavy restrictions
 - VPN environments (corporate and institutional)
 
 **Zero Local Configuration Required:**
 - No firewall rule modifications
-- No port forwarding setup  
+- No port forwarding setup
 - No IT department coordination
 - No public IP requirements
 
@@ -42,7 +42,7 @@ cd parsl-aws-provider/tools
 python real_compute_no_deps.py
 
 # Expected output:
-# 🎉 REAL COMPUTE TEST SUCCESS  
+# 🎉 REAL COMPUTE TEST SUCCESS
 # ✅ 2,031,877 operations/second on AWS
 # ✅ SSH reverse tunneling working with real workloads
 ```
@@ -56,7 +56,7 @@ python real_compute_no_deps.py
 aws configure
 # Enter: Access Key ID, Secret Access Key, region (e.g. us-east-1)
 
-# 2. Python 3.10+ 
+# 2. Python 3.10+
 pip install parsl boto3
 ```
 
@@ -88,10 +88,10 @@ parsl.load(config)
 def scientific_computation(dataset_size):
     import math
     import time
-    
+
     start = time.time()
     result = sum(math.sqrt(i * 2.5) * math.sin(i / 1000.0) for i in range(dataset_size))
-    
+
     return {
         'result': result,
         'compute_time': time.time() - start,
@@ -136,20 +136,20 @@ def containerized_analysis():
     """Scientific analysis in reproducible container environment."""
     import os
     import subprocess
-    
+
     # Verify container execution
     in_container = os.path.exists("/.dockerenv")
-    
+
     # Install scientific packages in container
-    subprocess.run(['conda', 'install', '-y', 'numpy', 'scipy'], 
+    subprocess.run(['conda', 'install', '-y', 'numpy', 'scipy'],
                    capture_output=True, check=True)
-    
+
     import numpy as np
-    
+
     # NumPy computation with full isolation
     matrix = np.random.rand(1000, 1000)
     eigenvalues = np.linalg.eigvals(matrix)
-    
+
     return {
         "in_container": in_container,
         "eigenvalue_count": len(eigenvalues),
@@ -174,7 +174,7 @@ Deploy enterprise Function-as-a-Service endpoints using our AWS Provider:
 # Install Globus Compute
 pip install globus-compute-endpoint globus-compute-sdk
 
-# Configure endpoint  
+# Configure endpoint
 globus-compute-endpoint configure aws_research_endpoint
 ```
 
@@ -184,7 +184,7 @@ Edit `~/.globus_compute/aws_research_endpoint/config.yaml`:
 display_name: "AWS Research Endpoint"
 engine:
   type: GlobusComputeEngine
-  
+
   provider:
     type: AWSProvider
     region: us-east-1
@@ -192,7 +192,7 @@ engine:
     enable_ssm_tunneling: true
     init_blocks: 1
     max_blocks: 20
-    
+
   max_workers_per_node: 1
 ```
 
@@ -205,22 +205,22 @@ def research_computation(dataset_params):
     """Scientific function for remote execution."""
     import math
     import time
-    
+
     start_time = time.time()
-    
+
     # Scientific computation
     results = []
     for i in range(dataset_params['sample_count']):
         value = math.sqrt(i * dataset_params['scale_factor']) * math.sin(i / 1000)
         results.append(value)
-    
+
     analysis = {
         'sample_count': len(results),
         'mean': sum(results) / len(results),
         'max': max(results),
         'computation_time': time.time() - start_time
     }
-    
+
     return analysis
 
 # Submit function to AWS endpoint
@@ -250,7 +250,7 @@ def process_s3_dataset(s3_input_uri, s3_output_uri):
     return f"""
     # Download data (AWS-internal, high bandwidth)
     aws s3 cp {s3_input_uri} /tmp/dataset.csv --region us-east-1
-    
+
     # Process locally on AWS instance
     python3 << 'EOF'
 import csv
@@ -277,7 +277,7 @@ EOF
 
     # Upload results (AWS-internal, high bandwidth)
     aws s3 cp /tmp/results.json {s3_output_uri} --region us-east-1
-    
+
     echo "Analysis complete: {s3_output_uri}"
     """
 
@@ -297,15 +297,15 @@ def analyze_public_dataset(dataset_url):
     import urllib.request
     import json
     import csv
-    
+
     # Download directly to AWS worker (no tunnel)
     urllib.request.urlretrieve(dataset_url, "/tmp/public_data.csv")
-    
+
     # Analyze
     with open("/tmp/public_data.csv", 'r') as f:
         reader = csv.DictReader(f)
         data = list(reader)
-    
+
     # Return analysis summary (small message via tunnel)
     return {
         'dataset_url': dataset_url,
@@ -336,16 +336,16 @@ def blast_analysis(sequence):
     """BLAST analysis in containerized environment."""
     import subprocess
     import os
-    
+
     # Verify container execution
     in_container = os.path.exists("/.dockerenv")
-    
+
     # Use pre-installed BLAST tools
     result = subprocess.run([
         "blastp", "-query", "/tmp/query.fasta",
         "-subject", "/tmp/query.fasta", "-outfmt", "6"
     ], capture_output=True, text=True)
-    
+
     return {
         "in_container": in_container,
         "blast_results": result.stdout,
@@ -379,7 +379,7 @@ def blast_analysis(sequence):
 Control Flow (SSH Tunnels):          Data Flow (S3/HTTPS):
 ┌─────────────────┐                   ┌─────────────────┐
 │ Job Submission  │ ────SSH Tunnel──► │ Large Datasets  │
-│ Worker Status   │ ◄──SSH Tunnel──── │ Result Files    │ 
+│ Worker Status   │ ◄──SSH Tunnel──── │ Result Files    │
 │ Error Messages  │                   │ Public Data     │
 │ (lightweight)   │                   │ (high bandwidth)│
 └─────────────────┘                   └─────────────────┘
@@ -395,15 +395,15 @@ provider = AWSProvider(
     region="us-east-1",                    # AWS region
     instance_type="c5.large",              # EC2 instance type
     ami_id="ami-0cab818949226441f",        # Custom AMI (optional)
-    
-    # Connectivity  
+
+    # Connectivity
     enable_ssm_tunneling=True,             # Universal connectivity
-    
+
     # Scaling
     init_blocks=1,                         # Initial instances
     max_blocks=10,                         # Maximum instances
     min_blocks=0,                          # Minimum instances
-    
+
     # Python Environment
     python_version="3.10",                 # Python version
     worker_init="pip install numpy",       # Worker setup commands
@@ -418,12 +418,12 @@ from container_executor import ContainerHighThroughputExecutor
 container_executor = ContainerHighThroughputExecutor(
     label="container_work",
     provider=AWSProvider(enable_ssm_tunneling=True),
-    
+
     # Container Settings
     container_image="python:3.10-slim",    # Docker image
     container_runtime="docker",            # Runtime (docker/podman)
     container_options="--network host",    # Docker options
-    
+
     # Execution
     max_workers_per_node=1,                # Workers per instance
 )
@@ -435,7 +435,7 @@ container_executor = ContainerHighThroughputExecutor(
 # Compute-optimized
 instance_type="c5.4xlarge"     # 16 vCPUs, 32 GB RAM
 
-# Memory-optimized  
+# Memory-optimized
 instance_type="r5.2xlarge"     # 8 vCPUs, 64 GB RAM
 
 # GPU instances
@@ -456,13 +456,13 @@ def process_s3_research_data(s3_input_uri, s3_output_uri):
     return f"""
     # Download from S3 (AWS-internal, fast)
     aws s3 cp {s3_input_uri} /tmp/data.csv
-    
+
     # Process on AWS instance
     python3 analysis_script.py /tmp/data.csv /tmp/results.json
-    
-    # Upload results to S3 (AWS-internal, fast)  
+
+    # Upload results to S3 (AWS-internal, fast)
     aws s3 cp /tmp/results.json {s3_output_uri}
-    
+
     echo "Complete"  # Only this message via SSH tunnel
     """
 
@@ -482,15 +482,15 @@ def analyze_public_dataset(dataset_url):
     import urllib.request
     import json
     import csv
-    
+
     # Download directly to AWS worker
     urllib.request.urlretrieve(dataset_url, "/tmp/public_data.csv")
-    
+
     # Process and return summary
     with open("/tmp/public_data.csv", 'r') as f:
         reader = csv.DictReader(f)
         data = list(reader)
-    
+
     return {
         'source_url': dataset_url,
         'record_count': len(data),
@@ -519,9 +519,9 @@ def process_climate_tile(s3_tile_uri):
     return climate_analysis_results
 ```
 
-**Drug Discovery**: Molecular dynamics simulations from corporate networks  
+**Drug Discovery**: Molecular dynamics simulations from corporate networks
 ```python
-@parsl.python_app  
+@parsl.python_app
 def molecular_simulation(compound_params):
     # Protein folding simulation
     return simulation_results
@@ -549,7 +549,7 @@ Our provider uses **SSH reverse tunneling over AWS SSM** to solve the fundamenta
 
 1. **Base64 Command Encoding**: Safely pass complex Docker commands through shell layers
 2. **Host Networking**: `--network host` for container SSH tunnel access
-3. **GatewayPorts Configuration**: SSH daemon setup for container connectivity  
+3. **GatewayPorts Configuration**: SSH daemon setup for container connectivity
 4. **Quote Preservation**: Eliminate shell parsing that corrupts commands
 
 ## 📚 Documentation
@@ -603,7 +603,7 @@ Required IAM permissions for the AWS Provider:
             "Effect": "Allow",
             "Action": [
                 "ec2:RunInstances",
-                "ec2:TerminateInstances", 
+                "ec2:TerminateInstances",
                 "ec2:DescribeInstances",
                 "ec2:DescribeInstanceStatus",
                 "ec2:CreateTags",
@@ -661,7 +661,7 @@ We welcome contributions! Areas of focus:
 
 - **Performance Optimization**: Improve startup times and throughput
 - **Container Support**: Additional runtimes (Singularity, Podman)
-- **Data Integration**: Enhanced S3/storage patterns  
+- **Data Integration**: Enhanced S3/storage patterns
 - **Documentation**: Usage examples and tutorials
 - **Testing**: Expand test coverage and validation
 
