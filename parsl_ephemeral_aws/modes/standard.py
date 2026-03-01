@@ -1151,8 +1151,19 @@ class StandardMode(OperatingMode):
                 time.sleep(10)
 
             if time.time() - start_time >= max_wait:
-                logger.warning(
-                    f"Timeout waiting for Spot Fleet block {block_id} to be running"
+                logger.error(
+                    f"Timeout waiting for Spot Fleet block {block_id} to reach RUNNING"
+                )
+                try:
+                    self.spot_fleet_manager.terminate_block(block_id)
+                    self.blocks.pop(block_id, None)
+                except Exception as cleanup_err:
+                    logger.error(
+                        f"Failed to clean up timed-out fleet block {block_id}: {cleanup_err}"
+                    )
+                raise ResourceCreationError(
+                    f"Spot Fleet block {block_id} did not reach RUNNING "
+                    f"state within {max_wait}s"
                 )
 
             # Register spot fleet with spot interruption monitor if enabled
