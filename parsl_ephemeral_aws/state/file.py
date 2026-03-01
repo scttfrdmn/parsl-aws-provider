@@ -10,6 +10,13 @@ import logging
 import os
 from typing import Any, Dict, Optional
 
+try:
+    import fcntl
+
+    _HAS_FCNTL = True
+except ImportError:
+    _HAS_FCNTL = False
+
 from parsl_ephemeral_aws.exceptions import (
     StateDeserializationError,
     StateSerializationError,
@@ -68,7 +75,13 @@ class FileStateStore(StateStore):
             os.makedirs(os.path.dirname(os.path.abspath(self.file_path)), exist_ok=True)
 
             with open(self.file_path, "w") as f:
-                json.dump(state, f, indent=2)
+                if _HAS_FCNTL:
+                    fcntl.flock(f, fcntl.LOCK_EX)
+                try:
+                    json.dump(state, f, indent=2)
+                finally:
+                    if _HAS_FCNTL:
+                        fcntl.flock(f, fcntl.LOCK_UN)
 
             logger.debug(f"Saved state to {self.file_path}")
         except json.JSONDecodeError as e:
@@ -106,7 +119,13 @@ class FileStateStore(StateStore):
 
         try:
             with open(self.file_path, "r") as f:
-                state = json.load(f)
+                if _HAS_FCNTL:
+                    fcntl.flock(f, fcntl.LOCK_SH)
+                try:
+                    state = json.load(f)
+                finally:
+                    if _HAS_FCNTL:
+                        fcntl.flock(f, fcntl.LOCK_UN)
 
             logger.debug(f"Loaded state from {self.file_path}")
             return state

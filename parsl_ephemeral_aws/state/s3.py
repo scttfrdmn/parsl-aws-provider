@@ -86,17 +86,25 @@ class S3State(StateStore):
                     # Create bucket in the current region
                     if self.provider.region == "us-east-1":
                         # us-east-1 requires special handling (no LocationConstraint)
-                        self.s3_client.create_bucket(
-                            Bucket=self.bucket_name, ACL="private"
-                        )
+                        self.s3_client.create_bucket(Bucket=self.bucket_name)
                     else:
                         self.s3_client.create_bucket(
                             Bucket=self.bucket_name,
                             CreateBucketConfiguration={
                                 "LocationConstraint": self.provider.region
                             },
-                            ACL="private",
                         )
+
+                    # Block all public access (replaces deprecated ACL="private")
+                    self.s3_client.put_public_access_block(
+                        Bucket=self.bucket_name,
+                        PublicAccessBlockConfiguration={
+                            "BlockPublicAcls": True,
+                            "IgnorePublicAcls": True,
+                            "BlockPublicPolicy": True,
+                            "RestrictPublicBuckets": True,
+                        },
+                    )
 
                     # Add tags to the bucket
                     self.s3_client.put_bucket_tagging(
