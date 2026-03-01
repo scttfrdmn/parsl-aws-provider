@@ -63,9 +63,22 @@ class ParameterStoreState(StateStore):
 
         # Initialize clients
         self.ssm_client = self.aws_session.client("ssm")
-        
-        # TODO: Integrate audit logging for state operations
-        # self.audit_logger = provider.security_config.get_audit_logger() if hasattr(provider, 'security_config') else None
+
+        self.audit_logger = getattr(provider, "audit_logger", None)
+
+    def _audit(self, operation: str, parameter_name: str) -> None:
+        """Emit a state-access audit event if an audit logger is configured."""
+        if self.audit_logger:
+            self.audit_logger.log_event(
+                SecurityEvent(
+                    event_type=SecurityEventType.STATE_ACCESS,
+                    severity=SecurityEventSeverity.INFO,
+                    details={
+                        "operation": operation,
+                        "parameter": parameter_name,
+                    },
+                )
+            )
 
     def _get_parameter_name(self, state_key: str) -> str:
         """Get the full parameter name.
@@ -129,6 +142,7 @@ class ParameterStoreState(StateStore):
                     raise
 
             logger.debug(f"Saved state to Parameter Store: {parameter_name}")
+            self._audit("save", parameter_name)
 
         except Exception as e:
             logger.error(f"Error saving state to Parameter Store: {e}")
@@ -160,6 +174,7 @@ class ParameterStoreState(StateStore):
                 state_data = json.loads(state_json)
 
                 logger.debug(f"Loaded state from Parameter Store: {parameter_name}")
+                self._audit("load", parameter_name)
 
                 return state_data
 
@@ -189,6 +204,7 @@ class ParameterStoreState(StateStore):
             try:
                 self.ssm_client.delete_parameter(Name=parameter_name)
                 logger.debug(f"Deleted state from Parameter Store: {parameter_name}")
+                self._audit("delete", parameter_name)
             except ClientError as e:
                 if e.response["Error"]["Code"] == "ParameterNotFound":
                     logger.debug(

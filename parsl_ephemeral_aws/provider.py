@@ -161,6 +161,14 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
         When True, automatically create an IAM role and instance profile with
         AmazonSSMManagedInstanceCore permissions if one does not already exist.
         Default is False.
+    status_polling_interval : int, optional
+        Interval in seconds between status polls. Default is 60.
+    waiter_delay : int, optional
+        Seconds between waiter attempts when polling for resource state changes.
+        Default is 5.
+    waiter_max_attempts : int, optional
+        Maximum number of waiter attempts before raising an error.
+        Default is 60 (5 minutes at the default delay).
     """
 
     @typechecked
@@ -204,6 +212,9 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
         provider_id: Optional[str] = None,
         iam_instance_profile_arn: Optional[str] = None,
         auto_create_instance_profile: bool = False,
+        status_polling_interval: int = 60,
+        waiter_delay: int = 5,
+        waiter_max_attempts: int = 60,
         **kwargs: Any,
     ) -> None:
         """Initialize the Ephemeral AWS Provider."""
@@ -279,6 +290,9 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
         self.provider_id = provider_id or str(uuid.uuid4())
         self.iam_instance_profile_arn = iam_instance_profile_arn
         self.auto_create_instance_profile = auto_create_instance_profile
+        self._status_polling_interval = status_polling_interval
+        self.waiter_delay = waiter_delay
+        self.waiter_max_attempts = waiter_max_attempts
         self.kwargs = kwargs
 
         # Initialize state
@@ -813,7 +827,7 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
         int
             Polling interval in seconds.
         """
-        return 60
+        return self._status_polling_interval
 
     @property
     def label(self) -> str:

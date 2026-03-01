@@ -474,7 +474,11 @@ class TestStandardModePartialInfraFailure:
     def _setup_ec2_for_vpc(self, mock_ec2):
         """Wire mock EC2 to succeed on VPC + IGW creation."""
         mock_ec2.create_vpc.return_value = {"Vpc": {"VpcId": "vpc-partial"}}
-        mock_ec2.describe_vpcs.return_value = {"Vpcs": [{"VpcId": "vpc-partial"}]}
+        # CidrBlock required by _find_available_vpc_cidr; use a non-10.x range
+        # so the helper still returns 10.0.0.0/16 for the new VPC.
+        mock_ec2.describe_vpcs.return_value = {
+            "Vpcs": [{"VpcId": "vpc-partial", "CidrBlock": "192.168.0.0/16"}]
+        }
         mock_ec2.create_internet_gateway.return_value = {
             "InternetGateway": {"InternetGatewayId": "igw-partial"}
         }
