@@ -123,6 +123,7 @@ markers = [
     "unit: Unit tests (no external dependencies)",
     "integration: Integration tests (requires LocalStack)",
     "aws: Tests requiring real AWS credentials",
+    "globus: Tests requiring Globus Compute credentials and a running endpoint",
     "slow: Slow-running tests",
     "localstack: Tests using LocalStack"
 ]

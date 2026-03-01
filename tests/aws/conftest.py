@@ -15,6 +15,7 @@ import uuid
 
 import pytest
 
+from parsl_ephemeral_aws import GlobusComputeProvider
 from parsl_ephemeral_aws.provider import EphemeralAWSProvider
 
 logger = logging.getLogger(__name__)
@@ -385,6 +386,55 @@ def s3_provider(aws_session, test_run_id, aws_region, s3_state_bucket):
     except Exception as exc:
         logger.warning(
             "s3_provider shutdown raised an exception (best-effort): %s", exc
+        )
+
+
+# ---------------------------------------------------------------------------
+# Globus Compute provider fixture (for #58 — Globus Compute E2E)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def globus_compute_provider(tmp_path, aws_session, test_run_id, aws_region):
+    """Provider configured for Globus Compute endpoint config generation.
+
+    Creates a ``GlobusComputeProvider`` backed by standard EC2 mode and yields
+    it without calling ``operating_mode.initialize()`` — Globus Compute
+    endpoint tests manage the lifecycle via the ``globus-compute-endpoint``
+    CLI rather than calling the provider directly.
+
+    The provider is shut down best-effort in teardown to release any EC2
+    resources that may have been provisioned by lifecycle tests.
+    """
+    state_file = str(tmp_path / f"state-gc-{test_run_id}.json")
+
+    provider = GlobusComputeProvider(
+        region=aws_region,
+        instance_type="t3.small",
+        mode="standard",
+        state_store_type="file",
+        state_file_path=state_file,
+        auto_shutdown=True,
+        auto_create_instance_profile=True,
+        profile_name=AWS_TEST_PROFILE,
+        additional_tags={
+            "E2ETestRunId": test_run_id,
+            "AutoCleanup": "true",
+        },
+        display_name=f"Parsl E2E Test {test_run_id}",
+        waiter_delay=15,
+        waiter_max_attempts=40,
+        debug=True,
+    )
+
+    yield provider
+
+    try:
+        provider.shutdown()
+    except Exception as exc:
+        logger.warning(
+            "globus_compute_provider shutdown raised an exception (best-effort): %s",
+            exc,
         )
 
 

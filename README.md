@@ -166,6 +166,9 @@ parsl.clear()
 
 ## 🌐 Globus Compute Integration
 
+> **Full guide**: [docs/globus_compute.md](docs/globus_compute.md) — architecture,
+> IAM setup, spot/container examples, multi-region deployment, and troubleshooting.
+
 Deploy enterprise Function-as-a-Service endpoints using our AWS Provider:
 
 ### Endpoint Configuration
