@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Real-AWS E2E test suite for StandardMode full lifecycle in `tests/aws/`
+  (`tests/aws/conftest.py`, `tests/aws/test_standard_mode_e2e.py`): covers VPC/subnet/SG
+  creation, CIDR conflict detection, instance tagging, PENDING→RUNNING→COMPLETED
+  status transitions, cancellation, and full infrastructure teardown (closes #53)
+
 ## [0.3.0] - 2026-02-28
 
 ### Added

@@ -322,46 +322,37 @@ For these limitations, use Claude to generate test plans or templates that you c
 
 ## Python Environment Setup
 
-When working on this project, follow these Python environment management practices:
+**This project uses [uv](https://docs.astral.sh/uv/) for all Python environment and
+dependency management.  Use `uv` exclusively — do not use `pip`, `pip install`,
+`python -m venv`, or `pyenv` directly.**
 
-1. **Using pyenv**: Use pyenv to manage Python versions
+```bash
+# Create / sync the virtual environment (reads pyproject.toml)
+uv sync --extra dev --extra test
+
+# Run a command inside the managed environment
+uv run pytest tests/unit/ -m unit --no-cov -q
+
+# Add a dependency
+uv add <package>
+
+# Add a dev/test dependency
+uv add --dev <package>
+```
+
+The virtual environment is created at `.venv/` automatically by `uv sync`.
+
+1. **Python version**: controlled by the `requires-python` field in `pyproject.toml`
+   and the `.python-version` file (managed by `uv`).
+
+2. **Requirements management**: dependencies live in `pyproject.toml` only.
+   Do not maintain separate `requirements.txt` or `requirements-dev.txt` files.
+
+3. **Linting and formatting**:
    ```bash
-   # Install the appropriate Python version
-   pyenv install 3.9.16
-
-   # Set the local Python version for this project
-   cd /path/to/parsl-aws-provider
-   pyenv local 3.9.16
-   ```
-
-2. **Virtual environments**: Always use virtual environments to isolate dependencies
-   ```bash
-   # Create a virtual environment in the project directory
-   python -m venv .venv
-
-   # Activate the virtual environment
-   source .venv/bin/activate  # On Linux/macOS
-   .venv\Scripts\activate     # On Windows
-
-   # Install development dependencies
-   pip install -e ".[dev,test]"
-   ```
-
-3. **Requirements management**:
-   - Use `requirements.txt` for production dependencies
-   - Use `requirements-dev.txt` for development and testing dependencies
-   - Use `setup.py` or `pyproject.toml` for package metadata
-
-4. **Linting and formatting**:
-   ```bash
-   # Run linting checks
-   flake8 parsl_ephemeral_aws tests
-
-   # Run type checking
-   mypy parsl_ephemeral_aws
-
-   # Format code
-   black parsl_ephemeral_aws tests
+   uv run flake8 parsl_ephemeral_aws tests
+   uv run mypy parsl_ephemeral_aws
+   uv run black parsl_ephemeral_aws tests
    ```
 
 ## Best Practices
