@@ -12,6 +12,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`tests/aws/conftest.py`, `tests/aws/test_standard_mode_e2e.py`): covers VPC/subnet/SG
   creation, CIDR conflict detection, instance tagging, PENDING→RUNNING→COMPLETED
   status transitions, cancellation, and full infrastructure teardown (closes #53)
+- Real-AWS E2E test suite for spot instances and interruption recovery
+  (`tests/aws/test_spot_e2e.py`): covers VPC/subnet/SG infrastructure with `use_spot=True`,
+  `InstanceLifecycle='spot'` verification, RUNNING status after submit, command
+  completion, cancellation, interruption monitor thread liveness, and
+  force-termination detection (closes #55)
+- Real-AWS E2E test suite for serverless mode Lambda/ECS
+  (`tests/aws/test_serverless_mode_e2e.py`): covers VPC creation for auto worker_type,
+  Lambda function existence after submit, COMPLETED status transition, Lambda
+  function removal after cancel, and VPC/Lambda cleanup on shutdown (closes #61)
+- Real-AWS E2E test suite for detached mode bastion host and SSM tunnel
+  (`tests/aws/test_detached_mode_e2e.py`): covers VPC creation, bastion instance
+  running state, bastion tagging, job submit/status/complete/cancel lifecycle,
+  and full infrastructure teardown including bastion termination (closes #54)
+- Real-AWS E2E test suite for Parameter Store and S3 state backends
+  (`tests/aws/test_state_backends_e2e.py`): covers state written after initialize,
+  job_id present in persisted state after submit, round-trip state restoration
+  with a second provider instance, and state cleanup on shutdown (closes #57)
+- New provider fixtures in `tests/aws/conftest.py`: `spot_provider`,
+  `serverless_provider`, `detached_provider`, `parameter_store_provider`,
+  `s3_state_bucket`, `s3_provider`; new autouse safety-net fixtures
+  `cleanup_stray_lambda_resources` and `cleanup_stray_ssm_parameters`
 
 ## [0.3.0] - 2026-02-28
 
