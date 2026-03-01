@@ -435,25 +435,52 @@ class ECSManager:
         Dict[str, str]
             Dictionary containing subnet IDs and security group ID
         """
-        # For simplicity, we'll use the default VPC and subnets
         try:
-            # Get default VPC
-            vpc_response = self.ec2_client.describe_vpcs(
-                Filters=[{"Name": "isDefault", "Values": ["true"]}]
+            # Prefer an explicit vpc_id from the provider; fall back to the default VPC
+            explicit_vpc_id = getattr(self.provider, "vpc_id", None)
+
+            if explicit_vpc_id:
+                vpc_id = explicit_vpc_id
+                logger.debug(f"ECS using provider-specified VPC: {vpc_id}")
+            else:
+                # Fall back to the account's default VPC
+                vpc_response = self.ec2_client.describe_vpcs(
+                    Filters=[{"Name": "isDefault", "Values": ["true"]}]
+                )
+
+                if not vpc_response["Vpcs"]:
+                    raise ResourceCreationError(
+                        "No default VPC found and no vpc_id was provided. "
+                        "Pass vpc_id to EphemeralAWSProvider or create a default VPC."
+                    )
+
+                vpc_id = vpc_response["Vpcs"][0]["VpcId"]
+                logger.debug(f"ECS using default VPC: {vpc_id}")
+
+            # Use explicit subnet_ids if provided; otherwise discover from VPC
+            explicit_subnet_ids = getattr(self.provider, "subnet_ids", None) or (
+                [getattr(self.provider, "subnet_id", None)]
+                if getattr(self.provider, "subnet_id", None)
+                else None
             )
 
-            if not vpc_response["Vpcs"]:
-                raise ResourceCreationError("No default VPC found")
+            if explicit_subnet_ids:
+                subnet_ids = explicit_subnet_ids
+                logger.debug(f"ECS using provider-specified subnets: {subnet_ids}")
+            else:
+                subnet_response = self.ec2_client.describe_subnets(
+                    Filters=[{"Name": "vpc-id", "Values": [vpc_id]}]
+                )
 
-            vpc_id = vpc_response["Vpcs"][0]["VpcId"]
+                if not subnet_response["Subnets"]:
+                    raise ResourceCreationError(
+                        f"No subnets found in VPC {vpc_id}. "
+                        "Create subnets or pass subnet_id to EphemeralAWSProvider."
+                    )
 
-            # Get subnets in the default VPC
-            subnet_response = self.ec2_client.describe_subnets(
-                Filters=[{"Name": "vpc-id", "Values": [vpc_id]}]
-            )
-
-            if not subnet_response["Subnets"]:
-                raise ResourceCreationError("No subnets found in default VPC")
+                subnet_ids = [
+                    subnet["SubnetId"] for subnet in subnet_response["Subnets"]
+                ]
 
             subnet_ids = [subnet["SubnetId"] for subnet in subnet_response["Subnets"]]
 
