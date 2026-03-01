@@ -7,7 +7,7 @@ SPDX-FileCopyrightText: 2025 Scott Friedman and Project Contributors
 import logging
 import uuid
 import time
-from typing import Dict, Any
+from typing import Any, Dict, Optional
 
 from botocore.exceptions import ClientError, NoCredentialsError
 
@@ -133,6 +133,81 @@ class EC2Manager:
         self.instances = {}
         self.blocks = {}
         self.spot_requests = {}
+
+    def _get_or_create_instance_profile(self) -> Optional[str]:
+        """Return an IAM instance profile ARN for SSM access, or None.
+
+        Resolution order:
+        1. ``provider.iam_instance_profile_arn`` if set → use directly.
+        2. ``provider.auto_create_instance_profile`` → get-or-create a
+           profile that has the AmazonSSMManagedInstanceCore policy.
+        3. Otherwise → return None (EC2 instances launch without a profile).
+        """
+        profile_arn: Optional[str] = getattr(
+            self.provider, "iam_instance_profile_arn", None
+        )
+        if profile_arn:
+            return profile_arn
+
+        if not getattr(self.provider, "auto_create_instance_profile", False):
+            return None
+
+        iam = self.aws_session.client("iam")
+        workflow_id = self.provider.workflow_id
+        role_name = f"parsl-ephemeral-ssm-role-{workflow_id}"
+        profile_name = f"parsl-ephemeral-ssm-profile-{workflow_id}"
+
+        # Ensure the IAM role exists
+        from ..utils.aws import get_or_create_iam_role
+
+        get_or_create_iam_role(
+            iam_client=iam,
+            role_name=role_name,
+            assume_role_policy={
+                "Version": "2012-10-17",
+                "Statement": [
+                    {
+                        "Effect": "Allow",
+                        "Principal": {"Service": "ec2.amazonaws.com"},
+                        "Action": "sts:AssumeRole",
+                    }
+                ],
+            },
+            policy_arns=["arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"],
+            description=f"SSM instance role for Parsl ({workflow_id})",
+        )
+
+        # Ensure the instance profile exists and has the role attached
+        try:
+            response = iam.get_instance_profile(InstanceProfileName=profile_name)
+            return response["InstanceProfile"]["Arn"]
+        except ClientError as e:
+            if e.response["Error"]["Code"] not in (
+                "NoSuchEntity",
+                "NoSuchEntityException",
+            ):
+                raise ResourceCreationError(
+                    f"Failed to check instance profile {profile_name}: {e}"
+                ) from e
+
+        try:
+            response = iam.create_instance_profile(
+                InstanceProfileName=profile_name,
+            )
+            arn: str = response["InstanceProfile"]["Arn"]
+            iam.add_role_to_instance_profile(
+                InstanceProfileName=profile_name,
+                RoleName=role_name,
+            )
+            logger.info(f"Created IAM instance profile: {profile_name}")
+            return arn
+        except ClientError as e:
+            if e.response["Error"]["Code"] in ("EntityAlreadyExists",):
+                response = iam.get_instance_profile(InstanceProfileName=profile_name)
+                return response["InstanceProfile"]["Arn"]
+            raise ResourceCreationError(
+                f"Failed to create instance profile {profile_name}: {e}"
+            ) from e
 
     def _setup_security_config(self) -> None:
         """Set up security configuration from provider settings."""
@@ -740,6 +815,11 @@ class EC2Manager:
                 {"Key": key, "Value": value}
             )
 
+        # Attach IAM instance profile for SSM access if configured
+        profile_arn = self._get_or_create_instance_profile()
+        if profile_arn:
+            instance_params["IamInstanceProfile"] = {"Arn": profile_arn}
+
         # Launch instance
         response = self.ec2_client.run_instances(**instance_params)
         instance_id = response["Instances"][0]["InstanceId"]
@@ -1087,6 +1167,11 @@ class EC2Manager:
                 instance_params["TagSpecifications"][0]["Tags"].append(
                     {"Key": key, "Value": value}
                 )
+
+            # Attach IAM instance profile for SSM access if configured
+            profile_arn = self._get_or_create_instance_profile()
+            if profile_arn:
+                instance_params["IamInstanceProfile"] = {"Arn": profile_arn}
 
             # Launch instance
             response = self.ec2_client.run_instances(**instance_params)

@@ -154,6 +154,13 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
         Whether image_id refers to a custom AMI. Default is False.
     provider_id : str, optional
         Provider ID for distinguishing between multiple providers. Default is a UUID.
+    iam_instance_profile_arn : str, optional
+        ARN of an existing IAM instance profile to attach to EC2 instances.
+        Required for SSM connectivity when using Session Manager tunneling.
+    auto_create_instance_profile : bool, optional
+        When True, automatically create an IAM role and instance profile with
+        AmazonSSMManagedInstanceCore permissions if one does not already exist.
+        Default is False.
     """
 
     @typechecked
@@ -195,6 +202,8 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
         use_public_ips: bool = True,
         custom_ami: bool = False,
         provider_id: Optional[str] = None,
+        iam_instance_profile_arn: Optional[str] = None,
+        auto_create_instance_profile: bool = False,
         **kwargs: Any,
     ) -> None:
         """Initialize the Ephemeral AWS Provider."""
@@ -268,6 +277,8 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
         self.use_public_ips = use_public_ips
         self.custom_ami = custom_ami
         self.provider_id = provider_id or str(uuid.uuid4())
+        self.iam_instance_profile_arn = iam_instance_profile_arn
+        self.auto_create_instance_profile = auto_create_instance_profile
         self.kwargs = kwargs
 
         # Initialize state
