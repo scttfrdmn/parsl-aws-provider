@@ -9,6 +9,7 @@ SPDX-FileCopyrightText: 2025 Scott Friedman and Project Contributors
 """
 
 import logging
+import threading
 import time
 import uuid
 from enum import Enum
@@ -214,14 +215,21 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
         )
 
         # Set basic attributes - resolve image_id if not provided
-        if image_id is None and mode.lower() in ['standard', 'detached'] and compute_type.lower() == 'ec2':
+        if (
+            image_id is None
+            and mode.lower() in ["standard", "detached"]
+            and compute_type.lower() == "ec2"
+        ):
             # Auto-detect default AMI for the region
             from parsl_ephemeral_aws.utils.aws import get_default_ami
+
             try:
                 self.image_id = get_default_ami(region)
                 logger.info(f"Auto-detected AMI {self.image_id} for region {region}")
             except Exception as e:
-                logger.warning(f"Failed to auto-detect AMI: {e}. Will need to be set later.")
+                logger.warning(
+                    f"Failed to auto-detect AMI: {e}. Will need to be set later."
+                )
                 self.image_id = None
         else:
             self.image_id = image_id
@@ -270,6 +278,8 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
         self.operating_mode = self._initialize_operating_mode()
         self.resources: Dict[str, Dict[str, Any]] = {}
         self.job_map: Dict[str, Dict[str, Any]] = {}
+        # Re-entrant lock so cancel() → _cleanup_resources() doesn't deadlock
+        self._lock = threading.RLock()
 
         logger.info(f"Initialized EphemeralAWSProvider in {self.mode_type.value} mode")
 
@@ -445,16 +455,17 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
         job_name = job_name or f"parsl-job-{str(uuid.uuid4())[:8]}"
         job_id = f"{self.provider_id}-{str(uuid.uuid4())}"
 
-        # Check if we have capacity
-        if len(self.resources) >= self.max_blocks:
-            logger.warning(
-                f"Cannot submit job {job_name}, already at max_blocks = {self.max_blocks}"
-            )
-            raise ProviderError(
-                f"Cannot submit job, already at max_blocks = {self.max_blocks}"
-            )
+        # Check if we have capacity (lock protects len(self.resources))
+        with self._lock:
+            if len(self.resources) >= self.max_blocks:
+                logger.warning(
+                    f"Cannot submit job {job_name}, already at max_blocks = {self.max_blocks}"
+                )
+                raise ProviderError(
+                    f"Cannot submit job, already at max_blocks = {self.max_blocks}"
+                )
 
-        # Submit the job to the operating mode
+        # Submit the job to the operating mode (outside the lock — may be slow)
         try:
             resource_id = self.operating_mode.submit_job(
                 job_id=job_id,
@@ -463,21 +474,22 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
                 job_name=job_name,
             )
 
-            # Record the job in our internal maps
-            self.resources[resource_id] = {
-                "job_id": job_id,
-                "job_name": job_name,
-                "status": "PENDING",
-                "tasks_per_node": tasks_per_node,
-                "command": command,
-                "timestamp": time.time(),
-            }
+            # Record the job in our internal maps (lock protects dict writes)
+            with self._lock:
+                self.resources[resource_id] = {
+                    "job_id": job_id,
+                    "job_name": job_name,
+                    "status": "PENDING",
+                    "tasks_per_node": tasks_per_node,
+                    "command": command,
+                    "timestamp": time.time(),
+                }
 
-            self.job_map[job_id] = {
-                "resource_id": resource_id,
-                "job_name": job_name,
-                "status": "PENDING",
-            }
+                self.job_map[job_id] = {
+                    "resource_id": resource_id,
+                    "job_name": job_name,
+                    "status": "PENDING",
+                }
 
             # Update the state store
             self._save_state()
@@ -505,31 +517,33 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
         statuses = []
 
         try:
-            # Get status from the operating mode
-            status_map = self.operating_mode.get_job_status(
-                [
+            # Read resource_ids under lock
+            with self._lock:
+                resource_ids = [
                     self.job_map[job_id]["resource_id"]
                     for job_id in job_ids
                     if job_id in self.job_map
                 ]
-            )
 
-            # Update our internal state
-            for job_id in job_ids:
-                if job_id in self.job_map:
-                    resource_id = self.job_map[job_id]["resource_id"]
-                    if resource_id in status_map:
-                        status = status_map[resource_id]
-                        self.job_map[job_id]["status"] = status
-                        if resource_id in self.resources:
-                            self.resources[resource_id]["status"] = status
-                        statuses.append({"job_id": job_id, "status": status})
+            # Fetch status outside lock (may involve network calls)
+            status_map = self.operating_mode.get_job_status(resource_ids)
+
+            # Update internal state under lock
+            with self._lock:
+                for job_id in job_ids:
+                    if job_id in self.job_map:
+                        resource_id = self.job_map[job_id]["resource_id"]
+                        if resource_id in status_map:
+                            status = status_map[resource_id]
+                            self.job_map[job_id]["status"] = status
+                            if resource_id in self.resources:
+                                self.resources[resource_id]["status"] = status
+                            statuses.append({"job_id": job_id, "status": status})
+                        else:
+                            # Resource not found — likely already cleaned up
+                            statuses.append({"job_id": job_id, "status": "COMPLETED"})
                     else:
-                        # If the resource isn't found, it might have been cleaned up
-                        statuses.append({"job_id": job_id, "status": "COMPLETED"})
-                else:
-                    # Job ID not found in our map
-                    statuses.append({"job_id": job_id, "status": "UNKNOWN"})
+                        statuses.append({"job_id": job_id, "status": "UNKNOWN"})
 
             # Save the updated state
             self._save_state()
@@ -556,34 +570,34 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
         cancelations = []
 
         try:
-            # Resources to terminate
-            resources_to_terminate = [
-                self.job_map[job_id]["resource_id"]
-                for job_id in job_ids
-                if job_id in self.job_map
-            ]
+            # Read resource IDs under lock
+            with self._lock:
+                resources_to_terminate = [
+                    self.job_map[job_id]["resource_id"]
+                    for job_id in job_ids
+                    if job_id in self.job_map
+                ]
 
-            # Cancel jobs in the operating mode
+            # Cancel jobs outside lock (may involve network calls)
             cancel_map = self.operating_mode.cancel_jobs(resources_to_terminate)
 
-            # Update our internal state
-            for job_id in job_ids:
-                if job_id in self.job_map:
-                    resource_id = self.job_map[job_id]["resource_id"]
-                    if resource_id in cancel_map:
-                        status = cancel_map[resource_id]
-                        self.job_map[job_id]["status"] = status
-                        if resource_id in self.resources:
-                            self.resources[resource_id]["status"] = status
-                        cancelations.append({"job_id": job_id, "status": status})
+            # Update internal state under lock
+            with self._lock:
+                for job_id in job_ids:
+                    if job_id in self.job_map:
+                        resource_id = self.job_map[job_id]["resource_id"]
+                        if resource_id in cancel_map:
+                            status = cancel_map[resource_id]
+                            self.job_map[job_id]["status"] = status
+                            if resource_id in self.resources:
+                                self.resources[resource_id]["status"] = status
+                            cancelations.append({"job_id": job_id, "status": status})
+                        else:
+                            cancelations.append({"job_id": job_id, "status": "UNKNOWN"})
                     else:
-                        # If the resource isn't found, it might have been cleaned up
                         cancelations.append({"job_id": job_id, "status": "UNKNOWN"})
-                else:
-                    # Job ID not found in our map
-                    cancelations.append({"job_id": job_id, "status": "UNKNOWN"})
 
-            # Clean up resources
+            # Clean up completed/failed resources (acquires lock internally)
             self._cleanup_resources()
 
             # Save the updated state
@@ -597,13 +611,14 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
 
     def _save_state(self) -> None:
         """Save the current state to the state store."""
-        state = {
-            "provider_id": self.provider_id,
-            "mode": self.mode_type.value,
-            "resources": self.resources,
-            "job_map": self.job_map,
-            "timestamp": time.time(),
-        }
+        with self._lock:
+            state = {
+                "provider_id": self.provider_id,
+                "mode": self.mode_type.value,
+                "resources": dict(self.resources),
+                "job_map": dict(self.job_map),
+                "timestamp": time.time(),
+            }
 
         try:
             self.state_store.save_state(state)
@@ -616,8 +631,9 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
         try:
             state = self.state_store.load_state()
             if state and state.get("provider_id") == self.provider_id:
-                self.resources = state.get("resources", {})
-                self.job_map = state.get("job_map", {})
+                with self._lock:
+                    self.resources = state.get("resources", {})
+                    self.job_map = state.get("job_map", {})
                 logger.info(f"Loaded state with {len(self.resources)} resources")
         except Exception as e:
             logger.error(f"Failed to load provider state: {e}")
@@ -626,36 +642,37 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
         """Clean up resources that are completed or failed."""
         resources_to_cleanup = []
 
-        # Find resources to clean up
-        for resource_id, resource in self.resources.items():
-            status = resource.get("status", "UNKNOWN")
-            if status in ["COMPLETED", "FAILED", "CANCELED"]:
-                resources_to_cleanup.append(resource_id)
-            elif (
-                self.auto_shutdown
-                and status == "RUNNING"
-                and time.time() - resource.get("timestamp", 0) > self.max_idle_time
-            ):
-                # Auto-shutdown for idle resources
-                logger.info(
-                    f"Resource {resource_id} has been idle for "
-                    f"{time.time() - resource.get('timestamp', 0)} seconds, "
-                    f"exceeding max_idle_time {self.max_idle_time}"
-                )
-                resources_to_cleanup.append(resource_id)
+        # Find resources to clean up (lock protects iteration over self.resources)
+        with self._lock:
+            for resource_id, resource in self.resources.items():
+                status = resource.get("status", "UNKNOWN")
+                if status in ["COMPLETED", "FAILED", "CANCELED"]:
+                    resources_to_cleanup.append(resource_id)
+                elif (
+                    self.auto_shutdown
+                    and status == "RUNNING"
+                    and time.time() - resource.get("timestamp", 0) > self.max_idle_time
+                ):
+                    logger.info(
+                        f"Resource {resource_id} has been idle for "
+                        f"{time.time() - resource.get('timestamp', 0)} seconds, "
+                        f"exceeding max_idle_time {self.max_idle_time}"
+                    )
+                    resources_to_cleanup.append(resource_id)
 
-        # Clean up resources
+        # Clean up resources outside the lock (network calls)
         if resources_to_cleanup:
             try:
                 self.operating_mode.cleanup_resources(resources_to_cleanup)
 
-                # Update internal state
-                for resource_id in resources_to_cleanup:
-                    if resource_id in self.resources:
-                        job_id = self.resources[resource_id].get("job_id")
-                        del self.resources[resource_id]
-                        if job_id and job_id in self.job_map:
-                            del self.job_map[job_id]
+                # Update internal state under lock
+                with self._lock:
+                    for resource_id in resources_to_cleanup:
+                        if resource_id in self.resources:
+                            job_id = self.resources[resource_id].get("job_id")
+                            del self.resources[resource_id]
+                            if job_id and job_id in self.job_map:
+                                del self.job_map[job_id]
 
                 # Save the updated state
                 self._save_state()
@@ -680,22 +697,21 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
         if blocks <= 0:
             return []
 
-        # Find running resources to terminate
-        running_resources = [
-            resource_id
-            for resource_id, resource in self.resources.items()
-            if resource.get("status") == "RUNNING"
-        ]
+        # Find running resources to terminate (lock protects self.resources)
+        with self._lock:
+            running_resources = [
+                resource_id
+                for resource_id, resource in self.resources.items()
+                if resource.get("status") == "RUNNING"
+            ]
+            resources_to_terminate = running_resources[:blocks]
+            job_ids = [
+                self.resources[resource_id].get("job_id")
+                for resource_id in resources_to_terminate
+                if resource_id in self.resources
+            ]
 
-        # Limit to the requested number of blocks
-        resources_to_terminate = running_resources[:blocks]
-        job_ids = [
-            self.resources[resource_id].get("job_id")
-            for resource_id in resources_to_terminate
-            if resource_id in self.resources
-        ]
-
-        # Cancel the selected jobs
+        # Cancel the selected jobs (cancel() acquires the lock internally)
         self.cancel(job_ids)
 
         return job_ids
@@ -722,17 +738,19 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
         logger.info("Shutting down EphemeralAWSProvider")
 
         try:
-            # Cancel all jobs
-            job_ids = list(self.job_map.keys())
+            # Cancel all jobs (cancel() acquires the lock internally)
+            with self._lock:
+                job_ids = list(self.job_map.keys())
             if job_ids:
                 self.cancel(job_ids)
 
-            # Clean up infrastructure
+            # Clean up infrastructure (outside lock — may be slow)
             self.operating_mode.cleanup_infrastructure()
 
             # Clear state
-            self.resources = {}
-            self.job_map = {}
+            with self._lock:
+                self.resources = {}
+                self.job_map = {}
 
             # Save the empty state
             self._save_state()
