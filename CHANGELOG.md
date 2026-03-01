@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `GlobusComputeProvider` in `parsl_ephemeral_aws/globus_compute.py`: a subclass
+  of `EphemeralAWSProvider` that accepts `endpoint_id`, `container_image`, and
+  `display_name` parameters and exposes `generate_endpoint_config(path)` which
+  writes a ready-to-use Globus Compute endpoint `config.yaml` (closes #56)
+- `GlobusComputeProvider.minimum_iam_policy(include_ecr=False)` static helper
+  returning the minimum IAM policy document required for EC2/SSM/IAM access
+  (add `include_ecr=True` for private ECR repositories)
+- `globus` optional extra in `pyproject.toml` (`globus-compute-sdk`,
+  `globus-compute-endpoint`); declared as conflicting with the `test` extra
+  to avoid `dill` version incompatibility with `localstack<4.10`
+- `GlobusComputeProvider` exported from `parsl_ephemeral_aws.__init__`
+- Unit tests for `GlobusComputeProvider` in
+  `tests/unit/test_globus_compute_provider.py`: 34 tests covering import,
+  construction, config generation for standard/spot/container variants,
+  and the IAM policy helper (closes #56)
+
 ## [0.4.0] - 2026-02-28
 
 ### Added
