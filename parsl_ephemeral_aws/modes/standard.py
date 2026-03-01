@@ -215,7 +215,11 @@ class StandardMode(OperatingMode):
             logger.debug("Initializing SpotFleetManager for StandardMode")
             self.spot_fleet_manager = SpotFleetManager(provider)
 
-        # Initialize spot interruption handling if enabled
+        # Initialize spot interruption handling if enabled.
+        # NOTE: start_monitoring() is called in initialize(), not here — so the
+        # monitoring thread is only started after infrastructure is fully set up.
+        # This prevents the monitor thread from leaking if __init__ succeeds but
+        # a later call (e.g. initialize()) raises before cleanup can run.
         if self.use_spot and self.spot_interruption_handling:
             if not self.checkpoint_bucket and self.spot_interruption_handling:
                 logger.warning(
@@ -229,7 +233,6 @@ class StandardMode(OperatingMode):
                     checkpoint_bucket=self.checkpoint_bucket,
                     checkpoint_prefix=self.checkpoint_prefix,
                 )
-                self.spot_interruption_monitor.start_monitoring()
 
         # If predefined VPC resources are provided, don't create new VPC
         if self.vpc_id:
@@ -421,10 +424,31 @@ class StandardMode(OperatingMode):
                 f"security_group_id={self.security_group_id}"
             )
 
+            # Start spot interruption monitoring here (not in __init__) so
+            # the thread is only alive when infrastructure is fully ready.
+            # The try/finally ensures we stop the thread if anything below
+            # (or a subsequent call to initialize()) raises.
+            if self.spot_interruption_monitor:
+                try:
+                    self.spot_interruption_monitor.start_monitoring()
+                    logger.info("Started spot interruption monitoring")
+                except Exception as monitor_err:
+                    logger.error(
+                        f"Failed to start spot interruption monitoring: {monitor_err}"
+                    )
+                    # Non-fatal — jobs can still run, just without interruption recovery
+                    self.spot_interruption_monitor = None
+
             # Mark as initialized
             self.initialized = True
         except Exception as e:
             logger.error(f"Failed to initialize standard mode infrastructure: {e}")
+            # Stop the monitor thread if it was started before the exception
+            if self.spot_interruption_monitor:
+                try:
+                    self.spot_interruption_monitor.stop_monitoring()
+                except Exception as stop_err:  # nosec B110
+                    logger.debug(f"Error stopping monitor during cleanup: {stop_err}")
             # Try to clean up any resources we created
             self.cleanup_infrastructure()
             raise ResourceCreationError(
