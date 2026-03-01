@@ -9,6 +9,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - Audit findings tracked as GitHub issues (v0.1.0 through v0.3.0 milestones)
+- Unit tests for core Parsl provider interface methods (submit, status, cancel,
+  scale_in, scale_out, shutdown, thread-safety, state persistence) (closes #41)
+- Unit tests for SpotFleetManager instance-type list generation (closes #11)
+- Integration tests for full job lifecycle and state recovery (closes #42)
+
+### Fixed
+- `SpotFleetManager` no longer synthesises invalid instance-type strings from
+  the primary type; falls back to `[instance_type]` when `instance_types` is
+  unset (closes #11)
+- Bastion manager script now embeds `workflow_id` and `provider_id` at
+  generation time via `self`, preventing `None` literals in shell exports
+  (closes #12)
+- Removed raw credential extraction via `session._session.get_credentials()`
+  from `StandardMode`; `SpotFleetManager` now resolves credentials through its
+  own `CredentialManager` (closes #13)
+- Spot interruption detection replaced fake `"marked-for-termination"` state
+  with real EC2 states (`shutting-down`, `stopping`); added `RLock` to protect
+  `instance_handlers` and `fleet_handlers` dict mutations (closes #14)
+- `EphemeralAWSProvider` now uses `threading.RLock` to guard all reads and
+  writes of `resources` and `job_map` across `submit`, `status`, `cancel`,
+  `scale_in`, `shutdown`, `_cleanup_resources`, `_save_state`, and `_load_state`
+  (closes #15)
+- `StandardMode.cleanup_resources` only removes entries from `self.resources`
+  after confirmed termination; failed terminations are retried next cycle
+  (closes #16)
+- `SpotInterruptionMonitor.start_monitoring()` moved from `__init__` to
+  `initialize()` with try/finally to prevent thread leaks on init failure
+  (closes #17)
+- Spot Fleet provisioning timeout now cancels the fleet request and raises
+  `ResourceCreationError` instead of silently continuing (closes #18)
+- Lambda async invocation now checks `StatusCode == 202` and `FunctionError`
+  before tracking the submitted job (closes #21)
+- ECS task definitions now create their CloudWatch log group before registration;
+  log groups are tracked and deleted on cleanup (closes #22)
 
 ## [0.1.0] - Unreleased
 

@@ -70,8 +70,9 @@ class SpotInterruptionMonitor:
         self.session = session
         self.check_interval = check_interval
         self.lead_time = lead_time
-        self.instance_handlers = {}  # instance_id -> handler function
-        self.fleet_handlers = {}  # fleet_request_id -> handler function
+        self.instance_handlers: Dict[str, Callable] = {}  # instance_id -> handler
+        self.fleet_handlers: Dict[str, Callable] = {}  # fleet_request_id -> handler
+        self._lock = threading.RLock()  # protects dict mutations from concurrent access
 
         # Background monitoring
         self.monitoring_thread = None
@@ -90,7 +91,8 @@ class SpotInterruptionMonitor:
         handler : Callable[[str, Dict[str, Any]], None]
             Function to call when interruption is detected, receives instance_id and event details
         """
-        self.instance_handlers[instance_id] = handler
+        with self._lock:
+            self.instance_handlers[instance_id] = handler
         logger.info(
             f"Registered spot instance {instance_id} for interruption monitoring"
         )
@@ -110,7 +112,8 @@ class SpotInterruptionMonitor:
             Function to call when interruption is detected, receives fleet_request_id,
             list of affected instance_ids, and event details
         """
-        self.fleet_handlers[fleet_request_id] = handler
+        with self._lock:
+            self.fleet_handlers[fleet_request_id] = handler
         logger.info(
             f"Registered spot fleet {fleet_request_id} for interruption monitoring"
         )
@@ -123,11 +126,12 @@ class SpotInterruptionMonitor:
         instance_id : str
             ID of the spot instance to stop monitoring
         """
-        if instance_id in self.instance_handlers:
-            del self.instance_handlers[instance_id]
-            logger.info(
-                f"Deregistered spot instance {instance_id} from interruption monitoring"
-            )
+        with self._lock:
+            if instance_id in self.instance_handlers:
+                del self.instance_handlers[instance_id]
+        logger.info(
+            f"Deregistered spot instance {instance_id} from interruption monitoring"
+        )
 
     def deregister_fleet(self, fleet_request_id: str) -> None:
         """Stop monitoring a spot fleet.
@@ -137,11 +141,12 @@ class SpotInterruptionMonitor:
         fleet_request_id : str
             ID of the spot fleet request to stop monitoring
         """
-        if fleet_request_id in self.fleet_handlers:
-            del self.fleet_handlers[fleet_request_id]
-            logger.info(
-                f"Deregistered spot fleet {fleet_request_id} from interruption monitoring"
-            )
+        with self._lock:
+            if fleet_request_id in self.fleet_handlers:
+                del self.fleet_handlers[fleet_request_id]
+        logger.info(
+            f"Deregistered spot fleet {fleet_request_id} from interruption monitoring"
+        )
 
     def start_monitoring(self) -> None:
         """Start background monitoring for spot interruption notices."""
@@ -197,21 +202,27 @@ class SpotInterruptionMonitor:
         if not self.instance_handlers:
             return
 
-        instance_ids = list(self.instance_handlers.keys())
+        with self._lock:
+            instance_ids = list(self.instance_handlers.keys())
 
         try:
-            # Method 1: Check instance metadata (most accurate but requires EC2 Metadata Service v2)
+            # Detect termination using real, observable EC2 states.
+            # NOTE: The authoritative 2-minute advance warning requires either
+            # EventBridge rules or worker-side IMDSv2 polling of
+            # 169.254.169.254/latest/meta-data/spot/termination-time — that
+            # is tracked as a future enhancement.  For now we detect
+            # interruption post-facto: spot instances entering "shutting-down"
+            # or "stopping" are treated as interrupted.
             instances = ec2_client.describe_instances(InstanceIds=instance_ids)
             for reservation in instances.get("Reservations", []):
                 for instance in reservation.get("Instances", []):
                     instance_id = instance["InstanceId"]
+                    state_name = instance.get("State", {}).get("Name", "")
+                    is_spot = instance.get("InstanceLifecycle") == "spot"
 
-                    # Check if instance is marked for termination
-                    if (
-                        instance.get("State", {}).get("Name")
-                        == "marked-for-termination"
-                    ):
-                        handler = self.instance_handlers.get(instance_id)
+                    if is_spot and state_name in ("shutting-down", "stopping"):
+                        with self._lock:
+                            handler = self.instance_handlers.get(instance_id)
                         if handler:
                             event_details = {
                                 "InstanceId": instance_id,
@@ -222,10 +233,6 @@ class SpotInterruptionMonitor:
                                 ("instance", instance_id, event_details)
                             )
 
-            # Method 2: Check CloudWatch Events for spot interruption warning
-            # This would be more complex and require setting up event pattern subscriptions
-            # For now, we'll use the instance state polling approach
-
         except ClientError as e:
             logger.error(f"Error checking spot instance interruptions: {e}")
 
@@ -234,7 +241,8 @@ class SpotInterruptionMonitor:
         if not self.fleet_handlers:
             return
 
-        fleet_request_ids = list(self.fleet_handlers.keys())
+        with self._lock:
+            fleet_request_ids = list(self.fleet_handlers.keys())
 
         try:
             # Get the instances in each fleet
@@ -251,23 +259,24 @@ class SpotInterruptionMonitor:
                 if not instance_ids:
                     continue
 
-                # Check if any fleet instances are marked for termination
+                # Detect interruption via real observable EC2 states.
+                # Spot instances entering "shutting-down" or "stopping" are
+                # treated as interrupted (post-facto detection).
                 instances = ec2_client.describe_instances(InstanceIds=instance_ids)
 
                 interrupted_instances = []
                 for reservation in instances.get("Reservations", []):
                     for instance in reservation.get("Instances", []):
                         instance_id = instance["InstanceId"]
+                        state_name = instance.get("State", {}).get("Name", "")
+                        is_spot = instance.get("InstanceLifecycle") == "spot"
 
-                        # Check if instance is marked for termination
-                        if (
-                            instance.get("State", {}).get("Name")
-                            == "marked-for-termination"
-                        ):
+                        if is_spot and state_name in ("shutting-down", "stopping"):
                             interrupted_instances.append(instance_id)
 
                 if interrupted_instances:
-                    handler = self.fleet_handlers.get(fleet_id)
+                    with self._lock:
+                        handler = self.fleet_handlers.get(fleet_id)
                     if handler:
                         event_details = {
                             "FleetRequestId": fleet_id,

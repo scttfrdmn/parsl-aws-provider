@@ -15,9 +15,8 @@ from botocore.exceptions import ClientError, NoCredentialsError
 from ..exceptions import ResourceCreationError, ResourceCleanupError, JobSubmissionError
 from ..config import SecurityConfig
 from ..security import (
-    CredentialManager, 
+    CredentialManager,
     CredentialConfiguration,
-    AuditLogger,
     SecurityEventType,
     SecurityEventSeverity,
     SecurityEvent,
@@ -67,14 +66,16 @@ class LambdaManager:
         # Initialize audit logging
         self.audit_logger = self.security_config.get_audit_logger()
         if self.audit_logger:
-            self.audit_logger.log_event(SecurityEvent(
-                event_type=SecurityEventType.CONFIG_CHANGE,
-                severity=SecurityEventSeverity.INFO,
-                message="LambdaManager initialized",
-                resource_type="lambda_manager",
-                workflow_id=self.provider.workflow_id,
-                metadata={"provider_region": self.provider.region}
-            ))
+            self.audit_logger.log_event(
+                SecurityEvent(
+                    event_type=SecurityEventType.CONFIG_CHANGE,
+                    severity=SecurityEventSeverity.INFO,
+                    message="LambdaManager initialized",
+                    resource_type="lambda_manager",
+                    workflow_id=self.provider.workflow_id,
+                    metadata={"provider_region": self.provider.region},
+                )
+            )
             logger.info("Audit logging enabled for Lambda operations")
 
         # Initialize credential manager
@@ -88,18 +89,18 @@ class LambdaManager:
         try:
             self.credential_manager = CredentialManager(credential_config)
             logger.info("Credential manager initialized successfully")
-            
+
             # Log successful credential initialization
             if self.audit_logger:
                 self.audit_logger.log_credential_access(
                     access_type="credential_init",
                     identity=credential_config.role_arn or "default",
                     success=True,
-                    workflow_id=self.provider.workflow_id
+                    workflow_id=self.provider.workflow_id,
                 )
         except Exception as e:
             logger.error(f"Failed to initialize credential manager: {e}")
-            
+
             # Log failed credential initialization
             if self.audit_logger:
                 self.audit_logger.log_credential_access(
@@ -107,9 +108,9 @@ class LambdaManager:
                     identity="unknown",
                     success=False,
                     error=str(e),
-                    workflow_id=self.provider.workflow_id
+                    workflow_id=self.provider.workflow_id,
                 )
-            
+
             raise ResourceCreationError(f"Credential initialization failed: {e}")
 
         # Initialize AWS session using credential manager
@@ -156,7 +157,7 @@ class LambdaManager:
         security_env = getattr(self.provider, "security_environment", "dev")
         vpc_cidr = getattr(self.provider, "vpc_cidr", None)
         admin_cidrs = getattr(self.provider, "admin_cidr_blocks", None)
-        
+
         # Use provider's security config if available, otherwise create default
         if hasattr(self.provider, "security_config") and self.provider.security_config:
             self.security_config = self.provider.security_config
@@ -164,7 +165,7 @@ class LambdaManager:
             if security_env.lower() == "production":
                 self.security_config = SecurityConfig.create_production_config(
                     vpc_cidr=vpc_cidr or "10.0.0.0/16",
-                    admin_cidrs=admin_cidrs or ["10.0.0.0/8"]
+                    admin_cidrs=admin_cidrs or ["10.0.0.0/8"],
                 )
             else:
                 self.security_config = SecurityConfig.create_development_config(
@@ -179,7 +180,7 @@ class LambdaManager:
             aws_session_token=getattr(self.provider, "aws_session_token", None),
             use_profile=getattr(self.provider, "aws_profile", "aws"),
             enable_sanitization=True,
-            sanitize_logs=True
+            sanitize_logs=True,
         )
 
     def _create_lambda_execution_role(self) -> str:
@@ -285,7 +286,7 @@ class LambdaManager:
             self.function_names.add(function_name)
 
             logger.info(f"Created Lambda function: {function_name}")
-            
+
             # Log successful Lambda function creation
             if self.audit_logger:
                 self.audit_logger.log_resource_operation(
@@ -297,14 +298,14 @@ class LambdaManager:
                     job_id=job_id,
                     runtime=DEFAULT_LAMBDA_RUNTIME,
                     timeout=min(self.provider.lambda_timeout, 900),
-                    memory=self.provider.lambda_memory
+                    memory=self.provider.lambda_memory,
                 )
 
             return function_name
 
         except ClientError as e:
             logger.error(f"Error creating Lambda function: {e}")
-            
+
             # Log failed Lambda function creation
             if self.audit_logger:
                 self.audit_logger.log_resource_operation(
@@ -314,9 +315,9 @@ class LambdaManager:
                     success=False,
                     workflow_id=self.provider.workflow_id,
                     job_id=job_id,
-                    error=str(e)
+                    error=str(e),
                 )
-            
+
             raise ResourceCreationError(f"Failed to create Lambda function: {e}")
 
     def _generate_lambda_code(self, command: str) -> bytes:
@@ -424,6 +425,20 @@ def main(event, context):
                 InvocationType="Event",  # Asynchronous invocation
                 Payload=json.dumps({"command": command, "job_id": job_id}),
             )
+
+            # Verify the async invocation was accepted (202 = queued successfully)
+            status_code = response.get("StatusCode")
+            if status_code != 202:
+                raise JobSubmissionError(
+                    f"Lambda async invocation failed for job {job_id}: "
+                    f"StatusCode={status_code}"
+                )
+            # FunctionError is absent for async invocations but guard defensively
+            if response.get("FunctionError"):
+                raise JobSubmissionError(
+                    f"Lambda invocation error for job {job_id}: "
+                    f"{response['FunctionError']}"
+                )
 
             # Get request ID from response
             request_id = response.get("ResponseMetadata", {}).get("RequestId")

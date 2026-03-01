@@ -196,9 +196,6 @@ class StandardMode(OperatingMode):
                 {
                     "workflow_id": self.provider_id,
                     "region": self.session.region_name,
-                    "aws_access_key_id": session._session.get_credentials().access_key,
-                    "aws_secret_access_key": session._session.get_credentials().secret_key,
-                    "aws_session_token": session._session.get_credentials().token,
                     "aws_profile": None,
                     "vpc_id": self.vpc_id,
                     "subnet_id": self.subnet_id,
@@ -218,7 +215,11 @@ class StandardMode(OperatingMode):
             logger.debug("Initializing SpotFleetManager for StandardMode")
             self.spot_fleet_manager = SpotFleetManager(provider)
 
-        # Initialize spot interruption handling if enabled
+        # Initialize spot interruption handling if enabled.
+        # NOTE: start_monitoring() is called in initialize(), not here — so the
+        # monitoring thread is only started after infrastructure is fully set up.
+        # This prevents the monitor thread from leaking if __init__ succeeds but
+        # a later call (e.g. initialize()) raises before cleanup can run.
         if self.use_spot and self.spot_interruption_handling:
             if not self.checkpoint_bucket and self.spot_interruption_handling:
                 logger.warning(
@@ -232,7 +233,6 @@ class StandardMode(OperatingMode):
                     checkpoint_bucket=self.checkpoint_bucket,
                     checkpoint_prefix=self.checkpoint_prefix,
                 )
-                self.spot_interruption_monitor.start_monitoring()
 
         # If predefined VPC resources are provided, don't create new VPC
         if self.vpc_id:
@@ -424,10 +424,31 @@ class StandardMode(OperatingMode):
                 f"security_group_id={self.security_group_id}"
             )
 
+            # Start spot interruption monitoring here (not in __init__) so
+            # the thread is only alive when infrastructure is fully ready.
+            # The try/finally ensures we stop the thread if anything below
+            # (or a subsequent call to initialize()) raises.
+            if self.spot_interruption_monitor:
+                try:
+                    self.spot_interruption_monitor.start_monitoring()
+                    logger.info("Started spot interruption monitoring")
+                except Exception as monitor_err:
+                    logger.error(
+                        f"Failed to start spot interruption monitoring: {monitor_err}"
+                    )
+                    # Non-fatal — jobs can still run, just without interruption recovery
+                    self.spot_interruption_monitor = None
+
             # Mark as initialized
             self.initialized = True
         except Exception as e:
             logger.error(f"Failed to initialize standard mode infrastructure: {e}")
+            # Stop the monitor thread if it was started before the exception
+            if self.spot_interruption_monitor:
+                try:
+                    self.spot_interruption_monitor.stop_monitoring()
+                except Exception as stop_err:  # nosec B110
+                    logger.debug(f"Error stopping monitor during cleanup: {stop_err}")
             # Try to clean up any resources we created
             self.cleanup_infrastructure()
             raise ResourceCreationError(
@@ -1130,8 +1151,19 @@ class StandardMode(OperatingMode):
                 time.sleep(10)
 
             if time.time() - start_time >= max_wait:
-                logger.warning(
-                    f"Timeout waiting for Spot Fleet block {block_id} to be running"
+                logger.error(
+                    f"Timeout waiting for Spot Fleet block {block_id} to reach RUNNING"
+                )
+                try:
+                    self.spot_fleet_manager.terminate_block(block_id)
+                    self.blocks.pop(block_id, None)
+                except Exception as cleanup_err:
+                    logger.error(
+                        f"Failed to clean up timed-out fleet block {block_id}: {cleanup_err}"
+                    )
+                raise ResourceCreationError(
+                    f"Spot Fleet block {block_id} did not reach RUNNING "
+                    f"state within {max_wait}s"
                 )
 
             # Register spot fleet with spot interruption monitor if enabled
@@ -1363,46 +1395,39 @@ class StandardMode(OperatingMode):
             elif resource.get("type") == RESOURCE_TYPE_SPOT_FLEET:
                 spot_fleet_blocks.append(resource_id)
 
-        # Terminate EC2 instances
+        # Terminate EC2 instances — only remove from tracking on confirmed success
+        # or when the instance is already gone (InvalidInstanceID.NotFound).
+        # On any other error, keep the entry so the next cleanup cycle can retry.
         if ec2_instances:
             try:
                 ec2.terminate_instances(InstanceIds=ec2_instances)
                 logger.info(f"Terminated {len(ec2_instances)} EC2 instances")
-
-                # Remove resources from tracking
                 for instance_id in ec2_instances:
-                    if instance_id in self.resources:
-                        del self.resources[instance_id]
+                    self.resources.pop(instance_id, None)
             except ClientError as e:
-                # If the instances are already terminated or don't exist, that's fine
-                if "InvalidInstanceID.NotFound" not in str(e):
+                if "InvalidInstanceID.NotFound" in str(e):
+                    # Instances already gone — safe to remove from tracking
+                    for instance_id in ec2_instances:
+                        self.resources.pop(instance_id, None)
+                else:
                     logger.error(f"Failed to terminate EC2 instances: {e}")
-
-                # Still remove resources from tracking
-                for instance_id in ec2_instances:
-                    if instance_id in self.resources:
-                        del self.resources[instance_id]
+                    # Do NOT remove — will be retried on next cleanup cycle
             except Exception as e:
                 logger.error(f"Unexpected error terminating EC2 instances: {e}")
+                # Do NOT remove — will be retried on next cleanup cycle
 
-        # Terminate Spot Fleet blocks
+        # Terminate Spot Fleet blocks — same conservative removal policy
         if spot_fleet_blocks and self.use_spot_fleet and self.spot_fleet_manager:
             for block_id in spot_fleet_blocks:
                 try:
                     self.spot_fleet_manager.terminate_block(block_id)
                     logger.info(f"Terminated Spot Fleet block {block_id}")
-
-                    # Remove resource from tracking
-                    if block_id in self.resources:
-                        del self.resources[block_id]
+                    self.resources.pop(block_id, None)
                 except Exception as e:
                     logger.error(
                         f"Failed to terminate Spot Fleet block {block_id}: {e}"
                     )
-
-                    # Still remove resource from tracking
-                    if block_id in self.resources:
-                        del self.resources[block_id]
+                    # Do NOT remove — will be retried on next cleanup cycle
 
         # Save state with updated resources
         self.save_state()

@@ -26,9 +26,8 @@ from ..constants import (
 )
 from ..config import SecurityConfig
 from ..security import (
-    CredentialManager, 
+    CredentialManager,
     CredentialConfiguration,
-    AuditLogger,
     SecurityEventType,
     SecurityEventSeverity,
     SecurityEvent,
@@ -66,14 +65,16 @@ class ECSManager:
         # Initialize audit logging
         self.audit_logger = self.security_config.get_audit_logger()
         if self.audit_logger:
-            self.audit_logger.log_event(SecurityEvent(
-                event_type=SecurityEventType.CONFIG_CHANGE,
-                severity=SecurityEventSeverity.INFO,
-                message="ECSManager initialized",
-                resource_type="ecs_manager",
-                workflow_id=self.provider.workflow_id,
-                metadata={"provider_region": self.provider.region}
-            ))
+            self.audit_logger.log_event(
+                SecurityEvent(
+                    event_type=SecurityEventType.CONFIG_CHANGE,
+                    severity=SecurityEventSeverity.INFO,
+                    message="ECSManager initialized",
+                    resource_type="ecs_manager",
+                    workflow_id=self.provider.workflow_id,
+                    metadata={"provider_region": self.provider.region},
+                )
+            )
             logger.info("Audit logging enabled for ECS operations")
 
         # Initialize credential manager
@@ -87,18 +88,18 @@ class ECSManager:
         try:
             self.credential_manager = CredentialManager(credential_config)
             logger.info("Credential manager initialized successfully")
-            
+
             # Log successful credential initialization
             if self.audit_logger:
                 self.audit_logger.log_credential_access(
                     access_type="credential_init",
                     identity=credential_config.role_arn or "default",
                     success=True,
-                    workflow_id=self.provider.workflow_id
+                    workflow_id=self.provider.workflow_id,
                 )
         except Exception as e:
             logger.error(f"Failed to initialize credential manager: {e}")
-            
+
             # Log failed credential initialization
             if self.audit_logger:
                 self.audit_logger.log_credential_access(
@@ -106,9 +107,9 @@ class ECSManager:
                     identity="unknown",
                     success=False,
                     error=str(e),
-                    workflow_id=self.provider.workflow_id
+                    workflow_id=self.provider.workflow_id,
                 )
-            
+
             raise ResourceCreationError(f"Credential initialization failed: {e}")
 
         # Initialize AWS session using credential manager
@@ -129,6 +130,7 @@ class ECSManager:
         self.clusters: Set[str] = set()
         self.task_definitions: Set[str] = set()
         self.role_names: Set[str] = set()
+        self.log_groups: Set[str] = set()  # CloudWatch log groups to clean up
         self.jobs: Dict[str, Any] = {}
 
         # Initialize ECS cluster if needed
@@ -224,7 +226,7 @@ class ECSManager:
             if response["clusters"] and response["clusters"][0]["status"] == "ACTIVE":
                 logger.info(f"Using existing ECS cluster: {cluster_name}")
                 self.clusters.add(cluster_name)
-                
+
                 # Log cluster access
                 if self.audit_logger:
                     self.audit_logger.log_resource_operation(
@@ -232,9 +234,9 @@ class ECSManager:
                         resource_type="ecs_cluster",
                         resource_id=cluster_name,
                         success=True,
-                        workflow_id=self.provider.workflow_id
+                        workflow_id=self.provider.workflow_id,
                     )
-                
+
                 return cluster_name
 
             # Create cluster
@@ -258,7 +260,7 @@ class ECSManager:
 
             logger.info(f"Created ECS cluster: {cluster_name}")
             self.clusters.add(cluster_name)
-            
+
             # Log successful cluster creation
             if self.audit_logger:
                 self.audit_logger.log_resource_operation(
@@ -267,14 +269,14 @@ class ECSManager:
                     resource_id=cluster_name,
                     success=True,
                     workflow_id=self.provider.workflow_id,
-                    capacity_providers=["FARGATE", "FARGATE_SPOT"]
+                    capacity_providers=["FARGATE", "FARGATE_SPOT"],
                 )
-            
+
             return cluster_name
 
         except Exception as e:
             logger.error(f"Error creating ECS cluster: {e}")
-            
+
             # Log failed cluster creation
             if self.audit_logger:
                 self.audit_logger.log_resource_operation(
@@ -283,9 +285,9 @@ class ECSManager:
                     resource_id=cluster_name,
                     success=False,
                     workflow_id=self.provider.workflow_id,
-                    error=str(e)
+                    error=str(e),
                 )
-            
+
             raise ResourceCreationError(f"Failed to create ECS cluster: {e}")
 
     def _create_task_execution_role(self) -> str:
@@ -364,6 +366,23 @@ class ECSManager:
         family = f"{TAG_PREFIX}-task-{self.provider.workflow_id}-{job_id[:8]}"
 
         try:
+            # Ensure the CloudWatch log group exists before registering the task
+            # definition.  ECS tasks fail immediately if the log driver cannot
+            # write to the group, so we create it proactively here.
+            log_group_name = f"/ecs/{family}"
+            logs_client = self.aws_session.client("logs")
+            try:
+                logs_client.create_log_group(logGroupName=log_group_name)
+                self.log_groups.add(log_group_name)
+                logger.debug(f"Created CloudWatch log group: {log_group_name}")
+            except logs_client.exceptions.ResourceAlreadyExistsException:
+                pass  # Already exists — fine, add to tracking for cleanup
+            except ClientError as cw_err:
+                logger.warning(
+                    f"Could not create log group {log_group_name}: {cw_err}. "
+                    "Task may fail if the log group does not already exist."
+                )
+
             # Create execution role if needed
             execution_role_arn = self._create_task_execution_role()
 
@@ -575,7 +594,7 @@ class ECSManager:
             logger.info(
                 f"Submitted job {job_id} to ECS cluster {self.cluster_name} with {len(task_ids)} tasks"
             )
-            
+
             # Log successful job submission
             if self.audit_logger:
                 self.audit_logger.log_resource_operation(
@@ -586,7 +605,7 @@ class ECSManager:
                     workflow_id=self.provider.workflow_id,
                     job_id=job_id,
                     task_count=len(task_ids),
-                    cluster=self.cluster_name
+                    cluster=self.cluster_name,
                 )
 
             return {
@@ -598,7 +617,7 @@ class ECSManager:
 
         except Exception as e:
             logger.error(f"Error submitting job: {e}")
-            
+
             # Log failed job submission
             if self.audit_logger:
                 self.audit_logger.log_resource_operation(
@@ -608,9 +627,9 @@ class ECSManager:
                     success=False,
                     workflow_id=self.provider.workflow_id,
                     job_id=job_id,
-                    error=str(e)
+                    error=str(e),
                 )
-            
+
             raise JobSubmissionError(f"Failed to submit job: {e}")
 
     def get_job_status(self, cluster: str, task_id: str) -> str:
@@ -782,6 +801,22 @@ class ECSManager:
                     self.role_names.remove(role_name)
                 except Exception as e:
                     logger.error(f"Error deleting IAM role {role_name}: {e}")
+
+            # Delete CloudWatch log groups created for ECS tasks
+            if self.log_groups:
+                logs_client = self.aws_session.client("logs")
+                for log_group_name in list(self.log_groups):
+                    try:
+                        logs_client.delete_log_group(logGroupName=log_group_name)
+                        self.log_groups.discard(log_group_name)
+                        logger.info(f"Deleted CloudWatch log group: {log_group_name}")
+                    except ClientError as e:
+                        if e.response["Error"]["Code"] == "ResourceNotFoundException":
+                            self.log_groups.discard(log_group_name)
+                        else:
+                            logger.error(
+                                f"Error deleting log group {log_group_name}: {e}"
+                            )
 
         except Exception as e:
             logger.error(f"Error cleaning up resources: {e}")
