@@ -7,7 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- `EphemeralAWSProvider.status()` now returns `List[parsl.jobs.states.JobStatus]`
+  instead of `List[Dict]`, matching the Parsl `ExecutionProvider` interface contract.
+  Without this fix, Parsl's `HighThroughputExecutor` would raise `AttributeError`
+  the first time it called `provider.status()`.
+- `EphemeralAWSProvider.cancel()` now returns `List[bool]` instead of `List[Dict]`,
+  matching the Parsl `ExecutionProvider` interface contract.
+- Added missing required `ExecutionProvider` attributes: `init_blocks`,
+  `nodes_per_block`, `parallelism`, `script_dir`. These are required by Parsl's
+  executor strategy and scaling code.
+- `DEFAULT_WORKER_INIT` changed from `pip install parsl` to
+  `python3 -m pip install --quiet --upgrade parsl`, which works correctly on
+  Amazon Linux 2023 (the default AMI). The old form used `pip` (not available
+  by default on AL2023) and injected a duplicate `#!/bin/bash` shebang line.
+
 ### Added
+- `init_blocks` and `nodes_per_block` constructor parameters on
+  `EphemeralAWSProvider` (previously silently accepted via `**kwargs` but never
+  stored on the instance).
+- Integration example `examples/parsl_aws_integration.py`: a runnable script
+  demonstrating end-to-end Parsl `@python_app` execution on EC2 via
+  `HighThroughputExecutor` + `EphemeralAWSProvider`. Includes clear
+  connectivity requirement documentation and Amazon Linux 2023 `worker_init`.
+
+### Changed
+- Parsl version pin updated from `>=1.2.0` to `>=2026.1.5` in `pyproject.toml`,
+  reflecting the calendar-versioned release scheme and ensuring the correct
+  `JobStatus` / `JobState` API is available.
+
 - `GlobusComputeProvider` in `parsl_ephemeral_aws/globus_compute.py`: a subclass
   of `EphemeralAWSProvider` that accepts `endpoint_id`, `container_image`, and
   `display_name` parameters and exposes `generate_endpoint_config(path)` which

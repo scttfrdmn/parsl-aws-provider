@@ -20,10 +20,10 @@ DEFAULT_INSTANCE_TYPE = "t3.micro"
 DEFAULT_MIN_BLOCKS = 0
 DEFAULT_MAX_BLOCKS = 10
 
-# Default worker initialization script
-DEFAULT_WORKER_INIT = """#!/bin/bash
-pip install parsl
-"""
+# Default worker initialization script — works on Amazon Linux 2023 and most
+# other Linux distributions.  python3 -m pip is available on AL2023 without
+# any additional packages; apt/yum is NOT used here to stay distro-neutral.
+DEFAULT_WORKER_INIT = "python3 -m pip install --quiet --upgrade parsl\n"
 
 # Resource management
 DEFAULT_MAX_IDLE_TIME = 300  # 5 minutes in seconds

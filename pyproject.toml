@@ -13,7 +13,7 @@ name = "parsl-ephemeral-aws"
 version = "0.1.0"
 description = "A modern, flexible AWS provider for the Parsl parallel scripting library"
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 license = {text = "Apache-2.0"}
 authors = [
     {name = "Scott Friedman and Project Contributors", email = "email@example.com"}
@@ -24,7 +24,6 @@ classifiers = [
     "Natural Language :: English",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
@@ -32,7 +31,7 @@ classifiers = [
     "Topic :: System :: Distributed Computing",
 ]
 dependencies = [
-    "parsl>=1.2.0",
+    "parsl>=2026.1.5",
     "boto3>=1.20.0",
     "botocore>=1.23.0",
 ]
@@ -84,7 +83,7 @@ conflicts = [
 
 [tool.black]
 line-length = 100
-target-version = ['py39']
+target-version = ['py310']
 include = '\.pyi?$'
 
 [tool.isort]
@@ -92,7 +91,7 @@ profile = "black"
 line_length = 100
 
 [tool.mypy]
-python_version = "3.9"
+python_version = "3.10"
 warn_return_any = false
 warn_unused_configs = true
 disallow_untyped_defs = false

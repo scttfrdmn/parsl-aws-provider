@@ -15,6 +15,7 @@ import uuid
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
+from parsl.jobs.states import JobState, JobStatus
 from parsl.providers.base import ExecutionProvider
 from parsl.utils import RepresentationMixin
 from typeguard import typechecked
@@ -44,6 +45,18 @@ from parsl_ephemeral_aws.utils.aws import create_session
 
 
 logger = logging.getLogger(__name__)
+
+
+# Map internal string status names to Parsl JobState values.
+_STRING_TO_JOB_STATE: Dict[str, JobState] = {
+    "PENDING": JobState.PENDING,
+    "RUNNING": JobState.RUNNING,
+    "COMPLETED": JobState.COMPLETED,
+    "FAILED": JobState.FAILED,
+    "CANCELED": JobState.CANCELLED,
+    "CANCELLED": JobState.CANCELLED,
+    "UNKNOWN": JobState.UNKNOWN,
+}
 
 
 class OperatingModeType(str, Enum):
@@ -180,6 +193,8 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
         mode: str = DEFAULT_MODE,
         min_blocks: int = DEFAULT_MIN_BLOCKS,
         max_blocks: int = DEFAULT_MAX_BLOCKS,
+        init_blocks: int = 0,
+        nodes_per_block: int = 1,
         worker_init: str = DEFAULT_WORKER_INIT,
         vpc_id: Optional[str] = None,
         subnet_id: Optional[str] = None,
@@ -258,6 +273,10 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
         self.mode_type = OperatingModeType(mode.lower())
         self.min_blocks = min_blocks
         self.max_blocks = max_blocks
+        self.init_blocks = init_blocks
+        self.nodes_per_block = nodes_per_block
+        self.parallelism = 1.0
+        self.script_dir: Optional[str] = None
         self.worker_init = worker_init
         self.vpc_id = vpc_id
         self.subnet_id = subnet_id
@@ -526,7 +545,7 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
             logger.error(f"Failed to submit job {job_name}: {e}")
             raise ProviderError(f"Failed to submit job: {e}")
 
-    def status(self, job_ids: List[str]) -> List[Dict[str, str]]:
+    def status(self, job_ids: List[str]) -> List[JobStatus]:
         """Get the status of a list of jobs.
 
         Parameters
@@ -536,10 +555,12 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
 
         Returns
         -------
-        List[Dict[str, str]]
-            List of dictionaries containing job status information.
+        List[JobStatus]
+            List of JobStatus objects corresponding to each job_id.
         """
-        statuses = []
+        # Internal string-keyed status map updated in-place; return value is
+        # rebuilt as List[JobStatus] at the end.
+        internal_statuses: Dict[str, str] = {}
 
         try:
             # Read resource_ids under lock
@@ -559,27 +580,35 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
                     if job_id in self.job_map:
                         resource_id = self.job_map[job_id]["resource_id"]
                         if resource_id in status_map:
-                            status = status_map[resource_id]
-                            self.job_map[job_id]["status"] = status
+                            status_str = status_map[resource_id]
+                            self.job_map[job_id]["status"] = status_str
                             if resource_id in self.resources:
-                                self.resources[resource_id]["status"] = status
-                            statuses.append({"job_id": job_id, "status": status})
+                                self.resources[resource_id]["status"] = status_str
+                            internal_statuses[job_id] = status_str
                         else:
                             # Resource not found — likely already cleaned up
-                            statuses.append({"job_id": job_id, "status": "COMPLETED"})
+                            internal_statuses[job_id] = "COMPLETED"
                     else:
-                        statuses.append({"job_id": job_id, "status": "UNKNOWN"})
+                        internal_statuses[job_id] = "UNKNOWN"
 
             # Save the updated state
             self._save_state()
 
-            return statuses
-
         except Exception as e:
             logger.error(f"Failed to get status for jobs {job_ids}: {e}")
-            return [{"job_id": job_id, "status": "UNKNOWN"} for job_id in job_ids]
+            for job_id in job_ids:
+                internal_statuses.setdefault(job_id, "UNKNOWN")
 
-    def cancel(self, job_ids: List[str]) -> List[Dict[str, str]]:
+        return [
+            JobStatus(
+                _STRING_TO_JOB_STATE.get(
+                    internal_statuses.get(jid, "UNKNOWN"), JobState.UNKNOWN
+                )
+            )
+            for jid in job_ids
+        ]
+
+    def cancel(self, job_ids: List[str]) -> List[bool]:
         """Cancel specified jobs.
 
         Parameters
@@ -589,10 +618,11 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
 
         Returns
         -------
-        List[Dict[str, str]]
-            List of dictionaries containing job cancellation status.
+        List[bool]
+            True for each job_id where cancellation was accepted, False otherwise.
         """
-        cancelations = []
+        # Track success per job_id; defaults to False (unknown / not found)
+        cancel_results: Dict[str, bool] = {jid: False for jid in job_ids}
 
         try:
             # Read resource IDs under lock
@@ -612,15 +642,12 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
                     if job_id in self.job_map:
                         resource_id = self.job_map[job_id]["resource_id"]
                         if resource_id in cancel_map:
-                            status = cancel_map[resource_id]
-                            self.job_map[job_id]["status"] = status
+                            status_str = cancel_map[resource_id]
+                            self.job_map[job_id]["status"] = status_str
                             if resource_id in self.resources:
-                                self.resources[resource_id]["status"] = status
-                            cancelations.append({"job_id": job_id, "status": status})
-                        else:
-                            cancelations.append({"job_id": job_id, "status": "UNKNOWN"})
-                    else:
-                        cancelations.append({"job_id": job_id, "status": "UNKNOWN"})
+                                self.resources[resource_id]["status"] = status_str
+                            cancel_results[job_id] = status_str != "UNKNOWN"
+                        # else: resource not in cancel_map → remains False
 
             # Clean up completed/failed resources (acquires lock internally)
             self._cleanup_resources()
@@ -628,11 +655,10 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
             # Save the updated state
             self._save_state()
 
-            return cancelations
-
         except Exception as e:
             logger.error(f"Failed to cancel jobs {job_ids}: {e}")
-            return [{"job_id": job_id, "status": "UNKNOWN"} for job_id in job_ids]
+
+        return [cancel_results[jid] for jid in job_ids]
 
     def _save_state(self) -> None:
         """Save the current state to the state store."""

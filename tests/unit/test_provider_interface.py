@@ -15,6 +15,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from parsl.jobs.states import JobState, JobStatus
+
 from parsl_ephemeral_aws.exceptions import ProviderError
 from parsl_ephemeral_aws.provider import EphemeralAWSProvider
 from parsl_ephemeral_aws.state.file import FileStateStore
@@ -116,7 +118,7 @@ class TestProviderInterface:
     # --- status ---
 
     def test_status_returns_list(self, tmp_dir):
-        """status() returns a list with one entry per requested job_id."""
+        """status() returns a list of JobStatus objects, one per job_id."""
         provider, mode = _make_provider(tmp_dir)
         resource_id = "resource-abc"
         mode.submit_job.return_value = resource_id
@@ -126,20 +128,21 @@ class TestProviderInterface:
         result = provider.status([job_id])
 
         assert len(result) == 1
-        assert result[0]["job_id"] == job_id
-        assert result[0]["status"] == "RUNNING"
+        assert isinstance(result[0], JobStatus)
+        assert result[0].state == JobState.RUNNING
 
     def test_status_unknown_job_id(self, tmp_dir):
-        """status() returns UNKNOWN for job_ids not in job_map."""
+        """status() returns UNKNOWN JobState for job_ids not in job_map."""
         provider, _ = _make_provider(tmp_dir)
         result = provider.status(["nonexistent-job-id"])
 
-        assert result[0]["status"] == "UNKNOWN"
+        assert isinstance(result[0], JobStatus)
+        assert result[0].state == JobState.UNKNOWN
 
     # --- cancel ---
 
     def test_cancel_jobs(self, tmp_dir):
-        """cancel() returns a result list and cleans up CANCELED resources."""
+        """cancel() returns List[bool] with True for cancelled jobs."""
         provider, mode = _make_provider(tmp_dir)
         resource_id = "resource-xyz"
         mode.submit_job.return_value = resource_id
@@ -153,14 +156,16 @@ class TestProviderInterface:
 
         result = provider.cancel([job_id])
 
-        assert any(r["job_id"] == job_id for r in result)
+        assert isinstance(result, list)
+        assert result[0] is True
 
     def test_cancel_nonexistent_job(self, tmp_dir):
-        """cancel() handles unknown job IDs without raising."""
+        """cancel() returns False for unknown job IDs without raising."""
         provider, _ = _make_provider(tmp_dir)
         result = provider.cancel(["no-such-job"])
 
-        assert result[0]["status"] == "UNKNOWN"
+        assert isinstance(result, list)
+        assert result[0] is False
 
     # --- scale_in ---
 
