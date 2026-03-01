@@ -8,6 +8,7 @@ SPDX-License-Identifier: Apache-2.0
 SPDX-FileCopyrightText: 2025 Scott Friedman and Project Contributors
 """
 
+import ipaddress
 import logging
 import time
 import uuid
@@ -22,7 +23,6 @@ from parsl_ephemeral_aws.constants import (
     DEFAULT_PUBLIC_SUBNET_CIDR,
     DEFAULT_SECURITY_GROUP_DESCRIPTION,
     DEFAULT_SECURITY_GROUP_NAME,
-    DEFAULT_VPC_CIDR,
     EC2_STATUS_MAPPING,
     RESOURCE_TYPE_EC2,
     RESOURCE_TYPE_SECURITY_GROUP,
@@ -503,6 +503,36 @@ class StandardMode(OperatingMode):
                 else:
                     raise
 
+    @staticmethod
+    def _find_available_vpc_cidr(ec2_client: Any) -> str:
+        """Find a /16 CIDR block in the 10.x.0.0/16 range that does not overlap
+        any existing VPC in the account.
+
+        Parameters
+        ----------
+        ec2_client : Any
+            Boto3 EC2 client
+
+        Returns
+        -------
+        str
+            Available CIDR block (e.g. '10.0.0.0/16')
+
+        Raises
+        ------
+        NetworkCreationError
+            If no non-overlapping /16 CIDR is available
+        """
+        existing = [
+            ipaddress.ip_network(vpc["CidrBlock"])
+            for vpc in ec2_client.describe_vpcs()["Vpcs"]
+        ]
+        for n in range(256):
+            candidate = ipaddress.ip_network(f"10.{n}.0.0/16")
+            if not any(candidate.overlaps(e) for e in existing):
+                return str(candidate)
+        raise NetworkCreationError("No /16 CIDR available in 10.x.0.0/16 range")
+
     def _create_vpc(self) -> str:
         """Create a VPC for the provider.
 
@@ -520,9 +550,12 @@ class StandardMode(OperatingMode):
         ec2 = self.session.client("ec2")
 
         try:
+            # Select a CIDR block that does not conflict with existing VPCs
+            vpc_cidr = self._find_available_vpc_cidr(ec2)
+
             # Create VPC
             response = ec2.create_vpc(
-                CidrBlock=DEFAULT_VPC_CIDR,
+                CidrBlock=vpc_cidr,
                 AmazonProvidedIpv6CidrBlock=False,
                 InstanceTenancy="default",
                 TagSpecifications=[
@@ -1610,7 +1643,7 @@ class StandardMode(OperatingMode):
 
         # Add detailed Spot Fleet information if available
         if self.use_spot_fleet and self.spot_fleet_manager:
-            # Add fleet requests
+            seen_fleet_ids = {f["id"] for f in result["spot_fleet"]}
             for fleet_id, fleet in self.spot_fleet_manager.fleet_requests.items():
                 block_id = fleet.get("block_id")
                 if block_id:
@@ -1622,9 +1655,9 @@ class StandardMode(OperatingMode):
                         "target_capacity": fleet.get("target_capacity"),
                     }
 
-                    # Check if this fleet is already in the result
-                    if not any(f["id"] == fleet_id for f in result["spot_fleet"]):
+                    if fleet_id not in seen_fleet_ids:
                         result["spot_fleet"].append(fleet_details)
+                        seen_fleet_ids.add(fleet_id)
 
         return result
 
