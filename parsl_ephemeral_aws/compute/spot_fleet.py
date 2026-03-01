@@ -39,9 +39,8 @@ from ..constants import (
 )
 from ..config import SecurityConfig
 from ..security import (
-    CredentialManager, 
+    CredentialManager,
     CredentialConfiguration,
-    AuditLogger,
     SecurityEventType,
     SecurityEventSeverity,
     SecurityEvent,
@@ -95,14 +94,16 @@ class SpotFleetManager:
         # Initialize audit logging
         self.audit_logger = self.security_config.get_audit_logger()
         if self.audit_logger:
-            self.audit_logger.log_event(SecurityEvent(
-                event_type=SecurityEventType.CONFIG_CHANGE,
-                severity=SecurityEventSeverity.INFO,
-                message="SpotFleetManager initialized",
-                resource_type="spot_fleet_manager",
-                workflow_id=self.provider.workflow_id,
-                metadata={"provider_region": self.provider.region}
-            ))
+            self.audit_logger.log_event(
+                SecurityEvent(
+                    event_type=SecurityEventType.CONFIG_CHANGE,
+                    severity=SecurityEventSeverity.INFO,
+                    message="SpotFleetManager initialized",
+                    resource_type="spot_fleet_manager",
+                    workflow_id=self.provider.workflow_id,
+                    metadata={"provider_region": self.provider.region},
+                )
+            )
             logger.info("Audit logging enabled for Spot Fleet operations")
 
         # Initialize credential manager
@@ -116,18 +117,18 @@ class SpotFleetManager:
         try:
             self.credential_manager = CredentialManager(credential_config)
             logger.info("Spot Fleet credential manager initialized successfully")
-            
+
             # Log successful credential initialization
             if self.audit_logger:
                 self.audit_logger.log_credential_access(
                     access_type="credential_init",
                     identity=credential_config.role_arn or "default",
                     success=True,
-                    workflow_id=self.provider.workflow_id
+                    workflow_id=self.provider.workflow_id,
                 )
         except Exception as e:
             logger.error(f"Failed to initialize credential manager: {e}")
-            
+
             # Log failed credential initialization
             if self.audit_logger:
                 self.audit_logger.log_credential_access(
@@ -135,9 +136,9 @@ class SpotFleetManager:
                     identity="unknown",
                     success=False,
                     error=str(e),
-                    workflow_id=self.provider.workflow_id
+                    workflow_id=self.provider.workflow_id,
                 )
-            
+
             raise ResourceCreationError(f"Credential initialization failed: {e}")
 
         # Initialize AWS session using credential manager
@@ -969,16 +970,17 @@ class SpotFleetManager:
         # Prepare launch specifications for multiple instance types
         launch_specifications = []
 
-        # Use instance types from provider or default to a set of common types
+        # Use instance types from provider, falling back to the single primary type.
+        # Do not attempt to synthesize alternatives from the instance type string
+        # (e.g. slicing family/generation chars) — that approach breaks for
+        # multi-char families (m5a, c6g) and produces invalid type names.
         instance_types = (
             self.provider.instance_types
-            if hasattr(self.provider, "instance_types")
-            else [
-                self.provider.instance_type,  # Primary instance type
-                # Add alternative instance types of similar capability
-                f"{self.provider.instance_type[0]}{int(self.provider.instance_type[1])+1}.{self.provider.instance_type.split('.')[-1]}",
-                f"m{self.provider.instance_type[1]}.{self.provider.instance_type.split('.')[-1]}",
-            ]
+            if (
+                hasattr(self.provider, "instance_types")
+                and self.provider.instance_types
+            )
+            else [self.provider.instance_type]
         )
 
         # Generate specs for each instance type
@@ -1099,7 +1101,7 @@ class SpotFleetManager:
                 "instance_ids": [],
                 "created_at": time.time(),
             }
-            
+
             # Log successful spot fleet creation
             if self.audit_logger:
                 self.audit_logger.log_resource_operation(
@@ -1110,7 +1112,7 @@ class SpotFleetManager:
                     workflow_id=self.provider.workflow_id,
                     block_id=block_id,
                     target_capacity=target_capacity,
-                    instance_types=instance_types
+                    instance_types=instance_types,
                 )
 
             return fleet_request_id
@@ -1121,7 +1123,7 @@ class SpotFleetManager:
             logger.error(
                 f"Error creating Spot Fleet request: {error_code} - {error_msg}"
             )
-            
+
             # Log failed spot fleet creation
             if self.audit_logger:
                 self.audit_logger.log_resource_operation(
@@ -1131,7 +1133,7 @@ class SpotFleetManager:
                     success=False,
                     workflow_id=self.provider.workflow_id,
                     block_id=block_id,
-                    error=f"{error_code}: {error_msg}"
+                    error=f"{error_code}: {error_msg}",
                 )
 
             # Handle specific error cases
