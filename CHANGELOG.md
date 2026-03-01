@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `status_polling_interval` constructor parameter on `EphemeralAWSProvider`
+  (default 60 s); the `status_polling_interval` property now returns the
+  configured value instead of a hardcoded constant (closes #37)
+- `waiter_delay` (default 5 s) and `waiter_max_attempts` (default 60) constructor
+  parameters on `EphemeralAWSProvider`; stored as provider attributes and
+  forwarded to `wait_for_resource()` via new `delay`/`max_attempts` keyword
+  arguments (closes #39)
+- `StandardMode._find_available_vpc_cidr()` static helper: scans existing VPCs
+  and selects the first non-overlapping `/16` from the `10.x.0.0/16` range;
+  `_create_vpc()` now calls this helper instead of using `DEFAULT_VPC_CIDR`
+  unconditionally (closes #36)
+- Unit tests for VPC manager, subnet CIDR generation, security group creation,
+  and CIDR conflict detection in `tests/unit/test_vpc_manager.py` (closes #48)
+- Unit tests for provider edge cases (zero-capacity submit, scale-in capping,
+  empty status/cancel lists, configurable polling interval, waiter params) in
+  `tests/unit/test_provider_edge_cases.py` (closes #49)
+
+### Fixed
+- VPC force-delete in `utils/aws.py` now deletes NAT Gateways (polling until
+  fully deleted), releases their EIPs, and removes detached ENIs **before**
+  attempting subnet deletion, preventing dependency errors on VPCs with NAT
+  infrastructure (closes #38)
+- `ParameterStoreState` now wires `provider.audit_logger` on construction and
+  emits `SecurityEventType.STATE_ACCESS` events after successful `save_state`,
+  `load_state`, and `delete_state` operations (closes #35)
+
+### Performance
+- Spot Fleet deduplication in `StandardMode.list_resources()` replaced O(n)
+  `any()` list scan with an O(1) `seen_fleet_ids` set lookup (closes #40)
+
 ## [0.2.0] - 2026-03-01
 
 ### Added
