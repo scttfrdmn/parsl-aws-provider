@@ -7,6 +7,7 @@ SPDX-FileCopyrightText: 2025 Scott Friedman and Project Contributors
 
 import json
 import logging
+import time
 from typing import Any, Dict, List, Optional, Union
 
 import boto3
@@ -123,6 +124,8 @@ def wait_for_resource(
     service_client: Any,
     waiter_config: Optional[Dict[str, Any]] = None,
     resource_name: str = "resource",
+    delay: int = 5,
+    max_attempts: int = 60,
 ) -> None:
     """Wait for a resource to reach the desired state.
 
@@ -138,6 +141,10 @@ def wait_for_resource(
         Waiter configuration, by default None
     resource_name : str, optional
         Name of the resource for logging purposes, by default "resource"
+    delay : int, optional
+        Seconds between waiter attempts, by default 5
+    max_attempts : int, optional
+        Maximum number of waiter attempts, by default 60
 
     Raises
     ------
@@ -150,8 +157,8 @@ def wait_for_resource(
 
         config = {
             "WaiterConfig": {
-                "Delay": 5,  # Seconds between attempts
-                "MaxAttempts": 60,  # Maximum number of attempts (5 minutes)
+                "Delay": delay,
+                "MaxAttempts": max_attempts,
             }
         }
 
@@ -377,6 +384,71 @@ def delete_resource(
 
             # Delete all resources within the VPC
             if force:
+                # 1. NAT Gateways must be deleted before subnets can be removed
+                nat_gws = ec2.describe_nat_gateways(
+                    Filters=[
+                        {"Name": "vpc-id", "Values": [resource_id]},
+                        {
+                            "Name": "state",
+                            "Values": ["available", "pending", "deleting"],
+                        },
+                    ]
+                ).get("NatGateways", [])
+                allocation_ids = [
+                    a["AllocationId"]
+                    for ngw in nat_gws
+                    for a in ngw.get("NatGatewayAddresses", [])
+                    if a.get("AllocationId")
+                ]
+                deleted_nat_gw_ids = []
+                for ngw in nat_gws:
+                    try:
+                        ec2.delete_nat_gateway(NatGatewayId=ngw["NatGatewayId"])
+                        deleted_nat_gw_ids.append(ngw["NatGatewayId"])
+                        logger.debug(f"Deleting NAT gateway {ngw['NatGatewayId']}")
+                    except ClientError as e:
+                        logger.warning(
+                            f"Could not delete NAT gateway "
+                            f"{ngw['NatGatewayId']}: {e}"
+                        )
+                # Poll until all NAT gateways have finished deleting (max ~2 min).
+                # Only enter the loop if we actually submitted deletion requests.
+                if deleted_nat_gw_ids:
+                    for _ in range(24):
+                        still_deleting = ec2.describe_nat_gateways(
+                            Filters=[
+                                {"Name": "vpc-id", "Values": [resource_id]},
+                                {"Name": "state", "Values": ["deleting"]},
+                            ]
+                        ).get("NatGateways", [])
+                        if not still_deleting:
+                            break
+                        time.sleep(5)
+
+                # 2. Release EIPs that backed the deleted NAT gateways
+                for alloc_id in allocation_ids:
+                    try:
+                        ec2.release_address(AllocationId=alloc_id)
+                        logger.debug(f"Released EIP {alloc_id}")
+                    except ClientError as e:
+                        logger.warning(f"Could not release EIP {alloc_id}: {e}")
+
+                # 3. Delete detached ENIs (e.g. leftover Lambda/ECS interfaces)
+                for eni in ec2.describe_network_interfaces(
+                    Filters=[{"Name": "vpc-id", "Values": [resource_id]}]
+                ).get("NetworkInterfaces", []):
+                    if eni.get("Status") == "available":
+                        try:
+                            ec2.delete_network_interface(
+                                NetworkInterfaceId=eni["NetworkInterfaceId"]
+                            )
+                            logger.debug(f"Deleted ENI {eni['NetworkInterfaceId']}")
+                        except ClientError as e:
+                            logger.warning(
+                                f"Could not delete ENI "
+                                f"{eni['NetworkInterfaceId']}: {e}"
+                            )
+
                 # Get all subnets in the VPC
                 subnets = ec2.describe_subnets(
                     Filters=[{"Name": "vpc-id", "Values": [resource_id]}]
