@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-03-01
+
 ### Added
 - Optional `iam_instance_profile_arn` and `auto_create_instance_profile` parameters
   on `EphemeralAWSProvider`; EC2 instances and bastion host now receive an IAM
@@ -112,5 +114,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - ECS task definitions now create their CloudWatch log group before registration;
   log groups are tracked and deleted on cleanup (closes #22)
 
-[Unreleased]: https://github.com/scttfrdmn/parsl-aws-provider/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/scttfrdmn/parsl-aws-provider/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/scttfrdmn/parsl-aws-provider/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/scttfrdmn/parsl-aws-provider/releases/tag/v0.1.0
