@@ -412,6 +412,33 @@ def delete_resource(
                         force,
                     )
 
+                # Delete non-main route tables (main RT is deleted with the VPC)
+                route_tables = ec2.describe_route_tables(
+                    Filters=[{"Name": "vpc-id", "Values": [resource_id]}]
+                )
+                for rt in route_tables.get("RouteTables", []):
+                    is_main = any(
+                        assoc.get("Main") for assoc in rt.get("Associations", [])
+                    )
+                    if is_main:
+                        continue
+                    # Disassociate all explicit associations first
+                    for assoc in rt.get("Associations", []):
+                        assoc_id = assoc.get("RouteTableAssociationId")
+                        if assoc_id:
+                            try:
+                                ec2.disassociate_route_table(AssociationId=assoc_id)
+                            except ClientError:
+                                pass
+                    try:
+                        ec2.delete_route_table(RouteTableId=rt["RouteTableId"])
+                        logger.debug(f"Deleted route table {rt['RouteTableId']}")
+                    except ClientError as e:
+                        logger.warning(
+                            f"Could not delete route table "
+                            f"{rt['RouteTableId']}: {e}"
+                        )
+
             # Delete the VPC
             ec2.delete_vpc(VpcId=resource_id)
             logger.debug(f"Deleted VPC {resource_id}")
