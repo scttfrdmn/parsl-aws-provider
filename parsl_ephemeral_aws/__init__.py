@@ -9,6 +9,7 @@ SPDX-FileCopyrightText: 2025 Scott Friedman and Project Contributors
 
 __version__ = "0.1.0"
 
+from .globus_compute import GlobusComputeProvider
 from .provider import EphemeralAWSProvider
 
-__all__ = ["EphemeralAWSProvider"]
+__all__ = ["EphemeralAWSProvider", "GlobusComputeProvider"]

@@ -56,6 +56,10 @@ test = [
     "localstack>=2.0.0",
     "requests>=2.25.0",
 ]
+globus = [
+    "globus-compute-sdk>=2.0.0",
+    "globus-compute-endpoint>=2.0.0",
+]
 docs = [
     "sphinx>=4.0.0",
     "sphinx-rtd-theme>=1.0.0",
@@ -66,6 +70,17 @@ docs = [
 "Homepage" = "https://github.com/scttfrdmn/parsl-aws-provider"
 "Bug Tracker" = "https://github.com/scttfrdmn/parsl-aws-provider/issues"
 "Documentation" = "https://parsl-ephemeral-aws.readthedocs.io"
+
+# globus-compute-sdk requires dill==0.3.9 which conflicts with localstack<4.10
+# (which requires dill==0.3.2 or 0.3.6).  Declare them as conflicting extras
+# so uv does not try to resolve them together during lock-file generation.
+[tool.uv]
+conflicts = [
+    [
+        {extra = "globus"},
+        {extra = "test"},
+    ],
+]
 
 [tool.black]
 line-length = 100
