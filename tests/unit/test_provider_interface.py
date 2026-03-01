@@ -259,3 +259,52 @@ class TestProviderInterface:
         provider.status([job_id])
 
         assert call_count, "_save_state not called during status"
+
+    # --- concurrent stress tests (closes #46) ---
+
+    def test_concurrent_submit_50_threads(self, tmp_dir):
+        """50 concurrent submits all complete without data races (closes #46)."""
+        provider, mode = _make_provider(tmp_dir, max_blocks=100)
+        mode.submit_job.side_effect = lambda **_: f"resource-{uuid.uuid4().hex[:8]}"
+
+        n = 50
+        futures_list = []
+        with ThreadPoolExecutor(max_workers=20) as ex:
+            futures_list = [
+                ex.submit(provider.submit, "echo hello", 1) for _ in range(n)
+            ]
+            job_ids = [f.result() for f in as_completed(futures_list)]
+
+        assert len(job_ids) == n
+        assert len(provider.resources) == n
+        assert len(provider.job_map) == n
+        # All job_ids must be unique
+        assert len(set(job_ids)) == n
+
+    def test_concurrent_status_and_submit(self, tmp_dir):
+        """Simultaneous submits and status calls do not deadlock or corrupt state."""
+        provider, mode = _make_provider(tmp_dir, max_blocks=100)
+        mode.submit_job.side_effect = lambda **_: f"resource-{uuid.uuid4().hex[:8]}"
+        mode.get_job_status.return_value = {}
+
+        errors = []
+
+        def do_submit():
+            try:
+                provider.submit("echo hello", 1)
+            except Exception as exc:
+                errors.append(exc)
+
+        def do_status():
+            try:
+                provider.status([])
+            except Exception as exc:
+                errors.append(exc)
+
+        with ThreadPoolExecutor(max_workers=20) as ex:
+            submit_futs = [ex.submit(do_submit) for _ in range(20)]
+            status_futs = [ex.submit(do_status) for _ in range(20)]
+            for f in as_completed(submit_futs + status_futs):
+                f.result()
+
+        assert not errors, f"Errors during concurrent submit+status: {errors}"

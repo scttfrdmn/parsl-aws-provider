@@ -13,16 +13,18 @@ from unittest.mock import MagicMock, patch
 from botocore.exceptions import ClientError, NoCredentialsError
 
 from parsl_ephemeral_aws.provider import EphemeralAWSProvider
+from parsl_ephemeral_aws.compute.ec2 import EC2Manager
 from parsl_ephemeral_aws.modes.standard import StandardMode
 from parsl_ephemeral_aws.modes.detached import DetachedMode
 from parsl_ephemeral_aws.modes.serverless import ServerlessMode
-from parsl_ephemeral_aws.compute.ec2 import EC2Manager
 from parsl_ephemeral_aws.compute.spot_fleet import SpotFleetManager
 from parsl_ephemeral_aws.compute.lambda_func import LambdaManager
 from parsl_ephemeral_aws.compute.ecs import ECSManager
 from parsl_ephemeral_aws.exceptions import (
     AWSAuthenticationError,
     AWSConnectionError,
+    EC2InstanceError,
+    ResourceCreationError,
     ResourceDeletionError,
     ResourceNotFoundError,
     ProviderConfigurationError,
@@ -837,3 +839,93 @@ class TestCloudFormationErrors:
         with pytest.raises(CloudFormationError):
             # Pass a very short timeout (1 second)
             serverless_mode._wait_for_stack("test-stack", "CREATE_COMPLETE", 1)
+
+
+@pytest.mark.unit
+class TestEC2ManagerQuotaErrors:
+    """Tests for EC2 quota, capacity, and instance-type error handling (closes #43)."""
+
+    @pytest.fixture
+    def ec2_manager_and_client(self):
+        """EC2Manager wired with a fully-mocked provider and boto3 session."""
+        mock_provider = MagicMock()
+        mock_provider.workflow_id = "test-workflow-quota"
+        mock_provider.region = "us-east-1"
+        mock_provider.image_id = "ami-12345678"
+        mock_provider.instance_type = "t3.micro"
+        mock_provider.vpc_id = "vpc-test"
+        mock_provider.subnet_id = "subnet-test"
+        mock_provider.security_group_id = "sg-test"
+        mock_provider.tags = {}
+        mock_provider.aws_access_key_id = None
+        mock_provider.aws_secret_access_key = None
+        mock_provider.aws_session_token = None
+        mock_provider.aws_profile = None
+        mock_provider.iam_instance_profile_arn = None
+        mock_provider.auto_create_instance_profile = False
+        # Required by SecurityConfig and CredentialConfig
+        mock_provider.vpc_cidr = "10.0.0.0/16"
+        mock_provider.security_environment = "dev"
+        mock_provider.admin_cidr_blocks = None
+        mock_provider.strict_security_mode = None
+        mock_provider.role_arn = None
+        # Control block creation behavior
+        mock_provider.use_spot_instances = False
+        mock_provider.nodes_per_block = 1
+
+        mock_ec2 = MagicMock()
+        mock_session = MagicMock()
+        mock_session.client.return_value = mock_ec2
+        mock_session.resource.return_value = MagicMock()
+        mock_session.region_name = "us-east-1"
+
+        with patch("parsl_ephemeral_aws.compute.ec2.CredentialManager") as mock_cm:
+            mock_cm.return_value.create_boto3_session.return_value = mock_session
+            manager = EC2Manager(provider=mock_provider)
+        manager.ec2_client = mock_ec2
+        return manager, mock_ec2
+
+    def _client_error(self, code, message="error"):
+        return ClientError(
+            {"Error": {"Code": code, "Message": message}}, "RunInstances"
+        )
+
+    def _run_create_blocks(self, manager, ec2):
+        """Call create_blocks with network resources pre-mocked."""
+        network = {
+            "vpc_id": "vpc-test",
+            "subnet_id": "subnet-test",
+            "security_group_id": "sg-test",
+        }
+        with patch.object(manager, "_setup_network_resources", return_value=network):
+            manager.create_blocks(1)
+
+    def test_quota_exceeded_error(self, ec2_manager_and_client):
+        """VcpuLimitExceeded on run_instances surfaces as ResourceCreationError."""
+        manager, ec2 = ec2_manager_and_client
+        ec2.run_instances.side_effect = self._client_error(
+            "VcpuLimitExceeded", "vCPU quota exceeded"
+        )
+
+        with pytest.raises(ResourceCreationError):
+            self._run_create_blocks(manager, ec2)
+
+    def test_invalid_instance_type_error(self, ec2_manager_and_client):
+        """InvalidInstanceType on run_instances surfaces as ResourceCreationError."""
+        manager, ec2 = ec2_manager_and_client
+        ec2.run_instances.side_effect = self._client_error(
+            "InvalidInstanceType", "The instance type is invalid"
+        )
+
+        with pytest.raises(ResourceCreationError):
+            self._run_create_blocks(manager, ec2)
+
+    def test_insufficient_spot_capacity_error(self, ec2_manager_and_client):
+        """InsufficientInstanceCapacity on run_instances surfaces as ResourceCreationError."""
+        manager, ec2 = ec2_manager_and_client
+        ec2.run_instances.side_effect = self._client_error(
+            "InsufficientInstanceCapacity", "Insufficient spot capacity"
+        )
+
+        with pytest.raises(ResourceCreationError):
+            self._run_create_blocks(manager, ec2)
