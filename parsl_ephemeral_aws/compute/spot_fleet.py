@@ -1074,10 +1074,17 @@ class SpotFleetManager:
 
         # Set a max price if specified
         if self.provider.spot_max_price_percentage:
-            # Get on-demand price for primary instance type
-            # For simplicity, we'll use a placeholder value
-            # In a production implementation, you would use the Price List API
-            on_demand_price = 0.10  # Placeholder
+            try:
+                history = self.ec2_client.describe_spot_price_history(
+                    InstanceTypes=[self.provider.instance_type],
+                    ProductDescriptions=["Linux/UNIX"],
+                    MaxResults=1,
+                ).get("SpotPriceHistory", [])
+                current_spot = float(history[0]["SpotPrice"]) if history else 1.0
+                # Use 3× current spot as a conservative on-demand proxy
+                on_demand_price = current_spot * 3
+            except Exception:
+                on_demand_price = 1.0  # safe fallback
             max_price = str(
                 on_demand_price * (self.provider.spot_max_price_percentage / 100.0)
             )

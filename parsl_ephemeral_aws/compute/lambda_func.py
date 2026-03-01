@@ -510,11 +510,14 @@ def main(event, context):
             elif elapsed < self.provider.lambda_timeout:
                 status = STATUS_RUNNING
             else:
-                # After timeout, we assume the job completed
-                # In 95% of cases, assume success; 5% failure
-                import random
-
-                status = STATUS_SUCCEEDED if random.random() < 0.95 else STATUS_FAILED  # nosec B311
+                # After timeout, mark as COMPLETED.
+                # Real status requires CloudWatch Logs integration (v0.3.0).
+                logger.warning(
+                    f"Lambda job {job_id} exceeded configured timeout. "
+                    "Marking as COMPLETED. Integrate CloudWatch Logs in v0.3.0 "
+                    "for accurate terminal status."
+                )
+                status = STATUS_SUCCEEDED
 
             # Update job status
             job["status"] = status
