@@ -5,6 +5,7 @@ SPDX-License-Identifier: Apache-2.0
 SPDX-FileCopyrightText: 2025 Scott Friedman and Project Contributors
 """
 
+import json
 import logging
 from typing import Any, Dict, List, Optional, Union
 
@@ -543,3 +544,87 @@ Resources:
   PlaceholderResource:
     Type: AWS::CloudFormation::WaitConditionHandle
 """
+
+
+def get_or_create_iam_role(
+    iam_client: Any,
+    role_name: str,
+    assume_role_policy: Dict[str, Any],
+    policy_arns: List[str],
+    tags: Optional[List[Dict[str, str]]] = None,
+    description: str = "",
+) -> str:
+    """Get or create an IAM role idempotently.
+
+    Checks whether the role already exists and returns its ARN without
+    modifying it.  If the role does not exist, creates it, attaches the
+    supplied managed-policy ARNs, and returns the new ARN.
+
+    Parameters
+    ----------
+    iam_client : Any
+        A boto3 IAM client.
+    role_name : str
+        Name of the IAM role.
+    assume_role_policy : Dict[str, Any]
+        Trust-relationship policy document (Python dict, not JSON string).
+    policy_arns : List[str]
+        Managed policy ARNs to attach.
+    tags : Optional[List[Dict[str, str]]], optional
+        Tags to apply when creating the role.
+    description : str, optional
+        Role description.
+
+    Returns
+    -------
+    str
+        ARN of the existing or newly created role.
+
+    Raises
+    ------
+    ResourceCreationError
+        If role creation or retrieval fails.
+    """
+    try:
+        response = iam_client.get_role(RoleName=role_name)
+        logger.debug(f"Reusing existing IAM role: {role_name}")
+        return response["Role"]["Arn"]
+    except ClientError as e:
+        if e.response["Error"]["Code"] not in ("NoSuchEntity", "NoSuchEntityException"):
+            raise ResourceCreationError(
+                f"Failed to check IAM role {role_name}: {e}"
+            ) from e
+
+    # Role does not exist — create it
+    try:
+        create_kwargs: Dict[str, Any] = {
+            "RoleName": role_name,
+            "AssumeRolePolicyDocument": json.dumps(assume_role_policy),
+            "Description": description,
+        }
+        if tags:
+            create_kwargs["Tags"] = tags
+
+        response = iam_client.create_role(**create_kwargs)
+        role_arn: str = response["Role"]["Arn"]
+
+        for policy_arn in policy_arns:
+            iam_client.attach_role_policy(RoleName=role_name, PolicyArn=policy_arn)
+
+        logger.info(f"Created IAM role: {role_name}")
+        return role_arn
+
+    except ClientError as e:
+        if e.response["Error"]["Code"] in ("EntityAlreadyExists",):
+            # Race condition — another process created it; fetch ARN
+            try:
+                response = iam_client.get_role(RoleName=role_name)
+                logger.debug(f"IAM role created by concurrent caller: {role_name}")
+                return response["Role"]["Arn"]
+            except Exception as inner_e:
+                raise ResourceCreationError(
+                    f"Failed to retrieve IAM role {role_name} after concurrent creation: {inner_e}"
+                ) from inner_e
+        raise ResourceCreationError(
+            f"Failed to create IAM role {role_name}: {e}"
+        ) from e
