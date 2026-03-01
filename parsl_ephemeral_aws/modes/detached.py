@@ -1012,12 +1012,21 @@ class DetachedMode(OperatingMode):
     def _get_bastion_manager_script(self) -> str:
         """Get the Python script for the bastion manager.
 
+        Injects the workflow_id and provider_id as literal string constants so
+        the bastion manager does not depend on environment variables being set
+        before the script starts (fixes the ``WORKFLOW_ID = None`` bug when
+        PARSL_WORKFLOW_ID is unset at module import/start time).
+
         Returns
         -------
         str
             Python script for the bastion manager
         """
-        return '''#!/usr/bin/env python3
+        # Build the script then substitute the two identity constants so the
+        # bastion does not silently embed "None" if the env vars aren't ready.
+        # The template is a local variable to avoid escaping all the {/} chars
+        # in the embedded Python f-strings that form the bastion worker script.
+        script = '''#!/usr/bin/env python3
 import json
 import logging
 import os
@@ -1819,6 +1828,17 @@ def main():
 if __name__ == '__main__':
     main()
 '''
+        # Inject the actual workflow/provider IDs so the bastion manager does
+        # not silently use "None" when PARSL_WORKFLOW_ID is unset at start.
+        script = script.replace(
+            "WORKFLOW_ID = os.environ.get('PARSL_WORKFLOW_ID')",
+            f"WORKFLOW_ID = '{self.workflow_id}'  # injected at script generation time",
+        )
+        script = script.replace(
+            "PROVIDER_ID = os.environ.get('PARSL_PROVIDER_ID')",
+            f"PROVIDER_ID = '{self.provider_id}'  # injected at script generation time",
+        )
+        return script
 
     def submit_job(
         self,
