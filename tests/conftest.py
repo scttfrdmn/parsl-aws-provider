@@ -201,6 +201,36 @@ def mock_ecs_client():
 
 
 @pytest.fixture
+def mock_iam_client():
+    """Create a mock IAM client that simulates missing resources."""
+    from botocore.exceptions import ClientError
+
+    client = MagicMock()
+    client.get_role.side_effect = ClientError(
+        {"Error": {"Code": "NoSuchEntityException", "Message": "Role does not exist"}},
+        "GetRole",
+    )
+    client.create_role.return_value = {
+        "Role": {"Arn": "arn:aws:iam::123456789012:role/test-role"}
+    }
+    client.get_instance_profile.side_effect = ClientError(
+        {
+            "Error": {
+                "Code": "NoSuchEntityException",
+                "Message": "Instance profile does not exist",
+            }
+        },
+        "GetInstanceProfile",
+    )
+    client.create_instance_profile.return_value = {
+        "InstanceProfile": {
+            "Arn": "arn:aws:iam::123456789012:instance-profile/test-profile"
+        }
+    }
+    return client
+
+
+@pytest.fixture
 def mock_boto3_session(
     aws_credentials,
     mock_ec2_client,
@@ -208,6 +238,7 @@ def mock_boto3_session(
     mock_ssm_client,
     mock_lambda_client,
     mock_ecs_client,
+    mock_iam_client,
 ):
     """Create a mock boto3 session with all needed clients."""
     session = MagicMock()
@@ -224,6 +255,8 @@ def mock_boto3_session(
             return mock_lambda_client
         elif service_name == "ecs":
             return mock_ecs_client
+        elif service_name == "iam":
+            return mock_iam_client
         else:
             return MagicMock()
 
