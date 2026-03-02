@@ -23,6 +23,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `tools/launch_test_driver.py`: `DRIVER_USER_DATA` now installs `python3.11` before
   cloning and installing the package (AL2023 ships python3.9 by default;
   `parsl>=2026.1.5` requires Python 3.10+).
+- `StandardMode.cleanup_infrastructure()` now waits for EC2 instances to reach
+  `terminated` state (using `instance_terminated` boto3 waiter) before attempting to
+  delete the security group. Previously the security group deletion raced against
+  instance shutdown, causing `DependencyViolation` errors because the ENIs of
+  shutting-down instances still held references to the SG.
+- `examples/parsl_aws_integration.py`: the `finally` cleanup block now kills any
+  lingering `parsl: HTEX interchange` subprocess after `parsl.clear()`. Without this,
+  the interchange process remained alive after task completion, blocking SSM
+  `send-command` invocations from returning.
 - `EphemeralAWSProvider.__init__` now calls `operating_mode.initialize()` automatically
   so the provider is ready for `submit()` immediately after construction, matching
   Parsl's `ExecutionProvider` contract (no separate initialize step required).

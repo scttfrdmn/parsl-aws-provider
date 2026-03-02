@@ -38,6 +38,8 @@ SPDX-FileCopyrightText: 2025 Scott Friedman and Project Contributors
 
 import logging
 import os
+import signal
+import subprocess  # nosec B404
 import sys
 import uuid
 
@@ -242,7 +244,33 @@ def main() -> int:
 
     finally:
         logger.info("Cleaning up Parsl resources ...")
-        parsl.clear()
+        try:
+            parsl.clear()
+        except Exception:
+            logger.warning("parsl.clear() raised an exception (continuing cleanup)")
+
+        # Parsl's HTEX interchange runs as a subprocess and is not always cleaned
+        # up by parsl.clear().  Kill any lingering interchange processes so that
+        # this script exits promptly (important when driven via SSM send-command).
+        try:
+            result = subprocess.run(  # nosec B603 B607
+                ["pgrep", "-f", "parsl: HTEX interchange"],
+                capture_output=True,
+                text=True,
+            )
+            pids = result.stdout.split()
+            if pids:
+                logger.info(
+                    "Killing %d lingering interchange process(es): %s", len(pids), pids
+                )
+                for pid_str in pids:
+                    try:
+                        os.kill(int(pid_str), signal.SIGTERM)
+                    except (ProcessLookupError, ValueError):
+                        pass
+        except Exception:  # nosec B110
+            pass  # best-effort; non-POSIX platforms may not have pgrep
+
         try:
             provider.shutdown()
         except Exception:

@@ -1495,9 +1495,39 @@ class StandardMode(OperatingMode):
         """
         logger.info("Cleaning up infrastructure")
 
+        # Collect EC2 instance IDs before cleanup so we can wait for termination.
+        # cleanup_all() sends terminate requests but does not wait; instances remain
+        # in "shutting-down" state and their ENIs keep references to the security
+        # group, causing a DependencyViolation when we try to delete the SG.
+        ec2_instance_ids = [
+            rid
+            for rid, r in self.resources.items()
+            if r.get("type") == RESOURCE_TYPE_EC2
+        ]
+
         # Delete all instances first
         if self.resources:
             self.cleanup_all()
+
+        # Wait for all EC2 instances to reach terminated state so that their
+        # network interfaces are released before we attempt SG/subnet deletion.
+        if ec2_instance_ids:
+            try:
+                ec2 = self.session.client("ec2")
+                waiter = ec2.get_waiter("instance_terminated")
+                waiter.wait(
+                    InstanceIds=ec2_instance_ids,
+                    WaiterConfig={"Delay": 5, "MaxAttempts": 36},  # up to 3 min
+                )
+                logger.debug(
+                    "All EC2 instances confirmed terminated: %s", ec2_instance_ids
+                )
+            except Exception as e:
+                logger.warning(
+                    "Timed out or error waiting for instance termination: %s — "
+                    "proceeding with infrastructure cleanup (SG deletion may fail)",
+                    e,
+                )
 
         try:
             # Stop spot interruption monitoring if enabled
