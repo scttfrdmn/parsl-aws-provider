@@ -405,19 +405,28 @@ class StandardMode(OperatingMode):
 
         logger.debug("Initializing standard mode infrastructure")
 
+        # Track which resources this provider created so cleanup only removes
+        # its own resources, not pre-existing VPCs/subnets passed by the caller.
+        self._owns_vpc = False
+        self._owns_subnet = False
+        self._owns_security_group = False
+
         # Create AWS resources
         try:
             # Create VPC if needed
             if not self.vpc_id and self.create_vpc:
                 self.vpc_id = self._create_vpc()
+                self._owns_vpc = True
 
             # Create subnet if needed
             if not self.subnet_id and self.vpc_id:
                 self.subnet_id = self._create_subnet()
+                self._owns_subnet = True
 
             # Create security group if needed
             if not self.security_group_id and self.vpc_id:
                 self.security_group_id = self._create_security_group()
+                self._owns_security_group = True
 
             # Save state
             self.save_state()
@@ -1501,8 +1510,8 @@ class StandardMode(OperatingMode):
                 self.spot_interruption_monitor = None
                 self.spot_interruption_handler = None
 
-            # Delete security group
-            if self.security_group_id:
+            # Delete security group (only if this provider created it)
+            if self.security_group_id and getattr(self, "_owns_security_group", True):
                 try:
                     delete_resource(
                         self.security_group_id,
@@ -1520,9 +1529,14 @@ class StandardMode(OperatingMode):
                     logger.error(
                         f"Failed to delete security group {self.security_group_id}: {e}"
                     )
+            elif self.security_group_id:
+                logger.debug(
+                    "Skipping deletion of pre-existing security group %s",
+                    self.security_group_id,
+                )
 
-            # Delete subnet
-            if self.subnet_id:
+            # Delete subnet (only if this provider created it)
+            if self.subnet_id and getattr(self, "_owns_subnet", True):
                 try:
                     delete_resource(self.subnet_id, self.session, RESOURCE_TYPE_SUBNET)
                     logger.info(f"Deleted subnet {self.subnet_id}")
@@ -1534,9 +1548,13 @@ class StandardMode(OperatingMode):
                     self.subnet_id = None
                 except Exception as e:
                     logger.error(f"Failed to delete subnet {self.subnet_id}: {e}")
+            elif self.subnet_id:
+                logger.debug(
+                    "Skipping deletion of pre-existing subnet %s", self.subnet_id
+                )
 
-            # Delete VPC
-            if self.vpc_id:
+            # Delete VPC (only if this provider created it)
+            if self.vpc_id and getattr(self, "_owns_vpc", True):
                 # Detach and delete internet gateways first
                 ec2 = self.session.client("ec2")
                 try:
@@ -1568,6 +1586,8 @@ class StandardMode(OperatingMode):
                     self.vpc_id = None
                 except Exception as e:
                     logger.error(f"Failed to delete VPC {self.vpc_id}: {e}")
+            elif self.vpc_id:
+                logger.debug("Skipping deletion of pre-existing VPC %s", self.vpc_id)
 
             # Clean up Spot Fleet resources if using spot fleet
             if self.use_spot_fleet and self.spot_fleet_manager:

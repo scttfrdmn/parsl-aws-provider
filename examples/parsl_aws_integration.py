@@ -203,6 +203,11 @@ def main() -> int:
                 address=interchange_address,
                 worker_port_range=WORKER_PORT_RANGE,
                 max_workers_per_node=1,
+                # AL2023 workers install python3.11 + parsl at boot, which takes
+                # 3-5 minutes.  Increase heartbeat_threshold so Parsl does not
+                # declare the worker MISSING before it has finished booting.
+                heartbeat_threshold=600,
+                heartbeat_period=30,
             )
         ],
         run_dir="/tmp/parsl-aws-runinfo",  # nosec B108
