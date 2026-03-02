@@ -104,21 +104,39 @@ def hello_from_ec2():
 def _get_interchange_address() -> str:
     """Return the IP address EC2 workers should use to reach this machine.
 
-    Tries the external (public) IP first; falls back to the routing-table
-    address for same-VPC / VPN scenarios.
+    The Parsl interchange BINDS to this address, so it must be an IP that is
+    actually assigned to a local network interface.  On EC2 the public/elastic
+    IP is managed externally by AWS and is NOT bound to the network interface;
+    only the private IP is.
+
+    When driver and workers share the same VPC (the intended deployment model
+    for this example) the private IP works perfectly — workers connect to the
+    interchange directly via the VPC fabric.
+
+    If you are running the driver on a non-EC2 machine with a public IP
+    assigned directly to the interface (e.g. a bare-metal cloud server or a
+    VM with no NAT), set PARSL_INTERCHANGE_ADDRESS to that IP and it will be
+    used instead.
     """
-    try:
-        addr = address_by_query(timeout=10)
-        logger.info("Public IP (from ipify.org): %s", addr)
-        return addr
-    except Exception:
-        addr = address_by_route()
-        logger.warning(
-            "Could not reach ipify.org; using route address: %s  "
-            "(This will only work if EC2 workers can reach this address directly.)",
-            addr,
+    override = os.environ.get("PARSL_INTERCHANGE_ADDRESS")
+    if override:
+        logger.info(
+            "Interchange address (from PARSL_INTERCHANGE_ADDRESS): %s", override
         )
-        return addr
+        return override
+
+    addr = address_by_route()
+    logger.info("Interchange address (private/route): %s", addr)
+
+    # Log the public IP as informational only — workers in same VPC do NOT
+    # need it, but it is useful for debugging connectivity from outside.
+    try:
+        public_ip = address_by_query(timeout=5)
+        logger.info("Public IP (for reference only): %s", public_ip)
+    except Exception:  # nosec B110
+        pass
+
+    return addr
 
 
 # ---------------------------------------------------------------------------
@@ -139,10 +157,8 @@ def main() -> int:
         "  Worker port range:    %d-%d", WORKER_PORT_RANGE[0], WORKER_PORT_RANGE[1]
     )
     logger.info("=" * 70)
-    logger.warning(
-        "Workers on EC2 must be able to reach %s on ports %d-%d.  "
-        "If this machine is behind NAT without port forwarding, the test will "
-        "time out after ~10 minutes.  Use detached mode for NAT environments.",
+    logger.info(
+        "Workers (same VPC) will connect to interchange at %s ports %d-%d.",
         interchange_address,
         WORKER_PORT_RANGE[0],
         WORKER_PORT_RANGE[1],
