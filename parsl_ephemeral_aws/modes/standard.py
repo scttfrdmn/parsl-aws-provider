@@ -786,14 +786,24 @@ class StandardMode(OperatingMode):
                     f"Added inbound rules to security group {security_group_id}"
                 )
 
-            # Add outbound rules
+            # Add outbound rules (ignore duplicate-rule errors — default SGs
+            # already have an allow-all egress rule)
             if DEFAULT_OUTBOUND_RULES:
-                ec2.authorize_security_group_egress(
-                    GroupId=security_group_id, IpPermissions=DEFAULT_OUTBOUND_RULES
-                )
-                logger.debug(
-                    f"Added outbound rules to security group {security_group_id}"
-                )
+                try:
+                    ec2.authorize_security_group_egress(
+                        GroupId=security_group_id, IpPermissions=DEFAULT_OUTBOUND_RULES
+                    )
+                    logger.debug(
+                        f"Added outbound rules to security group {security_group_id}"
+                    )
+                except ClientError as _dup_err:
+                    if "InvalidPermission.Duplicate" in str(_dup_err):
+                        logger.debug(
+                            "Outbound rule already present on %s; skipping",
+                            security_group_id,
+                        )
+                    else:
+                        raise
 
             # Add tags
             if self.additional_tags:

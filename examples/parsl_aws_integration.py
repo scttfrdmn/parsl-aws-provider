@@ -39,6 +39,7 @@ SPDX-FileCopyrightText: 2025 Scott Friedman and Project Contributors
 import logging
 import os
 import sys
+import uuid
 
 import parsl
 from parsl import python_app
@@ -178,7 +179,9 @@ def main() -> int:
         vpc_id=default_vpc_id,
         subnet_id=default_subnet_id,
         state_store_type="file",
-        state_file_path="/tmp/parsl-aws-integration-state.json",  # nosec B108
+        # Use a unique state file per run to avoid stale state from previous
+        # failed/interrupted runs overriding the provided vpc_id/subnet_id.
+        state_file_path=f"/tmp/parsl-aws-integration-{uuid.uuid4().hex[:8]}.json",  # nosec B108
         auto_shutdown=True,
         auto_create_instance_profile=True,
         profile_name=AWS_PROFILE,
