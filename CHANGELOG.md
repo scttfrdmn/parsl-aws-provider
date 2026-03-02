@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Warm pool** for `StandardMode`: set `warm_pool_size` (default `0`) to keep
+  completed EC2 instances alive and reuse them for subsequent jobs via AWS SSM
+  `SendCommand`, skipping the ~30–60 s `worker_init` cold-start cost.
+  - `warm_pool_size` — maximum number of idle instances to keep warm (0 = disabled).
+  - `warm_pool_ttl` — seconds a warm idle instance stays alive before eviction
+    (default 600).
+  - Requires `auto_create_instance_profile=True` or `iam_instance_profile_arn`
+    (SSM `SendCommand` needs an IAM role on the instance); a `ValueError` is raised
+    at construction time if neither is provided.
+  - Warm instances are tracked with `STATUS_WARM`; `_cleanup_resources()` handles
+    pool-full oldest-instance eviction and TTL-based termination.
+  - State (`_warm_instances` list) is persisted to the state file so warm instances
+    survive a provider restart with the same `state_file_path`.
+  - `status()` now short-circuits jobs already in a terminal state, preventing stale
+    re-queries when an instance has been reused for a different job.
+
 ### Fixed
 - `examples/parsl_aws_integration.py`: added `encrypted=False` to `HighThroughputExecutor`
   config. Parsl HTEX uses CurveZMQ encryption by default; the interchange generates TLS
