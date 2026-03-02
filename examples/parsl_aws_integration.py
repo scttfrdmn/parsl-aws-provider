@@ -164,10 +164,19 @@ def main() -> int:
         WORKER_PORT_RANGE[1],
     )
 
+    # Use the default VPC and its default subnet to avoid hitting the 5-VPC
+    # per-region limit.  Pass them explicitly; set create_vpc=False so the
+    # provider does not attempt to create a new VPC.
+    default_vpc_id = os.environ.get("AWS_DEFAULT_VPC_ID")
+    default_subnet_id = os.environ.get("AWS_DEFAULT_SUBNET_ID")
+
     provider = EphemeralAWSProvider(
         region=AWS_REGION,
         instance_type="t3.small",  # t3.micro may OOM during pip install
         mode="standard",
+        create_vpc=not bool(default_vpc_id),  # skip VPC creation if pre-supplied
+        vpc_id=default_vpc_id,
+        subnet_id=default_subnet_id,
         state_store_type="file",
         state_file_path="/tmp/parsl-aws-integration-state.json",  # nosec B108
         auto_shutdown=True,
