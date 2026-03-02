@@ -21,6 +21,7 @@ from parsl.utils import RepresentationMixin
 from typeguard import typechecked
 
 from parsl_ephemeral_aws.constants import (
+    DEFAULT_BAKE_AMI,
     DEFAULT_INSTANCE_TYPE,
     DEFAULT_MAX_BLOCKS,
     DEFAULT_MAX_IDLE_TIME,
@@ -202,6 +203,15 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
     warm_pool_ttl : int, optional
         Seconds a warm idle instance stays alive before being terminated.
         Default is 600 (10 minutes).
+    bake_ami : bool, optional
+        When True, run ``worker_init`` on a builder instance during
+        ``initialize()``, snapshot it into a custom AMI, and use that AMI for
+        all subsequent instance launches.  Eliminates the per-boot install
+        overhead for new instances.  Default is False.
+    baked_ami_id : str, optional
+        Pre-existing baked AMI ID to use instead of baking a new one.  When
+        supplied, ``initialize()`` skips the baking step and uses this AMI
+        directly for all instance launches.
     """
 
     @typechecked
@@ -252,6 +262,8 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
         waiter_max_attempts: int = 60,
         warm_pool_size: int = DEFAULT_WARM_POOL_SIZE,
         warm_pool_ttl: int = DEFAULT_WARM_POOL_TTL,
+        bake_ami: bool = DEFAULT_BAKE_AMI,
+        baked_ami_id: Optional[str] = None,
         **kwargs: Any,
     ) -> None:
         """Initialize the Ephemeral AWS Provider."""
@@ -336,6 +348,8 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
         self.waiter_max_attempts = waiter_max_attempts
         self.warm_pool_size = warm_pool_size
         self.warm_pool_ttl = warm_pool_ttl
+        self.bake_ami = bake_ami
+        self.baked_ami_id = baked_ami_id
         self.kwargs = kwargs
 
         # Guard: warm pool uses SSM SendCommand which requires an IAM instance profile
@@ -504,6 +518,8 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
                 iam_instance_profile_arn=self.iam_instance_profile_arn,
                 warm_pool_size=self.warm_pool_size,
                 warm_pool_ttl=self.warm_pool_ttl,
+                bake_ami=self.bake_ami,
+                baked_ami_id=self.baked_ami_id,
                 **common_params,
             )
         elif self.mode_type == OperatingModeType.DETACHED:

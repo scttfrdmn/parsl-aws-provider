@@ -305,3 +305,256 @@ class TestWarmPool:
         assert provider.resources["i-new"]["status"] == "WARM"
         assert "i-new" in mode._warm_instances
         assert "i-old" not in mode._warm_instances
+
+
+# ---------------------------------------------------------------------------
+# TestAMIBaking
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestAMIBaking:
+    """Unit tests for the AMI baking feature (issue #67)."""
+
+    @pytest.fixture
+    def tmp_dir(self):
+        with tempfile.TemporaryDirectory() as d:
+            yield d
+
+    # -----------------------------------------------------------------------
+    # 1. Default state
+    # -----------------------------------------------------------------------
+
+    def test_bake_ami_disabled_by_default(self, tmp_dir):
+        """bake_ami defaults to False and _baked_ami_id is None."""
+        provider, _ = _make_provider(tmp_dir)
+
+        assert provider.bake_ami is False
+        assert provider.baked_ami_id is None
+
+    # -----------------------------------------------------------------------
+    # 2. Pre-supplied baked AMI skips baking
+    # -----------------------------------------------------------------------
+
+    def test_pre_supplied_baked_ami_skips_baking(self, tmp_dir):
+        """When baked_ami_id is supplied, image_id is set and no create_image call is made."""
+        import os
+
+        provider_id = f"test-{uuid.uuid4().hex[:8]}"
+        state_file = os.path.join(tmp_dir, f"{provider_id}.json")
+
+        from parsl_ephemeral_aws.state.file import FileStateStore
+        from parsl_ephemeral_aws.modes.standard import StandardMode
+
+        state_store = FileStateStore(file_path=state_file, provider_id=provider_id)
+
+        ec2_mock = MagicMock()
+        session_mock = MagicMock()
+        session_mock.client.return_value = ec2_mock
+
+        mode = StandardMode(
+            provider_id=provider_id,
+            session=session_mock,
+            state_store=state_store,
+            image_id="ami-base",
+            baked_ami_id="ami-prefab",
+        )
+        # Manually drive initialize() — patch VPC/subnet/SG creation to be no-ops
+        mode.vpc_id = "vpc-123"
+        mode.subnet_id = "subnet-123"
+        mode.security_group_id = "sg-123"
+        mode._owns_vpc = False
+        mode._owns_subnet = False
+        mode._owns_security_group = False
+        # Run just the baking branch by calling initialize() with network already set
+        with patch.object(mode, "_create_vpc", return_value="vpc-123"), patch.object(
+            mode, "_create_subnet", return_value="subnet-123"
+        ), patch.object(
+            mode, "_create_security_group", return_value="sg-123"
+        ), patch.object(mode, "save_state"), patch.object(
+            mode, "load_state", return_value=False
+        ), patch.object(mode, "_verify_resources"):
+            mode.initialize()
+
+        assert mode.image_id == "ami-prefab"
+        assert mode._baked_ami_id == "ami-prefab"
+        # No EC2 create_image call should have been made
+        ec2_mock.create_image.assert_not_called()
+
+    # -----------------------------------------------------------------------
+    # 3. _bake_ami() launches builder and creates image
+    # -----------------------------------------------------------------------
+
+    def test_bake_ami_launches_builder_and_creates_image(self, tmp_dir):
+        """_bake_ami() calls run_instances, waits for stop, create_image, waits for available."""
+        import os
+
+        provider_id = f"test-{uuid.uuid4().hex[:8]}"
+        state_file = os.path.join(tmp_dir, f"{provider_id}.json")
+
+        from parsl_ephemeral_aws.state.file import FileStateStore
+        from parsl_ephemeral_aws.modes.standard import StandardMode
+
+        state_store = FileStateStore(file_path=state_file, provider_id=provider_id)
+
+        ec2_mock = MagicMock()
+        session_mock = MagicMock()
+        session_mock.client.return_value = ec2_mock
+
+        ec2_mock.run_instances.return_value = {
+            "Instances": [{"InstanceId": "i-builder001"}]
+        }
+        ec2_mock.create_image.return_value = {"ImageId": "ami-baked001"}
+
+        mode = StandardMode(
+            provider_id=provider_id,
+            session=session_mock,
+            state_store=state_store,
+            image_id="ami-base",
+            bake_ami=True,
+        )
+        mode.vpc_id = "vpc-123"
+        mode.subnet_id = "subnet-123"
+        mode.security_group_id = "sg-123"
+
+        with patch("parsl_ephemeral_aws.modes.standard.wait_for_resource") as mock_wait:
+            ami_id = mode._bake_ami()
+
+        assert ami_id == "ami-baked001"
+        ec2_mock.run_instances.assert_called_once()
+        ec2_mock.create_image.assert_called_once()
+        # wait_for_resource should have been called at least twice
+        # (instance_stopped and image_available)
+        assert mock_wait.call_count >= 2
+        # Builder should be terminated
+        ec2_mock.terminate_instances.assert_called_with(InstanceIds=["i-builder001"])
+
+    # -----------------------------------------------------------------------
+    # 4. save_state() persists baked_ami_id
+    # -----------------------------------------------------------------------
+
+    def test_baked_ami_persisted_in_save_state(self, tmp_dir):
+        """save_state() includes baked_ami_id and owns_baked_ami in the state dict."""
+        import os
+
+        provider_id = f"test-{uuid.uuid4().hex[:8]}"
+        state_file = os.path.join(tmp_dir, f"{provider_id}.json")
+
+        from parsl_ephemeral_aws.state.file import FileStateStore
+        from parsl_ephemeral_aws.modes.standard import StandardMode
+
+        state_store = FileStateStore(file_path=state_file, provider_id=provider_id)
+        session_mock = MagicMock()
+
+        mode = StandardMode(
+            provider_id=provider_id,
+            session=session_mock,
+            state_store=state_store,
+            image_id="ami-base",
+        )
+        mode._baked_ami_id = "ami-saved001"
+        mode._owns_baked_ami = True
+
+        saved = {}
+
+        def _capture_state(state):
+            saved.update(state)
+
+        with patch.object(state_store, "save_state", side_effect=_capture_state):
+            mode.save_state()
+
+        assert saved.get("baked_ami_id") == "ami-saved001"
+        assert saved.get("owns_baked_ami") is True
+
+    # -----------------------------------------------------------------------
+    # 5. load_state() restores baked_ami_id
+    # -----------------------------------------------------------------------
+
+    def test_baked_ami_restored_from_load_state(self, tmp_dir):
+        """load_state() restores _baked_ami_id and sets image_id to the baked AMI."""
+        import os
+
+        provider_id = f"test-{uuid.uuid4().hex[:8]}"
+        state_file = os.path.join(tmp_dir, f"{provider_id}.json")
+
+        from parsl_ephemeral_aws.state.file import FileStateStore
+        from parsl_ephemeral_aws.modes.standard import StandardMode
+
+        state_store = FileStateStore(file_path=state_file, provider_id=provider_id)
+        session_mock = MagicMock()
+
+        mode = StandardMode(
+            provider_id=provider_id,
+            session=session_mock,
+            state_store=state_store,
+            image_id="ami-base",
+        )
+        persisted_state = {
+            "provider_id": provider_id,
+            "resources": {},
+            "vpc_id": None,
+            "subnet_id": None,
+            "security_group_id": None,
+            "initialized": True,
+            "use_spot_fleet": False,
+            "spot_interruption_handling": False,
+            "warm_instances": [],
+            "baked_ami_id": "ami-restored001",
+            "owns_baked_ami": True,
+        }
+
+        with patch.object(state_store, "load_state", return_value=persisted_state):
+            mode.load_state()
+
+        assert mode._baked_ami_id == "ami-restored001"
+        assert mode._owns_baked_ami is True
+        assert mode.image_id == "ami-restored001"
+
+    # -----------------------------------------------------------------------
+    # 6. cleanup_infrastructure() deregisters baked AMI
+    # -----------------------------------------------------------------------
+
+    def test_deregister_baked_ami_on_cleanup(self, tmp_dir):
+        """cleanup_infrastructure() calls deregister_image and delete_snapshot when _owns_baked_ami."""
+        import os
+
+        provider_id = f"test-{uuid.uuid4().hex[:8]}"
+        state_file = os.path.join(tmp_dir, f"{provider_id}.json")
+
+        from parsl_ephemeral_aws.state.file import FileStateStore
+        from parsl_ephemeral_aws.modes.standard import StandardMode
+
+        state_store = FileStateStore(file_path=state_file, provider_id=provider_id)
+
+        ec2_mock = MagicMock()
+        ec2_mock.describe_images.return_value = {
+            "Images": [
+                {
+                    "BlockDeviceMappings": [
+                        {"Ebs": {"SnapshotId": "snap-abc123"}},
+                    ]
+                }
+            ]
+        }
+        session_mock = MagicMock()
+        session_mock.client.return_value = ec2_mock
+
+        mode = StandardMode(
+            provider_id=provider_id,
+            session=session_mock,
+            state_store=state_store,
+            image_id="ami-base",
+        )
+        mode._baked_ami_id = "ami-cleanup001"
+        mode._owns_baked_ami = True
+        mode.initialized = True
+        mode.vpc_id = None
+        mode.subnet_id = None
+        mode.security_group_id = None
+
+        with patch.object(mode, "cleanup_all"), patch.object(mode, "save_state"):
+            mode.cleanup_infrastructure()
+
+        ec2_mock.deregister_image.assert_called_once_with(ImageId="ami-cleanup001")
+        ec2_mock.delete_snapshot.assert_called_once_with(SnapshotId="snap-abc123")
+        assert mode._baked_ami_id is None

@@ -100,6 +100,8 @@ class StandardMode(OperatingMode):
         warm_pool_size: int = 0,
         warm_pool_ttl: int = 600,
         iam_instance_profile_arn: Optional[str] = None,
+        bake_ami: bool = False,
+        baked_ami_id: Optional[str] = None,
         **kwargs: Any,
     ) -> None:
         """Initialize the standard mode.
@@ -193,6 +195,12 @@ class StandardMode(OperatingMode):
         # List of instance IDs currently in the warm pool (ready for reuse, FIFO)
         self._warm_instances: List[str] = []
 
+        # AMI baking attributes
+        self.bake_ami = bake_ami
+        self.baked_ami_id = baked_ami_id  # user-supplied pre-baked AMI
+        self._baked_ami_id: Optional[str] = None  # resolved AMI ID (baked or supplied)
+        self._owns_baked_ami: bool = False  # True if this provider created the AMI
+
         # Initialize SpotFleetManager if using spot fleet
         self.spot_fleet_manager = None
         self.spot_interruption_monitor = None
@@ -249,6 +257,182 @@ class StandardMode(OperatingMode):
         if self.vpc_id:
             self.create_vpc = False
 
+    # ------------------------------------------------------------------
+    # AMI baking helpers
+    # ------------------------------------------------------------------
+
+    def _bake_ami(self) -> str:
+        """Bake worker_init into a custom AMI.
+
+        Launches a builder instance with worker_init as UserData, waits for it
+        to stop (via ``shutdown -h now`` at the end of UserData), creates an
+        image snapshot, waits for the image to become available, terminates the
+        builder, and returns the new AMI ID.
+
+        Returns
+        -------
+        str
+            ID of the newly created AMI.
+
+        Raises
+        ------
+        ResourceCreationError
+            If any step of the baking process fails.
+        """
+        ec2 = self.session.client("ec2")
+        builder_id = self._launch_builder_instance()
+        logger.info(f"Waiting for builder instance {builder_id} to stop...")
+        try:
+            wait_for_resource(
+                builder_id,
+                "instance_stopped",
+                ec2,
+                resource_name="AMI builder instance",
+                delay=15,
+                max_attempts=80,  # up to 20 minutes for slow UserData
+            )
+        except Exception as e:
+            # Terminate the builder before re-raising so it doesn't linger
+            try:
+                ec2.terminate_instances(InstanceIds=[builder_id])
+            except Exception:  # nosec B110
+                pass
+            raise ResourceCreationError(
+                f"Builder instance {builder_id} did not stop: {e}"
+            ) from e
+
+        ami_name = f"parsl-baked-{self.provider_id[:8]}-{int(time.time())}"
+        try:
+            response = ec2.create_image(
+                InstanceId=builder_id,
+                Name=ami_name,
+                NoReboot=True,
+                TagSpecifications=[
+                    {
+                        "ResourceType": "image",
+                        "Tags": [
+                            {"Key": "ParslBakedAMI", "Value": "true"},
+                            {"Key": "ProviderId", "Value": self.provider_id},
+                            {
+                                "Key": "CreatedBy",
+                                "Value": "ParslEphemeralAWSProvider",
+                            },
+                        ],
+                    }
+                ],
+            )
+        except Exception as e:
+            try:
+                ec2.terminate_instances(InstanceIds=[builder_id])
+            except Exception:  # nosec B110
+                pass
+            raise ResourceCreationError(f"create_image failed: {e}") from e
+
+        ami_id = response["ImageId"]
+        logger.info(f"Created AMI {ami_id}, waiting for it to become available...")
+        try:
+            wait_for_resource(
+                ami_id,
+                "image_available",
+                ec2,
+                resource_name="baked AMI",
+                delay=15,
+                max_attempts=80,
+            )
+        except Exception as e:
+            raise ResourceCreationError(
+                f"AMI {ami_id} did not become available: {e}"
+            ) from e
+        finally:
+            # Always terminate the builder, even on failure
+            try:
+                ec2.terminate_instances(InstanceIds=[builder_id])
+                logger.debug(f"Terminated builder instance {builder_id}")
+            except Exception as te:
+                logger.warning(f"Failed to terminate builder {builder_id}: {te}")
+
+        return ami_id
+
+    def _launch_builder_instance(self) -> str:
+        """Launch a builder EC2 instance that runs worker_init then shuts down.
+
+        Returns
+        -------
+        str
+            Instance ID of the launched builder.
+        """
+        ec2 = self.session.client("ec2")
+        user_data = f"#!/bin/bash\n{self.worker_init}\nshutdown -h now\n"
+        kwargs: Dict[str, Any] = {
+            "ImageId": self.image_id,
+            "InstanceType": self.instance_type,
+            "MinCount": 1,
+            "MaxCount": 1,
+            "UserData": user_data,
+            "TagSpecifications": [
+                {
+                    "ResourceType": "instance",
+                    "Tags": [
+                        {
+                            "Key": "Name",
+                            "Value": f"parsl-ami-builder-{self.provider_id[:8]}",
+                        },
+                        {"Key": "ParslAMIBuilder", "Value": "true"},
+                        {"Key": "ProviderId", "Value": self.provider_id},
+                        {
+                            "Key": "CreatedBy",
+                            "Value": "ParslEphemeralAWSProvider",
+                        },
+                    ],
+                }
+            ],
+        }
+        if self.subnet_id:
+            kwargs["SubnetId"] = self.subnet_id
+        if self.security_group_id:
+            kwargs["SecurityGroupIds"] = [self.security_group_id]
+        if self.key_name:
+            kwargs["KeyName"] = self.key_name
+        if self.iam_instance_profile_arn:
+            kwargs["IamInstanceProfile"] = {"Arn": self.iam_instance_profile_arn}
+
+        response = ec2.run_instances(**kwargs)
+        instance_id = response["Instances"][0]["InstanceId"]
+        logger.info(f"Launched AMI builder instance {instance_id}")
+        return instance_id
+
+    def _deregister_baked_ami(self, ami_id: str) -> None:
+        """Deregister a baked AMI and delete its backing EBS snapshots.
+
+        Parameters
+        ----------
+        ami_id : str
+            AMI ID to deregister.
+        """
+        ec2 = self.session.client("ec2")
+        # Collect snapshot IDs before deregistering the image
+        snapshot_ids: List[str] = []
+        try:
+            response = ec2.describe_images(ImageIds=[ami_id])
+            images = response.get("Images", [])
+            if images:
+                for block_device in images[0].get("BlockDeviceMappings", []):
+                    ebs = block_device.get("Ebs", {})
+                    if "SnapshotId" in ebs:
+                        snapshot_ids.append(ebs["SnapshotId"])
+        except Exception as e:
+            logger.warning(f"Could not describe AMI {ami_id} before deregistering: {e}")
+
+        ec2.deregister_image(ImageId=ami_id)
+        logger.debug(f"Deregistered AMI {ami_id}")
+
+        for snapshot_id in snapshot_ids:
+            try:
+                ec2.delete_snapshot(SnapshotId=snapshot_id)
+                logger.debug(f"Deleted snapshot {snapshot_id}")
+            except Exception as e:
+                logger.warning(f"Failed to delete snapshot {snapshot_id}: {e}")
+
     def save_state(self) -> None:
         """Save the current state to the state store."""
         # Default state
@@ -263,6 +447,8 @@ class StandardMode(OperatingMode):
             "use_spot_fleet": self.use_spot_fleet,
             "spot_interruption_handling": self.spot_interruption_handling,
             "warm_instances": list(self._warm_instances),
+            "baked_ami_id": self._baked_ami_id,
+            "owns_baked_ami": self._owns_baked_ami,
         }
 
         # Include spot fleet state if applicable
@@ -283,8 +469,11 @@ class StandardMode(OperatingMode):
             except Exception as e:
                 logger.error(f"Failed to save state: {e}")
         else:
-            # Call parent implementation if not using spot fleet
-            super().save_state()
+            # Save directly (includes baked AMI fields not in the base class state)
+            try:
+                self.state_store.save_state(state)
+            except Exception as e:
+                logger.error(f"Failed to save state: {e}")
 
     def load_state(self) -> bool:
         """Load state from the state store.
@@ -314,6 +503,14 @@ class StandardMode(OperatingMode):
                         for rid, r in self.resources.items()
                         if r.get("warm_pool") and r.get("status") == STATUS_WARM
                     ]
+
+                # Restore baked AMI state
+                saved_baked_ami = state.get("baked_ami_id")
+                if saved_baked_ami:
+                    self._baked_ami_id = saved_baked_ami
+                    self._owns_baked_ami = state.get("owns_baked_ami", False)
+                    self.image_id = saved_baked_ami
+                    logger.info(f"Restored baked AMI {saved_baked_ami} from state")
 
                 # Check if spot interruption handling was previously enabled
                 previous_spot_handling = state.get("spot_interruption_handling", False)
@@ -449,6 +646,18 @@ class StandardMode(OperatingMode):
             if not self.security_group_id and self.vpc_id:
                 self.security_group_id = self._create_security_group()
                 self._owns_security_group = True
+
+            # AMI baking: snapshot worker_init into a custom AMI
+            if self.bake_ami and not self._baked_ami_id:
+                ami_id = self._bake_ami()
+                self._baked_ami_id = ami_id
+                self._owns_baked_ami = True
+                self.image_id = ami_id
+                logger.info(f"Baked AMI {ami_id} from worker_init")
+            elif self.baked_ami_id and not self._baked_ami_id:
+                self._baked_ami_id = self.baked_ami_id
+                self.image_id = self.baked_ami_id
+                logger.info(f"Using pre-supplied baked AMI {self.baked_ami_id}")
 
             # Save state
             self.save_state()
@@ -1798,6 +2007,17 @@ class StandardMode(OperatingMode):
                     logger.error(f"Failed to stop spot interruption monitoring: {e}")
                 self.spot_interruption_monitor = None
                 self.spot_interruption_handler = None
+
+            # Deregister baked AMI if this provider created it
+            if self._baked_ami_id and getattr(self, "_owns_baked_ami", False):
+                try:
+                    self._deregister_baked_ami(self._baked_ami_id)
+                    logger.info(f"Deregistered baked AMI {self._baked_ami_id}")
+                    self._baked_ami_id = None
+                except Exception as e:
+                    logger.error(
+                        f"Failed to deregister baked AMI {self._baked_ami_id}: {e}"
+                    )
 
             # Delete security group (only if this provider created it)
             if self.security_group_id and getattr(self, "_owns_security_group", True):
