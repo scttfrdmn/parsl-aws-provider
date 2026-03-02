@@ -327,6 +327,11 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
 
         logger.info(f"Initialized EphemeralAWSProvider in {self.mode_type.value} mode")
 
+        # Auto-initialize the operating mode so the provider is ready for
+        # submit() immediately after construction (matches Parsl's
+        # ExecutionProvider contract — no separate initialize() call required).
+        self.operating_mode.initialize()
+
     def _validate_config(
         self,
         image_id: Optional[str],

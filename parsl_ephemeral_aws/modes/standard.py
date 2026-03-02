@@ -392,6 +392,10 @@ class StandardMode(OperatingMode):
         ResourceCreationError
             If resource creation fails
         """
+        # Idempotent: if already initialized, do nothing.
+        if self.initialized:
+            return
+
         # Try to load state first
         if self.load_state():
             logger.debug("Loaded state, checking resources")

@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- `EphemeralAWSProvider.__init__` now calls `operating_mode.initialize()` automatically
+  so the provider is ready for `submit()` immediately after construction, matching
+  Parsl's `ExecutionProvider` contract (no separate initialize step required).
+  All three mode `initialize()` methods are now idempotent (`if self.initialized: return`).
 - `EphemeralAWSProvider.status()` now returns `List[parsl.jobs.states.JobStatus]`
   instead of `List[Dict]`, matching the Parsl `ExecutionProvider` interface contract.
   Without this fix, Parsl's `HighThroughputExecutor` would raise `AttributeError`
