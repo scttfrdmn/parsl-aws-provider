@@ -558,3 +558,59 @@ class TestAMIBaking:
         ec2_mock.deregister_image.assert_called_once_with(ImageId="ami-cleanup001")
         ec2_mock.delete_snapshot.assert_called_once_with(SnapshotId="snap-abc123")
         assert mode._baked_ami_id is None
+
+
+# ---------------------------------------------------------------------------
+# TestOneShotMode
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestOneShotMode:
+    """Unit tests for the one_shot parameter (issue #66)."""
+
+    @pytest.fixture
+    def tmp_dir(self):
+        with tempfile.TemporaryDirectory() as d:
+            yield d
+
+    def test_one_shot_disabled_by_default(self, tmp_dir):
+        """one_shot defaults to False on the provider."""
+        provider, _ = _make_provider(tmp_dir)
+        assert provider.one_shot is False
+
+    def test_one_shot_warm_pool_guard_raises(self, tmp_dir):
+        """one_shot=True combined with warm_pool_size > 0 raises ValueError."""
+        with pytest.raises(ValueError, match="one_shot"):
+            _make_provider(
+                tmp_dir,
+                one_shot=True,
+                warm_pool_size=1,
+                iam_instance_profile_arn=_FAKE_IAM_ARN,
+            )
+
+    def test_one_shot_compatible_with_zero_warm_pool(self, tmp_dir):
+        """one_shot=True with warm_pool_size=0 (default) constructs without error."""
+        provider, _ = _make_provider(tmp_dir, one_shot=True, warm_pool_size=0)
+        assert provider.one_shot is True
+
+    def test_one_shot_enforces_shutdown_in_init_script(self, tmp_dir):
+        """_prepare_init_script includes 'shutdown -h now' when one_shot=True, auto_shutdown=False."""
+        from parsl_ephemeral_aws.modes.standard import StandardMode
+
+        provider_id = f"test-{uuid.uuid4().hex[:8]}"
+        state_file = os.path.join(tmp_dir, f"{provider_id}.json")
+        state_store = FileStateStore(file_path=state_file, provider_id=provider_id)
+        session_mock = MagicMock()
+
+        mode = StandardMode(
+            provider_id=provider_id,
+            session=session_mock,
+            state_store=state_store,
+            image_id="ami-12345678",
+            auto_shutdown=False,
+            one_shot=True,
+        )
+
+        script = mode._prepare_init_script("echo hi", "job-1")
+        assert "shutdown -h now" in script

@@ -27,6 +27,7 @@ from parsl_ephemeral_aws.constants import (
     DEFAULT_MAX_IDLE_TIME,
     DEFAULT_MIN_BLOCKS,
     DEFAULT_MODE,
+    DEFAULT_ONE_SHOT,
     DEFAULT_REGION,
     DEFAULT_WARM_POOL_SIZE,
     DEFAULT_WARM_POOL_TTL,
@@ -264,6 +265,7 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
         warm_pool_ttl: int = DEFAULT_WARM_POOL_TTL,
         bake_ami: bool = DEFAULT_BAKE_AMI,
         baked_ami_id: Optional[str] = None,
+        one_shot: bool = DEFAULT_ONE_SHOT,
         **kwargs: Any,
     ) -> None:
         """Initialize the Ephemeral AWS Provider."""
@@ -350,7 +352,15 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
         self.warm_pool_ttl = warm_pool_ttl
         self.bake_ami = bake_ami
         self.baked_ami_id = baked_ami_id
+        self.one_shot = one_shot
         self.kwargs = kwargs
+
+        # Guard: one_shot is incompatible with warm pool (instances are terminated immediately)
+        if one_shot and warm_pool_size > 0:
+            raise ValueError(
+                "one_shot=True is incompatible with warm_pool_size > 0: "
+                "one-shot instances are terminated immediately and cannot be reused"
+            )
 
         # Guard: warm pool uses SSM SendCommand which requires an IAM instance profile
         if (
@@ -520,6 +530,7 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
                 warm_pool_ttl=self.warm_pool_ttl,
                 bake_ami=self.bake_ami,
                 baked_ami_id=self.baked_ami_id,
+                one_shot=self.one_shot,
                 **common_params,
             )
         elif self.mode_type == OperatingModeType.DETACHED:

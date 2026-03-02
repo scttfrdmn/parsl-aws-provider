@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **One-shot mode** for `StandardMode`: set `one_shot=True` to explicitly declare
+  that each EC2 instance runs a single command then terminates, regardless of the
+  `auto_shutdown` setting (closes #66).
+  - `one_shot=True` unconditionally appends `shutdown -h now` to the UserData
+    init script even when `auto_shutdown=False`.
+  - Raises `ValueError` at construction time if combined with `warm_pool_size > 0`
+    (incompatible: one-shot instances are terminated immediately and cannot be reused).
+  - `one_shot=False` (default): zero code-path changes for existing users.
+
 ## [0.6.0] - 2026-03-02
 
 ### Added

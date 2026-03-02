@@ -165,6 +165,7 @@ DEFAULT_WARM_POOL_TTL = 600  # seconds a warm idle instance stays alive
 
 # AMI baking defaults
 DEFAULT_BAKE_AMI = False  # bake worker_init into a custom AMI during initialize()
+DEFAULT_ONE_SHOT = False  # each instance runs one command then terminates
 
 # Lambda defaults (minimal for imports)
 DEFAULT_LAMBDA_TIMEOUT = 300

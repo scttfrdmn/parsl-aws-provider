@@ -102,6 +102,7 @@ class StandardMode(OperatingMode):
         iam_instance_profile_arn: Optional[str] = None,
         bake_ami: bool = False,
         baked_ami_id: Optional[str] = None,
+        one_shot: bool = False,
         **kwargs: Any,
     ) -> None:
         """Initialize the standard mode.
@@ -200,6 +201,9 @@ class StandardMode(OperatingMode):
         self.baked_ami_id = baked_ami_id  # user-supplied pre-baked AMI
         self._baked_ami_id: Optional[str] = None  # resolved AMI ID (baked or supplied)
         self._owns_baked_ami: bool = False  # True if this provider created the AMI
+
+        # One-shot mode: each instance runs exactly one command then terminates
+        self.one_shot = one_shot
 
         # Initialize SpotFleetManager if using spot fleet
         self.spot_fleet_manager = None
@@ -1229,8 +1233,8 @@ class StandardMode(OperatingMode):
         init_script += "\n# Execute Parsl worker command\n"
         init_script += f"{command}\n"
 
-        # Add cleanup if auto shutdown is enabled
-        if self.auto_shutdown:
+        # Add cleanup if auto shutdown is enabled or one_shot mode forces it
+        if self.auto_shutdown or self.one_shot:
             init_script += "\n# Auto-shutdown\n"
             init_script += "shutdown -h now\n"
 
