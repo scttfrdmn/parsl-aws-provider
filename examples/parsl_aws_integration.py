@@ -62,9 +62,13 @@ AWS_REGION = os.environ.get("AWS_TEST_REGION", "us-west-2")
 AWS_PROFILE = os.environ.get("AWS_TEST_PROFILE", "aws")
 
 # Worker init for Amazon Linux 2023 (the default AMI used by EphemeralAWSProvider).
-# python3 -m pip is available on AL2023 without extra packages.
+# AL2023's default python3 is 3.9; parsl>=2026.1.5 requires Python 3.10+.
+# Install python3.11 from dnf and make it the default python3, then install
+# parsl and psutil so the HTEX worker manager can be started.
 AL2023_WORKER_INIT = (
-    "python3 -m pip install --quiet --upgrade 'parsl>=2026.1.5' psutil\n"
+    "dnf install -y python3.11 python3.11-pip\n"
+    "ln -sf /usr/bin/python3.11 /usr/bin/python3\n"
+    "pip3.11 install --quiet 'parsl>=2026.1.5' psutil\n"
 )
 
 # HTEX worker ZMQ port range — interchange binds a port in this range.
