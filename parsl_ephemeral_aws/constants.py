@@ -63,22 +63,23 @@ DEFAULT_OUTBOUND_RULES = [
 ]
 
 # AMI mappings for different regions (Amazon Linux 2023)
+# Updated 2026-03-01 — al2023-ami-2023.10.20260216.1-kernel-6.12-x86_64
 DEFAULT_AMI_MAPPING = {
-    "us-east-1": "ami-080e1f13689e07408",  # N. Virginia
-    "us-east-2": "ami-03d21eed81858c120",  # Ohio
-    "us-west-1": "ami-0d5b7dce3973d8817",  # N. California
-    "us-west-2": "ami-0473ec1595e64e666",  # Oregon
+    "us-east-1": "ami-0f3caa1cf4417e51b",  # N. Virginia
+    "us-east-2": "ami-0d5503fb907719409",  # Ohio
+    "us-west-1": "ami-0e2de80e7636c4837",  # N. California
+    "us-west-2": "ami-075b5421f670d735c",  # Oregon
     "af-south-1": "ami-08d7290d17859bd2e",  # Cape Town
     "ap-east-1": "ami-0d96ec8a788679eb2",  # Hong Kong
-    "ap-southeast-2": "ami-068d77de57cf72650",  # Sydney
-    "ap-southeast-1": "ami-05400835b426ad39e",  # Singapore
-    "ap-northeast-1": "ami-0df7d959e1ae99093",  # Tokyo
+    "ap-southeast-2": "ami-0a11f7293cd9a562e",  # Sydney
+    "ap-southeast-1": "ami-0ac0e4288aa341886",  # Singapore
+    "ap-northeast-1": "ami-088103e734f7e0529",  # Tokyo
     "ap-northeast-2": "ami-0ef0d6b9c5b7d9c81",  # Seoul
     "ap-northeast-3": "ami-088a969d6f085cca3",  # Osaka
     "ap-south-1": "ami-07e8927ba33de363c",  # Mumbai
     "ca-central-1": "ami-0b512d33ad3b7b983",  # Canada
-    "eu-central-1": "ami-06ca3d9ec5caa8d5c",  # Frankfurt
-    "eu-west-1": "ami-09961115387019735",  # Ireland
+    "eu-central-1": "ami-0c42fad2ea005202d",  # Frankfurt
+    "eu-west-1": "ami-09c20105c9b62f893",  # Ireland
     "eu-west-2": "ami-06f89d8f36d17aa27",  # London
     "eu-west-3": "ami-0a13801de97493e85",  # Paris
     "eu-north-1": "ami-03df6dab118053bcb",  # Stockholm

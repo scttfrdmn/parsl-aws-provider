@@ -67,7 +67,7 @@ def create_session(
     try:
         session = boto3.Session(
             region_name=region or DEFAULT_REGION,
-            profile_name=profile_name,
+            profile_name=profile_name or None,  # treat "" same as None
             aws_access_key_id=aws_access_key_id,
             aws_secret_access_key=aws_secret_access_key,
             aws_session_token=aws_session_token,

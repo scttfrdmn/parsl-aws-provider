@@ -59,7 +59,8 @@ logger = logging.getLogger("parsl-aws-integration")
 # ---------------------------------------------------------------------------
 
 AWS_REGION = os.environ.get("AWS_TEST_REGION", "us-west-2")
-AWS_PROFILE = os.environ.get("AWS_TEST_PROFILE", "aws")
+# None → use instance role (EC2) or default credential chain; never pass ""
+AWS_PROFILE: str | None = os.environ.get("AWS_TEST_PROFILE") or None
 
 # Worker init for Amazon Linux 2023 (the default AMI used by EphemeralAWSProvider).
 # AL2023's default python3 is 3.9; parsl>=2026.1.5 requires Python 3.10+.
