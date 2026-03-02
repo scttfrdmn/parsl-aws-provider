@@ -157,6 +157,11 @@ STATUS_CANCELED = "CANCELED"
 STATUS_CANCELLED = "CANCELED"  # British spelling alias
 STATUS_UNKNOWN = "UNKNOWN"
 STATUS_SUCCEEDED = "COMPLETED"  # Alias for compatibility
+STATUS_WARM = "WARM"  # instance running, job done, ready for reuse
+
+# Warm pool defaults
+DEFAULT_WARM_POOL_SIZE = 0  # 0 = disabled
+DEFAULT_WARM_POOL_TTL = 600  # seconds a warm idle instance stays alive
 
 # Lambda defaults (minimal for imports)
 DEFAULT_LAMBDA_TIMEOUT = 300
