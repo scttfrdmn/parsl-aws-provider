@@ -35,6 +35,7 @@ from parsl_ephemeral_aws.constants import (
     STATUS_PENDING,
     STATUS_RUNNING,
     STATUS_UNKNOWN,
+    STATUS_WARM,
 )
 from parsl_ephemeral_aws.exceptions import (
     NetworkCreationError,
@@ -96,6 +97,9 @@ class StandardMode(OperatingMode):
         instance_types: Optional[List[str]] = None,
         nodes_per_block: int = 1,
         spot_max_price_percentage: Optional[int] = None,
+        warm_pool_size: int = 0,
+        warm_pool_ttl: int = 600,
+        iam_instance_profile_arn: Optional[str] = None,
         **kwargs: Any,
     ) -> None:
         """Initialize the standard mode.
@@ -182,6 +186,13 @@ class StandardMode(OperatingMode):
         self.nodes_per_block = nodes_per_block
         self.spot_max_price_percentage = spot_max_price_percentage
 
+        # Warm pool attributes
+        self.warm_pool_size = warm_pool_size
+        self.warm_pool_ttl = warm_pool_ttl
+        self.iam_instance_profile_arn = iam_instance_profile_arn
+        # List of instance IDs currently in the warm pool (ready for reuse, FIFO)
+        self._warm_instances: List[str] = []
+
         # Initialize SpotFleetManager if using spot fleet
         self.spot_fleet_manager = None
         self.spot_interruption_monitor = None
@@ -251,6 +262,7 @@ class StandardMode(OperatingMode):
             "initialized": self.initialized,
             "use_spot_fleet": self.use_spot_fleet,
             "spot_interruption_handling": self.spot_interruption_handling,
+            "warm_instances": list(self._warm_instances),
         }
 
         # Include spot fleet state if applicable
@@ -292,6 +304,16 @@ class StandardMode(OperatingMode):
                     "security_group_id", self.security_group_id
                 )
                 self.initialized = state.get("initialized", False)
+                # Restore warm pool list; fall back to scanning resources for
+                # STATUS_WARM entries in case the key is absent (older state files)
+                if "warm_instances" in state:
+                    self._warm_instances = state["warm_instances"]
+                else:
+                    self._warm_instances = [
+                        rid
+                        for rid, r in self.resources.items()
+                        if r.get("warm_pool") and r.get("status") == STATUS_WARM
+                    ]
 
                 # Check if spot interruption handling was previously enabled
                 previous_spot_handling = state.get("spot_interruption_handling", False)
@@ -879,15 +901,38 @@ class StandardMode(OperatingMode):
         logger.info(f"Submitting job {job_id} ({job_name if job_name else 'unnamed'})")
 
         try:
-            # Prepare worker initialization script
-            init_script = self._prepare_init_script(command, job_id)
+            # --- Warm pool fast path: reuse an idle instance ---
+            if self.warm_pool_size > 0:
+                warm_instance_id = self._get_warm_instance()
+                if warm_instance_id is not None:
+                    logger.info(
+                        f"Reusing warm instance {warm_instance_id} for job {job_id}"
+                    )
+                    ssm_command_id = self._dispatch_ssm_command(
+                        warm_instance_id, command, job_id
+                    )
+                    # Update resource record in-place for the new job
+                    self.resources[warm_instance_id].update(
+                        {
+                            "job_id": job_id,
+                            "job_name": job_name or "unnamed",
+                            "status": STATUS_RUNNING,
+                            "command": command,
+                            "tasks_per_node": tasks_per_node,
+                            "ssm_command_id": ssm_command_id,
+                            "warm_since": None,
+                            "created_at": time.time(),
+                        }
+                    )
+                    self.save_state()
+                    return warm_instance_id
 
-            # Create EC2 instance
+            # --- Cold path: create a new EC2 instance ---
+            init_script = self._prepare_init_script(command, job_id)
             instance_id = self._create_instance(init_script, job_id, job_name)
 
             # Track the resource
             resource_type = RESOURCE_TYPE_EC2
-            # Check if this is actually a Spot Fleet block ID
             if (
                 self.use_spot_fleet
                 and self.spot_fleet_manager
@@ -895,7 +940,7 @@ class StandardMode(OperatingMode):
             ):
                 resource_type = RESOURCE_TYPE_SPOT_FLEET
 
-            self.resources[instance_id] = {
+            resource_data: Dict[str, Any] = {
                 "type": resource_type,
                 "job_id": job_id,
                 "job_name": job_name or "unnamed",
@@ -904,6 +949,29 @@ class StandardMode(OperatingMode):
                 "command": command,
                 "tasks_per_node": tasks_per_node,
             }
+
+            if self.warm_pool_size > 0:
+                # Warm pool cold start: wait for SSM then dispatch command
+                resource_data["warm_pool"] = True
+                self.resources[instance_id] = resource_data
+                try:
+                    self._wait_for_ssm_online(instance_id)
+                    self._wait_for_worker_ready(instance_id)
+                    ssm_command_id = self._dispatch_ssm_command(
+                        instance_id, command, job_id
+                    )
+                    self.resources[instance_id]["ssm_command_id"] = ssm_command_id
+                    self.resources[instance_id]["status"] = STATUS_RUNNING
+                    self.resources[instance_id]["warm_since"] = None
+                except Exception as ssm_err:
+                    logger.error(
+                        f"SSM setup failed for warm pool instance {instance_id}: "
+                        f"{ssm_err}. Falling back to UserData execution."
+                    )
+                    # Remove warm_pool flag so status is tracked via EC2 state
+                    self.resources[instance_id].pop("warm_pool", None)
+            else:
+                self.resources[instance_id] = resource_data
 
             # Save state
             self.save_state()
@@ -920,7 +988,7 @@ class StandardMode(OperatingMode):
         Parameters
         ----------
         command : str
-            Command to execute
+            Command to execute (ignored when warm_pool_size > 0; dispatched via SSM)
         job_id : str
             Job ID
 
@@ -934,7 +1002,15 @@ class StandardMode(OperatingMode):
         if self.worker_init:
             init_script += f"{self.worker_init}\n"
 
-        # Set environment variables
+        if self.warm_pool_size > 0:
+            # Warm pool: UserData only runs worker_init and drops a ready marker.
+            # The actual command is dispatched later via SSM SendCommand so the
+            # instance can be reused across multiple jobs without re-installing.
+            init_script += "mkdir -p /var/run/parsl\n"
+            init_script += "touch /var/run/parsl_worker_ready\n"
+            return init_script
+
+        # Non-warm-pool path: embed command and optional shutdown in UserData
         init_script += "\n# Set environment variables\n"
         init_script += f"export PARSL_JOB_ID={job_id}\n"
         init_script += f"export PARSL_PROVIDER_ID={self.provider_id}\n"
@@ -950,6 +1026,144 @@ class StandardMode(OperatingMode):
             init_script += "shutdown -h now\n"
 
         return init_script
+
+    # ------------------------------------------------------------------
+    # Warm pool helpers
+    # ------------------------------------------------------------------
+
+    def _get_warm_instance(self) -> Optional[str]:
+        """Pop the oldest available warm instance from the pool (FIFO).
+
+        Returns
+        -------
+        Optional[str]
+            Instance ID if a warm instance is available, otherwise None.
+            The returned instance's status is updated to STATUS_RUNNING.
+        """
+        if not self._warm_instances:
+            return None
+        instance_id = self._warm_instances.pop(0)
+        if instance_id in self.resources:
+            self.resources[instance_id]["status"] = STATUS_RUNNING
+            self.resources[instance_id]["warm_since"] = None
+        logger.debug(
+            f"Popped warm instance {instance_id} from pool "
+            f"({len(self._warm_instances)} remaining)"
+        )
+        return instance_id
+
+    def _wait_for_ssm_online(self, instance_id: str, timeout: int = 300) -> None:
+        """Wait for an EC2 instance to register with AWS Systems Manager.
+
+        Parameters
+        ----------
+        instance_id : str
+            EC2 instance ID to wait for.
+        timeout : int, optional
+            Maximum seconds to wait, by default 300.
+
+        Raises
+        ------
+        OperatingModeError
+            If the instance does not appear in SSM within *timeout* seconds.
+        """
+        ssm = self.session.client("ssm")
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                resp = ssm.describe_instance_information(
+                    Filters=[{"Key": "InstanceIds", "Values": [instance_id]}]
+                )
+                if resp.get("InstanceInformationList"):
+                    logger.debug(f"Instance {instance_id} is online in SSM")
+                    return
+            except ClientError as e:
+                logger.debug(f"SSM describe_instance_information: {e}")
+            time.sleep(10)
+        raise OperatingModeError(
+            f"Instance {instance_id} did not become available in SSM "
+            f"within {timeout}s"
+        )
+
+    def _wait_for_worker_ready(self, instance_id: str, timeout: int = 600) -> None:
+        """Wait for the worker ready marker on an instance via SSM RunCommand.
+
+        The init script (UserData) touches ``/var/run/parsl_worker_ready`` once
+        worker_init completes.  This method polls until that file exists.
+
+        Parameters
+        ----------
+        instance_id : str
+            EC2 instance ID to check.
+        timeout : int, optional
+            Maximum seconds to wait, by default 600.
+
+        Raises
+        ------
+        OperatingModeError
+            If the ready marker is not found within *timeout* seconds.
+        """
+        ssm = self.session.client("ssm")
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                resp = ssm.send_command(
+                    InstanceIds=[instance_id],
+                    DocumentName="AWS-RunShellScript",
+                    Parameters={"commands": ["test -f /var/run/parsl_worker_ready"]},
+                    Comment="Parsl worker ready check",
+                )
+                command_id = resp["Command"]["CommandId"]
+                # Brief wait then check the result
+                time.sleep(5)
+                invocation = ssm.get_command_invocation(
+                    CommandId=command_id,
+                    InstanceId=instance_id,
+                )
+                if invocation.get("StatusDetails") == "Success":
+                    logger.debug(f"Worker ready on {instance_id}")
+                    return
+            except ClientError as e:
+                logger.debug(f"SSM ready check: {e}")
+            time.sleep(15)
+        raise OperatingModeError(
+            f"Worker ready marker not found on {instance_id} within {timeout}s"
+        )
+
+    def _dispatch_ssm_command(self, instance_id: str, command: str, job_id: str) -> str:
+        """Dispatch a shell command to an EC2 instance via SSM SendCommand.
+
+        Parameters
+        ----------
+        instance_id : str
+            Target EC2 instance ID.
+        command : str
+            Shell command to execute.
+        job_id : str
+            Parsl job ID (used for environment variable export and comment).
+
+        Returns
+        -------
+        str
+            SSM CommandId for later status polling via ``get_command_invocation``.
+        """
+        ssm = self.session.client("ssm")
+        env_setup = (
+            f"export PARSL_JOB_ID={job_id}\n"
+            f"export PARSL_PROVIDER_ID={self.provider_id}\n"
+            "export PARSL_WORKER_ID=$(hostname)\n"
+        )
+        response = ssm.send_command(
+            InstanceIds=[instance_id],
+            DocumentName="AWS-RunShellScript",
+            Parameters={"commands": [env_setup + command]},
+            Comment=f"Parsl job {job_id[:16]}",
+        )
+        command_id = response["Command"]["CommandId"]
+        logger.debug(
+            f"Dispatched SSM command {command_id} to {instance_id} for job {job_id}"
+        )
+        return command_id
 
     def _create_instance(
         self, init_script: str, job_id: str, job_name: Optional[str] = None
@@ -1025,6 +1239,10 @@ class StandardMode(OperatingMode):
         # Add key pair if specified
         if self.key_name:
             run_args["KeyName"] = self.key_name
+
+        # Attach IAM instance profile when warm pool is enabled (SSM requires it)
+        if self.warm_pool_size > 0 and self.iam_instance_profile_arn:
+            run_args["IamInstanceProfile"] = {"Arn": self.iam_instance_profile_arn}
 
         # Use spot instances if requested
         if self.use_spot:
@@ -1269,9 +1487,10 @@ class StandardMode(OperatingMode):
         ec2 = self.session.client("ec2")
         status_map = {}
 
-        # Group IDs by resource type
+        # Group IDs by resource type / tracking method
         ec2_instances = []
         spot_fleet_blocks = []
+        warm_pool_instances = []  # tracked via SSM command invocation
 
         for resource_id in resource_ids:
             resource = self.resources.get(resource_id)
@@ -1279,12 +1498,52 @@ class StandardMode(OperatingMode):
                 status_map[resource_id] = STATUS_UNKNOWN
                 continue
 
-            if resource.get("type") == RESOURCE_TYPE_EC2:
+            if resource.get("warm_pool") and resource.get("ssm_command_id"):
+                warm_pool_instances.append(resource_id)
+            elif resource.get("type") == RESOURCE_TYPE_EC2:
                 ec2_instances.append(resource_id)
             elif resource.get("type") == RESOURCE_TYPE_SPOT_FLEET:
                 spot_fleet_blocks.append(resource_id)
             else:
                 status_map[resource_id] = STATUS_UNKNOWN
+
+        # --- Warm pool: poll SSM command invocation status ---
+        if warm_pool_instances:
+            ssm = self.session.client("ssm")
+            for instance_id in warm_pool_instances:
+                resource = self.resources[instance_id]
+                command_id = resource["ssm_command_id"]
+                try:
+                    response = ssm.get_command_invocation(
+                        CommandId=command_id,
+                        InstanceId=instance_id,
+                    )
+                    ssm_status = response.get("Status", "Unknown")
+                    if ssm_status == "Success":
+                        status = STATUS_COMPLETED
+                    elif ssm_status in (
+                        "Failed",
+                        "TimedOut",
+                        "Cancelled",
+                        "Undeliverable",
+                        "DeliveryTimedOut",
+                        "ExecutionTimedOut",
+                    ):
+                        status = STATUS_FAILED
+                    else:
+                        # InProgress, Pending, Delayed, etc.
+                        status = STATUS_RUNNING
+                    status_map[instance_id] = status
+                    self.resources[instance_id]["status"] = status
+                except ClientError as e:
+                    if "InvocationDoesNotExist" in str(e):
+                        # Command not yet received by the instance
+                        status_map[instance_id] = STATUS_RUNNING
+                    else:
+                        logger.error(
+                            f"Failed to get SSM command status for {instance_id}: {e}"
+                        )
+                        status_map[instance_id] = STATUS_UNKNOWN
 
         # Check EC2 instance status
         if ec2_instances:

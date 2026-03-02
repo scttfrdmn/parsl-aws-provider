@@ -27,7 +27,10 @@ from parsl_ephemeral_aws.constants import (
     DEFAULT_MIN_BLOCKS,
     DEFAULT_MODE,
     DEFAULT_REGION,
+    DEFAULT_WARM_POOL_SIZE,
+    DEFAULT_WARM_POOL_TTL,
     DEFAULT_WORKER_INIT,
+    STATUS_WARM,
 )
 from parsl_ephemeral_aws.exceptions import (
     ProviderConfigurationError,
@@ -56,7 +59,15 @@ _STRING_TO_JOB_STATE: Dict[str, JobState] = {
     "CANCELED": JobState.CANCELLED,
     "CANCELLED": JobState.CANCELLED,
     "UNKNOWN": JobState.UNKNOWN,
+    # WARM = instance idle in warm pool; the JOB is done so Parsl sees RUNNING
+    # (prevents premature cancellation while we reuse the instance).
+    "WARM": JobState.RUNNING,
 }
+
+# Job states that are terminal (Parsl will not re-submit once in these states)
+_TERMINAL_STATES: frozenset = frozenset(
+    {"COMPLETED", "FAILED", "CANCELED", "CANCELLED"}
+)
 
 
 class OperatingModeType(str, Enum):
@@ -182,6 +193,15 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
     waiter_max_attempts : int, optional
         Maximum number of waiter attempts before raising an error.
         Default is 60 (5 minutes at the default delay).
+    warm_pool_size : int, optional
+        Maximum number of instances to keep warm after their job finishes,
+        ready for immediate reuse without re-running worker_init.
+        Requires ``auto_create_instance_profile=True`` or
+        ``iam_instance_profile_arn`` (SSM SendCommand needs an IAM role).
+        Default is 0 (disabled).
+    warm_pool_ttl : int, optional
+        Seconds a warm idle instance stays alive before being terminated.
+        Default is 600 (10 minutes).
     """
 
     @typechecked
@@ -230,6 +250,8 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
         status_polling_interval: int = 60,
         waiter_delay: int = 5,
         waiter_max_attempts: int = 60,
+        warm_pool_size: int = DEFAULT_WARM_POOL_SIZE,
+        warm_pool_ttl: int = DEFAULT_WARM_POOL_TTL,
         **kwargs: Any,
     ) -> None:
         """Initialize the Ephemeral AWS Provider."""
@@ -312,7 +334,20 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
         self._status_polling_interval = status_polling_interval
         self.waiter_delay = waiter_delay
         self.waiter_max_attempts = waiter_max_attempts
+        self.warm_pool_size = warm_pool_size
+        self.warm_pool_ttl = warm_pool_ttl
         self.kwargs = kwargs
+
+        # Guard: warm pool uses SSM SendCommand which requires an IAM instance profile
+        if (
+            warm_pool_size > 0
+            and not auto_create_instance_profile
+            and not iam_instance_profile_arn
+        ):
+            raise ValueError(
+                "warm_pool_size > 0 requires either auto_create_instance_profile=True "
+                "or iam_instance_profile_arn to be set (SSM SendCommand needs IAM permissions)"
+            )
 
         # Initialize state
         self.session = create_session(
@@ -465,7 +500,12 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
         }
 
         if self.mode_type == OperatingModeType.STANDARD:
-            return StandardMode(**common_params)
+            return StandardMode(
+                iam_instance_profile_arn=self.iam_instance_profile_arn,
+                warm_pool_size=self.warm_pool_size,
+                warm_pool_ttl=self.warm_pool_ttl,
+                **common_params,
+            )
         elif self.mode_type == OperatingModeType.DETACHED:
             return DetachedMode(
                 bastion_instance_type=self.bastion_instance_type, **common_params
@@ -533,6 +573,8 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
                     "command": command,
                     "timestamp": time.time(),
                 }
+                if self.warm_pool_size > 0:
+                    self.resources[resource_id]["warm_pool"] = True
 
                 self.job_map[job_id] = {
                     "resource_id": resource_id,
@@ -568,20 +610,33 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
         internal_statuses: Dict[str, str] = {}
 
         try:
-            # Read resource_ids under lock
+            # Short-circuit jobs already in a terminal state — avoids stale
+            # re-queries when an instance has been reused for a different job.
             with self._lock:
+                for job_id in job_ids:
+                    if job_id in self.job_map:
+                        cached = self.job_map[job_id].get("status", "UNKNOWN")
+                        if cached in _TERMINAL_STATES:
+                            internal_statuses[job_id] = cached
+
+                # Only poll for non-terminal jobs
                 resource_ids = [
                     self.job_map[job_id]["resource_id"]
                     for job_id in job_ids
                     if job_id in self.job_map
+                    and self.job_map[job_id].get("status") not in _TERMINAL_STATES
                 ]
 
             # Fetch status outside lock (may involve network calls)
-            status_map = self.operating_mode.get_job_status(resource_ids)
+            status_map = (
+                self.operating_mode.get_job_status(resource_ids) if resource_ids else {}
+            )
 
             # Update internal state under lock
             with self._lock:
                 for job_id in job_ids:
+                    if job_id in internal_statuses:
+                        continue  # already set by terminal short-circuit
                     if job_id in self.job_map:
                         resource_id = self.job_map[job_id]["resource_id"]
                         if resource_id in status_map:
@@ -603,6 +658,11 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
             logger.error(f"Failed to get status for jobs {job_ids}: {e}")
             for job_id in job_ids:
                 internal_statuses.setdefault(job_id, "UNKNOWN")
+
+        # Trigger cleanup to process warm-pool transitions and TTL evictions.
+        # _cleanup_resources() is idempotent and handles its own errors.
+        if self.warm_pool_size > 0:
+            self._cleanup_resources()
 
         return [
             JobStatus(
@@ -674,6 +734,9 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
                 "resources": dict(self.resources),
                 "job_map": dict(self.job_map),
                 "timestamp": time.time(),
+                "warm_instances": list(
+                    getattr(self.operating_mode, "_warm_instances", [])
+                ),
             }
 
         try:
@@ -690,18 +753,56 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
                 with self._lock:
                     self.resources = state.get("resources", {})
                     self.job_map = state.get("job_map", {})
+                    # Restore warm-pool instance list into the operating mode
+                    if self.warm_pool_size > 0 and hasattr(
+                        self.operating_mode, "_warm_instances"
+                    ):
+                        self.operating_mode._warm_instances = state.get(
+                            "warm_instances", []
+                        )
                 logger.info(f"Loaded state with {len(self.resources)} resources")
         except Exception as e:
             logger.error(f"Failed to load provider state: {e}")
 
     def _cleanup_resources(self) -> None:
-        """Clean up resources that are completed or failed."""
-        resources_to_cleanup = []
+        """Clean up resources that are completed or failed.
 
-        # Find resources to clean up (lock protects iteration over self.resources)
+        Also handles the warm-pool lifecycle: transitioning COMPLETED warm-pool
+        instances to WARM state (keeping them alive for reuse) and evicting
+        instances that have exceeded their TTL.
+        """
+        resources_to_cleanup: List[str] = []
+        warm_transitions: List[str] = []  # COMPLETED warm-pool → WARM
+
+        # Scan resources under lock to build action lists
         with self._lock:
             for resource_id, resource in self.resources.items():
                 status = resource.get("status", "UNKNOWN")
+
+                if resource.get("warm_pool"):
+                    if status == STATUS_WARM:
+                        # Check TTL for warm idle instances
+                        age = time.time() - resource.get("warm_since", 0)
+                        if age > self.warm_pool_ttl:
+                            logger.info(
+                                f"Warm instance {resource_id} TTL expired "
+                                f"({age:.0f}s > {self.warm_pool_ttl}s), terminating"
+                            )
+                            resources_to_cleanup.append(resource_id)
+                        continue  # don't apply normal cleanup logic
+
+                    elif status == "COMPLETED":
+                        warm_transitions.append(resource_id)
+                        continue  # decision made below
+
+                    elif status in ("FAILED", "CANCELED"):
+                        resources_to_cleanup.append(resource_id)
+                        continue
+
+                    else:
+                        continue  # PENDING/RUNNING — leave alone
+
+                # Normal (non-warm-pool) lifecycle
                 if status in ["COMPLETED", "FAILED", "CANCELED"]:
                     resources_to_cleanup.append(resource_id)
                 elif (
@@ -711,12 +812,74 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
                 ):
                     logger.info(
                         f"Resource {resource_id} has been idle for "
-                        f"{time.time() - resource.get('timestamp', 0)} seconds, "
+                        f"{time.time() - resource.get('timestamp', 0):.0f} seconds, "
                         f"exceeding max_idle_time {self.max_idle_time}"
                     )
                     resources_to_cleanup.append(resource_id)
 
-        # Clean up resources outside the lock (network calls)
+        # Process COMPLETED → WARM transitions
+        if warm_transitions:
+            with self._lock:
+                current_warm = [
+                    rid
+                    for rid, r in self.resources.items()
+                    if r.get("warm_pool") and r.get("status") == STATUS_WARM
+                ]
+                for resource_id in warm_transitions:
+                    if resource_id not in self.resources:
+                        continue
+                    if len(current_warm) < self.warm_pool_size:
+                        # Transition this instance into the warm pool
+                        self.resources[resource_id]["status"] = STATUS_WARM
+                        self.resources[resource_id]["warm_since"] = time.time()
+                        current_warm.append(resource_id)
+                        if hasattr(self.operating_mode, "_warm_instances"):
+                            self.operating_mode._warm_instances.append(resource_id)
+                        logger.info(
+                            f"Instance {resource_id} moved to warm pool "
+                            f"({len(current_warm)}/{self.warm_pool_size})"
+                        )
+                    else:
+                        # Pool full — evict the oldest warm instance to make room
+                        oldest = min(
+                            current_warm,
+                            key=lambda r: self.resources.get(r, {}).get(
+                                "warm_since", 0
+                            ),
+                        )
+                        current_warm.remove(oldest)
+                        resources_to_cleanup.append(oldest)
+                        if hasattr(self.operating_mode, "_warm_instances"):
+                            try:
+                                self.operating_mode._warm_instances.remove(oldest)
+                            except ValueError:
+                                pass
+                        logger.info(
+                            f"Warm pool full; evicting oldest instance {oldest}, "
+                            f"replacing with {resource_id}"
+                        )
+                        self.resources[resource_id]["status"] = STATUS_WARM
+                        self.resources[resource_id]["warm_since"] = time.time()
+                        current_warm.append(resource_id)
+                        if hasattr(self.operating_mode, "_warm_instances"):
+                            self.operating_mode._warm_instances.append(resource_id)
+
+        # Remove TTL-expired warm instances from the mode's reuse list before
+        # the network termination call (so they can't be dispatched to mid-flight)
+        if resources_to_cleanup and hasattr(self.operating_mode, "_warm_instances"):
+            with self._lock:
+                for resource_id in resources_to_cleanup:
+                    resource = self.resources.get(resource_id, {})
+                    if (
+                        resource.get("warm_pool")
+                        and resource.get("status") == STATUS_WARM
+                    ):
+                        try:
+                            self.operating_mode._warm_instances.remove(resource_id)
+                        except ValueError:
+                            pass
+
+        # Terminate and remove cleaned-up resources (network calls, outside lock)
         if resources_to_cleanup:
             try:
                 self.operating_mode.cleanup_resources(resources_to_cleanup)

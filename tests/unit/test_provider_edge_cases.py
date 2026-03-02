@@ -8,6 +8,7 @@ SPDX-FileCopyrightText: 2025 Scott Friedman and Project Contributors
 
 import os
 import tempfile
+import time
 import uuid
 from unittest.mock import MagicMock, patch
 
@@ -146,3 +147,161 @@ class TestProviderEdgeCases:
 
         assert provider.waiter_delay == 5
         assert provider.waiter_max_attempts == 60
+
+
+# ---------------------------------------------------------------------------
+# TestWarmPool
+# ---------------------------------------------------------------------------
+
+
+_FAKE_IAM_ARN = "arn:aws:iam::123456789012:instance-profile/ParslSSMProfile"
+
+
+@pytest.mark.unit
+class TestWarmPool:
+    """Unit tests for the warm pool instance-reuse feature."""
+
+    @pytest.fixture
+    def tmp_dir(self):
+        with tempfile.TemporaryDirectory() as d:
+            yield d
+
+    # --- parameter / guard tests ---
+
+    def test_warm_pool_disabled_by_default(self, tmp_dir):
+        """warm_pool_size defaults to 0 and warm_pool_ttl to 600."""
+        provider, _ = _make_provider(tmp_dir)
+
+        assert provider.warm_pool_size == 0
+        assert provider.warm_pool_ttl == 600
+
+    def test_warm_pool_iam_guard_raises(self, tmp_dir):
+        """warm_pool_size > 0 without an IAM profile raises ValueError."""
+        with pytest.raises(ValueError, match="iam_instance_profile_arn"):
+            _make_provider(tmp_dir, warm_pool_size=1)
+
+    def test_warm_pool_iam_guard_passes_with_arn(self, tmp_dir):
+        """warm_pool_size > 0 with iam_instance_profile_arn does not raise."""
+        provider, _ = _make_provider(
+            tmp_dir,
+            warm_pool_size=2,
+            iam_instance_profile_arn=_FAKE_IAM_ARN,
+        )
+
+        assert provider.warm_pool_size == 2
+
+    def test_warm_pool_iam_guard_passes_with_auto_create(self, tmp_dir):
+        """warm_pool_size > 0 with auto_create_instance_profile=True does not raise."""
+        provider, _ = _make_provider(
+            tmp_dir,
+            warm_pool_size=1,
+            auto_create_instance_profile=True,
+        )
+
+        assert provider.warm_pool_size == 1
+
+    # --- lifecycle: COMPLETED → WARM transition ---
+
+    def _make_warm_provider(self, tmp_dir, warm_pool_size=2, warm_pool_ttl=600):
+        """Create a provider with warm pool enabled and a mode mock with _warm_instances."""
+        provider, mode = _make_provider(
+            tmp_dir,
+            warm_pool_size=warm_pool_size,
+            warm_pool_ttl=warm_pool_ttl,
+            iam_instance_profile_arn=_FAKE_IAM_ARN,
+        )
+        mode._warm_instances = []
+        return provider, mode
+
+    def test_completed_warm_pool_instance_transitions_to_warm(self, tmp_dir):
+        """_cleanup_resources() moves a COMPLETED warm-pool resource to WARM state."""
+        provider, mode = self._make_warm_provider(tmp_dir)
+
+        provider.resources["i-001"] = {
+            "job_id": "j-001",
+            "status": "COMPLETED",
+            "warm_pool": True,
+            "timestamp": time.time(),
+        }
+        provider.job_map["j-001"] = {"resource_id": "i-001", "status": "COMPLETED"}
+
+        provider._cleanup_resources()
+
+        assert "i-001" in provider.resources
+        assert provider.resources["i-001"]["status"] == "WARM"
+        assert "warm_since" in provider.resources["i-001"]
+        assert "i-001" in mode._warm_instances
+
+    def test_warm_instance_not_cleaned_up_before_ttl(self, tmp_dir):
+        """A WARM instance within its TTL is not terminated."""
+        provider, mode = self._make_warm_provider(tmp_dir, warm_pool_ttl=600)
+        mode._warm_instances = ["i-001"]
+
+        provider.resources["i-001"] = {
+            "job_id": "j-001",
+            "status": "WARM",
+            "warm_pool": True,
+            "warm_since": time.time() - 60,  # 60s old, TTL is 600s
+        }
+        provider.job_map["j-001"] = {"resource_id": "i-001", "status": "COMPLETED"}
+
+        provider._cleanup_resources()
+
+        assert "i-001" in provider.resources  # still alive
+        assert mode.cleanup_resources.call_count == 0
+
+    # --- TTL eviction ---
+
+    def test_ttl_eviction_terminates_expired_warm_instance(self, tmp_dir):
+        """A WARM instance past its TTL is terminated by _cleanup_resources()."""
+        provider, mode = self._make_warm_provider(tmp_dir, warm_pool_ttl=60)
+        mode._warm_instances = ["i-001"]
+
+        provider.resources["i-001"] = {
+            "job_id": "j-001",
+            "status": "WARM",
+            "warm_pool": True,
+            "warm_since": time.time() - 120,  # 120s old > 60s TTL
+        }
+        provider.job_map["j-001"] = {"resource_id": "i-001", "status": "COMPLETED"}
+
+        provider._cleanup_resources()
+
+        assert "i-001" not in provider.resources
+        assert "i-001" not in mode._warm_instances
+        mode.cleanup_resources.assert_called_once_with(["i-001"])
+
+    # --- pool-full eviction ---
+
+    def test_pool_full_evicts_oldest_warm_instance(self, tmp_dir):
+        """When the pool is full, the oldest warm instance is evicted for the newcomer."""
+        provider, mode = self._make_warm_provider(tmp_dir, warm_pool_size=1)
+        now = time.time()
+
+        # Existing warm instance (old)
+        mode._warm_instances = ["i-old"]
+        provider.resources["i-old"] = {
+            "job_id": "j-old",
+            "status": "WARM",
+            "warm_pool": True,
+            "warm_since": now - 300,
+        }
+        provider.job_map["j-old"] = {"resource_id": "i-old", "status": "COMPLETED"}
+
+        # New instance whose job just completed
+        provider.resources["i-new"] = {
+            "job_id": "j-new",
+            "status": "COMPLETED",
+            "warm_pool": True,
+            "timestamp": now,
+        }
+        provider.job_map["j-new"] = {"resource_id": "i-new", "status": "COMPLETED"}
+
+        provider._cleanup_resources()
+
+        # Oldest evicted, newcomer kept
+        assert "i-old" not in provider.resources
+        assert "i-new" in provider.resources
+        assert provider.resources["i-new"]["status"] == "WARM"
+        assert "i-new" in mode._warm_instances
+        assert "i-old" not in mode._warm_instances
