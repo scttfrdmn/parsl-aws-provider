@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **AMI baking** for `StandardMode`: set `bake_ami=True` to snapshot
+  `worker_init` into a custom AMI during `initialize()`, so subsequent
+  instance launches skip the ~30–60 s install entirely (closes #68).
+  - `bake_ami` — when `True`, a builder instance runs `worker_init` then shuts
+    itself down; once stopped, `create_image` snapshots it and all future
+    `_create_instance()` calls use the resulting AMI.
+  - `baked_ami_id` — supply a pre-existing baked AMI to skip the baking step
+    and use the AMI directly.
+  - Baked AMI ID and ownership flag are persisted in the state file; on
+    provider restart, `image_id` is restored automatically without re-baking.
+  - `cleanup_infrastructure()` deregisters the AMI and deletes its EBS
+    snapshots when `_owns_baked_ami=True`.
+  - `bake_ami=False` (default): zero code-path changes for existing users.
+
 ## [0.5.0] - 2026-03-01
 
 ### Added
