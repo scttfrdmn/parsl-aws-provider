@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-03-02
+
 ### Added
 - **AMI baking** for `StandardMode`: set `bake_ami=True` to snapshot
   `worker_init` into a custom AMI during `initialize()`, so subsequent
@@ -21,6 +23,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `cleanup_infrastructure()` deregisters the AMI and deletes its EBS
     snapshots when `_owns_baked_ami=True`.
   - `bake_ami=False` (default): zero code-path changes for existing users.
+- **Warm pool** for `StandardMode`: set `warm_pool_size` (default `0`) to keep
+  completed EC2 instances alive and reuse them for subsequent jobs via AWS SSM
+  `SendCommand`, skipping the ~30–60 s `worker_init` cold-start cost (closes #63).
+  - `warm_pool_size` — maximum number of idle instances to keep warm (0 = disabled).
+  - `warm_pool_ttl` — seconds a warm idle instance stays alive before eviction
+    (default 600).
+  - Requires `auto_create_instance_profile=True` or `iam_instance_profile_arn`
+    (SSM `SendCommand` needs an IAM role on the instance); a `ValueError` is raised
+    at construction time if neither is provided.
+  - Warm instances are tracked with `STATUS_WARM`; `_cleanup_resources()` handles
+    pool-full oldest-instance eviction and TTL-based termination.
+  - State (`_warm_instances` list) is persisted to the state file so warm instances
+    survive a provider restart with the same `state_file_path`.
 
 ## [0.5.0] - 2026-03-01
 
@@ -283,7 +298,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - ECS task definitions now create their CloudWatch log group before registration;
   log groups are tracked and deleted on cleanup (closes #22)
 
-[Unreleased]: https://github.com/scttfrdmn/parsl-aws-provider/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/scttfrdmn/parsl-aws-provider/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/scttfrdmn/parsl-aws-provider/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/scttfrdmn/parsl-aws-provider/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/scttfrdmn/parsl-aws-provider/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/scttfrdmn/parsl-aws-provider/compare/v0.2.0...v0.3.0
