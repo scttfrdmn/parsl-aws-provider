@@ -41,8 +41,8 @@ import os
 import sys
 
 import parsl
+from parsl import python_app
 from parsl.addresses import address_by_query, address_by_route
-from parsl.app.python import python_app
 from parsl.config import Config
 from parsl.executors import HighThroughputExecutor
 
