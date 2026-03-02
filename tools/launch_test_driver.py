@@ -55,19 +55,29 @@ AL2023_AMI = {
 # IAM instance profile that has AdministratorAccess (for creating workers)
 DRIVER_INSTANCE_PROFILE = "benchmark-builder-profile"
 
-# UserData: install git, clone the repo, install the package
+# UserData: install python3.11, git, clone the repo, install the package.
+# AL2023 ships python3.9 by default; parsl>=2026.1.5 requires Python 3.10+.
 DRIVER_USER_DATA = """\
 #!/bin/bash
 set -euo pipefail
-yum install -y git
+dnf install -y git python3.11 python3.11-pip
+ln -sf /usr/bin/python3.11 /usr/bin/python3
 cd /home/ec2-user
 git clone https://github.com/scttfrdmn/parsl-aws-provider.git
 cd parsl-aws-provider
-python3 -m pip install --quiet --upgrade pip
-python3 -m pip install --quiet -e .
+pip3.11 install --quiet -e '.[test]'
 chown -R ec2-user:ec2-user /home/ec2-user/parsl-aws-provider
 echo "DRIVER_READY" >> /var/log/driver-setup.log
 """
+
+
+def get_default_vpc(ec2) -> dict:
+    """Return the default VPC (id and CIDR block)."""
+    resp = ec2.describe_vpcs(Filters=[{"Name": "isDefault", "Values": ["true"]}])
+    vpcs = resp.get("Vpcs", [])
+    if not vpcs:
+        raise RuntimeError("No default VPC found in this region.")
+    return {"VpcId": vpcs[0]["VpcId"], "CidrBlock": vpcs[0]["CidrBlock"]}
 
 
 def get_default_subnet(ec2, region: str) -> str:
@@ -89,6 +99,64 @@ def get_default_subnet(ec2, region: str) -> str:
             "No default subnet found — create one or specify --subnet-id"
         )
     return subnets[0]["SubnetId"]
+
+
+def get_or_create_driver_sg(ec2, vpc_id: str, vpc_cidr: str) -> str:
+    """Return (creating if needed) a security group for the Parsl driver.
+
+    The driver's interchange must accept inbound ZMQ connections from workers
+    on ports 54000-55000.  The default VPC security group only allows inbound
+    from instances in the same SG; workers created by the provider use a
+    separate SG, so a dedicated driver SG is required.
+    """
+    sg_name = "parsl-test-driver-sg"
+    resp = ec2.describe_security_groups(
+        Filters=[
+            {"Name": "group-name", "Values": [sg_name]},
+            {"Name": "vpc-id", "Values": [vpc_id]},
+        ]
+    )
+    if resp.get("SecurityGroups"):
+        sg_id = resp["SecurityGroups"][0]["GroupId"]
+        log.info("Re-using existing driver SG %s", sg_id)
+        return sg_id
+
+    resp = ec2.create_security_group(
+        GroupName=sg_name,
+        Description="Parsl test driver: allows ZMQ worker connections",
+        VpcId=vpc_id,
+        TagSpecifications=[
+            {
+                "ResourceType": "security-group",
+                "Tags": [
+                    {"Key": "Name", "Value": sg_name},
+                    {"Key": "Purpose", "Value": "ParslIntegrationTestDriver"},
+                    {"Key": "AutoCleanup", "Value": "true"},
+                ],
+            }
+        ],
+    )
+    sg_id = resp["GroupId"]
+    log.info("Created driver SG %s", sg_id)
+
+    # Allow inbound ZMQ from anywhere in the VPC (workers connect outbound to us)
+    ec2.authorize_security_group_ingress(
+        GroupId=sg_id,
+        IpPermissions=[
+            {
+                "IpProtocol": "tcp",
+                "FromPort": 54000,
+                "ToPort": 55000,
+                "IpRanges": [
+                    {
+                        "CidrIp": vpc_cidr,
+                        "Description": "Parsl HTEX ZMQ worker connections",
+                    }
+                ],
+            }
+        ],
+    )
+    return sg_id
 
 
 def get_al2023_ami(ec2, region: str) -> str:
@@ -125,8 +193,18 @@ def launch_driver(region: str) -> str:
 
     ami = get_al2023_ami(ec2, region)
 
+    vpc = get_default_vpc(ec2)
+    vpc_id = vpc["VpcId"]
+    vpc_cidr = vpc["CidrBlock"]
+    log.info("Using default VPC %s (CIDR %s) in %s", vpc_id, vpc_cidr, region)
+
     subnet_id = get_default_subnet(ec2, region)
-    log.info("Using default subnet %s in %s", subnet_id, region)
+    log.info("Using default subnet %s", subnet_id)
+
+    # Create (or reuse) a driver SG that allows worker ZMQ connections inbound.
+    # The default VPC SG only allows inbound from the same SG; workers use a
+    # separate SG created by the provider.
+    sg_id = get_or_create_driver_sg(ec2, vpc_id, vpc_cidr)
 
     resp = ec2.run_instances(
         ImageId=ami,
@@ -134,6 +212,7 @@ def launch_driver(region: str) -> str:
         MinCount=1,
         MaxCount=1,
         SubnetId=subnet_id,
+        SecurityGroupIds=[sg_id],
         IamInstanceProfile={"Name": DRIVER_INSTANCE_PROFILE},
         UserData=DRIVER_USER_DATA,
         TagSpecifications=[
@@ -149,7 +228,7 @@ def launch_driver(region: str) -> str:
         MetadataOptions={"HttpTokens": "required"},  # IMDSv2
     )
     instance_id = resp["Instances"][0]["InstanceId"]
-    log.info("Launched driver instance %s", instance_id)
+    log.info("Launched driver instance %s (SG %s)", instance_id, sg_id)
     return instance_id
 
 

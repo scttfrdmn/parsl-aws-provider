@@ -8,6 +8,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- `examples/parsl_aws_integration.py`: added `encrypted=False` to `HighThroughputExecutor`
+  config. Parsl HTEX uses CurveZMQ encryption by default; the interchange generates TLS
+  certificates in `run_dir` on the driver, but workers on fresh EC2 instances cannot
+  access the driver's local filesystem. Workers were failing immediately with
+  `FileNotFoundError: .../certificates`. Same-VPC deployments rely on VPC network
+  isolation instead; cross-VPC or cross-internet deployments need certificate distribution
+  (tracked in issue #62).
+- `tools/launch_test_driver.py`: driver instances were launched with the default VPC
+  security group, which only allows inbound from instances in the same SG. Workers created
+  by the provider use a separate SG, so the interchange (bound on the driver) was
+  unreachable. Now creates/reuses a dedicated `parsl-test-driver-sg` with TCP 54000-55000
+  inbound from the VPC CIDR.
+- `tools/launch_test_driver.py`: `DRIVER_USER_DATA` now installs `python3.11` before
+  cloning and installing the package (AL2023 ships python3.9 by default;
+  `parsl>=2026.1.5` requires Python 3.10+).
 - `EphemeralAWSProvider.__init__` now calls `operating_mode.initialize()` automatically
   so the provider is ready for `submit()` immediately after construction, matching
   Parsl's `ExecutionProvider` contract (no separate initialize step required).
