@@ -172,8 +172,6 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
         Timeout in seconds for Lambda functions. Default is 300.
     debug : bool, optional
         Whether to enable debug logging. Default is False.
-    create_vpc : bool, optional
-        Whether to create a new VPC if vpc_id is not provided. Default is True.
     use_public_ips : bool, optional
         Whether to assign public IPs to instances. Default is True.
     custom_ami : bool, optional
@@ -252,7 +250,6 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
         memory_size: int = 1024,
         timeout: int = 300,
         debug: bool = False,
-        create_vpc: bool = True,
         use_public_ips: bool = True,
         custom_ami: bool = False,
         provider_id: Optional[str] = None,
@@ -339,7 +336,6 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
         self.memory_size = memory_size
         self.timeout = timeout
         self.debug = debug
-        self.create_vpc = create_vpc
         self.use_public_ips = use_public_ips
         self.custom_ami = custom_ami
         self.provider_id = provider_id or str(uuid.uuid4())
@@ -354,6 +350,13 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
         self.baked_ami_id = baked_ami_id
         self.one_shot = one_shot
         self.kwargs = kwargs
+
+        # Guard: network IDs are required (provider no longer creates VPC/subnet/SG)
+        if not vpc_id or not subnet_id or not security_group_id:
+            raise ValueError(
+                "vpc_id, subnet_id, and security_group_id are required. "
+                "Pre-provision network resources outside the provider."
+            )
 
         # Guard: one_shot is incompatible with warm pool (instances are terminated immediately)
         if one_shot and warm_pool_size > 0:
@@ -517,7 +520,6 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
             "additional_tags": self.additional_tags,
             "auto_shutdown": self.auto_shutdown,
             "max_idle_time": self.max_idle_time,
-            "create_vpc": self.create_vpc,
             "use_public_ips": self.use_public_ips,
             "custom_ami": self.custom_ami,
             "debug": self.debug,

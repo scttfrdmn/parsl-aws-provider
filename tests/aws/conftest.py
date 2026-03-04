@@ -22,6 +22,9 @@ logger = logging.getLogger(__name__)
 
 AWS_TEST_REGION = os.environ.get("AWS_TEST_REGION", "us-west-2")
 AWS_TEST_PROFILE = os.environ.get("AWS_TEST_PROFILE", "aws")
+AWS_TEST_VPC_ID = os.environ.get("AWS_TEST_VPC_ID")
+AWS_TEST_SUBNET_ID = os.environ.get("AWS_TEST_SUBNET_ID")
+AWS_TEST_SG_ID = os.environ.get("AWS_TEST_SG_ID")
 
 
 # ---------------------------------------------------------------------------
@@ -33,6 +36,32 @@ AWS_TEST_PROFILE = os.environ.get("AWS_TEST_PROFILE", "aws")
 def aws_region() -> str:
     """Return the AWS region under test."""
     return AWS_TEST_REGION
+
+
+# ---------------------------------------------------------------------------
+# Network IDs fixture — required for all E2E tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="session")
+def network_ids():
+    """Return pre-provisioned VPC/subnet/SG IDs, or skip if unset."""
+    missing = [
+        name
+        for name, val in [
+            ("AWS_TEST_VPC_ID", AWS_TEST_VPC_ID),
+            ("AWS_TEST_SUBNET_ID", AWS_TEST_SUBNET_ID),
+            ("AWS_TEST_SG_ID", AWS_TEST_SG_ID),
+        ]
+        if not val
+    ]
+    if missing:
+        pytest.skip(f"Set {', '.join(missing)} to run E2E tests")
+    return dict(
+        vpc_id=AWS_TEST_VPC_ID,
+        subnet_id=AWS_TEST_SUBNET_ID,
+        security_group_id=AWS_TEST_SG_ID,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -52,7 +81,7 @@ def test_run_id() -> str:
 
 
 @pytest.fixture
-def aws_provider(tmp_path, aws_session, test_run_id, aws_region):
+def aws_provider(tmp_path, aws_session, test_run_id, aws_region, network_ids):
     """Create and initialize a real EphemeralAWSProvider.
 
     Yields a fully initialised provider and tears it down afterwards.
@@ -78,9 +107,8 @@ def aws_provider(tmp_path, aws_session, test_run_id, aws_region):
         waiter_delay=15,
         waiter_max_attempts=40,
         debug=True,
+        **network_ids,
     )
-
-    provider.operating_mode.initialize()
 
     yield provider
 
@@ -133,7 +161,7 @@ def cleanup_stray_instances(aws_session, aws_region, test_run_id):
 
 
 @pytest.fixture
-def spot_provider(tmp_path, aws_session, test_run_id, aws_region):
+def spot_provider(tmp_path, aws_session, test_run_id, aws_region, network_ids):
     """Provider configured for spot instances without interruption handling.
 
     Uses ``use_spot=True`` with ``spot_interruption_handling=False`` to avoid
@@ -159,9 +187,8 @@ def spot_provider(tmp_path, aws_session, test_run_id, aws_region):
         waiter_delay=15,
         waiter_max_attempts=40,
         debug=True,
+        **network_ids,
     )
-
-    provider.operating_mode.initialize()
 
     yield provider
 
@@ -179,13 +206,8 @@ def spot_provider(tmp_path, aws_session, test_run_id, aws_region):
 
 
 @pytest.fixture
-def serverless_provider(tmp_path, aws_session, test_run_id, aws_region):
-    """Provider configured for serverless (auto worker_type) mode.
-
-    The default worker_type is WORKER_TYPE_AUTO which creates VPC/subnet/SG
-    resources for ECS *and* initialises LambdaManager for Lambda jobs.  Short
-    single-task commands are dispatched to Lambda; everything else goes to ECS.
-    """
+def serverless_provider(tmp_path, aws_session, test_run_id, aws_region, network_ids):
+    """Provider configured for serverless (auto worker_type) mode."""
     state_file = str(tmp_path / f"state-{test_run_id}.json")
 
     provider = EphemeralAWSProvider(
@@ -203,9 +225,8 @@ def serverless_provider(tmp_path, aws_session, test_run_id, aws_region):
         waiter_delay=15,
         waiter_max_attempts=40,
         debug=True,
+        **network_ids,
     )
-
-    provider.operating_mode.initialize()
 
     yield provider
 
@@ -250,7 +271,7 @@ def cleanup_stray_lambda_resources(aws_session, aws_region, test_run_id):
 
 
 @pytest.fixture
-def detached_provider(tmp_path, aws_session, test_run_id, aws_region):
+def detached_provider(tmp_path, aws_session, test_run_id, aws_region, network_ids):
     """Provider configured for detached (bastion host) mode."""
     state_file = str(tmp_path / f"state-{test_run_id}.json")
 
@@ -271,9 +292,8 @@ def detached_provider(tmp_path, aws_session, test_run_id, aws_region):
         waiter_delay=15,
         waiter_max_attempts=40,
         debug=True,
+        **network_ids,
     )
-
-    provider.operating_mode.initialize()
 
     yield provider
 
@@ -291,7 +311,7 @@ def detached_provider(tmp_path, aws_session, test_run_id, aws_region):
 
 
 @pytest.fixture
-def parameter_store_provider(aws_session, test_run_id, aws_region):
+def parameter_store_provider(aws_session, test_run_id, aws_region, network_ids):
     """Provider using AWS Parameter Store as the state backend."""
     provider = EphemeralAWSProvider(
         region=aws_region,
@@ -309,9 +329,8 @@ def parameter_store_provider(aws_session, test_run_id, aws_region):
         waiter_delay=15,
         waiter_max_attempts=40,
         debug=True,
+        **network_ids,
     )
-
-    provider.operating_mode.initialize()
 
     yield provider
 
@@ -357,7 +376,7 @@ def s3_state_bucket(aws_session, test_run_id, aws_region):
 
 
 @pytest.fixture
-def s3_provider(aws_session, test_run_id, aws_region, s3_state_bucket):
+def s3_provider(aws_session, test_run_id, aws_region, s3_state_bucket, network_ids):
     """Provider using S3 as the state backend."""
     provider = EphemeralAWSProvider(
         region=aws_region,
@@ -375,9 +394,8 @@ def s3_provider(aws_session, test_run_id, aws_region, s3_state_bucket):
         waiter_delay=15,
         waiter_max_attempts=40,
         debug=True,
+        **network_ids,
     )
-
-    provider.operating_mode.initialize()
 
     yield provider
 
@@ -395,17 +413,10 @@ def s3_provider(aws_session, test_run_id, aws_region, s3_state_bucket):
 
 
 @pytest.fixture
-def globus_compute_provider(tmp_path, aws_session, test_run_id, aws_region):
-    """Provider configured for Globus Compute endpoint config generation.
-
-    Creates a ``GlobusComputeProvider`` backed by standard EC2 mode and yields
-    it without calling ``operating_mode.initialize()`` — Globus Compute
-    endpoint tests manage the lifecycle via the ``globus-compute-endpoint``
-    CLI rather than calling the provider directly.
-
-    The provider is shut down best-effort in teardown to release any EC2
-    resources that may have been provisioned by lifecycle tests.
-    """
+def globus_compute_provider(
+    tmp_path, aws_session, test_run_id, aws_region, network_ids
+):
+    """Provider configured for Globus Compute endpoint config generation."""
     state_file = str(tmp_path / f"state-gc-{test_run_id}.json")
 
     provider = GlobusComputeProvider(
@@ -425,6 +436,7 @@ def globus_compute_provider(tmp_path, aws_session, test_run_id, aws_region):
         waiter_delay=15,
         waiter_max_attempts=40,
         debug=True,
+        **network_ids,
     )
 
     yield provider

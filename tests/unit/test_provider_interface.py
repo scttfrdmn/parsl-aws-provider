@@ -71,6 +71,9 @@ def _make_provider(tmp_dir, mode_mock=None, max_blocks=5):
             max_blocks=max_blocks,
             min_blocks=0,
             init_blocks=0,
+            vpc_id="vpc-test00001",
+            subnet_id="subnet-test001",
+            security_group_id="sg-test00001",
         )
 
     return provider, mode_mock

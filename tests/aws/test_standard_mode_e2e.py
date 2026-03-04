@@ -1,7 +1,7 @@
 """Real-AWS end-to-end tests for StandardMode full lifecycle.
 
-These tests create actual AWS infrastructure (VPC, subnet, security group,
-EC2 instances) and verify the full provider lifecycle:
+These tests verify the full provider lifecycle against pre-provisioned AWS
+network resources (VPC/subnet/SG passed via environment variables):
 
     PENDING → RUNNING → COMPLETED
 
@@ -10,18 +10,17 @@ and the provider reports COMPLETED only after the instance terminates.
 
 Run with::
 
+    AWS_TEST_VPC_ID=vpc-xxx AWS_TEST_SUBNET_ID=subnet-xxx AWS_TEST_SG_ID=sg-xxx \\
     AWS_PROFILE=aws pytest tests/aws/ -m "aws" --no-cov -v
 
 SPDX-License-Identifier: Apache-2.0
 SPDX-FileCopyrightText: 2025 Scott Friedman and Project Contributors
 """
 
-import ipaddress
 import time
 import logging
 
 import pytest
-from botocore.exceptions import ClientError
 
 logger = logging.getLogger(__name__)
 
@@ -61,93 +60,6 @@ def _poll_until(
             return True
         time.sleep(POLL_INTERVAL_S)
     return False
-
-
-# ---------------------------------------------------------------------------
-# TestStandardModeInfrastructure
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.aws
-@pytest.mark.slow
-class TestStandardModeInfrastructure:
-    """Verify that the VPC/subnet/SG resources are created correctly.
-
-    Uses a single provider instance for the whole class (class-scoped
-    fixture) to avoid repeated infrastructure setup/teardown.
-    """
-
-    def test_vpc_created_and_available(self, aws_provider, aws_session, aws_region):
-        """Provider creates a VPC and it reaches 'available' state."""
-        vpc_id = aws_provider.operating_mode.vpc_id
-        assert vpc_id is not None, "vpc_id should be set after initialize()"
-
-        ec2 = aws_session.client("ec2", region_name=aws_region)
-        response = ec2.describe_vpcs(VpcIds=[vpc_id])
-        vpcs = response.get("Vpcs", [])
-        assert len(vpcs) == 1, f"Expected exactly one VPC for {vpc_id}, got {vpcs}"
-        assert (
-            vpcs[0]["State"] == "available"
-        ), f"VPC {vpc_id} is in state '{vpcs[0]['State']}', expected 'available'"
-
-    def test_subnet_created_in_vpc(self, aws_provider, aws_session, aws_region):
-        """Provider creates a subnet inside the provider VPC."""
-        subnet_id = aws_provider.operating_mode.subnet_id
-        vpc_id = aws_provider.operating_mode.vpc_id
-        assert subnet_id is not None, "subnet_id should be set after initialize()"
-
-        ec2 = aws_session.client("ec2", region_name=aws_region)
-        response = ec2.describe_subnets(SubnetIds=[subnet_id])
-        subnets = response.get("Subnets", [])
-        assert (
-            len(subnets) == 1
-        ), f"Expected exactly one subnet for {subnet_id}, got {subnets}"
-        assert subnets[0]["VpcId"] == vpc_id, (
-            f"Subnet {subnet_id} belongs to VPC {subnets[0]['VpcId']}, "
-            f"expected {vpc_id}"
-        )
-
-    def test_security_group_created_in_vpc(self, aws_provider, aws_session, aws_region):
-        """Provider creates a security group inside the provider VPC."""
-        sg_id = aws_provider.operating_mode.security_group_id
-        vpc_id = aws_provider.operating_mode.vpc_id
-        assert sg_id is not None, "security_group_id should be set after initialize()"
-
-        ec2 = aws_session.client("ec2", region_name=aws_region)
-        response = ec2.describe_security_groups(GroupIds=[sg_id])
-        groups = response.get("SecurityGroups", [])
-        assert len(groups) == 1, f"Expected exactly one SG for {sg_id}, got {groups}"
-        assert groups[0]["VpcId"] == vpc_id, (
-            f"Security group {sg_id} belongs to VPC {groups[0]['VpcId']}, "
-            f"expected {vpc_id}"
-        )
-
-    def test_vpc_cidr_no_conflict(self, aws_provider, aws_session, aws_region):
-        """The provider VPC CIDR does not overlap any other VPC in the account."""
-        vpc_id = aws_provider.operating_mode.vpc_id
-        assert vpc_id is not None
-
-        ec2 = aws_session.client("ec2", region_name=aws_region)
-        response = ec2.describe_vpcs()
-        all_vpcs = response.get("Vpcs", [])
-
-        # Find our VPC's CIDR
-        provider_cidr = None
-        other_cidrs = []
-        for vpc in all_vpcs:
-            if vpc["VpcId"] == vpc_id:
-                provider_cidr = vpc["CidrBlock"]
-            else:
-                other_cidrs.append(vpc["CidrBlock"])
-
-        assert provider_cidr is not None, f"Could not find CIDR for VPC {vpc_id}"
-
-        provider_net = ipaddress.IPv4Network(provider_cidr, strict=False)
-        for cidr in other_cidrs:
-            other_net = ipaddress.IPv4Network(cidr, strict=False)
-            assert not provider_net.overlaps(
-                other_net
-            ), f"Provider VPC CIDR {provider_cidr} overlaps existing VPC CIDR {cidr}"
 
 
 # ---------------------------------------------------------------------------
@@ -287,74 +199,3 @@ class TestStandardModeComputeLifecycle:
             f"Instance {resource_id} did not reach a terminal state after cancel(); "
             f"last observed state: {final_state}"
         )
-
-
-# ---------------------------------------------------------------------------
-# TestStandardModeCleanup
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.aws
-@pytest.mark.slow
-class TestStandardModeCleanup:
-    """Verify that provider.shutdown() removes all created infrastructure."""
-
-    def test_shutdown_removes_vpc(self, aws_provider, aws_session, aws_region):
-        """After shutdown() the provider VPC no longer exists."""
-        vpc_id = aws_provider.operating_mode.vpc_id
-        assert vpc_id is not None
-
-        aws_provider.shutdown()
-
-        ec2 = aws_session.client("ec2", region_name=aws_region)
-        try:
-            response = ec2.describe_vpcs(VpcIds=[vpc_id])
-            vpcs = response.get("Vpcs", [])
-            assert vpcs == [], f"VPC {vpc_id} still exists after shutdown(): {vpcs}"
-        except ClientError as exc:
-            error_code = exc.response["Error"]["Code"]
-            assert (
-                error_code == "InvalidVpcID.NotFound"
-            ), f"Unexpected ClientError checking VPC after shutdown(): {exc}"
-
-    def test_shutdown_removes_subnet(self, aws_provider, aws_session, aws_region):
-        """After shutdown() the provider subnet no longer exists."""
-        subnet_id = aws_provider.operating_mode.subnet_id
-        assert subnet_id is not None
-
-        aws_provider.shutdown()
-
-        ec2 = aws_session.client("ec2", region_name=aws_region)
-        try:
-            response = ec2.describe_subnets(SubnetIds=[subnet_id])
-            subnets = response.get("Subnets", [])
-            assert (
-                subnets == []
-            ), f"Subnet {subnet_id} still exists after shutdown(): {subnets}"
-        except ClientError as exc:
-            error_code = exc.response["Error"]["Code"]
-            assert (
-                error_code == "InvalidSubnetID.NotFound"
-            ), f"Unexpected ClientError checking subnet after shutdown(): {exc}"
-
-    def test_shutdown_removes_security_group(
-        self, aws_provider, aws_session, aws_region
-    ):
-        """After shutdown() the provider security group no longer exists."""
-        sg_id = aws_provider.operating_mode.security_group_id
-        assert sg_id is not None
-
-        aws_provider.shutdown()
-
-        ec2 = aws_session.client("ec2", region_name=aws_region)
-        try:
-            response = ec2.describe_security_groups(GroupIds=[sg_id])
-            groups = response.get("SecurityGroups", [])
-            assert (
-                groups == []
-            ), f"Security group {sg_id} still exists after shutdown(): {groups}"
-        except ClientError as exc:
-            error_code = exc.response["Error"]["Code"]
-            assert (
-                error_code == "InvalidGroup.NotFound"
-            ), f"Unexpected ClientError checking SG after shutdown(): {exc}"

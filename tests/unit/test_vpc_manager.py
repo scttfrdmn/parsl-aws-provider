@@ -1,6 +1,6 @@
-"""Unit tests for VPC manager, security group manager, and VPC CIDR conflict detection.
+"""Unit tests for VPC manager and security group manager.
 
-Tests #48 and part of #36 coverage.
+Tests #48 coverage.
 
 SPDX-License-Identifier: Apache-2.0
 SPDX-FileCopyrightText: 2025 Scott Friedman and Project Contributors
@@ -11,8 +11,6 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from parsl_ephemeral_aws.exceptions import NetworkCreationError
-from parsl_ephemeral_aws.modes.standard import StandardMode
 from parsl_ephemeral_aws.network.vpc import VPCManager
 
 
@@ -122,41 +120,3 @@ class TestVPCManagerCreation:
         for i, a in enumerate(networks):
             for b in networks[i + 1 :]:
                 assert not a.overlaps(b), f"{a} overlaps {b}"
-
-
-# ---------------------------------------------------------------------------
-# TestVPCCIDRConflict  (covers issue #36)
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.unit
-class TestVPCCIDRConflict:
-    """Tests for StandardMode._find_available_vpc_cidr."""
-
-    def test_find_available_cidr_skips_conflicting(self):
-        """Returns 10.1.0.0/16 when 10.0.0.0/16 is already in use."""
-        ec2 = MagicMock()
-        ec2.describe_vpcs.return_value = {"Vpcs": [{"CidrBlock": "10.0.0.0/16"}]}
-
-        cidr = StandardMode._find_available_vpc_cidr(ec2)
-
-        assert cidr == "10.1.0.0/16"
-
-    def test_find_available_cidr_returns_first_free(self):
-        """Returns 10.0.0.0/16 when no VPCs exist."""
-        ec2 = MagicMock()
-        ec2.describe_vpcs.return_value = {"Vpcs": []}
-
-        cidr = StandardMode._find_available_vpc_cidr(ec2)
-
-        assert cidr == "10.0.0.0/16"
-
-    def test_find_available_cidr_raises_when_all_occupied(self):
-        """Raises NetworkCreationError when all 256 /16 CIDRs are occupied."""
-        ec2 = MagicMock()
-        ec2.describe_vpcs.return_value = {
-            "Vpcs": [{"CidrBlock": f"10.{n}.0.0/16"} for n in range(256)]
-        }
-
-        with pytest.raises(NetworkCreationError, match="No /16 CIDR available"):
-            StandardMode._find_available_vpc_cidr(ec2)

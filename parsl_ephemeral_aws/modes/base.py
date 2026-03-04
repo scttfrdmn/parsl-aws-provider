@@ -67,8 +67,6 @@ class OperatingMode(abc.ABC):
         Whether to automatically shut down idle resources
     max_idle_time : int
         Maximum idle time in seconds before shutdown
-    create_vpc : bool
-        Whether to create a new VPC if vpc_id is not provided
     use_public_ips : bool
         Whether to assign public IPs to instances
     custom_ami : bool
@@ -99,7 +97,6 @@ class OperatingMode(abc.ABC):
         additional_tags: Optional[Dict[str, str]] = None,
         auto_shutdown: bool = True,
         max_idle_time: int = 300,
-        create_vpc: bool = True,
         use_public_ips: bool = True,
         custom_ami: bool = False,
         debug: bool = False,
@@ -150,8 +147,6 @@ class OperatingMode(abc.ABC):
             Whether to automatically shut down idle resources, by default True
         max_idle_time : int, optional
             Maximum idle time in seconds before shutdown, by default 300
-        create_vpc : bool, optional
-            Whether to create a new VPC if vpc_id is not provided, by default True
         use_public_ips : bool, optional
             Whether to assign public IPs to instances, by default True
         custom_ami : bool, optional
@@ -179,7 +174,6 @@ class OperatingMode(abc.ABC):
         self.additional_tags = additional_tags or {}
         self.auto_shutdown = auto_shutdown
         self.max_idle_time = max_idle_time
-        self.create_vpc = create_vpc
         self.use_public_ips = use_public_ips
         self.custom_ami = custom_ami
         self.debug = debug
@@ -193,6 +187,12 @@ class OperatingMode(abc.ABC):
         # Initialize state
         self.resources: Dict[str, Dict[str, Any]] = {}
         self.initialized = False
+
+        if not self.vpc_id or not self.subnet_id or not self.security_group_id:
+            raise ValueError(
+                "vpc_id, subnet_id, and security_group_id are required. "
+                "Pre-provision network resources and pass their IDs."
+            )
 
         logger.debug(f"Initialized {self.__class__.__name__}")
 

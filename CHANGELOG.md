@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+- `create_vpc` parameter — VPC/subnet/security-group creation removed from the
+  provider entirely (closes #69).
+- `_create_vpc()`, `_create_subnet()`, `_create_security_group()`, and
+  `_find_available_vpc_cidr()` helpers deleted from `StandardMode` and
+  `DetachedMode`.
+
+### Changed
+- `vpc_id`, `subnet_id`, and `security_group_id` are now **required** constructor
+  arguments; a `ValueError` is raised at init if any are missing.
+- `cleanup_infrastructure()` no longer destroys network resources — VPC,
+  subnet, and security group are now the caller's responsibility.
+- E2E tests read `AWS_TEST_VPC_ID`, `AWS_TEST_SUBNET_ID`, and `AWS_TEST_SG_ID`
+  from the environment; tests are skipped (not failed) when these are unset.
+- Added `docs/network-prerequisites.md` with Terraform and CloudFormation
+  snippets for provisioning the required network resources.
+
 ### Added
 - **One-shot mode** for `StandardMode`: set `one_shot=True` to explicitly declare
   that each EC2 instance runs a single command then terminates, regardless of the

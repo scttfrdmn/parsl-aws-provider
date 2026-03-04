@@ -64,6 +64,9 @@ def _make_provider(tmp_dir, max_blocks=5, **extra_kwargs):
             max_blocks=max_blocks,
             min_blocks=0,
             init_blocks=0,
+            vpc_id="vpc-test00001",
+            subnet_id="subnet-test001",
+            security_group_id="sg-test00001",
             **extra_kwargs,
         )
 
@@ -358,20 +361,12 @@ class TestAMIBaking:
             state_store=state_store,
             image_id="ami-base",
             baked_ami_id="ami-prefab",
+            vpc_id="vpc-123",
+            subnet_id="subnet-123",
+            security_group_id="sg-123",
         )
-        # Manually drive initialize() — patch VPC/subnet/SG creation to be no-ops
-        mode.vpc_id = "vpc-123"
-        mode.subnet_id = "subnet-123"
-        mode.security_group_id = "sg-123"
-        mode._owns_vpc = False
-        mode._owns_subnet = False
-        mode._owns_security_group = False
         # Run just the baking branch by calling initialize() with network already set
-        with patch.object(mode, "_create_vpc", return_value="vpc-123"), patch.object(
-            mode, "_create_subnet", return_value="subnet-123"
-        ), patch.object(
-            mode, "_create_security_group", return_value="sg-123"
-        ), patch.object(mode, "save_state"), patch.object(
+        with patch.object(mode, "save_state"), patch.object(
             mode, "load_state", return_value=False
         ), patch.object(mode, "_verify_resources"):
             mode.initialize()
@@ -412,10 +407,10 @@ class TestAMIBaking:
             state_store=state_store,
             image_id="ami-base",
             bake_ami=True,
+            vpc_id="vpc-123",
+            subnet_id="subnet-123",
+            security_group_id="sg-123",
         )
-        mode.vpc_id = "vpc-123"
-        mode.subnet_id = "subnet-123"
-        mode.security_group_id = "sg-123"
 
         with patch("parsl_ephemeral_aws.modes.standard.wait_for_resource") as mock_wait:
             ami_id = mode._bake_ami()
@@ -451,6 +446,9 @@ class TestAMIBaking:
             session=session_mock,
             state_store=state_store,
             image_id="ami-base",
+            vpc_id="vpc-test00001",
+            subnet_id="subnet-test001",
+            security_group_id="sg-test00001",
         )
         mode._baked_ami_id = "ami-saved001"
         mode._owns_baked_ami = True
@@ -488,13 +486,16 @@ class TestAMIBaking:
             session=session_mock,
             state_store=state_store,
             image_id="ami-base",
+            vpc_id="vpc-test00001",
+            subnet_id="subnet-test001",
+            security_group_id="sg-test00001",
         )
         persisted_state = {
             "provider_id": provider_id,
             "resources": {},
-            "vpc_id": None,
-            "subnet_id": None,
-            "security_group_id": None,
+            "vpc_id": "vpc-test00001",
+            "subnet_id": "subnet-test001",
+            "security_group_id": "sg-test00001",
             "initialized": True,
             "use_spot_fleet": False,
             "spot_interruption_handling": False,
@@ -544,13 +545,13 @@ class TestAMIBaking:
             session=session_mock,
             state_store=state_store,
             image_id="ami-base",
+            vpc_id="vpc-test00001",
+            subnet_id="subnet-test001",
+            security_group_id="sg-test00001",
         )
         mode._baked_ami_id = "ami-cleanup001"
         mode._owns_baked_ami = True
         mode.initialized = True
-        mode.vpc_id = None
-        mode.subnet_id = None
-        mode.security_group_id = None
 
         with patch.object(mode, "cleanup_all"), patch.object(mode, "save_state"):
             mode.cleanup_infrastructure()
@@ -610,6 +611,9 @@ class TestOneShotMode:
             image_id="ami-12345678",
             auto_shutdown=False,
             one_shot=True,
+            vpc_id="vpc-test00001",
+            subnet_id="subnet-test001",
+            security_group_id="sg-test00001",
         )
 
         script = mode._prepare_init_script("echo hi", "job-1")

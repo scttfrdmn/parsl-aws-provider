@@ -8,7 +8,6 @@ SPDX-License-Identifier: Apache-2.0
 SPDX-FileCopyrightText: 2025 Scott Friedman and Project Contributors
 """
 
-import ipaddress
 import logging
 import time
 import uuid
@@ -18,16 +17,8 @@ import boto3
 from botocore.exceptions import ClientError
 
 from parsl_ephemeral_aws.constants import (
-    DEFAULT_INBOUND_RULES,
-    DEFAULT_OUTBOUND_RULES,
-    DEFAULT_PUBLIC_SUBNET_CIDR,
-    DEFAULT_SECURITY_GROUP_DESCRIPTION,
-    DEFAULT_SECURITY_GROUP_NAME,
     EC2_STATUS_MAPPING,
     RESOURCE_TYPE_EC2,
-    RESOURCE_TYPE_SECURITY_GROUP,
-    RESOURCE_TYPE_SUBNET,
-    RESOURCE_TYPE_VPC,
     RESOURCE_TYPE_SPOT_FLEET,
     STATUS_CANCELED,
     STATUS_COMPLETED,
@@ -38,10 +29,8 @@ from parsl_ephemeral_aws.constants import (
     STATUS_WARM,
 )
 from parsl_ephemeral_aws.exceptions import (
-    NetworkCreationError,
     OperatingModeError,
     ResourceCreationError,
-    ResourceNotFoundError,
     SpotFleetError,
 )
 from parsl_ephemeral_aws.modes.base import OperatingMode
@@ -51,8 +40,6 @@ from parsl_ephemeral_aws.compute.spot_interruption import (
     ParslSpotInterruptionHandler,
 )
 from parsl_ephemeral_aws.utils.aws import (
-    create_tags,
-    delete_resource,
     get_default_ami,
     wait_for_resource,
 )
@@ -89,7 +76,6 @@ class StandardMode(OperatingMode):
         additional_tags: Optional[Dict[str, str]] = None,
         auto_shutdown: bool = True,
         max_idle_time: int = 300,
-        create_vpc: bool = True,
         use_public_ips: bool = True,
         custom_ami: bool = False,
         debug: bool = False,
@@ -141,8 +127,6 @@ class StandardMode(OperatingMode):
             Whether to automatically shut down idle resources, by default True
         max_idle_time : int, optional
             Maximum idle time in seconds before shutdown, by default 300
-        create_vpc : bool, optional
-            Whether to create a new VPC if vpc_id is not provided, by default True
         use_public_ips : bool, optional
             Whether to assign public IPs to instances, by default True
         custom_ami : bool, optional
@@ -176,7 +160,6 @@ class StandardMode(OperatingMode):
             additional_tags=additional_tags,
             auto_shutdown=auto_shutdown,
             max_idle_time=max_idle_time,
-            create_vpc=create_vpc,
             use_public_ips=use_public_ips,
             custom_ami=custom_ami,
             debug=debug,
@@ -256,10 +239,6 @@ class StandardMode(OperatingMode):
                     checkpoint_bucket=self.checkpoint_bucket,
                     checkpoint_prefix=self.checkpoint_prefix,
                 )
-
-        # If predefined VPC resources are provided, don't create new VPC
-        if self.vpc_id:
-            self.create_vpc = False
 
     # ------------------------------------------------------------------
     # AMI baking helpers
@@ -607,9 +586,6 @@ class StandardMode(OperatingMode):
     def initialize(self) -> None:
         """Initialize standard mode infrastructure.
 
-        Creates the necessary VPC, subnet, and security group resources
-        if they don't already exist.
-
         Raises
         ------
         ResourceCreationError
@@ -628,29 +604,8 @@ class StandardMode(OperatingMode):
 
         logger.debug("Initializing standard mode infrastructure")
 
-        # Track which resources this provider created so cleanup only removes
-        # its own resources, not pre-existing VPCs/subnets passed by the caller.
-        self._owns_vpc = False
-        self._owns_subnet = False
-        self._owns_security_group = False
-
         # Create AWS resources
         try:
-            # Create VPC if needed
-            if not self.vpc_id and self.create_vpc:
-                self.vpc_id = self._create_vpc()
-                self._owns_vpc = True
-
-            # Create subnet if needed
-            if not self.subnet_id and self.vpc_id:
-                self.subnet_id = self._create_subnet()
-                self._owns_subnet = True
-
-            # Create security group if needed
-            if not self.security_group_id and self.vpc_id:
-                self.security_group_id = self._create_security_group()
-                self._owns_security_group = True
-
             # AMI baking: snapshot worker_init into a custom AMI
             if self.bake_ami and not self._baked_ami_id:
                 ami_id = self._bake_ami()
@@ -750,323 +705,6 @@ class StandardMode(OperatingMode):
                     self.security_group_id = None
                 else:
                     raise
-
-    @staticmethod
-    def _find_available_vpc_cidr(ec2_client: Any) -> str:
-        """Find a /16 CIDR block in the 10.x.0.0/16 range that does not overlap
-        any existing VPC in the account.
-
-        Parameters
-        ----------
-        ec2_client : Any
-            Boto3 EC2 client
-
-        Returns
-        -------
-        str
-            Available CIDR block (e.g. '10.0.0.0/16')
-
-        Raises
-        ------
-        NetworkCreationError
-            If no non-overlapping /16 CIDR is available
-        """
-        existing = [
-            ipaddress.ip_network(vpc["CidrBlock"])
-            for vpc in ec2_client.describe_vpcs()["Vpcs"]
-        ]
-        for n in range(256):
-            candidate = ipaddress.ip_network(f"10.{n}.0.0/16")
-            if not any(candidate.overlaps(e) for e in existing):
-                return str(candidate)
-        raise NetworkCreationError("No /16 CIDR available in 10.x.0.0/16 range")
-
-    def _create_vpc(self) -> str:
-        """Create a VPC for the provider.
-
-        Returns
-        -------
-        str
-            VPC ID
-
-        Raises
-        ------
-        NetworkCreationError
-            If VPC creation fails
-        """
-        logger.info("Creating VPC")
-        ec2 = self.session.client("ec2")
-
-        try:
-            # Select a CIDR block that does not conflict with existing VPCs
-            vpc_cidr = self._find_available_vpc_cidr(ec2)
-
-            # Create VPC
-            response = ec2.create_vpc(
-                CidrBlock=vpc_cidr,
-                AmazonProvidedIpv6CidrBlock=False,
-                InstanceTenancy="default",
-                TagSpecifications=[
-                    {
-                        "ResourceType": "vpc",
-                        "Tags": [
-                            {
-                                "Key": "Name",
-                                "Value": f"parsl-ephemeral-{self.provider_id[:8]}",
-                            },
-                            {"Key": "CreatedBy", "Value": "ParslEphemeralAWSProvider"},
-                            {"Key": "ProviderId", "Value": self.provider_id},
-                        ],
-                    }
-                ],
-            )
-
-            vpc_id = response["Vpc"]["VpcId"]
-            logger.debug(f"Created VPC {vpc_id}")
-
-            # Enable DNS support and hostnames
-            ec2.modify_vpc_attribute(VpcId=vpc_id, EnableDnsSupport={"Value": True})
-            ec2.modify_vpc_attribute(VpcId=vpc_id, EnableDnsHostnames={"Value": True})
-
-            # Create internet gateway
-            igw_response = ec2.create_internet_gateway(
-                TagSpecifications=[
-                    {
-                        "ResourceType": "internet-gateway",
-                        "Tags": [
-                            {
-                                "Key": "Name",
-                                "Value": f"parsl-ephemeral-igw-{self.provider_id[:8]}",
-                            },
-                            {"Key": "CreatedBy", "Value": "ParslEphemeralAWSProvider"},
-                            {"Key": "ProviderId", "Value": self.provider_id},
-                        ],
-                    }
-                ]
-            )
-
-            igw_id = igw_response["InternetGateway"]["InternetGatewayId"]
-
-            # Attach internet gateway to VPC
-            ec2.attach_internet_gateway(InternetGatewayId=igw_id, VpcId=vpc_id)
-
-            logger.debug(f"Attached internet gateway {igw_id} to VPC {vpc_id}")
-
-            # Add tags
-            if self.additional_tags:
-                create_tags(vpc_id, self.additional_tags, self.session)
-                create_tags(igw_id, self.additional_tags, self.session)
-
-            # Wait for VPC to be available
-            wait_for_resource(vpc_id, "vpc_available", ec2, resource_name="VPC")
-
-            return vpc_id
-        except Exception as e:
-            logger.error(f"Failed to create VPC: {e}")
-            raise NetworkCreationError(f"Failed to create VPC: {e}") from e
-
-    def _create_subnet(self) -> str:
-        """Create a subnet for the provider.
-
-        Returns
-        -------
-        str
-            Subnet ID
-
-        Raises
-        ------
-        NetworkCreationError
-            If subnet creation fails
-        """
-        if not self.vpc_id:
-            raise NetworkCreationError("VPC ID is required to create a subnet")
-
-        logger.info(f"Creating subnet in VPC {self.vpc_id}")
-        ec2 = self.session.client("ec2")
-
-        try:
-            # Create subnet
-            cidr_block = DEFAULT_PUBLIC_SUBNET_CIDR
-            response = ec2.create_subnet(
-                VpcId=self.vpc_id,
-                CidrBlock=cidr_block,
-                TagSpecifications=[
-                    {
-                        "ResourceType": "subnet",
-                        "Tags": [
-                            {
-                                "Key": "Name",
-                                "Value": f"parsl-ephemeral-subnet-{self.provider_id[:8]}",
-                            },
-                            {"Key": "CreatedBy", "Value": "ParslEphemeralAWSProvider"},
-                            {"Key": "ProviderId", "Value": self.provider_id},
-                        ],
-                    }
-                ],
-            )
-
-            subnet_id = response["Subnet"]["SubnetId"]
-            logger.debug(f"Created subnet {subnet_id} in VPC {self.vpc_id}")
-
-            # Enable auto-assign public IP if public IPs are requested
-            if self.use_public_ips:
-                ec2.modify_subnet_attribute(
-                    SubnetId=subnet_id, MapPublicIpOnLaunch={"Value": True}
-                )
-                logger.debug(f"Enabled auto-assign public IP for subnet {subnet_id}")
-
-            # Create route table
-            route_table_response = ec2.create_route_table(
-                VpcId=self.vpc_id,
-                TagSpecifications=[
-                    {
-                        "ResourceType": "route-table",
-                        "Tags": [
-                            {
-                                "Key": "Name",
-                                "Value": f"parsl-ephemeral-rt-{self.provider_id[:8]}",
-                            },
-                            {"Key": "CreatedBy", "Value": "ParslEphemeralAWSProvider"},
-                            {"Key": "ProviderId", "Value": self.provider_id},
-                        ],
-                    }
-                ],
-            )
-
-            route_table_id = route_table_response["RouteTable"]["RouteTableId"]
-
-            # Associate route table with subnet
-            ec2.associate_route_table(RouteTableId=route_table_id, SubnetId=subnet_id)
-
-            # Get internet gateway ID
-            igw_response = ec2.describe_internet_gateways(
-                Filters=[{"Name": "attachment.vpc-id", "Values": [self.vpc_id]}]
-            )
-
-            if igw_response["InternetGateways"]:
-                igw_id = igw_response["InternetGateways"][0]["InternetGatewayId"]
-
-                # Create route to internet
-                ec2.create_route(
-                    RouteTableId=route_table_id,
-                    DestinationCidrBlock="0.0.0.0/0",
-                    GatewayId=igw_id,
-                )
-
-                logger.debug(
-                    f"Created route to internet via {igw_id} for subnet {subnet_id}"
-                )
-            else:
-                logger.warning(f"No internet gateway found for VPC {self.vpc_id}")
-
-            # Add tags
-            if self.additional_tags:
-                create_tags(subnet_id, self.additional_tags, self.session)
-                create_tags(route_table_id, self.additional_tags, self.session)
-
-            # Wait for subnet to be available
-            wait_for_resource(
-                subnet_id, "subnet_available", ec2, resource_name="subnet"
-            )
-
-            return subnet_id
-        except Exception as e:
-            logger.error(f"Failed to create subnet in VPC {self.vpc_id}: {e}")
-            raise NetworkCreationError(
-                f"Failed to create subnet in VPC {self.vpc_id}: {e}"
-            ) from e
-
-    def _create_security_group(self) -> str:
-        """Create a security group for the provider.
-
-        Returns
-        -------
-        str
-            Security group ID
-
-        Raises
-        ------
-        NetworkCreationError
-            If security group creation fails
-        """
-        if not self.vpc_id:
-            raise NetworkCreationError("VPC ID is required to create a security group")
-
-        logger.info(f"Creating security group in VPC {self.vpc_id}")
-        ec2 = self.session.client("ec2")
-
-        try:
-            # Create security group
-            response = ec2.create_security_group(
-                GroupName=f"{DEFAULT_SECURITY_GROUP_NAME}-{self.provider_id[:8]}",
-                Description=DEFAULT_SECURITY_GROUP_DESCRIPTION,
-                VpcId=self.vpc_id,
-                TagSpecifications=[
-                    {
-                        "ResourceType": "security-group",
-                        "Tags": [
-                            {
-                                "Key": "Name",
-                                "Value": f"parsl-ephemeral-sg-{self.provider_id[:8]}",
-                            },
-                            {"Key": "CreatedBy", "Value": "ParslEphemeralAWSProvider"},
-                            {"Key": "ProviderId", "Value": self.provider_id},
-                        ],
-                    }
-                ],
-            )
-
-            security_group_id = response["GroupId"]
-            logger.debug(
-                f"Created security group {security_group_id} in VPC {self.vpc_id}"
-            )
-
-            # Add inbound rules
-            if DEFAULT_INBOUND_RULES:
-                ec2.authorize_security_group_ingress(
-                    GroupId=security_group_id, IpPermissions=DEFAULT_INBOUND_RULES
-                )
-                logger.debug(
-                    f"Added inbound rules to security group {security_group_id}"
-                )
-
-            # Add outbound rules (ignore duplicate-rule errors — default SGs
-            # already have an allow-all egress rule)
-            if DEFAULT_OUTBOUND_RULES:
-                try:
-                    ec2.authorize_security_group_egress(
-                        GroupId=security_group_id, IpPermissions=DEFAULT_OUTBOUND_RULES
-                    )
-                    logger.debug(
-                        f"Added outbound rules to security group {security_group_id}"
-                    )
-                except ClientError as _dup_err:
-                    if "InvalidPermission.Duplicate" in str(_dup_err):
-                        logger.debug(
-                            "Outbound rule already present on %s; skipping",
-                            security_group_id,
-                        )
-                    else:
-                        raise
-
-            # Add tags
-            if self.additional_tags:
-                create_tags(security_group_id, self.additional_tags, self.session)
-
-            # Wait for security group to be available
-            wait_for_resource(
-                security_group_id,
-                "security_group_exists",
-                ec2,
-                resource_name="security group",
-            )
-
-            return security_group_id
-        except Exception as e:
-            logger.error(f"Failed to create security group in VPC {self.vpc_id}: {e}")
-            raise NetworkCreationError(
-                f"Failed to create security group in VPC {self.vpc_id}: {e}"
-            ) from e
 
     def submit_job(
         self,
@@ -2022,85 +1660,6 @@ class StandardMode(OperatingMode):
                     logger.error(
                         f"Failed to deregister baked AMI {self._baked_ami_id}: {e}"
                     )
-
-            # Delete security group (only if this provider created it)
-            if self.security_group_id and getattr(self, "_owns_security_group", True):
-                try:
-                    delete_resource(
-                        self.security_group_id,
-                        self.session,
-                        RESOURCE_TYPE_SECURITY_GROUP,
-                    )
-                    logger.info(f"Deleted security group {self.security_group_id}")
-                    self.security_group_id = None
-                except ResourceNotFoundError:
-                    logger.debug(
-                        f"Security group {self.security_group_id} not found or already deleted"
-                    )
-                    self.security_group_id = None
-                except Exception as e:
-                    logger.error(
-                        f"Failed to delete security group {self.security_group_id}: {e}"
-                    )
-            elif self.security_group_id:
-                logger.debug(
-                    "Skipping deletion of pre-existing security group %s",
-                    self.security_group_id,
-                )
-
-            # Delete subnet (only if this provider created it)
-            if self.subnet_id and getattr(self, "_owns_subnet", True):
-                try:
-                    delete_resource(self.subnet_id, self.session, RESOURCE_TYPE_SUBNET)
-                    logger.info(f"Deleted subnet {self.subnet_id}")
-                    self.subnet_id = None
-                except ResourceNotFoundError:
-                    logger.debug(
-                        f"Subnet {self.subnet_id} not found or already deleted"
-                    )
-                    self.subnet_id = None
-                except Exception as e:
-                    logger.error(f"Failed to delete subnet {self.subnet_id}: {e}")
-            elif self.subnet_id:
-                logger.debug(
-                    "Skipping deletion of pre-existing subnet %s", self.subnet_id
-                )
-
-            # Delete VPC (only if this provider created it)
-            if self.vpc_id and getattr(self, "_owns_vpc", True):
-                # Detach and delete internet gateways first
-                ec2 = self.session.client("ec2")
-                try:
-                    igw_response = ec2.describe_internet_gateways(
-                        Filters=[{"Name": "attachment.vpc-id", "Values": [self.vpc_id]}]
-                    )
-
-                    for igw in igw_response.get("InternetGateways", []):
-                        igw_id = igw["InternetGatewayId"]
-                        ec2.detach_internet_gateway(
-                            InternetGatewayId=igw_id, VpcId=self.vpc_id
-                        )
-                        ec2.delete_internet_gateway(InternetGatewayId=igw_id)
-                        logger.debug(f"Deleted internet gateway {igw_id}")
-                except Exception as e:
-                    logger.error(
-                        f"Failed to delete internet gateways for VPC {self.vpc_id}: {e}"
-                    )
-
-                # Now delete the VPC
-                try:
-                    delete_resource(
-                        self.vpc_id, self.session, RESOURCE_TYPE_VPC, force=True
-                    )
-                    logger.info(f"Deleted VPC {self.vpc_id}")
-                    self.vpc_id = None
-                except ResourceNotFoundError:
-                    logger.debug(f"VPC {self.vpc_id} not found or already deleted")
-                    self.vpc_id = None
-                except Exception as e:
-                    logger.error(f"Failed to delete VPC {self.vpc_id}: {e}")
-            elif self.vpc_id:
-                logger.debug("Skipping deletion of pre-existing VPC %s", self.vpc_id)
 
             # Clean up Spot Fleet resources if using spot fleet
             if self.use_spot_fleet and self.spot_fleet_manager:

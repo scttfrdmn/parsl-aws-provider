@@ -59,6 +59,9 @@ def _make_provider(tmp_path, **extra_kwargs) -> GlobusComputeProvider:
             image_id="ami-12345678",
             instance_type="t3.micro",
             mode="standard",
+            vpc_id="vpc-test00001",
+            subnet_id="subnet-test001",
+            security_group_id="sg-test00001",
             **extra_kwargs,
         )
 
