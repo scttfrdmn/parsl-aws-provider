@@ -366,9 +366,11 @@ class TestAMIBaking:
             security_group_id="sg-123",
         )
         # Run just the baking branch by calling initialize() with network already set
-        with patch.object(mode, "save_state"), patch.object(
-            mode, "load_state", return_value=False
-        ), patch.object(mode, "_verify_resources"):
+        with (
+            patch.object(mode, "save_state"),
+            patch.object(mode, "load_state", return_value=False),
+            patch.object(mode, "_verify_resources"),
+        ):
             mode.initialize()
 
         assert mode.image_id == "ami-prefab"
@@ -592,21 +594,37 @@ class TestOneShotMode:
 
     def test_one_shot_compatible_with_zero_warm_pool(self, tmp_dir):
         """one_shot=True with warm_pool_size=0 (default) constructs without error."""
-        provider, _ = _make_provider(tmp_dir, one_shot=True, warm_pool_size=0)
+        provider, _ = _make_provider(
+            tmp_dir,
+            one_shot=True,
+            warm_pool_size=0,
+            iam_instance_profile_arn=_FAKE_IAM_ARN,
+        )
         assert provider.one_shot is True
 
-    def test_one_shot_enforces_shutdown_in_init_script(self, tmp_dir):
-        """_prepare_init_script includes 'shutdown -h now' when one_shot=True, auto_shutdown=False."""
+    def test_one_shot_iam_guard_raises(self, tmp_dir):
+        """One-shot dispatches over SSM, so it needs an instance profile too."""
+        with pytest.raises(ValueError, match="one_shot=True requires"):
+            _make_provider(tmp_dir, one_shot=True)
+
+    def test_one_shot_iam_guard_passes_with_auto_create(self, tmp_dir):
+        """auto_create_instance_profile=True satisfies the one-shot IAM guard."""
+        provider, _ = _make_provider(
+            tmp_dir, one_shot=True, auto_create_instance_profile=True
+        )
+        assert provider.one_shot is True
+
+    def _one_shot_mode(self, tmp_dir, **overrides):
+        """Build a StandardMode with one_shot=True and a mocked session."""
         from parsl_ephemeral_aws.modes.standard import StandardMode
 
         provider_id = f"test-{uuid.uuid4().hex[:8]}"
         state_file = os.path.join(tmp_dir, f"{provider_id}.json")
         state_store = FileStateStore(file_path=state_file, provider_id=provider_id)
-        session_mock = MagicMock()
 
-        mode = StandardMode(
+        params = dict(
             provider_id=provider_id,
-            session=session_mock,
+            session=MagicMock(),
             state_store=state_store,
             image_id="ami-12345678",
             auto_shutdown=False,
@@ -615,6 +633,138 @@ class TestOneShotMode:
             subnet_id="subnet-test001",
             security_group_id="sg-test00001",
         )
+        params.update(overrides)
+        return StandardMode(**params)
+
+    def test_one_shot_dispatches_over_ssm_not_userdata(self, tmp_dir):
+        """One-shot uses SSM so the command's exit code is observable.
+
+        UserData cannot report an exit code — the instance state is identical
+        whether the command succeeded or failed (#76).
+        """
+        mode = self._one_shot_mode(tmp_dir)
+
+        assert mode._uses_ssm_dispatch() is True
 
         script = mode._prepare_init_script("echo hi", "job-1")
+        assert "echo hi" not in script
+        assert "/var/run/parsl_worker_ready" in script
+        # No UserData shutdown: it would race the SSM dispatch and kill the
+        # instance before the command was ever delivered.
+        assert "shutdown -h now" not in script
+
+    def test_one_shot_ssm_command_carries_shutdown_backstop(self, tmp_dir):
+        """The dispatched command shuts the instance down if the driver dies."""
+        mode = self._one_shot_mode(tmp_dir)
+        ssm = mode.session.client.return_value
+        ssm.send_command.return_value = {"Command": {"CommandId": "cmd-1"}}
+
+        mode._dispatch_ssm_command("i-123", "echo hi", "job-1")
+
+        script = ssm.send_command.call_args.kwargs["Parameters"]["commands"][0]
+        assert "echo hi" in script
         assert "shutdown -h now" in script
+        # The exit code is captured before the shutdown is scheduled, and
+        # re-raised, so a failing command still reports FAILED.
+        assert "_parsl_rc=$?" in script
+        assert "exit $_parsl_rc" in script
+
+    def test_non_one_shot_ssm_command_has_no_shutdown(self, tmp_dir):
+        """Warm-pool instances must survive the command for reuse."""
+        mode = self._one_shot_mode(
+            tmp_dir, one_shot=False, warm_pool_size=2, auto_shutdown=True
+        )
+        ssm = mode.session.client.return_value
+        ssm.send_command.return_value = {"Command": {"CommandId": "cmd-1"}}
+
+        mode._dispatch_ssm_command("i-123", "echo hi", "job-1")
+
+        script = ssm.send_command.call_args.kwargs["Parameters"]["commands"][0]
+        assert "shutdown" not in script
+
+    def test_instances_terminate_rather_than_stop_on_shutdown(self, tmp_dir):
+        """EC2 defaults an instance-initiated shutdown to *stop*, billing EBS.
+
+        Regression for #76: a stopped instance keeps a billed volume, and
+        EC2_STATUS_MAPPING maps "stopped" to COMPLETED, so the provider drops
+        the tracking record and the volume is orphaned as well as billed.
+        """
+        mode = self._one_shot_mode(tmp_dir)
+        ec2 = mode.session.client.return_value
+        ec2.run_instances.return_value = {"Instances": [{"InstanceId": "i-123"}]}
+
+        mode._create_instance("#!/bin/bash\n", "job-1")
+
+        run_args = ec2.run_instances.call_args.kwargs
+        assert run_args["InstanceInitiatedShutdownBehavior"] == "terminate"
+
+    def test_spot_launch_spec_omits_run_instances_only_keys(self, tmp_dir):
+        """RequestSpotInstances rejects RunInstances-only keys (#97).
+
+        ``run_args`` is built for ``run_instances`` and reused as the spot
+        ``LaunchSpecification``; boto3 validates parameter names client-side, so
+        leaving any of these in makes every spot request raise before it reaches
+        AWS.
+        """
+        mode = self._one_shot_mode(tmp_dir, use_spot=True)
+        ec2 = mode.session.client.return_value
+        ec2.request_spot_instances.return_value = {
+            "SpotInstanceRequests": [{"SpotInstanceRequestId": "sir-1"}]
+        }
+        ec2.describe_spot_instance_requests.return_value = {
+            "SpotInstanceRequests": [{"InstanceId": "i-123"}]
+        }
+
+        mode._create_instance("#!/bin/bash\n", "job-1")
+
+        spec = ec2.request_spot_instances.call_args.kwargs["LaunchSpecification"]
+        for key in ("MinCount", "MaxCount", "InstanceInitiatedShutdownBehavior"):
+            assert key not in spec, f"{key} is not valid in a LaunchSpecification"
+
+    def test_one_shot_status_comes_from_the_ssm_exit_code(self, tmp_dir):
+        """A non-zero exit must report FAILED, not COMPLETED."""
+        from parsl_ephemeral_aws.constants import STATUS_COMPLETED, STATUS_FAILED
+
+        mode = self._one_shot_mode(tmp_dir)
+        mode.resources["i-123"] = {
+            "type": "ec2",
+            "one_shot": True,
+            "ssm_command_id": "cmd-1",
+            "status": "RUNNING",
+        }
+        ssm = mode.session.client.return_value
+        ssm.get_command_invocation.return_value = {
+            "Status": "Failed",
+            "ResponseCode": 1,
+            "StandardErrorContent": "boom",
+        }
+
+        assert mode.get_job_status(["i-123"]) == {"i-123": STATUS_FAILED}
+        assert mode.resources["i-123"]["exit_code"] == 1
+
+        ssm.get_command_invocation.return_value = {
+            "Status": "Success",
+            "ResponseCode": 0,
+        }
+        assert mode.get_job_status(["i-123"]) == {"i-123": STATUS_COMPLETED}
+        assert mode.resources["i-123"]["exit_code"] == 0
+
+    def test_failed_dispatch_terminates_the_instance(self, tmp_dir):
+        """With no command in UserData there is nothing to fall back to.
+
+        Leaving the instance up would idle it until max_idle_time while
+        reporting RUNNING, so the submit fails loudly and the instance goes.
+        """
+        mode = self._one_shot_mode(tmp_dir)
+        mode.initialized = True
+        ec2 = mode.session.client.return_value
+        ec2.run_instances.return_value = {"Instances": [{"InstanceId": "i-123"}]}
+
+        with patch.object(
+            mode, "_wait_for_ssm_online", side_effect=RuntimeError("no SSM")
+        ):
+            with pytest.raises(Exception, match="no SSM"):
+                mode.submit_job(job_id="job-1", command="echo hi", tasks_per_node=1)
+
+        ec2.terminate_instances.assert_called_once_with(InstanceIds=["i-123"])
+        assert "i-123" not in mode.resources

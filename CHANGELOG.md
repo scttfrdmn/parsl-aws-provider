@@ -71,6 +71,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `initialize()`, on both the fresh and resumed paths (the ARN is not persisted
   in state). A failure to create the profile is logged, not fatal: dispatch
   degrades to UserData rather than the provider failing to start (closes #75).
+- One-shot instances stopped instead of terminating, leaving a billed EBS volume.
+  `StandardMode._create_instance()` never set
+  `InstanceInitiatedShutdownBehavior`, and EC2 defaults an instance-initiated
+  shutdown to *stop* — so the `shutdown -h now` appended by
+  `_prepare_init_script()` stopped the instance. Because `EC2_STATUS_MAPPING`
+  maps `stopped` to `COMPLETED`, the provider then dropped the tracking record,
+  orphaning the volume as well as billing for it. `DetachedMode` had set
+  `terminate` on all three of its launch paths since v0.2.0 (closes #76).
+- One-shot command failures reported `COMPLETED`. #66 specified "command exits
+  non-zero → FAILED", but status was derived purely from EC2 instance state,
+  which is identical whether the command succeeded or failed. One-shot dispatch
+  now goes through the same SSM `SendCommand` path the warm pool uses, so the
+  exit code is reported; it is also recorded on the resource as `exit_code`, and
+  a failure logs the command's stderr (closes #76).
+- `StandardMode._create_spot_instance()` raised
+  `ParamValidationError: Unknown parameter in LaunchSpecification: "MinCount"`
+  on every call. `run_args` is built for `run_instances` and reused as the spot
+  `LaunchSpecification`, which expresses count as the top-level `InstanceCount`;
+  boto3 validates parameter names client-side, so `use_spot=True` could never
+  submit a job unless `use_spot_fleet=True` routed around it. The
+  `RunInstances`-only keys are now stripped (closes #97).
 - Instance-profile resolution no longer leaves a profile permanently empty. The
   previous implementation returned early when `get_instance_profile` succeeded,
   so a profile whose role attachment had failed midway kept being reused with no
@@ -78,6 +99,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   paths (pre-existing profile, freshly created, and lost creation race).
 
 ### Added
+- **One-shot mode** for `StandardMode`: set `one_shot=True` to declare that each
+  EC2 instance runs a single command and then terminates, regardless of the
+  `auto_shutdown` setting (closes #66).
+  - The command is dispatched over SSM `SendCommand` after the instance reports
+    ready, so its exit code determines the job status. UserData carries only
+    `worker_init` and the readiness marker.
+  - The instance is terminated by `_cleanup_resources()` once the command
+    reaches a terminal state; a detached `shutdown -h now` in the dispatched
+    script bounds the cost if the driver process dies first. It is scheduled
+    after the exit code is captured, so it cannot mask a non-zero exit.
+  - Raises `ValueError` at construction time if combined with
+    `warm_pool_size > 0` (one-shot instances are terminated and cannot be
+    reused), or if no instance profile is available.
+  - `one_shot=False` (default): zero code-path changes for existing users.
+- `tests/aws/test_one_shot_e2e.py` — 8 real-AWS tests covering exit-code
+  propagation (`exit 0` → COMPLETED, `exit 1` → FAILED, `exit 42` recorded),
+  termination rather than stopping, no leftover billable EBS volume, the
+  instance-profile guard, and the absence of the command from UserData.
+  Specified in #66 and never written.
+- 8 tests in `TestOneShotMode` covering SSM dispatch, the shutdown backstop,
+  `InstanceInitiatedShutdownBehavior`, the spot `LaunchSpecification` key
+  stripping, exit-code-derived status, dispatch-failure termination, and the
+  instance-profile guard.
+- `docs/network-prerequisites.md` with Terraform and CloudFormation snippets for
+  provisioning the required network resources.
 - `tests/unit/test_ecs_manager.py` — 6 tests covering explicit `subnet_id`,
   explicit `subnet_ids` precedence, subnet discovery, default-VPC fallback, and
   both empty-result error paths.
@@ -108,6 +154,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   it too, and an unused profile costs nothing.
 - `EC2Manager._get_or_create_instance_profile()` now delegates to
   `utils.aws.get_or_create_ssm_instance_profile()`.
+- One-shot mode now requires `auto_create_instance_profile=True` or
+  `iam_instance_profile_arn`, because its command is delivered by SSM
+  `SendCommand`. The requirement was previously warm-pool-only.
+- A failed SSM dispatch now terminates the instance and re-raises instead of
+  logging "falling back to UserData execution". There was nothing to fall back
+  to — the command is not in the UserData, so the instance would have idled
+  until `max_idle_time` while reporting `RUNNING`.
+- `EphemeralAWSProvider.status()` runs `_cleanup_resources()` when `one_shot` is
+  set, not only when a warm pool is configured; a one-shot instance has no
+  UserData shutdown to end it.
+- `vpc_id`, `subnet_id`, and `security_group_id` are now **required** constructor
+  arguments; a `ValueError` is raised at init if any are missing.
+- `cleanup_infrastructure()` no longer destroys network resources — VPC,
+  subnet, and security group are now the caller's responsibility.
+- E2E tests read `AWS_TEST_VPC_ID`, `AWS_TEST_SUBNET_ID`, and `AWS_TEST_SG_ID`
+  from the environment; tests are skipped (not failed) when these are unset.
 
 ### Removed
 - `SpotFleetManager._create_vpc()`, `_create_subnet()`, `_create_security_group()`,
@@ -123,26 +185,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `_create_security_group()` (182 LOC). These built the VPC through
   CloudFormation rather than direct EC2 calls, which is why #69's pass missed
   them; `create_vpc` is gone from `ServerlessMode` as well (closes #73).
-
-### Changed
-- `vpc_id`, `subnet_id`, and `security_group_id` are now **required** constructor
-  arguments; a `ValueError` is raised at init if any are missing.
-- `cleanup_infrastructure()` no longer destroys network resources — VPC,
-  subnet, and security group are now the caller's responsibility.
-- E2E tests read `AWS_TEST_VPC_ID`, `AWS_TEST_SUBNET_ID`, and `AWS_TEST_SG_ID`
-  from the environment; tests are skipped (not failed) when these are unset.
-- Added `docs/network-prerequisites.md` with Terraform and CloudFormation
-  snippets for provisioning the required network resources.
-
-### Added
-- **One-shot mode** for `StandardMode`: set `one_shot=True` to explicitly declare
-  that each EC2 instance runs a single command then terminates, regardless of the
-  `auto_shutdown` setting (closes #66).
-  - `one_shot=True` unconditionally appends `shutdown -h now` to the UserData
-    init script even when `auto_shutdown=False`.
-  - Raises `ValueError` at construction time if combined with `warm_pool_size > 0`
-    (incompatible: one-shot instances are terminated immediately and cannot be reused).
-  - `one_shot=False` (default): zero code-path changes for existing users.
 
 ## [0.6.0] - 2026-03-02
 

@@ -371,14 +371,19 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
                 "one-shot instances are terminated immediately and cannot be reused"
             )
 
-        # Guard: warm pool uses SSM SendCommand which requires an IAM instance profile
+        # Guard: the warm pool and one-shot mode both dispatch over SSM
+        # SendCommand, which needs the instance to carry an IAM instance profile
+        # holding AmazonSSMManagedInstanceCore. Without one the agent never
+        # registers and the command is never delivered.
+        needs_ssm = warm_pool_size > 0 or one_shot
         if (
-            warm_pool_size > 0
+            needs_ssm
             and not auto_create_instance_profile
             and not iam_instance_profile_arn
         ):
+            trigger = "warm_pool_size > 0" if warm_pool_size > 0 else "one_shot=True"
             raise ValueError(
-                "warm_pool_size > 0 requires either auto_create_instance_profile=True "
+                f"{trigger} requires either auto_create_instance_profile=True "
                 "or iam_instance_profile_arn to be set (SSM SendCommand needs IAM permissions)"
             )
 
@@ -696,9 +701,11 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
             for job_id in job_ids:
                 internal_statuses.setdefault(job_id, "UNKNOWN")
 
-        # Trigger cleanup to process warm-pool transitions and TTL evictions.
+        # Trigger cleanup to process warm-pool transitions and TTL evictions, and
+        # to terminate finished one-shot instances — their command is delivered
+        # over SSM rather than UserData, so nothing on the instance shuts it down.
         # _cleanup_resources() is idempotent and handles its own errors.
-        if self.warm_pool_size > 0:
+        if self.warm_pool_size > 0 or self.one_shot:
             self._cleanup_resources()
 
         return [

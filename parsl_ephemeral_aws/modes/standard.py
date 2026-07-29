@@ -857,9 +857,13 @@ class StandardMode(OperatingMode):
                 "tasks_per_node": tasks_per_node,
             }
 
-            if self.warm_pool_size > 0:
-                # Warm pool cold start: wait for SSM then dispatch command
-                resource_data["warm_pool"] = True
+            if self._uses_ssm_dispatch():
+                # Cold start for the SSM paths: wait for SSM, then dispatch. The
+                # UserData carries no command, so this is the only way the job runs.
+                if self.warm_pool_size > 0:
+                    resource_data["warm_pool"] = True
+                else:
+                    resource_data["one_shot"] = True
                 self.resources[instance_id] = resource_data
                 try:
                     self._wait_for_ssm_online(instance_id)
@@ -871,12 +875,17 @@ class StandardMode(OperatingMode):
                     self.resources[instance_id]["status"] = STATUS_RUNNING
                     self.resources[instance_id]["warm_since"] = None
                 except Exception as ssm_err:
+                    # The command is not in the UserData, so there is nothing to
+                    # fall back to — the instance would idle until max_idle_time
+                    # while reporting RUNNING. Terminate it and fail the submit.
                     logger.error(
-                        f"SSM setup failed for warm pool instance {instance_id}: "
-                        f"{ssm_err}. Falling back to UserData execution."
+                        f"SSM dispatch failed for instance {instance_id}: {ssm_err}. "
+                        "Terminating it; the command was never delivered."
                     )
-                    # Remove warm_pool flag so status is tracked via EC2 state
-                    self.resources[instance_id].pop("warm_pool", None)
+                    self._force_terminate(instance_id)
+                    self.resources.pop(instance_id, None)
+                    self.save_state()
+                    raise
             else:
                 self.resources[instance_id] = resource_data
 
@@ -895,7 +904,8 @@ class StandardMode(OperatingMode):
         Parameters
         ----------
         command : str
-            Command to execute (ignored when warm_pool_size > 0; dispatched via SSM)
+            Command to execute. Ignored when the command is dispatched over SSM
+            instead — see :meth:`_uses_ssm_dispatch`.
         job_id : str
             Job ID
 
@@ -909,10 +919,13 @@ class StandardMode(OperatingMode):
         if self.worker_init:
             init_script += f"{self.worker_init}\n"
 
-        if self.warm_pool_size > 0:
-            # Warm pool: UserData only runs worker_init and drops a ready marker.
-            # The actual command is dispatched later via SSM SendCommand so the
-            # instance can be reused across multiple jobs without re-installing.
+        if self._uses_ssm_dispatch():
+            # UserData only runs worker_init and drops a ready marker. The command
+            # is dispatched later via SSM SendCommand, which reports its exit code
+            # — and for the warm pool, lets the instance serve several jobs without
+            # re-running worker_init. No shutdown is appended: the provider
+            # terminates the instance through cleanup_resources() once the command
+            # reaches a terminal state.
             init_script += "mkdir -p /var/run/parsl\n"
             init_script += "touch /var/run/parsl_worker_ready\n"
             return init_script
@@ -935,8 +948,36 @@ class StandardMode(OperatingMode):
         return init_script
 
     # ------------------------------------------------------------------
-    # Warm pool helpers
+    # SSM dispatch helpers (shared by the warm pool and one-shot mode)
     # ------------------------------------------------------------------
+
+    def _uses_ssm_dispatch(self) -> bool:
+        """Whether the command is delivered by SSM rather than embedded in UserData.
+
+        Both the warm pool and one-shot mode need the command's exit code, which
+        UserData cannot report — the instance state is identical whether the
+        command succeeded or failed. SSM ``SendCommand`` reports it, so both
+        launch with a marker-only UserData and dispatch afterwards.
+        """
+        return self.warm_pool_size > 0 or self.one_shot
+
+    def _force_terminate(self, instance_id: str) -> None:
+        """Terminate an instance best-effort, swallowing any error.
+
+        Used on the SSM-dispatch failure path, where the caller is already
+        raising and must not have that exception masked by a cleanup failure.
+        The provider's ``cleanup_stray_instances`` safety net and the
+        ``ProviderId`` tag both cover the case where this does not succeed.
+        """
+        try:
+            self.session.client("ec2").terminate_instances(InstanceIds=[instance_id])
+            logger.info(f"Terminated instance {instance_id} after failed dispatch")
+        except Exception as e:
+            logger.error(
+                f"Could not terminate instance {instance_id} after failed "
+                f"dispatch: {e}. It may still be running — check the "
+                f"ProviderId={self.provider_id} tag."
+            )
 
     def _get_warm_instance(self) -> Optional[str]:
         """Pop the oldest available warm instance from the pool (FIFO).
@@ -1052,6 +1093,15 @@ class StandardMode(OperatingMode):
         -------
         str
             SSM CommandId for later status polling via ``get_command_invocation``.
+
+        Notes
+        -----
+        In one-shot mode a self-shutdown backstop is appended. The provider
+        normally terminates the instance from ``_cleanup_resources()`` once the
+        command reaches a terminal state, but that requires the driver process to
+        still be alive to poll. The backstop bounds the cost of a driver that
+        dies mid-job; it is scheduled after the command's exit status is captured
+        so it cannot mask a non-zero exit.
         """
         ssm = self.session.client("ssm")
         env_setup = (
@@ -1059,10 +1109,19 @@ class StandardMode(OperatingMode):
             f"export PARSL_PROVIDER_ID={self.provider_id}\n"
             "export PARSL_WORKER_ID=$(hostname)\n"
         )
+        script = env_setup + command
+        if self.one_shot:
+            # Detach the shutdown so SSM sees the command finish and reports the
+            # real exit code, then exit with that same code.
+            script += (
+                "\n_parsl_rc=$?\n"
+                "nohup sh -c 'sleep 30; shutdown -h now' >/dev/null 2>&1 &\n"
+                "exit $_parsl_rc\n"
+            )
         response = ssm.send_command(
             InstanceIds=[instance_id],
             DocumentName="AWS-RunShellScript",
-            Parameters={"commands": [env_setup + command]},
+            Parameters={"commands": [script]},
             Comment=f"Parsl job {job_id[:16]}",
         )
         command_id = response["Command"]["CommandId"]
@@ -1134,6 +1193,14 @@ class StandardMode(OperatingMode):
             "MinCount": 1,
             "UserData": init_script,
             "TagSpecifications": [{"ResourceType": "instance", "Tags": tags}],
+            # The init script runs `shutdown -h now` when auto_shutdown or
+            # one_shot is set, and EC2's default for an instance-initiated
+            # shutdown is *stop*, not terminate — leaving a stopped instance
+            # with a billed EBS volume. Worse, EC2_STATUS_MAPPING maps
+            # "stopped" to COMPLETED, so the provider drops the tracking record
+            # and the volume is orphaned as well as billed. DetachedMode already
+            # sets this on all of its launch paths.
+            "InstanceInitiatedShutdownBehavior": "terminate",
         }
 
         # Add network configuration if available
@@ -1201,6 +1268,20 @@ class StandardMode(OperatingMode):
 
         # Extract tags
         tags = run_args.pop("TagSpecifications", [{}])[0].get("Tags", [])
+
+        # RunInstances-only keys that RequestSpotInstances rejects in a
+        # LaunchSpecification. MinCount/MaxCount become InstanceCount, and
+        # InstanceInitiatedShutdownBehavior has no spot equivalent — a spot
+        # instance that shuts itself down is stopped, then reclaimed by EC2
+        # when the one-time request is already closed, so the provider's own
+        # terminate_instances in cleanup_resources() is what reclaims the EBS
+        # volume here.
+        for run_only_key in (
+            "InstanceInitiatedShutdownBehavior",
+            "MinCount",
+            "MaxCount",
+        ):
+            run_args.pop(run_only_key, None)
 
         # Prepare spot request
         spot_args = {
@@ -1397,7 +1478,7 @@ class StandardMode(OperatingMode):
         # Group IDs by resource type / tracking method
         ec2_instances = []
         spot_fleet_blocks = []
-        warm_pool_instances = []  # tracked via SSM command invocation
+        ssm_instances = []  # tracked via SSM command invocation
 
         for resource_id in resource_ids:
             resource = self.resources.get(resource_id)
@@ -1405,8 +1486,11 @@ class StandardMode(OperatingMode):
                 status_map[resource_id] = STATUS_UNKNOWN
                 continue
 
-            if resource.get("warm_pool") and resource.get("ssm_command_id"):
-                warm_pool_instances.append(resource_id)
+            # Any resource carrying an SSM command ID — warm pool or one-shot —
+            # is tracked by the command's own status, which reports the exit code.
+            # EC2 instance state cannot: it looks the same either way.
+            if resource.get("ssm_command_id"):
+                ssm_instances.append(resource_id)
             elif resource.get("type") == RESOURCE_TYPE_EC2:
                 ec2_instances.append(resource_id)
             elif resource.get("type") == RESOURCE_TYPE_SPOT_FLEET:
@@ -1414,10 +1498,10 @@ class StandardMode(OperatingMode):
             else:
                 status_map[resource_id] = STATUS_UNKNOWN
 
-        # --- Warm pool: poll SSM command invocation status ---
-        if warm_pool_instances:
+        # --- SSM dispatch: poll command invocation status for the exit code ---
+        if ssm_instances:
             ssm = self.session.client("ssm")
-            for instance_id in warm_pool_instances:
+            for instance_id in ssm_instances:
                 resource = self.resources[instance_id]
                 command_id = resource["ssm_command_id"]
                 try:
@@ -1442,6 +1526,18 @@ class StandardMode(OperatingMode):
                         status = STATUS_RUNNING
                     status_map[instance_id] = status
                     self.resources[instance_id]["status"] = status
+
+                    # Record the exit code so a FAILED job is diagnosable
+                    # without a second SSM round-trip.
+                    exit_code = response.get("ResponseCode")
+                    if exit_code is not None and exit_code >= 0:
+                        self.resources[instance_id]["exit_code"] = exit_code
+                    if status == STATUS_FAILED:
+                        logger.error(
+                            f"Command on {instance_id} reported {ssm_status} "
+                            f"(exit code {exit_code}): "
+                            f"{response.get('StandardErrorContent', '')[:500]}"
+                        )
                 except ClientError as e:
                     if "InvocationDoesNotExist" in str(e):
                         # Command not yet received by the instance
