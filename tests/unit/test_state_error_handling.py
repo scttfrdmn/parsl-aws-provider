@@ -10,6 +10,8 @@ SPDX-FileCopyrightText: 2025 Scott Friedman and Project Contributors
 import os
 import json
 import tempfile
+
+import boto3
 import pytest
 from unittest.mock import MagicMock, patch
 from botocore.exceptions import ClientError
@@ -263,13 +265,12 @@ class TestFileStateStoreKeying:
         assert store.load_state(STATE_KEY_PROVIDER) == {"job_map": {"job-1": "res-1"}}
 
 
-@patch("boto3.Session")
 class TestParameterStoreStateErrorHandling:
     """Tests for error handling in ParameterStoreState."""
 
     @pytest.fixture
     def provider_mock(self):
-        """Create a mock provider."""
+        """Create a mock provider carrying a session the store will reuse."""
         provider = MagicMock()
         provider.workflow_id = "test-workflow"
         provider.region = "us-east-1"
@@ -277,6 +278,12 @@ class TestParameterStoreStateErrorHandling:
         provider.aws_secret_access_key = None
         provider.aws_session_token = None
         provider.aws_profile = None
+        # ``spec=`` is load-bearing: resolve_session() reuses provider.session
+        # only when isinstance(session, boto3.Session), and a spec'd MagicMock
+        # satisfies that. A bare MagicMock falls through to building a *real*
+        # session, which is how these tests reached AWS-shaped code paths with
+        # unmocked clients.
+        provider.session = MagicMock(spec=boto3.Session)
         return provider
 
     @pytest.fixture
@@ -286,10 +293,9 @@ class TestParameterStoreStateErrorHandling:
         return client
 
     @pytest.fixture
-    def parameter_store_state(self, provider_mock, ssm_client_mock, boto3_session_mock):
+    def parameter_store_state(self, provider_mock, ssm_client_mock):
         """Create a ParameterStoreState instance with mocked AWS clients."""
-        session_instance = boto3_session_mock.return_value
-        session_instance.client.return_value = ssm_client_mock
+        provider_mock.session.client.return_value = ssm_client_mock
 
         return ParameterStoreState(provider_mock)
 
@@ -403,13 +409,12 @@ class TestParameterStoreStateErrorHandling:
         assert "Failed to delete state" in str(exc_info.value)
 
 
-@patch("boto3.Session")
 class TestS3StateErrorHandling:
     """Tests for error handling in S3State."""
 
     @pytest.fixture
     def provider_mock(self):
-        """Create a mock provider."""
+        """Create a mock provider carrying a session the store will reuse."""
         provider = MagicMock()
         provider.workflow_id = "test-workflow"
         provider.region = "us-east-1"
@@ -417,6 +422,9 @@ class TestS3StateErrorHandling:
         provider.aws_secret_access_key = None
         provider.aws_session_token = None
         provider.aws_profile = None
+        # See the note on the ParameterStore fixture: ``spec=`` is what makes
+        # resolve_session() reuse this mock instead of building a real session.
+        provider.session = MagicMock(spec=boto3.Session)
         return provider
 
     @pytest.fixture
@@ -426,11 +434,10 @@ class TestS3StateErrorHandling:
         return client
 
     @pytest.fixture
-    def s3_state(self, provider_mock, s3_client_mock, boto3_session_mock):
+    def s3_state(self, provider_mock, s3_client_mock):
         """Create an S3State instance with mocked AWS clients."""
-        session_instance = boto3_session_mock.return_value
-        session_instance.client.return_value = s3_client_mock
-        session_instance.resource.return_value = MagicMock()
+        provider_mock.session.client.return_value = s3_client_mock
+        provider_mock.session.resource.return_value = MagicMock()
 
         return S3State(provider_mock, "test-bucket")
 
@@ -549,13 +556,9 @@ class TestS3StateErrorHandling:
 
         assert "Failed to delete state" in str(exc_info.value)
 
-    def test_bucket_creation_error(
-        self, provider_mock, s3_client_mock, boto3_session_mock
-    ):
+    def test_bucket_creation_error(self, provider_mock, s3_client_mock):
         """Test handling errors during bucket creation."""
-        # Setup session mock
-        session_instance = boto3_session_mock.return_value
-        session_instance.client.return_value = s3_client_mock
+        provider_mock.session.client.return_value = s3_client_mock
 
         # Setup client mock to raise error on bucket check
         error_response = {"Error": {"Code": "404", "Message": "Not Found"}}
