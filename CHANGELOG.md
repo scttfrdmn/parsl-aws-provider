@@ -26,6 +26,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `DependencyViolation`, but the internet-gateway detach could succeed against a
   live VPC and blackhole egress for unrelated workloads (closes #94).
 
+### Fixed
+- `ECSManager._get_or_create_network_resources()` raised
+  `UnboundLocalError: cannot access local variable 'subnet_response'` on every
+  ECS/Fargate submission. A leftover line dereferenced `subnet_response`, which
+  is bound only in the subnet-discovery branch; once `subnet_id` became required
+  in #69 the explicit-subnet branch always ran, so the line always raised. It
+  also overwrote the caller's explicit subnet with every subnet discovered in the
+  VPC (closes #71).
+
+### Added
+- `tests/unit/test_ecs_manager.py` — 6 tests covering explicit `subnet_id`,
+  explicit `subnet_ids` precedence, subnet discovery, default-VPC fallback, and
+  both empty-result error paths.
+
 ### Removed
 - `SpotFleetManager._create_vpc()`, `_create_subnet()`, `_create_security_group()`,
   and `_cleanup_network_resources()`. `_setup_network_resources()` now only

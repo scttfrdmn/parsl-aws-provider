@@ -482,8 +482,6 @@ class ECSManager:
                     subnet["SubnetId"] for subnet in subnet_response["Subnets"]
                 ]
 
-            subnet_ids = [subnet["SubnetId"] for subnet in subnet_response["Subnets"]]
-
             # Get or create security group
             sg_name = f"{TAG_PREFIX}-ecs-sg-{self.provider.workflow_id}"
 
