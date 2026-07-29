@@ -147,6 +147,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   baked-AMI ownership flag. Found against real AWS while probing #79 — a resumed
   provider silently took the create path and never noticed its security group had
   been deleted (closes #101).
+- `warm_pool_size`, `warm_pool_ttl`, `bake_ami`, `baked_ami_id`, and `one_shot`
+  are implemented only by `StandardMode`, and were forwarded only on that branch
+  — but the provider acted on them regardless of mode, which made the mismatch
+  leak rather than merely no-op. With `mode="detached", warm_pool_size=2` every
+  resource was tagged `warm_pool=True`, `_cleanup_resources()` took the warm-pool
+  branch, and jobs were set to `STATUS_WARM` — a status no other mode's
+  `get_job_status()` recognises — so those instances were **never cleaned up** and
+  leaked with no error or warning. `__init__` now raises
+  `ProviderConfigurationError` naming every offending option and the mode asked
+  for. It is ordered before the SSM instance-profile guard, which would otherwise
+  answer `one_shot=True` on detached mode by advising
+  `auto_create_instance_profile` — advice that cannot help, since detached mode
+  does not implement one-shot at all (closes #80).
 - Real-AWS E2E tests read `provider.status(...)[0]["status"]` in 14 places, but
   `status()` has returned `List[JobStatus]` since v0.5.0 and `JobStatus` is not
   subscriptable, so each raised `TypeError`. The pattern dates to when the suite
@@ -240,6 +253,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   failure leaving prior state intact, and shutdown deleting both documents. The
   key-isolation tests were mutation-checked: collapsing `STATE_KEY_MODE` onto the
   provider's key fails all three separation tests.
+- 23 tests in `TestStandardOnlyOptionGuard` covering each StandardMode-only
+  option against each mode that cannot honour it, acceptance on standard mode,
+  explicitly-passed defaults, multi-option messages, and guard ordering.
+  Mutation-checked: disabling the guard fails 14, comparing presence instead of
+  the default fails 4, and reordering it after the IAM guard fails 2.
+- `one_shot` is now documented on `EphemeralAWSProvider`; it had been accepted
+  but absent from the docstring. The four warm-pool and AMI-baking parameters
+  are now marked `mode="standard"` only.
 - 5 tests in `TestWaitForInstanceProfile` covering the IAM propagation wait —
   including a fake clock driven through `sleep` so the retry-then-give-up path
   genuinely iterates.

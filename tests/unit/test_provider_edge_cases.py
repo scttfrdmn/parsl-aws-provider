@@ -14,7 +14,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from parsl_ephemeral_aws.exceptions import ProviderError
+from parsl_ephemeral_aws.exceptions import ProviderConfigurationError, ProviderError
 from parsl_ephemeral_aws.provider import EphemeralAWSProvider
 from parsl_ephemeral_aws.state.base import STATE_KEY_MODE, STATE_KEY_PROVIDER
 from parsl_ephemeral_aws.state.file import FileStateStore
@@ -1020,3 +1020,167 @@ class TestStateKeySeparation:
         provider.shutdown()
 
         assert provider.state_store.load_state(STATE_KEY_PROVIDER) is None
+
+
+# ---------------------------------------------------------------------------
+# TestStandardOnlyOptionGuard
+# ---------------------------------------------------------------------------
+
+
+#: The options StandardMode alone implements, with a non-default value for each.
+#: ``_initialize_operating_mode()`` forwards them only on the STANDARD branch --
+#: correct -- but the provider acts on them regardless of mode, which is what
+#: makes the mismatch leak rather than merely no-op. See #80.
+STANDARD_ONLY_OPTIONS = [
+    ("warm_pool_size", 2),
+    ("warm_pool_ttl", 900),
+    ("bake_ami", True),
+    ("baked_ami_id", "ami-prebaked01"),
+    ("one_shot", True),
+]
+
+NON_STANDARD_MODES = ["detached", "serverless"]
+
+
+def _construct(mode, **extra_kwargs):
+    """Construct a provider in *mode*, with AWS and the operating mode mocked.
+
+    Unlike ``_make_provider`` this does not pin ``mode="standard"``, and it
+    patches ``initialize`` so construction does not reach AWS. The guard under
+    test runs in ``__init__`` before either the state store or the mode is
+    built, so nothing here can mask it.
+    """
+    with (
+        patch("parsl_ephemeral_aws.provider.create_session") as mock_session_factory,
+        patch.object(
+            EphemeralAWSProvider, "_initialize_state_store", return_value=MagicMock()
+        ),
+        patch.object(
+            EphemeralAWSProvider, "_initialize_operating_mode", return_value=MagicMock()
+        ),
+        patch.object(EphemeralAWSProvider, "_load_state", return_value=None),
+    ):
+        mock_session_factory.return_value = MagicMock()
+        return EphemeralAWSProvider(
+            region="us-east-1",
+            image_id="ami-12345678",
+            mode=mode,
+            vpc_id="vpc-test00001",
+            subnet_id="subnet-test001",
+            security_group_id="sg-test00001",
+            **extra_kwargs,
+        )
+
+
+@pytest.mark.unit
+class TestStandardOnlyOptionGuard:
+    """StandardMode-only options must be refused on other modes (#80)."""
+
+    @pytest.mark.parametrize("mode", NON_STANDARD_MODES)
+    @pytest.mark.parametrize("option,value", STANDARD_ONLY_OPTIONS)
+    def test_the_option_is_refused_on_a_non_standard_mode(self, mode, option, value):
+        """Each option, on each mode that cannot honour it, must raise.
+
+        Silently ignoring it is what #80 is about: with
+        ``mode="detached", warm_pool_size=2`` the provider tagged resources
+        ``warm_pool=True``, took the warm-pool branch in ``_cleanup_resources()``,
+        and set ``STATUS_WARM`` -- a status no other mode's
+        ``get_job_status()`` recognises -- so the instances were never cleaned
+        up and leaked with no error at all.
+        """
+        extra = {option: value}
+        # warm_pool_size and one_shot also trip the SSM IAM guard; supply a
+        # profile so a pass here cannot be the wrong guard firing.
+        extra["iam_instance_profile_arn"] = _FAKE_IAM_ARN
+
+        with pytest.raises(ProviderConfigurationError, match=option):
+            _construct(mode, **extra)
+
+    @pytest.mark.parametrize("option,value", STANDARD_ONLY_OPTIONS)
+    def test_the_option_is_accepted_on_standard_mode(self, option, value):
+        """The same option must still be accepted where it is implemented.
+
+        A guard that rejected these everywhere would pass the test above while
+        breaking the feature.
+        """
+        extra = {option: value, "iam_instance_profile_arn": _FAKE_IAM_ARN}
+
+        provider = _construct("standard", **extra)
+
+        assert getattr(provider, option) == value
+
+    @pytest.mark.parametrize("mode", NON_STANDARD_MODES)
+    def test_a_non_standard_mode_with_no_such_option_constructs(self, mode):
+        """The guard must not fire on the defaults.
+
+        Every provider passes through it, so a wrong comparison here would
+        break detached and serverless mode outright.
+        """
+        provider = _construct(mode)
+
+        assert provider.mode_type.value == mode
+
+    @pytest.mark.parametrize("mode", NON_STANDARD_MODES)
+    def test_explicitly_passing_a_default_is_not_refused(self, mode):
+        """Passing the documented default is a no-op, not a misconfiguration.
+
+        The guard compares against the default rather than testing presence, so
+        ``warm_pool_size=0`` -- which asks for nothing -- must be allowed.
+        """
+        provider = _construct(
+            mode,
+            warm_pool_size=0,
+            warm_pool_ttl=600,
+            bake_ami=False,
+            baked_ami_id=None,
+            one_shot=False,
+        )
+
+        assert provider.warm_pool_size == 0
+
+    def test_every_offending_option_is_named_at_once(self):
+        """The message must list all of them, not just the first found.
+
+        Reporting one at a time means a caller who set three fixes them one
+        construction at a time.
+        """
+        with pytest.raises(ProviderConfigurationError) as excinfo:
+            _construct(
+                "detached",
+                warm_pool_size=2,
+                bake_ami=True,
+                one_shot=True,
+                iam_instance_profile_arn=_FAKE_IAM_ARN,
+            )
+
+        message = str(excinfo.value)
+        for option in ("warm_pool_size", "bake_ami", "one_shot"):
+            assert option in message
+
+    def test_the_message_names_the_mode_that_was_asked_for(self):
+        """Naming the mode is what makes the error actionable."""
+        with pytest.raises(ProviderConfigurationError, match="serverless"):
+            _construct("serverless", bake_ami=True)
+
+    def test_the_mode_guard_precedes_the_ssm_iam_guard(self):
+        """Mode rejection must come first, or the error misdirects.
+
+        ``one_shot=True`` on detached mode with no IAM profile trips two guards.
+        The IAM one would tell the caller to set
+        ``auto_create_instance_profile`` -- which cannot help, because detached
+        mode does not implement one-shot at all.
+        """
+        with pytest.raises(ProviderConfigurationError, match="one_shot"):
+            _construct("detached", one_shot=True)
+
+    def test_a_standard_only_option_does_not_leak_through_kwargs(self):
+        """The guard must catch the option itself, not just the named parameter.
+
+        All five are real ``__init__`` parameters today, so this is a
+        regression fence: were one ever demoted to ``**kwargs`` it would reach
+        the mode silently again.
+        """
+        with pytest.raises(ProviderConfigurationError, match="warm_pool_size"):
+            _construct(
+                "detached", warm_pool_size=1, iam_instance_profile_arn=_FAKE_IAM_ARN
+            )

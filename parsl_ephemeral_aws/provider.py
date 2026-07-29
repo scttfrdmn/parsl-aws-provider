@@ -202,19 +202,31 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
         ready for immediate reuse without re-running worker_init.
         Requires ``auto_create_instance_profile=True`` or
         ``iam_instance_profile_arn`` (SSM SendCommand needs an IAM role).
-        Default is 0 (disabled).
+        Default is 0 (disabled).  ``mode="standard"`` only.
     warm_pool_ttl : int, optional
         Seconds a warm idle instance stays alive before being terminated.
-        Default is 600 (10 minutes).
+        Default is 600 (10 minutes).  ``mode="standard"`` only.
     bake_ami : bool, optional
         When True, run ``worker_init`` on a builder instance during
         ``initialize()``, snapshot it into a custom AMI, and use that AMI for
         all subsequent instance launches.  Eliminates the per-boot install
         overhead for new instances.  Default is False.
+        ``mode="standard"`` only.
     baked_ami_id : str, optional
         Pre-existing baked AMI ID to use instead of baking a new one.  When
         supplied, ``initialize()`` skips the baking step and uses this AMI
-        directly for all instance launches.
+        directly for all instance launches.  ``mode="standard"`` only.
+    one_shot : bool, optional
+        When True, each instance runs a single command over SSM and then
+        terminates, so the command's exit code determines the job status.
+        Default is False.  ``mode="standard"`` only.
+
+    Raises
+    ------
+    ProviderConfigurationError
+        If ``warm_pool_size``, ``warm_pool_ttl``, ``bake_ami``,
+        ``baked_ami_id``, or ``one_shot`` is set on any mode other than
+        ``"standard"`` — no other mode implements them.
     """
 
     @typechecked
@@ -366,6 +378,35 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
             raise ValueError(
                 "vpc_id, subnet_id, and security_group_id are required. "
                 "Pre-provision network resources outside the provider."
+            )
+
+        # Guard: the warm pool, AMI baking, and one-shot dispatch are implemented
+        # only by StandardMode, and _initialize_operating_mode() forwards them
+        # only on that branch. The provider itself, however, acts on them
+        # regardless of mode: it tags resources warm_pool=True, takes the
+        # warm-pool branch in _cleanup_resources(), and reports STATUS_WARM. No
+        # other mode's get_job_status() knows that status, so those instances are
+        # never cleaned up and leak with no error or warning. Refuse the
+        # combination rather than silently half-honouring it.
+        standard_only = [
+            name
+            for name, value, default in (
+                ("warm_pool_size", warm_pool_size, DEFAULT_WARM_POOL_SIZE),
+                ("warm_pool_ttl", warm_pool_ttl, DEFAULT_WARM_POOL_TTL),
+                ("bake_ami", bake_ami, DEFAULT_BAKE_AMI),
+                ("baked_ami_id", baked_ami_id, None),
+                ("one_shot", one_shot, DEFAULT_ONE_SHOT),
+            )
+            if value != default
+        ]
+        if standard_only and self.mode_type != OperatingModeType.STANDARD:
+            raise ProviderConfigurationError(
+                f"{', '.join(standard_only)} "
+                f"{'are' if len(standard_only) > 1 else 'is'} supported only by "
+                f"mode='standard', not mode='{self.mode_type.value}'. "
+                "The option would be silently ignored by the mode while the "
+                "provider still acted on it, leaking instances that no mode "
+                "would clean up."
             )
 
         # Guard: one_shot is incompatible with warm pool (instances are terminated immediately)
