@@ -1480,7 +1480,9 @@ class ServerlessMode(OperatingMode):
     def cleanup_infrastructure(self) -> None:
         """Clean up infrastructure created by this mode.
 
-        This cleans up the VPC, subnet, and security group if they were created by the provider.
+        The VPC, subnet, and security group are supplied by the caller and are
+        never created — or deleted — by this mode.  Only the Lambda functions,
+        ECS tasks, and Spot Fleet resources created here are removed.
         """
         logger.info("Cleaning up serverless mode infrastructure")
 
@@ -1497,59 +1499,6 @@ class ServerlessMode(OperatingMode):
                 logger.error(f"Failed to stop spot interruption monitoring: {e}")
             self.spot_interruption_monitor = None
             self.spot_interruption_handler = None
-
-        # Check if we created a VPC using CloudFormation
-        stack_name = f"parsl-vpc-{self.provider_id[:8]}"
-        try:
-            self.cf_client.describe_stacks(StackName=stack_name)
-
-            # Stack exists, delete it
-            logger.info(f"Deleting VPC stack {stack_name}")
-            self.cf_client.delete_stack(StackName=stack_name)
-
-            # Wait for deletion to complete (with timeout)
-            start_time = time.time()
-            while time.time() - start_time < 300:  # 5 minute timeout
-                try:
-                    response = self.cf_client.describe_stacks(StackName=stack_name)
-                    status = response["Stacks"][0]["StackStatus"]
-
-                    if status == "DELETE_COMPLETE":
-                        logger.info(f"VPC stack {stack_name} deleted successfully")
-                        break
-                    elif status == "DELETE_FAILED":
-                        logger.error(f"Failed to delete VPC stack {stack_name}")
-                        break
-
-                    time.sleep(10)
-                except ClientError as e:
-                    if "does not exist" in str(e):
-                        logger.info(f"VPC stack {stack_name} deleted successfully")
-                        break
-                    raise
-
-            # Reset IDs
-            self.vpc_id = None
-            self.subnet_id = None
-
-        except ClientError as e:
-            # If stack doesn't exist, that's fine
-            if "does not exist" not in str(e):
-                logger.error(f"Error checking VPC stack {stack_name}: {e}")
-
-        # Delete security group if we created it directly
-        if self.security_group_id:
-            try:
-                ec2 = self.session.client("ec2")
-                ec2.delete_security_group(GroupId=self.security_group_id)
-                logger.info(f"Deleted security group {self.security_group_id}")
-                self.security_group_id = None
-            except ClientError as e:
-                if "InvalidGroup.NotFound" not in str(e):
-                    logger.error(
-                        f"Failed to delete security group {self.security_group_id}: {e}"
-                    )
-                self.security_group_id = None
 
         # Clean up compute managers
         if self.lambda_manager:

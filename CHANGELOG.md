@@ -7,7 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+- `ServerlessMode.cleanup_infrastructure()` no longer deletes the caller's
+  security group. The code was guarded only by a comment claiming "if we created
+  it directly" — nothing verified ownership, and after #69 the ID is always
+  user-supplied. It was reached from the `except` handler on every failed
+  `initialize()`. The unconditional `parsl-vpc-<provider_id[:8]}` CloudFormation
+  stack deletion (whose 8-character truncated IDs can collide across providers)
+  was removed with it (closes #70).
+- `SpotFleetManager._cleanup_network_resources()` removed. It unconditionally
+  deleted the caller's security group, subnet, **every internet gateway attached
+  to the VPC**, every non-main route table, and the VPC itself — with no
+  ownership check, on IDs that `_setup_network_resources()` had adopted from the
+  provider. It ran as the last step of `cleanup_all_resources()`, so with
+  `use_spot_fleet=True` every normal provider shutdown attempted to destroy the
+  caller's pre-provisioned network; a second path invoked it from the setup
+  `except` handler. `delete_vpc`/`delete_subnet` usually failed with
+  `DependencyViolation`, but the internet-gateway detach could succeed against a
+  live VPC and blackhole egress for unrelated workloads (closes #94).
+
 ### Removed
+- `SpotFleetManager._create_vpc()`, `_create_subnet()`, `_create_security_group()`,
+  and `_cleanup_network_resources()`. `_setup_network_resources()` now only
+  resolves the caller-supplied IDs and raises `ResourceCreationError` if any are
+  missing (closes #94).
 - `create_vpc` parameter — VPC/subnet/security-group creation removed from the
   provider entirely (closes #69).
 - `_create_vpc()`, `_create_subnet()`, `_create_security_group()`, and
