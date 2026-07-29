@@ -42,7 +42,7 @@ from parsl_ephemeral_aws.modes.base import OperatingMode
 from parsl_ephemeral_aws.modes.detached import DetachedMode
 from parsl_ephemeral_aws.modes.serverless import ServerlessMode
 from parsl_ephemeral_aws.modes.standard import StandardMode
-from parsl_ephemeral_aws.state.base import StateStore
+from parsl_ephemeral_aws.state.base import STATE_KEY_PROVIDER, StateStore
 from parsl_ephemeral_aws.state.file import FileStateStore
 from parsl_ephemeral_aws.state.parameter_store import ParameterStoreStateStore
 from parsl_ephemeral_aws.state.s3 import S3StateStore
@@ -392,11 +392,22 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
             region=self.region, profile_name=self.profile_name
         )
         self.state_store = self._initialize_state_store()
+
+        # Adopt any provider_id already recorded at this state location, before
+        # the operating mode is built with it.
+        if provider_id is None:
+            self._adopt_persisted_provider_id()
+
         self.operating_mode = self._initialize_operating_mode()
         self.resources: Dict[str, Dict[str, Any]] = {}
         self.job_map: Dict[str, Dict[str, Any]] = {}
         # Re-entrant lock so cancel() → _cleanup_resources() doesn't deadlock
         self._lock = threading.RLock()
+
+        # Restore whatever was persisted at this state location. Safe only now
+        # that the provider and its mode write separate keys (#78) — before
+        # that, loading here would have activated the mutual clobbering.
+        self._load_state()
 
         logger.info(f"Initialized EphemeralAWSProvider in {self.mode_type.value} mode")
 
@@ -468,6 +479,28 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
                 f"{', '.join([c.value for c in ComputeType])}"
             )
 
+    def _parameter_store_prefix(self) -> str:
+        """Return the SSM parameter prefix the state keys hang off.
+
+        Each state key becomes ``{prefix}/{key}``, so two providers sharing a
+        path share a slot — the same semantics as two ``FileStateStore``
+        instances on one file path, which is what makes state hand-off between
+        provider instances possible.
+        """
+        return self.parameter_store_path.rstrip("/")
+
+    def _s3_key_prefix(self) -> str:
+        """Return the S3 key prefix the state keys hang off.
+
+        ``s3_key`` predates state keys and defaults to a file name, which would
+        yield the odd ``ephemeral_aws_state.json/provider``. A ``.json`` suffix
+        is dropped so the prefix reads as the directory it now is.
+        """
+        prefix = self.s3_key.rstrip("/")
+        if prefix.endswith(".json"):
+            prefix = prefix[: -len(".json")]
+        return prefix
+
     def _initialize_state_store(self) -> StateStore:
         """Initialize the state store based on configuration.
 
@@ -481,10 +514,11 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
                 file_path=self.state_file_path, provider_id=self.provider_id
             )
         elif self.state_store_type == StateStoreType.PARAMETER_STORE:
+            # The AWS stores take the provider itself: they read its region and
+            # credentials, and Parameter Store also reads its audit_logger.
             return ParameterStoreStateStore(
-                session=self.session,
-                path=self.parameter_store_path,
-                provider_id=self.provider_id,
+                provider=self,
+                prefix=self._parameter_store_prefix(),
             )
         elif self.state_store_type == StateStoreType.S3:
             if not self.s3_bucket:
@@ -492,10 +526,9 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
                     "s3_bucket is required when using 's3' state store"
                 )
             return S3StateStore(
-                session=self.session,
-                bucket=self.s3_bucket,
-                key=self.s3_key,
-                provider_id=self.provider_id,
+                provider=self,
+                bucket_name=self.s3_bucket,
+                key_prefix=self._s3_key_prefix(),
             )
         else:
             raise ProviderConfigurationError(
@@ -770,7 +803,13 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
         return [cancel_results[jid] for jid in job_ids]
 
     def _save_state(self) -> None:
-        """Save the current state to the state store."""
+        """Save the current state under the provider's own state key.
+
+        The operating mode writes ``STATE_KEY_MODE`` from its own
+        ``save_state()``. Both used to write the whole document to one slot with
+        different key sets, so each overwrite destroyed the other's fields —
+        losing ``job_map`` here and the baked AMI ID there (#78).
+        """
         with self._lock:
             state = {
                 "provider_id": self.provider_id,
@@ -784,15 +823,44 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
             }
 
         try:
-            self.state_store.save_state(state)
+            self.state_store.save_state(STATE_KEY_PROVIDER, state)
             logger.debug("Saved provider state")
         except Exception as e:
             logger.error(f"Failed to save provider state: {e}")
 
-    def _load_state(self) -> None:
-        """Load the state from the state store."""
+    def _adopt_persisted_provider_id(self) -> None:
+        """Take over the provider_id recorded at this state location, if any.
+
+        Nothing about *where* state is stored depends on ``provider_id`` — the
+        file path, SSM prefix, and S3 key prefix are the only scoping. So two
+        providers sharing a path share a slot, which is exactly how state is
+        handed from one provider instance to its successor.
+
+        But ``provider_id`` defaults to a fresh UUID, and both this class and
+        ``OperatingMode.load_state()`` refuse to load a document whose
+        ``provider_id`` differs from their own. A successor therefore rejected
+        the very state it was pointed at, unless the caller happened to pass the
+        original ID back in. Adopting the persisted ID makes restart work with
+        nothing but a shared state location.
+
+        Only called when the caller did not pass ``provider_id`` explicitly; an
+        explicit ID is a deliberate choice and is left alone.
+        """
         try:
-            state = self.state_store.load_state()
+            state = self.state_store.load_state(STATE_KEY_PROVIDER)
+        except Exception as e:
+            logger.debug(f"No provider state to adopt an ID from: {e}")
+            return
+
+        persisted_id = (state or {}).get("provider_id")
+        if persisted_id and persisted_id != self.provider_id:
+            logger.info(f"Adopting persisted provider_id {persisted_id}")
+            self.provider_id = persisted_id
+
+    def _load_state(self) -> None:
+        """Load the state stored under the provider's own state key."""
+        try:
+            state = self.state_store.load_state(STATE_KEY_PROVIDER)
             if state and state.get("provider_id") == self.provider_id:
                 with self._lock:
                     self.resources = state.get("resources", {})
@@ -807,6 +875,24 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
                 logger.info(f"Loaded state with {len(self.resources)} resources")
         except Exception as e:
             logger.error(f"Failed to load provider state: {e}")
+
+    def _delete_state(self) -> None:
+        """Delete the persisted state for both the provider and its mode.
+
+        Both keys go: a mode document that outlives the provider's still
+        describes network IDs and a baked AMI that shutdown has just released.
+        """
+        try:
+            self.state_store.delete_state(STATE_KEY_PROVIDER)
+        except Exception as e:
+            logger.error(f"Failed to delete provider state: {e}")
+
+        delete_mode_state = getattr(self.operating_mode, "delete_state", None)
+        if callable(delete_mode_state):
+            try:
+                delete_mode_state()
+            except Exception as e:
+                logger.error(f"Failed to delete mode state: {e}")
 
     def _cleanup_resources(self) -> None:
         """Clean up resources that are completed or failed.
@@ -1015,8 +1101,11 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
                 self.resources = {}
                 self.job_map = {}
 
-            # Save the empty state
-            self._save_state()
+            # Delete the persisted state rather than saving an empty document.
+            # The resources it describes are gone, so a surviving document only
+            # misleads the next provider that reads the same slot — and for the
+            # AWS backends it also leaves parameters and objects behind.
+            self._delete_state()
 
             logger.info("Provider shutdown complete")
         except Exception as e:

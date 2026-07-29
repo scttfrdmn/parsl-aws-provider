@@ -34,7 +34,7 @@ from parsl_ephemeral_aws.exceptions import (
     ResourceCreationError,
 )
 from parsl_ephemeral_aws.modes.base import OperatingMode
-from parsl_ephemeral_aws.state.base import StateStore
+from parsl_ephemeral_aws.state.base import STATE_KEY_MODE, StateStore
 from parsl_ephemeral_aws.utils.aws import (
     get_default_ami,
     wait_for_resource,
@@ -2091,7 +2091,7 @@ if __name__ == '__main__':
         }
 
         try:
-            self.state_store.save_state(state)
+            self.state_store.save_state(STATE_KEY_MODE, state)
         except Exception as e:
             logger.error(f"Failed to save state: {e}")
 
@@ -2104,14 +2104,10 @@ if __name__ == '__main__':
             True if state was loaded successfully, False otherwise
         """
         try:
-            state = self.state_store.load_state()
+            state = self.state_store.load_state(STATE_KEY_MODE)
             if state and state.get("provider_id") == self.provider_id:
                 self.resources = state.get("resources", {})
-                self.vpc_id = state.get("vpc_id", self.vpc_id)
-                self.subnet_id = state.get("subnet_id", self.subnet_id)
-                self.security_group_id = state.get(
-                    "security_group_id", self.security_group_id
-                )
+                self._restore_network_ids(state)
                 self.initialized = state.get("initialized", False)
                 self.workflow_id = state.get("workflow_id", self.workflow_id)
                 self.bastion_id = state.get("bastion_id", self.bastion_id)

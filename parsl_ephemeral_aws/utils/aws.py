@@ -815,6 +815,7 @@ def get_or_create_ssm_instance_profile(
         arn: str = response["InstanceProfile"]["Arn"]
         _attach_role_to_instance_profile(iam, profile_name, role_name)
         logger.info(f"Created IAM instance profile: {profile_name}")
+        _wait_for_instance_profile(session, arn)
         return arn
     except ClientError as e:
         if e.response["Error"]["Code"] == "EntityAlreadyExists":
@@ -822,10 +823,68 @@ def get_or_create_ssm_instance_profile(
             response = iam.get_instance_profile(InstanceProfileName=profile_name)
             raced_arn: str = response["InstanceProfile"]["Arn"]
             _attach_role_to_instance_profile(iam, profile_name, role_name)
+            _wait_for_instance_profile(session, raced_arn)
             return raced_arn
         raise ResourceCreationError(
             f"Failed to create instance profile {profile_name}: {e}"
         ) from e
+
+
+#: How long to wait for a new instance profile to become visible to EC2.
+_PROFILE_PROPAGATION_TIMEOUT_S = 60
+_PROFILE_PROPAGATION_DELAY_S = 2
+
+
+def _wait_for_instance_profile(
+    session: boto3.Session,
+    profile_arn: str,
+    timeout: int = _PROFILE_PROPAGATION_TIMEOUT_S,
+) -> None:
+    """Block until EC2 will accept *profile_arn*, or give up after *timeout*.
+
+    IAM is eventually consistent with respect to EC2: a profile that
+    ``create_instance_profile`` has already returned an ARN for is rejected by
+    ``RunInstances`` with ``InvalidParameterValue: Invalid IAM Instance Profile
+    ARN`` for the first several seconds (measured at ~10s). A dry-run
+    ``RunInstances`` is the only check that exercises the path that matters —
+    ``get_instance_profile`` succeeds immediately and so proves nothing.
+
+    A timeout is logged rather than raised: the launch that follows will report
+    the real error, and failing here would turn a slow propagation into a hard
+    error on a profile that is about to work.
+    """
+    ec2 = session.client("ec2")
+    image_id = get_default_ami(session.region_name or DEFAULT_REGION)
+    deadline = time.time() + timeout
+
+    while time.time() < deadline:
+        try:
+            ec2.run_instances(
+                ImageId=image_id,
+                MinCount=1,
+                MaxCount=1,
+                InstanceType="t3.micro",
+                IamInstanceProfile={"Arn": profile_arn},
+                DryRun=True,
+            )
+            return
+        except ClientError as e:
+            code = e.response["Error"]["Code"]
+            if code == "DryRunOperation":
+                # EC2 validated everything including the profile.
+                logger.debug(f"Instance profile {profile_arn} is visible to EC2")
+                return
+            if code != "InvalidParameterValue":
+                # Anything else (an unusable AMI here, say) is not what this
+                # check is for; let the real launch report it.
+                logger.debug(f"Instance profile propagation check skipped: {e}")
+                return
+            time.sleep(_PROFILE_PROPAGATION_DELAY_S)
+
+    logger.warning(
+        f"Instance profile {profile_arn} still not visible to EC2 after "
+        f"{timeout}s; launching anyway"
+    )
 
 
 def _attach_role_to_instance_profile(

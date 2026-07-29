@@ -13,6 +13,7 @@ import logging
 import os
 import uuid
 
+import boto3
 import pytest
 
 from parsl_ephemeral_aws import GlobusComputeProvider
@@ -45,7 +46,19 @@ def aws_region() -> str:
 
 @pytest.fixture(scope="session")
 def network_ids():
-    """Return pre-provisioned VPC/subnet/SG IDs, or skip if unset."""
+    """Return pre-provisioned VPC/subnet/SG IDs, or skip if unset.
+
+    The IDs are checked against ``AWS_TEST_REGION`` before any test runs. IDs
+    belonging to another region are not an error until a launch is attempted,
+    where they surface minutes in as ``InvalidSubnetID.NotFound`` from deep
+    inside ``RunInstances`` — after real instances have been billed.
+    ``AWS_TEST_REGION`` defaults to ``us-west-2``, so supplying the IDs alone is
+    easy to get wrong.
+
+    The session is built here rather than taken from the ``aws_session``
+    fixture, which is function-scoped and cannot be consumed by a session-scoped
+    fixture.
+    """
     missing = [
         name
         for name, val in [
@@ -57,6 +70,21 @@ def network_ids():
     ]
     if missing:
         pytest.skip(f"Set {', '.join(missing)} to run E2E tests")
+
+    try:
+        ec2 = boto3.Session(
+            profile_name=AWS_TEST_PROFILE, region_name=AWS_TEST_REGION
+        ).client("ec2")
+        ec2.describe_subnets(SubnetIds=[AWS_TEST_SUBNET_ID])
+        ec2.describe_security_groups(GroupIds=[AWS_TEST_SG_ID])
+    except Exception as exc:
+        pytest.fail(
+            f"AWS_TEST_SUBNET_ID={AWS_TEST_SUBNET_ID} / "
+            f"AWS_TEST_SG_ID={AWS_TEST_SG_ID} are not usable in region "
+            f"{AWS_TEST_REGION}: {exc}\n"
+            "Set AWS_TEST_REGION to the region holding these resources."
+        )
+
     return dict(
         vpc_id=AWS_TEST_VPC_ID,
         subnet_id=AWS_TEST_SUBNET_ID,

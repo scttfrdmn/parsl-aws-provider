@@ -34,6 +34,7 @@ from parsl_ephemeral_aws.exceptions import (
     SpotFleetError,
 )
 from parsl_ephemeral_aws.modes.base import OperatingMode
+from parsl_ephemeral_aws.state.base import STATE_KEY_MODE
 from parsl_ephemeral_aws.compute.spot_fleet import SpotFleetManager
 from parsl_ephemeral_aws.compute.spot_interruption import (
     SpotInterruptionMonitor,
@@ -466,7 +467,7 @@ class StandardMode(OperatingMode):
             state["spot_fleet_state"] = spot_fleet_state
 
             try:
-                self.state_store.save_state(state)
+                self.state_store.save_state(STATE_KEY_MODE, state)
                 logger.debug(
                     f"Saved state including SpotFleetManager with {len(self.spot_fleet_manager.blocks)} blocks"
                 )
@@ -475,7 +476,7 @@ class StandardMode(OperatingMode):
         else:
             # Save directly (includes baked AMI fields not in the base class state)
             try:
-                self.state_store.save_state(state)
+                self.state_store.save_state(STATE_KEY_MODE, state)
             except Exception as e:
                 logger.error(f"Failed to save state: {e}")
 
@@ -488,14 +489,10 @@ class StandardMode(OperatingMode):
             True if state was loaded successfully, False otherwise
         """
         try:
-            state = self.state_store.load_state()
+            state = self.state_store.load_state(STATE_KEY_MODE)
             if state and state.get("provider_id") == self.provider_id:
                 self.resources = state.get("resources", {})
-                self.vpc_id = state.get("vpc_id", self.vpc_id)
-                self.subnet_id = state.get("subnet_id", self.subnet_id)
-                self.security_group_id = state.get(
-                    "security_group_id", self.security_group_id
-                )
+                self._restore_network_ids(state)
                 self.initialized = state.get("initialized", False)
                 # Restore warm pool list; fall back to scanning resources for
                 # STATUS_WARM entries in case the key is absent (older state files)

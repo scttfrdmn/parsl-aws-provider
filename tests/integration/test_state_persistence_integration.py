@@ -12,7 +12,9 @@ import uuid
 import pytest
 import tempfile
 import boto3
+from botocore.exceptions import ClientError
 
+from parsl_ephemeral_aws.state.base import STATE_KEY_PROVIDER
 from parsl_ephemeral_aws.state.file import FileStateStore
 from parsl_ephemeral_aws.state.parameter_store import ParameterStoreState
 from parsl_ephemeral_aws.state.s3 import S3State
@@ -48,6 +50,11 @@ class TestFileStateStoreIntegration:
     @pytest.fixture
     def complex_state(self):
         """Create a complex state dictionary with nested structures."""
+        # Bound to names so the two resource keys are visibly distinct. Written
+        # inline they were textually identical expressions -- distinct at runtime
+        # because uuid4() differs, but indistinguishable to a reader or a linter.
+        first_res = f"res-{uuid.uuid4().hex[:8]}"
+        second_res = f"res-{uuid.uuid4().hex[:8]}"
         return {
             "provider_info": {
                 "id": f"provider-{uuid.uuid4().hex[:8]}",
@@ -55,13 +62,13 @@ class TestFileStateStoreIntegration:
                 "created_at": "2023-01-01T00:00:00Z",
             },
             "resources": {
-                f"res-{uuid.uuid4().hex[:8]}": {
+                first_res: {
                     "instance_id": f"i-{uuid.uuid4().hex[:12]}",
                     "status": "running",
                     "ip_address": "10.0.0.1",
                     "tags": ["compute", "worker"],
                 },
-                f"res-{uuid.uuid4().hex[:8]}": {
+                second_res: {
                     "instance_id": f"i-{uuid.uuid4().hex[:12]}",
                     "status": "pending",
                     "ip_address": "10.0.0.2",
@@ -89,13 +96,13 @@ class TestFileStateStoreIntegration:
     def test_full_lifecycle(self, file_state_store, complex_state):
         """Test the full lifecycle of state persistence."""
         # 1. Save state
-        file_state_store.save_state(complex_state)
+        file_state_store.save_state(STATE_KEY_PROVIDER, complex_state)
 
         # Verify file exists
         assert os.path.exists(file_state_store.file_path)
 
         # 2. Load state
-        loaded_state = file_state_store.load_state()
+        loaded_state = file_state_store.load_state(STATE_KEY_PROVIDER)
 
         # Verify loaded state matches original
         assert loaded_state is not None
@@ -111,21 +118,21 @@ class TestFileStateStoreIntegration:
         # 3. Update state
         loaded_state["statistics"]["job_count"] += 1
         loaded_state["statistics"]["success_count"] += 1
-        file_state_store.save_state(loaded_state)
+        file_state_store.save_state(STATE_KEY_PROVIDER, loaded_state)
 
         # 4. Reload state and verify updates
-        reloaded_state = file_state_store.load_state()
+        reloaded_state = file_state_store.load_state(STATE_KEY_PROVIDER)
         assert reloaded_state["statistics"]["job_count"] == 11
         assert reloaded_state["statistics"]["success_count"] == 9
 
         # 5. Delete state
-        file_state_store.delete_state()
+        file_state_store.delete_state(STATE_KEY_PROVIDER)
 
-        # Verify file no longer exists
+        # Verify file no longer exists — this was the only key in it
         assert not os.path.exists(file_state_store.file_path)
 
         # 6. Load after delete should return None
-        final_state = file_state_store.load_state()
+        final_state = file_state_store.load_state(STATE_KEY_PROVIDER)
         assert final_state is None
 
     def test_concurrent_access(self, temp_dir, complex_state):
@@ -138,16 +145,16 @@ class TestFileStateStoreIntegration:
         store2 = FileStateStore(file_path=file_path, provider_id=provider_id)
 
         # Store 1 saves initial state
-        store1.save_state(complex_state)
+        store1.save_state(STATE_KEY_PROVIDER, complex_state)
 
         # Store 2 loads state, modifies it, and saves back
-        state2 = store2.load_state()
+        state2 = store2.load_state(STATE_KEY_PROVIDER)
         state2["statistics"]["job_count"] = 20
         state2["provider_info"]["updated_by"] = "store2"
-        store2.save_state(state2)
+        store2.save_state(STATE_KEY_PROVIDER, state2)
 
         # Store 1 reloads state - should see Store 2's changes
-        updated_state = store1.load_state()
+        updated_state = store1.load_state(STATE_KEY_PROVIDER)
         assert updated_state["statistics"]["job_count"] == 20
         assert updated_state["provider_info"]["updated_by"] == "store2"
 
@@ -516,7 +523,7 @@ class TestS3StateIntegration:
         try:
             s3_client.head_bucket(Bucket=bucket_name)
             bucket_exists = True
-        except:
+        except ClientError:
             bucket_exists = False
 
         assert not bucket_exists
@@ -533,7 +540,7 @@ class TestS3StateIntegration:
         try:
             s3_client.head_bucket(Bucket=bucket_name)
             bucket_exists = True
-        except:
+        except ClientError:
             bucket_exists = False
 
         assert bucket_exists

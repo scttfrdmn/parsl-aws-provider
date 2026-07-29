@@ -16,6 +16,7 @@ import pytest
 
 from parsl_ephemeral_aws.exceptions import ProviderError
 from parsl_ephemeral_aws.provider import EphemeralAWSProvider
+from parsl_ephemeral_aws.state.base import STATE_KEY_MODE, STATE_KEY_PROVIDER
 from parsl_ephemeral_aws.state.file import FileStateStore
 
 
@@ -456,13 +457,16 @@ class TestAMIBaking:
         mode._owns_baked_ami = True
 
         saved = {}
+        keys_written = []
 
-        def _capture_state(state):
+        def _capture_state(state_key, state):
+            keys_written.append(state_key)
             saved.update(state)
 
         with patch.object(state_store, "save_state", side_effect=_capture_state):
             mode.save_state()
 
+        assert keys_written == [STATE_KEY_MODE]
         assert saved.get("baked_ami_id") == "ami-saved001"
         assert saved.get("owns_baked_ami") is True
 
@@ -768,3 +772,221 @@ class TestOneShotMode:
 
         ec2.terminate_instances.assert_called_once_with(InstanceIds=["i-123"])
         assert "i-123" not in mode.resources
+
+
+# ---------------------------------------------------------------------------
+# TestStateKeySeparation
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestStateKeySeparation:
+    """The provider and its mode must not overwrite each other's state (#78)."""
+
+    @pytest.fixture
+    def tmp_dir(self):
+        with tempfile.TemporaryDirectory() as d:
+            yield d
+
+    @staticmethod
+    def _mode(provider_id, state_store):
+        """Return a StandardMode sharing *state_store* with the provider."""
+        from parsl_ephemeral_aws.modes.standard import StandardMode
+
+        return StandardMode(
+            provider_id=provider_id,
+            session=MagicMock(),
+            state_store=state_store,
+            image_id="ami-base",
+            vpc_id="vpc-test00001",
+            subnet_id="subnet-test001",
+            security_group_id="sg-test00001",
+        )
+
+    def test_provider_and_mode_writes_coexist(self, tmp_dir):
+        """A mode write must not destroy job_map, nor a provider write the baked AMI.
+
+        Both writers previously issued full-document overwrites into one slot, so
+        whichever went last erased the other's fields: the baked AMI ID (leaking
+        the AMI and its snapshots, since cleanup could no longer see it) or
+        job_map (losing the job-to-resource mapping across restart).
+        """
+        provider, _ = _make_provider(tmp_dir)
+        state_store = provider.state_store
+        mode = self._mode(provider.provider_id, state_store)
+        mode._baked_ami_id = "ami-baked001"
+        mode._owns_baked_ami = True
+
+        mode.save_state()
+        provider.job_map["job-1"] = "resource-1"
+        provider._save_state()
+        # A second mode write is the point at which the provider's fields used
+        # to disappear.
+        mode.save_state()
+
+        mode_state = state_store.load_state(STATE_KEY_MODE)
+        provider_state = state_store.load_state(STATE_KEY_PROVIDER)
+
+        assert mode_state["baked_ami_id"] == "ami-baked001"
+        assert mode_state["owns_baked_ami"] is True
+        assert provider_state["job_map"] == {"job-1": "resource-1"}
+
+    def test_both_writers_survive_a_round_trip(self, tmp_dir):
+        """Reloading restores the mode's baked AMI and the provider's job_map."""
+        provider, _ = _make_provider(tmp_dir)
+        state_store = provider.state_store
+        mode = self._mode(provider.provider_id, state_store)
+        mode._baked_ami_id = "ami-baked001"
+        mode._owns_baked_ami = True
+        mode.initialized = True
+
+        mode.save_state()
+        provider.job_map["job-1"] = "resource-1"
+        provider._save_state()
+
+        # A fresh mode and provider reading the same file, as after a restart.
+        reloaded_mode = self._mode(provider.provider_id, state_store)
+        assert reloaded_mode.load_state() is True
+        assert reloaded_mode._baked_ami_id == "ami-baked001"
+        assert reloaded_mode._owns_baked_ami is True
+        assert reloaded_mode.image_id == "ami-baked001"
+
+        provider.job_map.clear()
+        provider._load_state()
+        assert provider.job_map == {"job-1": "resource-1"}
+
+    def test_mode_load_ignores_the_provider_document(self, tmp_dir):
+        """The mode must not pick up the provider's document as its own.
+
+        The provider writes provider_id too, so an unkeyed read would match the
+        mode's own provider_id check and load the wrong shape.
+        """
+        provider, _ = _make_provider(tmp_dir)
+        provider.job_map["job-1"] = "resource-1"
+        provider._save_state()
+
+        mode = self._mode(provider.provider_id, provider.state_store)
+        assert mode.load_state() is False
+        assert mode.initialized is False
+
+    def test_shutdown_deletes_both_documents(self, tmp_dir):
+        """shutdown() must delete both keys, not save an empty document.
+
+        ``delete_state`` was implemented in all three stores and the ABC but
+        called from nowhere; shutdown wrote an empty document instead, which on
+        the AWS backends left SSM parameters and S3 objects behind and on any
+        backend left a document describing resources that no longer exist.
+        """
+        provider, _ = _make_provider(tmp_dir)
+        state_store = provider.state_store
+        mode = self._mode(provider.provider_id, state_store)
+        mode._baked_ami_id = "ami-baked001"
+
+        mode.save_state()
+        provider.job_map["job-1"] = "resource-1"
+        provider._save_state()
+        assert state_store.load_state(STATE_KEY_MODE) is not None
+        assert state_store.load_state(STATE_KEY_PROVIDER) is not None
+
+        # The provider's operating_mode is a MagicMock, so route the mode
+        # deletion at the real store the way the live mode would.
+        provider.operating_mode.delete_state.side_effect = mode.delete_state
+
+        provider.shutdown()
+
+        assert state_store.load_state(STATE_KEY_MODE) is None
+        assert state_store.load_state(STATE_KEY_PROVIDER) is None
+
+    @staticmethod
+    def _provider_sharing(state_file, **extra):
+        """Build a provider at *state_file* without passing a provider_id.
+
+        ``_make_provider`` always supplies one, which is exactly the case that
+        skips adoption — so restart has to be modelled with a provider that lets
+        the ID default, as a real successor process would.
+        """
+        with (
+            patch(
+                "parsl_ephemeral_aws.provider.create_session"
+            ) as mock_session_factory,
+            patch.object(
+                EphemeralAWSProvider,
+                "_initialize_operating_mode",
+                return_value=MagicMock(),
+            ),
+        ):
+            mock_session_factory.return_value = MagicMock()
+            return EphemeralAWSProvider(
+                region="us-east-1",
+                image_id="ami-12345678",
+                instance_type="t3.micro",
+                mode="standard",
+                state_store_type="file",
+                state_file_path=state_file,
+                min_blocks=0,
+                init_blocks=0,
+                vpc_id="vpc-test00001",
+                subnet_id="subnet-test001",
+                security_group_id="sg-test00001",
+                **extra,
+            )
+
+    def test_a_successor_provider_loads_state_from_the_same_path(self, tmp_dir):
+        """Restart must restore job_map given nothing but a shared state path.
+
+        Two independent defects made this impossible: ``_load_state()`` was
+        never called from ``__init__`` at all, and it refuses a document whose
+        ``provider_id`` differs from its own -- while ``provider_id`` defaults to
+        a fresh UUID and does not affect *where* state is stored. So a successor
+        rejected the very state it was pointed at.
+        """
+        state_file = os.path.join(tmp_dir, "shared.json")
+
+        first = self._provider_sharing(state_file)
+        first.job_map["job-1"] = {"resource_id": "resource-1"}
+        first._save_state()
+
+        second = self._provider_sharing(state_file)
+
+        assert second.provider_id == first.provider_id
+        assert second.job_map == {"job-1": {"resource_id": "resource-1"}}
+
+    def test_an_explicit_provider_id_is_never_overridden(self, tmp_dir):
+        """A caller-supplied ID is a deliberate choice; adoption must skip it.
+
+        Otherwise a provider asked for a specific identity would silently answer
+        to whichever ID happened to be sitting at that state location.
+        """
+        state_file = os.path.join(tmp_dir, "shared.json")
+
+        first = self._provider_sharing(state_file)
+        first._save_state()
+
+        second = self._provider_sharing(state_file, provider_id="explicit-id")
+
+        assert second.provider_id == "explicit-id"
+        # And it declines the other provider's state rather than adopting it.
+        assert second.job_map == {}
+
+    def test_a_fresh_path_leaves_the_generated_id_alone(self, tmp_dir):
+        """With nothing persisted there is no ID to adopt and no state to load."""
+        provider = self._provider_sharing(os.path.join(tmp_dir, "empty.json"))
+
+        assert provider.provider_id
+        assert provider.job_map == {}
+
+    def test_shutdown_survives_a_mode_without_delete_state(self, tmp_dir):
+        """A mode that predates delete_state must not break shutdown.
+
+        ``_delete_state`` guards with ``callable(getattr(...))``; without it a
+        third-party mode -- or a test double built with ``spec=`` -- would turn
+        shutdown into an error path.
+        """
+        provider, _ = _make_provider(tmp_dir)
+        provider.job_map["job-1"] = "resource-1"
+        provider._save_state()
+        del provider.operating_mode.delete_state
+
+        provider.shutdown()
+
+        assert provider.state_store.load_state(STATE_KEY_PROVIDER) is None

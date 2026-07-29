@@ -45,6 +45,7 @@ from parsl_ephemeral_aws.exceptions import (
     ResourceCreationError,
 )
 from parsl_ephemeral_aws.modes.base import OperatingMode
+from parsl_ephemeral_aws.state.base import STATE_KEY_MODE
 from parsl_ephemeral_aws.compute.lambda_func import LambdaManager
 from parsl_ephemeral_aws.compute.ecs import ECSManager
 from parsl_ephemeral_aws.compute.spot_interruption import (
@@ -1509,7 +1510,7 @@ class ServerlessMode(OperatingMode):
         }
 
         try:
-            self.state_store.save_state(state)
+            self.state_store.save_state(STATE_KEY_MODE, state)
         except Exception as e:
             logger.error(f"Failed to save state: {e}")
 
@@ -1522,14 +1523,10 @@ class ServerlessMode(OperatingMode):
             True if state was loaded successfully, False otherwise
         """
         try:
-            state = self.state_store.load_state()
+            state = self.state_store.load_state(STATE_KEY_MODE)
             if state and state.get("provider_id") == self.provider_id:
                 self.resources = state.get("resources", {})
-                self.vpc_id = state.get("vpc_id", self.vpc_id)
-                self.subnet_id = state.get("subnet_id", self.subnet_id)
-                self.security_group_id = state.get(
-                    "security_group_id", self.security_group_id
-                )
+                self._restore_network_ids(state)
                 self.initialized = state.get("initialized", False)
 
                 # Check if spot interruption handling was previously enabled

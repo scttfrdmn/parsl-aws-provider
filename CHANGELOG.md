@@ -97,6 +97,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   so a profile whose role attachment had failed midway kept being reused with no
   role attached and SSM never came online. The role is now attached on all three
   paths (pre-existing profile, freshly created, and lost creation race).
+- `state_store_type="s3"` and `"parameter_store"` could not be constructed at
+  all — three stacked defects, each hidden behind the previous one. The provider
+  passed `session=`/`path=`/`bucket=`/`key=`/`provider_id=`, none of which are
+  parameters of `S3State` or `ParameterStoreState` (`TypeError`); the AWS stores
+  implement a *keyed* three-method interface while the provider and
+  `FileStateStore` used an unkeyed one; and both stores unguardedly read six
+  credential attributes that `EphemeralAWSProvider` does not define, building
+  their own `boto3.Session` and ignoring `provider.session` entirely
+  (`AttributeError`). The `session=` kwarg exists nowhere else in the codebase —
+  this path had never been executed. The stores' provider-object contract is
+  kept; the provider and `FileStateStore` were adapted to it (closes #57, #77).
+- The provider and its operating mode no longer overwrite each other's state.
+  Both wrote full-document overwrites, with different field sets, into the same
+  slot, so whichever wrote last erased the other's fields. Losing the mode's
+  `baked_ami_id`/`owns_baked_ami` meant `cleanup_infrastructure()` could no
+  longer see the AMI it owned — **leaking the AMI and its EBS snapshots**, and
+  silently re-baking on restart. Losing the provider's `job_map` lost the
+  job-to-resource mapping. State is now addressed by key, one per writer
+  (closes #78).
+- Auto-created IAM instance profiles were handed to `RunInstances` before EC2
+  could see them, failing every launch with `InvalidParameterValue: Invalid IAM
+  Instance Profile ARN`. IAM is eventually consistent with respect to EC2:
+  measured against real AWS, `create_instance_profile` returned the ARN at
+  t+4.1s but `RunInstances` did not accept it until t+14.5s. This was
+  unreachable until `auto_create_instance_profile` began to take effect (#75).
+  `get_or_create_ssm_instance_profile()` now waits for the profile to become
+  visible on both its create and creation-race paths, polling a dry-run
+  `RunInstances` — `get_instance_profile` succeeds immediately and so proves
+  nothing about the path that matters. A timeout warns rather than raising, since
+  the launch that follows reports any real error (closes #98).
+- The provider never restored persisted state, so nothing survived a restart on
+  any backend. Two independent defects: `_load_state()` was not called from
+  `__init__` at all (only tests called it), and it refuses a document whose
+  `provider_id` differs from its own — while `provider_id` defaults to a fresh
+  UUID and does **not** affect where state is stored (only `state_file_path` /
+  `parameter_store_path` / `s3_key` do). A successor therefore generated a new
+  ID and discarded the very document it was pointed at. `__init__` now loads
+  state, and adopts the `provider_id` recorded at that location unless the caller
+  supplied one explicitly. Wiring this up was only safe once the provider and its
+  mode stopped sharing a slot (#78) (closes #100).
+- `shutdown()` saved an **empty** state document instead of deleting it, so SSM
+  parameters and S3 objects survived every shutdown and accumulated per run
+  (Parameter Store has an account quota). On any backend the surviving document
+  described network IDs — and, for the mode, a baked AMI — that shutdown had just
+  released. `delete_state` was implemented in all three stores and declared on
+  the ABC, but called from nowhere in the package (closes #99).
 
 ### Added
 - **One-shot mode** for `StandardMode`: set `one_shot=True` to declare that each
@@ -134,6 +180,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `_generate_lambda_code()` body and compile its output.
 - `tests/unit/test_instance_profile.py` — 10 tests covering SSM instance-profile
   resolution against moto and `StandardMode`'s resolution behaviour.
+- `STATE_KEY_PROVIDER` and `STATE_KEY_MODE` in `state/base.py`, and
+  `OperatingMode.delete_state()` — one state document per writer.
+- `FileStateStore` keyed layout: a single file holding one sub-document per key
+  under `_states`, versioned with `_version`, read-modify-written under the
+  existing `fcntl.flock`. A flat pre-v0.7.0 document is still readable under any
+  key and is seeded into both keys on first write.
+- `resolve_session(provider)` in `state/base.py` — prefers `provider.session`
+  before assembling one from credential fields, so the AWS stores stop
+  duplicating the credential plumbing the provider already does via
+  `create_session()`.
+- 8 tests in `TestFileStateStoreKeying` and 5 in `TestStateKeySeparation`
+  covering key isolation, per-key deletion, flat-document upgrade, serialization
+  failure leaving prior state intact, and shutdown deleting both documents. The
+  key-isolation tests were mutation-checked: collapsing `STATE_KEY_MODE` onto the
+  provider's key fails all three separation tests.
+- 5 tests in `TestWaitForInstanceProfile` covering the IAM propagation wait —
+  including a fake clock driven through `sleep` so the retry-then-give-up path
+  genuinely iterates.
+- The `tests/aws` `network_ids` fixture now validates the supplied IDs against
+  `AWS_TEST_REGION` before any test runs. IDs from another region were not an
+  error until a launch was attempted, surfacing minutes in as
+  `InvalidSubnetID.NotFound` from inside `RunInstances` — after real instances had
+  been billed. `AWS_TEST_REGION` defaults to `us-west-2`, so supplying the IDs
+  alone is easy to get wrong; the check now fails in seconds with the region named.
 - `get_or_create_ssm_instance_profile()` in `utils/aws.py` — promoted from
   `EC2Manager._get_or_create_instance_profile()` so `StandardMode` and
   `EC2Manager` share one implementation. Resolution order is explicit ARN, then
@@ -149,6 +219,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   flag) (closes #74).
 - `EphemeralAWSProvider` now passes `region` explicitly to the operating mode
   rather than letting it fall back to `session.region_name`.
+- **`StateStore` is now a keyed interface**: `save_state(state_key, state_data)`,
+  `load_state(state_key)`, `delete_state(state_key)`. `FileStateStore` gained the
+  key parameter; the two AWS stores already had it and now call
+  `super().__init__()`. Callers holding a store directly must pass a key.
+- `OperatingMode.load_state()` no longer restores a `None` network ID over a
+  validated constructor value. A state document written before these IDs became
+  required can carry nulls, which previously surfaced much later as an opaque
+  boto3 `InvalidParameterValue` at launch.
 - `StandardMode._create_instance()` attaches the IAM instance profile whenever
   one is available, not only when `warm_pool_size > 0`. One-shot dispatch needs
   it too, and an unused profile costs nothing.

@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional
 import boto3
 
 from parsl_ephemeral_aws.exceptions import OperatingModeError
-from parsl_ephemeral_aws.state.base import StateStore
+from parsl_ephemeral_aws.state.base import STATE_KEY_MODE, StateStore
 
 
 logger = logging.getLogger(__name__)
@@ -337,7 +337,11 @@ class OperatingMode(abc.ABC):
                 raise OperatingModeError(f"Initialization failed: {e}") from e
 
     def save_state(self) -> None:
-        """Save the current state to the state store."""
+        """Save the current state under the mode's own state key.
+
+        The provider writes ``STATE_KEY_PROVIDER`` separately; see
+        ``EphemeralAWSProvider._save_state``.
+        """
         state = {
             "resources": self.resources,
             "provider_id": self.provider_id,
@@ -349,12 +353,41 @@ class OperatingMode(abc.ABC):
         }
 
         try:
-            self.state_store.save_state(state)
+            self.state_store.save_state(STATE_KEY_MODE, state)
         except Exception as e:
             logger.error(f"Failed to save state: {e}")
 
+    def delete_state(self) -> None:
+        """Delete the state stored under the mode's own state key.
+
+        Called on provider shutdown. The provider deletes its own key
+        separately; leaving either behind strands a document that describes
+        resources which no longer exist.
+        """
+        try:
+            self.state_store.delete_state(STATE_KEY_MODE)
+        except Exception as e:
+            logger.error(f"Failed to delete state: {e}")
+
+    def _restore_network_ids(self, state: Dict[str, Any]) -> None:
+        """Restore network IDs from *state*, never overwriting one with None.
+
+        A state document from before these IDs became required can carry
+        ``None`` for any of them. The constructor value was validated; a null
+        from an old file has not been, and would surface later as an opaque
+        boto3 ``InvalidParameterValue`` at launch.
+        """
+        for attribute in ("vpc_id", "subnet_id", "security_group_id"):
+            saved = state.get(attribute)
+            if saved:
+                setattr(self, attribute, saved)
+            elif getattr(self, attribute, None):
+                logger.debug(
+                    f"Keeping configured {attribute} — saved state has no value"
+                )
+
     def load_state(self) -> bool:
-        """Load state from the state store.
+        """Load state from the mode's own state key.
 
         Returns
         -------
@@ -362,14 +395,10 @@ class OperatingMode(abc.ABC):
             True if state was loaded successfully, False otherwise
         """
         try:
-            state = self.state_store.load_state()
+            state = self.state_store.load_state(STATE_KEY_MODE)
             if state and state.get("provider_id") == self.provider_id:
                 self.resources = state.get("resources", {})
-                self.vpc_id = state.get("vpc_id", self.vpc_id)
-                self.subnet_id = state.get("subnet_id", self.subnet_id)
-                self.security_group_id = state.get(
-                    "security_group_id", self.security_group_id
-                )
+                self._restore_network_ids(state)
                 self.initialized = state.get("initialized", False)
                 logger.debug(f"Loaded state with {len(self.resources)} resources")
                 return True

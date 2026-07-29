@@ -13,8 +13,8 @@ import pytest
 import json
 
 try:
-    # Check if moto is available
-    import moto
+    # Check if moto is available — importing the decorators is the probe; a
+    # bare `import moto` alongside them was redundant.
     from moto import mock_ec2, mock_iam, mock_ssm, mock_cloudformation
 
     MOTO_AVAILABLE = True
@@ -36,20 +36,27 @@ pytestmark = pytest.mark.skipif(not MOTO_AVAILABLE, reason="moto not installed")
 
 
 class MockStateStore:
-    """Mock state store implementation for testing."""
+    """Mock state store implementation for testing.
+
+    Keyed like the real stores, so writing one key does not disturb another.
+    """
 
     def __init__(self):
         """Initialize with empty state."""
-        self.state = None
+        self.states = {}
 
-    def save_state(self, state):
-        """Save state."""
-        self.state = state
+    def save_state(self, state_key, state_data):
+        """Save state under a key."""
+        self.states[state_key] = state_data
         return True
 
-    def load_state(self):
-        """Load state."""
-        return self.state
+    def load_state(self, state_key):
+        """Load state stored under a key."""
+        return self.states.get(state_key)
+
+    def delete_state(self, state_key):
+        """Delete state stored under a key."""
+        self.states.pop(state_key, None)
 
 
 @mock_ec2

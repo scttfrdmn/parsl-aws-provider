@@ -13,10 +13,14 @@ from unittest.mock import MagicMock, patch
 
 import boto3
 import pytest
+from botocore.exceptions import ClientError
 from moto import mock_aws
 
 from parsl_ephemeral_aws.modes.standard import StandardMode
-from parsl_ephemeral_aws.utils.aws import get_or_create_ssm_instance_profile
+from parsl_ephemeral_aws.utils.aws import (
+    _wait_for_instance_profile,
+    get_or_create_ssm_instance_profile,
+)
 
 
 pytestmark = pytest.mark.unit
@@ -145,6 +149,115 @@ class TestGetOrCreateSSMInstanceProfile:
         assert [r["RoleName"] for r in profile["Roles"]] == [
             "parsl-ephemeral-ssm-role-wf-3"
         ]
+
+
+def _client_error(code):
+    """Return a ClientError carrying *code*, as boto3 would raise it."""
+    return ClientError({"Error": {"Code": code, "Message": code}}, "RunInstances")
+
+
+class TestWaitForInstanceProfile:
+    """IAM is eventually consistent with respect to EC2.
+
+    ``create_instance_profile`` returns an ARN that ``RunInstances`` rejects with
+    ``InvalidParameterValue: Invalid IAM Instance Profile ARN`` for roughly the
+    first ten seconds (measured against real AWS: created at t+4.1s, accepted at
+    t+14.5s). Making ``auto_create_instance_profile`` actually take effect
+    exposed this -- every warm-pool launch hit it. ``get_instance_profile``
+    succeeds immediately and so proves nothing; only a dry-run ``RunInstances``
+    exercises the path that matters.
+    """
+
+    @pytest.fixture
+    def session(self):
+        session = MagicMock(spec=boto3.Session)
+        session.region_name = "us-east-1"
+        return session
+
+    def test_returns_as_soon_as_ec2_accepts_the_arn(self, session):
+        """DryRunOperation means EC2 validated everything, profile included."""
+        ec2 = session.client.return_value
+        ec2.run_instances.side_effect = _client_error("DryRunOperation")
+
+        with patch("parsl_ephemeral_aws.utils.aws.time.sleep") as sleep:
+            _wait_for_instance_profile(session, "arn:aws:iam::1:instance-profile/p")
+
+        assert ec2.run_instances.call_count == 1
+        sleep.assert_not_called()
+
+    def test_retries_while_the_profile_is_still_propagating(self, session):
+        """InvalidParameterValue is the propagation window; keep waiting."""
+        ec2 = session.client.return_value
+        ec2.run_instances.side_effect = [
+            _client_error("InvalidParameterValue"),
+            _client_error("InvalidParameterValue"),
+            _client_error("DryRunOperation"),
+        ]
+
+        with patch("parsl_ephemeral_aws.utils.aws.time.sleep") as sleep:
+            _wait_for_instance_profile(session, "arn:aws:iam::1:instance-profile/p")
+
+        assert ec2.run_instances.call_count == 3
+        assert sleep.call_count == 2
+
+    def test_dry_run_passes_the_profile_arn_to_ec2(self, session):
+        """The dry run must actually name the profile, or it checks nothing."""
+        ec2 = session.client.return_value
+        ec2.run_instances.side_effect = _client_error("DryRunOperation")
+
+        _wait_for_instance_profile(session, "arn:aws:iam::1:instance-profile/p")
+
+        kwargs = ec2.run_instances.call_args.kwargs
+        assert kwargs["IamInstanceProfile"] == {
+            "Arn": "arn:aws:iam::1:instance-profile/p"
+        }
+        assert kwargs["DryRun"] is True
+
+    def test_unrelated_errors_do_not_spin(self, session):
+        """An unusable AMI here is not what this check is for.
+
+        Retrying would burn the whole timeout on an error that will never clear;
+        the real launch is the right place to report it.
+        """
+        ec2 = session.client.return_value
+        ec2.run_instances.side_effect = _client_error("InvalidAMIID.NotFound")
+
+        with patch("parsl_ephemeral_aws.utils.aws.time.sleep") as sleep:
+            _wait_for_instance_profile(session, "arn:aws:iam::1:instance-profile/p")
+
+        assert ec2.run_instances.call_count == 1
+        sleep.assert_not_called()
+
+    def test_timeout_warns_rather_than_raising(self, session):
+        """A slow propagation must not become a hard failure.
+
+        The launch that follows reports the real error if there is one; raising
+        here would fail a profile that is about to start working. Sleep drives a
+        fake clock so the loop really does iterate and then give up -- a zero
+        timeout would skip the body and prove nothing about the retry path.
+        """
+        ec2 = session.client.return_value
+        ec2.run_instances.side_effect = _client_error("InvalidParameterValue")
+
+        clock = [1000.0]
+
+        def advance(seconds):
+            clock[0] += seconds
+
+        with (
+            patch(
+                "parsl_ephemeral_aws.utils.aws.time.time", side_effect=lambda: clock[0]
+            ),
+            patch("parsl_ephemeral_aws.utils.aws.time.sleep", side_effect=advance),
+        ):
+            _wait_for_instance_profile(
+                session, "arn:aws:iam::1:instance-profile/p", timeout=10
+            )
+
+        # It retried for the full window, then returned so the launch reports
+        # the real error itself.
+        assert ec2.run_instances.call_count == 5
+        assert clock[0] == 1010.0
 
 
 class TestStandardModeProfileResolution:

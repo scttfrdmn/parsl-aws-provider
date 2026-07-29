@@ -19,6 +19,7 @@ import pytest
 
 from parsl_ephemeral_aws.exceptions import ProviderError
 from parsl_ephemeral_aws.provider import EphemeralAWSProvider
+from parsl_ephemeral_aws.state.base import STATE_KEY_PROVIDER
 from parsl_ephemeral_aws.state.file import FileStateStore
 from parsl_ephemeral_aws.utils.localstack import is_localstack_available
 
@@ -175,7 +176,7 @@ class TestJobLifecycle:
 
         # State is persisted by _save_state after submit; load it in a new instance
         state_store_2 = FileStateStore(file_path=state_file, provider_id=provider_id)
-        state = state_store_2.load_state()
+        state = state_store_2.load_state(STATE_KEY_PROVIDER)
 
         assert state is not None
         assert job_id in state.get("job_map", {})
