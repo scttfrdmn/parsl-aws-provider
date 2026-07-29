@@ -617,11 +617,16 @@ class StandardMode(OperatingMode):
         # resumed provider gets an ARN too — it is not persisted in state.
         self._resolve_instance_profile()
 
+        # Confirm the caller-supplied network resources exist. This runs on both
+        # paths: verification used to sit inside the resume branch only, so a
+        # first-run provider — the common case — never checked at all, and a
+        # mistyped or cross-region ID surfaced much later as an opaque
+        # InvalidParameterValue from inside run_instances.
+        self._verify_resources()
+
         # Try to load state first
         if self.load_state():
-            logger.debug("Loaded state, checking resources")
-            # Verify that the loaded resources exist
-            self._verify_resources()
+            logger.debug("Loaded state, resources already verified")
             return
 
         logger.debug("Initializing standard mode infrastructure")
@@ -710,54 +715,6 @@ class StandardMode(OperatingMode):
                 f"Failed to create IAM instance profile: {e}. SSM command "
                 "dispatch will not be available."
             )
-
-    def _verify_resources(self) -> None:
-        """Verify that the required resources exist.
-
-        Raises
-        ------
-        ResourceNotFoundError
-            If a required resource does not exist
-        """
-        ec2 = self.session.client("ec2")
-
-        # Verify VPC
-        if self.vpc_id:
-            try:
-                ec2.describe_vpcs(VpcIds=[self.vpc_id])
-                logger.debug(f"Verified VPC {self.vpc_id} exists")
-            except ClientError as e:
-                if "InvalidVpcID.NotFound" in str(e):
-                    logger.warning(f"VPC {self.vpc_id} does not exist")
-                    self.vpc_id = None
-                else:
-                    raise
-
-        # Verify subnet
-        if self.subnet_id:
-            try:
-                ec2.describe_subnets(SubnetIds=[self.subnet_id])
-                logger.debug(f"Verified subnet {self.subnet_id} exists")
-            except ClientError as e:
-                if "InvalidSubnetID.NotFound" in str(e):
-                    logger.warning(f"Subnet {self.subnet_id} does not exist")
-                    self.subnet_id = None
-                else:
-                    raise
-
-        # Verify security group
-        if self.security_group_id:
-            try:
-                ec2.describe_security_groups(GroupIds=[self.security_group_id])
-                logger.debug(f"Verified security group {self.security_group_id} exists")
-            except ClientError as e:
-                if "InvalidGroup.NotFound" in str(e):
-                    logger.warning(
-                        f"Security group {self.security_group_id} does not exist"
-                    )
-                    self.security_group_id = None
-                else:
-                    raise
 
     def submit_job(
         self,

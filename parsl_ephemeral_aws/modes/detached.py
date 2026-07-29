@@ -182,12 +182,28 @@ class DetachedMode(OperatingMode):
         if self.initialized:
             return
 
-        # Try to load state first
-        if self.load_state():
-            logger.debug("Loaded state, checking resources")
-            # Verify that the loaded resources exist
-            self._verify_resources()
-            return
+        # Try to load state first — bastion_id comes from it, so the bastion
+        # check below has to run afterwards.
+        loaded = self.load_state()
+
+        # Confirm the caller-supplied network resources exist, then the bastion.
+        # Verification used to sit inside the resume branch only, so a first-run
+        # provider — the common case — never checked at all, and a mistyped or
+        # cross-region ID surfaced much later as an opaque InvalidParameterValue
+        # from inside run_instances.
+        self._verify_resources()
+
+        if loaded:
+            logger.debug("Loaded state, resources verified")
+            # _verify_resources() clears bastion_id if the bastion is gone, so
+            # that the block below can rebuild it. Returning unconditionally
+            # skipped that, leaving a resumed provider with no bastion and no
+            # way to submit — every job dispatched into an SSM path nothing was
+            # reading.
+            if self.bastion_id:
+                return
+
+            logger.info("Bastion host is gone; recreating it")
 
         logger.debug("Initializing detached mode infrastructure")
 
@@ -220,52 +236,22 @@ class DetachedMode(OperatingMode):
             ) from e
 
     def _verify_resources(self) -> None:
-        """Verify that the required resources exist.
+        """Verify the network resources, then the bastion host.
 
         Raises
         ------
         ResourceNotFoundError
-            If a required resource does not exist
+            If a configured VPC, subnet, or security group is gone.
+
+        Notes
+        -----
+        A missing bastion is *not* an error: unlike the network resources it is
+        created by this mode, so ``initialize()`` can and does build a
+        replacement. Clearing ``bastion_id`` is what tells it to.
         """
+        super()._verify_resources()
+
         ec2 = self.session.client("ec2")
-
-        # Verify VPC
-        if self.vpc_id:
-            try:
-                ec2.describe_vpcs(VpcIds=[self.vpc_id])
-                logger.debug(f"Verified VPC {self.vpc_id} exists")
-            except ClientError as e:
-                if "InvalidVpcID.NotFound" in str(e):
-                    logger.warning(f"VPC {self.vpc_id} does not exist")
-                    self.vpc_id = None
-                else:
-                    raise
-
-        # Verify subnet
-        if self.subnet_id:
-            try:
-                ec2.describe_subnets(SubnetIds=[self.subnet_id])
-                logger.debug(f"Verified subnet {self.subnet_id} exists")
-            except ClientError as e:
-                if "InvalidSubnetID.NotFound" in str(e):
-                    logger.warning(f"Subnet {self.subnet_id} does not exist")
-                    self.subnet_id = None
-                else:
-                    raise
-
-        # Verify security group
-        if self.security_group_id:
-            try:
-                ec2.describe_security_groups(GroupIds=[self.security_group_id])
-                logger.debug(f"Verified security group {self.security_group_id} exists")
-            except ClientError as e:
-                if "InvalidGroup.NotFound" in str(e):
-                    logger.warning(
-                        f"Security group {self.security_group_id} does not exist"
-                    )
-                    self.security_group_id = None
-                else:
-                    raise
 
         # Verify bastion host
         if self.bastion_id:

@@ -42,7 +42,11 @@ from parsl_ephemeral_aws.modes.base import OperatingMode
 from parsl_ephemeral_aws.modes.detached import DetachedMode
 from parsl_ephemeral_aws.modes.serverless import ServerlessMode
 from parsl_ephemeral_aws.modes.standard import StandardMode
-from parsl_ephemeral_aws.state.base import STATE_KEY_PROVIDER, StateStore
+from parsl_ephemeral_aws.state.base import (
+    STATE_KEY_MODE,
+    STATE_KEY_PROVIDER,
+    StateStore,
+)
 from parsl_ephemeral_aws.state.file import FileStateStore
 from parsl_ephemeral_aws.state.parameter_store import ParameterStoreStateStore
 from parsl_ephemeral_aws.state.s3 import S3StateStore
@@ -845,17 +849,27 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
 
         Only called when the caller did not pass ``provider_id`` explicitly; an
         explicit ID is a deliberate choice and is left alone.
-        """
-        try:
-            state = self.state_store.load_state(STATE_KEY_PROVIDER)
-        except Exception as e:
-            logger.debug(f"No provider state to adopt an ID from: {e}")
-            return
 
-        persisted_id = (state or {}).get("provider_id")
-        if persisted_id and persisted_id != self.provider_id:
-            logger.info(f"Adopting persisted provider_id {persisted_id}")
-            self.provider_id = persisted_id
+        Both keys are consulted. The provider writes its own key only once a job
+        has been submitted, so a provider that constructed and exited without
+        submitting leaves the mode key alone at the location — and that is
+        precisely the state a successor needs, since it holds the network IDs and
+        the baked-AMI ownership flag.
+        """
+        for state_key in (STATE_KEY_PROVIDER, STATE_KEY_MODE):
+            try:
+                state = self.state_store.load_state(state_key)
+            except Exception as e:
+                logger.debug(f"No {state_key} state to adopt an ID from: {e}")
+                continue
+
+            persisted_id = (state or {}).get("provider_id")
+            if persisted_id and persisted_id != self.provider_id:
+                logger.info(
+                    f"Adopting provider_id {persisted_id} from {state_key} state"
+                )
+                self.provider_id = persisted_id
+                return
 
     def _load_state(self) -> None:
         """Load the state stored under the provider's own state key."""

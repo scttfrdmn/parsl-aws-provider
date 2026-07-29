@@ -951,6 +951,36 @@ class TestStateKeySeparation:
         assert second.provider_id == first.provider_id
         assert second.job_map == {"job-1": {"resource_id": "resource-1"}}
 
+    def test_the_id_is_adopted_from_mode_state_when_no_provider_state_exists(
+        self, tmp_dir
+    ):
+        """Only the mode key exists until a job is submitted.
+
+        The provider writes its own key from ``_save_state()``, which runs on
+        submit/status/cancel — so a provider that constructed and exited without
+        submitting leaves *only* the mode document behind. Adoption originally
+        read the provider key alone and found nothing, so the successor kept its
+        fresh UUID and ``OperatingMode.load_state()`` rejected the mode document
+        on the ID gate. Found against real AWS: a resumed provider silently took
+        the create path and never noticed its security group had been deleted.
+        """
+        state_file = os.path.join(tmp_dir, "mode-only.json")
+
+        first = self._provider_sharing(state_file)
+        mode = self._mode(first.provider_id, first.state_store)
+        mode.save_state()
+
+        # Only the mode key is present — exactly the no-submit case.
+        assert first.state_store.load_state(STATE_KEY_PROVIDER) is None
+        assert first.state_store.load_state(STATE_KEY_MODE) is not None
+
+        second = self._provider_sharing(state_file)
+
+        assert second.provider_id == first.provider_id
+        # And with the ID adopted, the mode's own load now clears its gate.
+        successor_mode = self._mode(second.provider_id, second.state_store)
+        assert successor_mode.load_state() is True
+
     def test_an_explicit_provider_id_is_never_overridden(self, tmp_dir):
         """A caller-supplied ID is a deliberate choice; adoption must skip it.
 

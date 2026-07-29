@@ -22,6 +22,8 @@ import logging
 
 import pytest
 
+from parsl.jobs.states import JobState
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -33,9 +35,9 @@ MAX_WAIT_S = 600  # 10 minutes
 
 
 def _poll_until(
-    provider, job_id: str, target_status: str, timeout: int = MAX_WAIT_S
+    provider, job_id: str, target_state: JobState, timeout: int = MAX_WAIT_S
 ) -> bool:
-    """Poll provider.status() until the job reaches *target_status* or timeout.
+    """Poll provider.status() until the job reaches *target_state* or timeout.
 
     Parameters
     ----------
@@ -43,20 +45,27 @@ def _poll_until(
         An initialised EphemeralAWSProvider instance.
     job_id:
         The job ID returned by provider.submit().
-    target_status:
-        The status string to wait for (e.g. "COMPLETED", "RUNNING").
+    target_state:
+        The ``JobState`` to wait for (e.g. ``JobState.COMPLETED``).
     timeout:
         Maximum number of seconds to wait before returning False.
 
     Returns
     -------
     bool
-        True if the target status was reached before the timeout.
+        True if the target state was reached before the timeout.
+
+    Notes
+    -----
+    ``status()`` returns ``List[JobStatus]``, not the ``List[Dict[str, str]]``
+    this suite was written against — and ``JobStatus`` is not subscriptable, so
+    the old ``result[0]["status"]`` raised ``TypeError`` on the first poll
+    rather than timing out. See #102.
     """
     deadline = time.time() + timeout
     while time.time() < deadline:
         result = provider.status([job_id])
-        if result and result[0]["status"] == target_status:
+        if result and result[0].state == target_state:
             return True
         time.sleep(POLL_INTERVAL_S)
     return False
@@ -128,10 +137,10 @@ class TestStandardModeComputeLifecycle:
         try:
             result = aws_provider.status([job_id])
             assert result, "status() returned an empty list"
-            status = result[0]["status"]
+            state = result[0].state
             assert (
-                status == "RUNNING"
-            ), f"Expected status RUNNING immediately after submit, got {status}"
+                state == JobState.RUNNING
+            ), f"Expected RUNNING immediately after submit, got {state}"
         finally:
             try:
                 aws_provider.cancel([job_id])
@@ -149,7 +158,7 @@ class TestStandardModeComputeLifecycle:
         job_id = aws_provider.submit("echo hello-from-ec2", tasks_per_node=1)
         resource_id = aws_provider.job_map[job_id]["resource_id"]
 
-        reached = _poll_until(aws_provider, job_id, "COMPLETED")
+        reached = _poll_until(aws_provider, job_id, JobState.COMPLETED)
         assert reached, f"Job {job_id} did not reach COMPLETED within {MAX_WAIT_S}s"
 
         # Verify the EC2 instance is in a terminal state
@@ -174,7 +183,9 @@ class TestStandardModeComputeLifecycle:
 
         # Confirm it is running first
         result = aws_provider.status([job_id])
-        assert result[0]["status"] == "RUNNING", "Expected RUNNING before cancellation"
+        assert (
+            result[0].state == JobState.RUNNING
+        ), "Expected RUNNING before cancellation"
 
         aws_provider.cancel([job_id])
 

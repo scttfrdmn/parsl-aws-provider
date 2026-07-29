@@ -357,54 +357,6 @@ class ServerlessMode(OperatingMode):
             logger.debug("Initializing ECS manager")
             self.ecs_manager = ECSManager(self)
 
-    def _verify_resources(self) -> None:
-        """Verify that the required resources exist.
-
-        Raises
-        ------
-        ResourceNotFoundError
-            If a required resource does not exist
-        """
-        ec2 = self.session.client("ec2")
-
-        # Verify VPC (if needed)
-        if self.vpc_id:
-            try:
-                ec2.describe_vpcs(VpcIds=[self.vpc_id])
-                logger.debug(f"Verified VPC {self.vpc_id} exists")
-            except ClientError as e:
-                if "InvalidVpcID.NotFound" in str(e):
-                    logger.warning(f"VPC {self.vpc_id} does not exist")
-                    self.vpc_id = None
-                else:
-                    raise
-
-        # Verify subnet (if needed)
-        if self.subnet_id:
-            try:
-                ec2.describe_subnets(SubnetIds=[self.subnet_id])
-                logger.debug(f"Verified subnet {self.subnet_id} exists")
-            except ClientError as e:
-                if "InvalidSubnetID.NotFound" in str(e):
-                    logger.warning(f"Subnet {self.subnet_id} does not exist")
-                    self.subnet_id = None
-                else:
-                    raise
-
-        # Verify security group (if needed)
-        if self.security_group_id:
-            try:
-                ec2.describe_security_groups(GroupIds=[self.security_group_id])
-                logger.debug(f"Verified security group {self.security_group_id} exists")
-            except ClientError as e:
-                if "InvalidGroup.NotFound" in str(e):
-                    logger.warning(
-                        f"Security group {self.security_group_id} does not exist"
-                    )
-                    self.security_group_id = None
-                else:
-                    raise
-
     def _select_worker_type(self, command: str, tasks_per_node: int) -> str:
         """Select the appropriate worker type for a job.
 

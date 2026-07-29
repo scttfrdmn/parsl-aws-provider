@@ -22,6 +22,8 @@ import time
 
 import pytest
 
+from parsl.jobs.states import JobState
+
 from parsl_ephemeral_aws.provider import EphemeralAWSProvider
 
 logger = logging.getLogger(__name__)
@@ -35,34 +37,34 @@ MAX_WAIT_S = 600  # 10 minutes
 
 
 def _poll_until(
-    provider, job_id: str, target_status: str, timeout: int = MAX_WAIT_S
+    provider, job_id: str, target_state: JobState, timeout: int = MAX_WAIT_S
 ) -> bool:
-    """Poll provider.status() until the job reaches *target_status* or timeout.
+    """Poll provider.status() until the job reaches *target_state* or timeout.
 
-    Returns True if the target status was reached, False on timeout.
+    Returns True if the target state was reached, False on timeout.
+
+    ``status()`` returns ``List[JobStatus]``, not the ``List[Dict[str, str]]``
+    this suite was written against, and ``JobStatus`` is not subscriptable —
+    see #102.
     """
     deadline = time.time() + timeout
     while time.time() < deadline:
         result = provider.status([job_id])
-        if result and result[0]["status"] == target_status:
+        if result and result[0].state == target_state:
             return True
         time.sleep(POLL_INTERVAL_S)
     return False
 
 
-def _poll_until_not(
-    provider, job_id: str, current_status: str, timeout: int = MAX_WAIT_S
-) -> str:
-    """Poll until the job leaves *current_status*; return the new status or '' on timeout."""
+def _poll_until_not(provider, job_id: str, current_state: JobState, timeout=MAX_WAIT_S):
+    """Poll until the job leaves *current_state*; return the new state or None."""
     deadline = time.time() + timeout
     while time.time() < deadline:
         result = provider.status([job_id])
-        if result:
-            status = result[0]["status"]
-            if status != current_status:
-                return status
+        if result and result[0].state != current_state:
+            return result[0].state
         time.sleep(POLL_INTERVAL_S)
-    return ""
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -214,10 +216,10 @@ class TestSpotComputeLifecycle:
         try:
             result = spot_provider.status([job_id])
             assert result, "status() returned an empty list"
-            status = result[0]["status"]
+            state = result[0].state
             assert (
-                status == "RUNNING"
-            ), f"Expected status RUNNING immediately after submit, got {status}"
+                state == JobState.RUNNING
+            ), f"Expected RUNNING immediately after submit, got {state}"
         finally:
             try:
                 spot_provider.cancel([job_id])
@@ -233,7 +235,7 @@ class TestSpotComputeLifecycle:
         job_id = spot_provider.submit("echo hello-from-spot", tasks_per_node=1)
         resource_id = spot_provider.job_map[job_id]["resource_id"]
 
-        reached = _poll_until(spot_provider, job_id, "COMPLETED")
+        reached = _poll_until(spot_provider, job_id, JobState.COMPLETED)
         assert reached, f"Job {job_id} did not reach COMPLETED within {MAX_WAIT_S}s"
 
         ec2 = aws_session.client("ec2", region_name=aws_region)
@@ -258,7 +260,9 @@ class TestSpotComputeLifecycle:
         resource_id = spot_provider.job_map[job_id]["resource_id"]
 
         result = spot_provider.status([job_id])
-        assert result[0]["status"] == "RUNNING", "Expected RUNNING before cancellation"
+        assert (
+            result[0].state == JobState.RUNNING
+        ), "Expected RUNNING before cancellation"
 
         spot_provider.cancel([job_id])
 
@@ -400,7 +404,7 @@ class TestSpotInterruptionMonitor:
         # Confirm it is RUNNING first
         result = spot_provider.status([job_id])
         assert (
-            result and result[0]["status"] == "RUNNING"
+            result and result[0].state == JobState.RUNNING
         ), "Expected RUNNING status before force-termination"
 
         # Force-terminate the EC2 instance directly
@@ -413,13 +417,15 @@ class TestSpotInterruptionMonitor:
         )
 
         # Poll until the provider detects the change (3 minute timeout)
-        new_status = _poll_until_not(spot_provider, job_id, "RUNNING", timeout=180)
-        assert new_status, (
+        new_state = _poll_until_not(
+            spot_provider, job_id, JobState.RUNNING, timeout=180
+        )
+        assert new_state is not None, (
             f"Job {job_id} did not leave RUNNING state within 180s after "
             f"instance {resource_id} was force-terminated"
         )
         logger.info(
             "test_forced_termination: job %s transitioned from RUNNING to %s",
             job_id,
-            new_status,
+            new_state,
         )

@@ -137,6 +137,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   state, and adopts the `provider_id` recorded at that location unless the caller
   supplied one explicitly. Wiring this up was only safe once the provider and its
   mode stopped sharing a slot (#78) (closes #100).
+- Provider-ID adoption consulted only the provider's own state key, which does not
+  exist until a job has been submitted — the provider writes it from
+  `_save_state()`, on submit/status/cancel. A provider that constructed and
+  exited without submitting therefore left *only* the mode document behind, the
+  successor kept its fresh UUID, and `OperatingMode.load_state()` rejected that
+  document on the ID gate. Both keys are now consulted, provider key first. The
+  mode document is the one that matters here: it holds the network IDs and the
+  baked-AMI ownership flag. Found against real AWS while probing #79 — a resumed
+  provider silently took the create path and never noticed its security group had
+  been deleted (closes #101).
+- Real-AWS E2E tests read `provider.status(...)[0]["status"]` in 14 places, but
+  `status()` has returned `List[JobStatus]` since v0.5.0 and `JobStatus` is not
+  subscriptable, so each raised `TypeError`. The pattern dates to when the suite
+  was written, against the old `List[Dict[str, str]]`. This mattered more than
+  the three visible failures suggest: a polling helper that raises on its first
+  call cannot time out — it aborts the test — so no spot, detached, serverless,
+  or Globus lifecycle assertion downstream of a `_poll_until` had ever run. All
+  call sites now compare `statuses[0].state` against `JobState` (closes #102).
+- `_verify_resources()` nulled the network ID it had just found missing instead of
+  reporting it. The nulling is a leftover from the create-on-demand era — since
+  #69 nothing creates a replacement, so the `None` reached `run_instances` as an
+  opaque `InvalidParameterValue` far from the missing resource, and in serverless
+  mode re-entered a guard that read a `create_vpc` attribute which no longer
+  exists. It now raises `ResourceNotFoundError` naming the offending ID.
+  `load_state()` also no longer restores a `None` from a pre-#69 state document
+  over a validated ID. The network half of the method was byte-identical in all
+  three modes — the condition that let them drift — and now lives once on
+  `OperatingMode`; `DetachedMode` still adds its bastion check on top, where a
+  missing bastion is correctly *not* an error, since that resource is one the
+  mode does create (closes #79).
+- Network resources were verified only when resuming from state, so a first-run
+  provider — the common case — never checked its IDs at all. `initialize()` now
+  verifies on both paths in all three modes. Found by probing #79's fix against
+  real AWS: the expected `ResourceNotFoundError` never fired.
+- A syntactically invalid network ID escaped as a raw `ClientError`. EC2 answers
+  a malformed ID with a distinct code rather than `NotFound` — verified against
+  real AWS, where `sg-00000000000000000` yields `InvalidGroupId.Malformed` while
+  a subnet or VPC ID of the same shape yields `NotFound`, and the suffix casing
+  differs per resource. All six codes are now matched, on the `Error.Code` field
+  rather than the rendered message.
+- `DetachedMode.initialize()` returned unconditionally when it loaded state, so a
+  resumed provider whose bastion had been terminated never rebuilt it — every job
+  was dispatched into an SSM path nothing was reading. It also ran its bastion
+  check before `load_state()`, which is where `bastion_id` comes from, so on a
+  fresh process there was nothing to check.
 - `shutdown()` saved an **empty** state document instead of deleting it, so SSM
   parameters and S3 objects survived every shutdown and accumulated per run
   (Parameter Store has an account quota). On any backend the surviving document

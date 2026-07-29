@@ -19,6 +19,8 @@ import time
 import pytest
 from botocore.exceptions import ClientError
 
+from parsl.jobs.states import JobState
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -30,13 +32,18 @@ MAX_WAIT_S = 600  # 10 minutes
 
 
 def _poll_until(
-    provider, job_id: str, target_status: str, timeout: int = MAX_WAIT_S
+    provider, job_id: str, target_state: JobState, timeout: int = MAX_WAIT_S
 ) -> bool:
-    """Poll provider.status() until the job reaches *target_status* or timeout."""
+    """Poll provider.status() until the job reaches *target_state* or timeout.
+
+    ``status()`` returns ``List[JobStatus]``, not the ``List[Dict[str, str]]``
+    this suite was written against, and ``JobStatus`` is not subscriptable —
+    see #102.
+    """
     deadline = time.time() + timeout
     while time.time() < deadline:
         result = provider.status([job_id])
-        if result and result[0]["status"] == target_status:
+        if result and result[0].state == target_state:
             return True
         time.sleep(POLL_INTERVAL_S)
     return False
@@ -185,11 +192,11 @@ class TestDetachedModeComputeLifecycle:
         try:
             result = detached_provider.status([job_id])
             assert result, "status() returned an empty list"
-            status = result[0]["status"]
-            assert status in (
-                "PENDING",
-                "RUNNING",
-            ), f"Expected PENDING or RUNNING immediately after submit, got {status}"
+            state = result[0].state
+            assert state in (
+                JobState.PENDING,
+                JobState.RUNNING,
+            ), f"Expected PENDING or RUNNING immediately after submit, got {state}"
         finally:
             try:
                 detached_provider.cancel([job_id])
@@ -200,7 +207,7 @@ class TestDetachedModeComputeLifecycle:
         """A short ``echo`` command reaches COMPLETED within the timeout."""
         job_id = detached_provider.submit("echo hello-from-detached", tasks_per_node=1)
 
-        reached = _poll_until(detached_provider, job_id, "COMPLETED")
+        reached = _poll_until(detached_provider, job_id, JobState.COMPLETED)
         assert reached, f"Job {job_id} did not reach COMPLETED within {MAX_WAIT_S}s"
 
     def test_cancel_removes_job(self, detached_provider):
@@ -212,7 +219,7 @@ class TestDetachedModeComputeLifecycle:
         started = False
         while time.time() < deadline:
             result = detached_provider.status([job_id])
-            if result and result[0]["status"] in ("PENDING", "RUNNING"):
+            if result and result[0].state in (JobState.PENDING, JobState.RUNNING):
                 started = True
                 break
             time.sleep(POLL_INTERVAL_S)
@@ -223,10 +230,10 @@ class TestDetachedModeComputeLifecycle:
         # After cancel, the job should not be RUNNING
         result = detached_provider.status([job_id])
         if result:
-            status = result[0]["status"]
-            assert status not in (
-                "RUNNING",
-            ), f"Job {job_id} is still RUNNING after cancel(); status={status}"
+            state = result[0].state
+            assert (
+                state != JobState.RUNNING
+            ), f"Job {job_id} is still RUNNING after cancel(); state={state}"
 
 
 # ---------------------------------------------------------------------------

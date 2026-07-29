@@ -11,7 +11,9 @@ from typing import Any, Dict, List, Optional
 
 import boto3
 
-from parsl_ephemeral_aws.exceptions import OperatingModeError
+from botocore.exceptions import ClientError
+
+from parsl_ephemeral_aws.exceptions import OperatingModeError, ResourceNotFoundError
 from parsl_ephemeral_aws.state.base import STATE_KEY_MODE, StateStore
 
 
@@ -368,6 +370,75 @@ class OperatingMode(abc.ABC):
             self.state_store.delete_state(STATE_KEY_MODE)
         except Exception as e:
             logger.error(f"Failed to delete state: {e}")
+
+    #: EC2 error codes and describe call for each network ID, in the order they
+    #: are checked. VPC first, so a wholly deleted VPC is reported as such
+    #: rather than as three unrelated missing children.
+    #:
+    #: Both ``NotFound`` and ``Malformed`` are treated as "unusable ID". EC2
+    #: returns the latter for a syntactically invalid ID — verified against real
+    #: AWS, where ``sg-00000000000000000`` yields ``InvalidGroupId.Malformed``
+    #: while the same shape of subnet or VPC ID yields ``NotFound``. To the
+    #: caller both mean the same thing: the ID they supplied cannot be used.
+    _NETWORK_RESOURCES = (
+        (
+            "vpc_id",
+            "describe_vpcs",
+            "VpcIds",
+            ("InvalidVpcID.NotFound", "InvalidVpcID.Malformed"),
+        ),
+        (
+            "subnet_id",
+            "describe_subnets",
+            "SubnetIds",
+            ("InvalidSubnetID.NotFound", "InvalidSubnetId.Malformed"),
+        ),
+        (
+            "security_group_id",
+            "describe_security_groups",
+            "GroupIds",
+            ("InvalidGroup.NotFound", "InvalidGroupId.Malformed"),
+        ),
+    )
+
+    def _verify_resources(self) -> None:
+        """Confirm the caller-supplied network resources still exist.
+
+        Raises
+        ------
+        ResourceNotFoundError
+            If a configured VPC, subnet, or security group is missing or its ID
+            is malformed.
+
+        Notes
+        -----
+        Every mode used to null the attribute out here instead of raising, so
+        that ``initialize()`` would create a replacement. Since #69 nothing
+        creates one: the ``None`` propagates to ``run_instances`` and surfaces as
+        an opaque ``InvalidParameterValue`` far from the missing resource, or —
+        in serverless mode — re-entered a guard that read a ``create_vpc``
+        attribute which no longer exists. Naming the resource here is the whole
+        point of verifying it.
+        """
+        ec2 = self.session.client("ec2")
+
+        for attribute, describe, id_param, bad_id_codes in self._NETWORK_RESOURCES:
+            resource_id = getattr(self, attribute, None)
+            if not resource_id:
+                continue
+
+            try:
+                getattr(ec2, describe)(**{id_param: [resource_id]})
+                logger.debug(f"Verified {attribute} {resource_id} exists")
+            except ClientError as e:
+                if e.response.get("Error", {}).get("Code") in bad_id_codes:
+                    raise ResourceNotFoundError(
+                        f"{attribute} {resource_id} is not usable. It is "
+                        "malformed, was deleted, or belongs to a different "
+                        "region or account; pre-provision the network resources "
+                        "and pass their IDs."
+                    ) from e
+                raise
 
     def _restore_network_ids(self, state: Dict[str, Any]) -> None:
         """Restore network IDs from *state*, never overwriting one with None.
