@@ -41,6 +41,8 @@ from typing import Optional
 
 import pytest
 
+from parsl.jobs.states import JobState
+
 from parsl_ephemeral_aws import GlobusComputeProvider
 
 logger = logging.getLogger(__name__)
@@ -606,7 +608,7 @@ class TestGlobusComputeEC2Cleanup:
         deadline = time.time() + 120
         while time.time() < deadline:
             result = provider.status([job_id])
-            if result and result[0]["status"] in ("RUNNING", "COMPLETED"):
+            if result and result[0].state in (JobState.RUNNING, JobState.COMPLETED):
                 break
             time.sleep(POLL_INTERVAL_S)
 

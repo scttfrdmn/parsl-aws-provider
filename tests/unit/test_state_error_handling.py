@@ -14,10 +14,16 @@ import pytest
 from unittest.mock import MagicMock, patch
 from botocore.exceptions import ClientError
 
+from parsl_ephemeral_aws.state.base import STATE_KEY_MODE, STATE_KEY_PROVIDER
 from parsl_ephemeral_aws.state.file import FileStateStore
 from parsl_ephemeral_aws.state.parameter_store import ParameterStoreState
 from parsl_ephemeral_aws.state.s3 import S3State
-from parsl_ephemeral_aws.exceptions import StateError, StateDeserializationError
+from parsl_ephemeral_aws.exceptions import (
+    StateDeserializationError,
+    StateError,
+    StateSerializationError,
+    StateStoreError,
+)
 
 
 class TestFileStateStoreErrorHandling:
@@ -45,8 +51,10 @@ class TestFileStateStoreErrorHandling:
     def test_save_state_permission_error(self, file_state_store, test_state):
         """Test handling permission error when saving state."""
         with patch("builtins.open", side_effect=PermissionError("Permission denied")):
-            with pytest.raises(StateError) as exc_info:
-                file_state_store.save_state(test_state)
+            # StateStoreError, not the StateError subclass: an unwritable file is
+            # a store failure, and file.py has always raised the parent.
+            with pytest.raises(StateStoreError) as exc_info:
+                file_state_store.save_state(STATE_KEY_PROVIDER, test_state)
 
             assert "Permission denied" in str(exc_info.value)
 
@@ -60,7 +68,7 @@ class TestFileStateStoreErrorHandling:
 
         # Should create directories and save successfully
         test_state = {"key": "value"}
-        file_store.save_state(test_state)
+        file_store.save_state(STATE_KEY_PROVIDER, test_state)
 
         # Verify file was created
         assert os.path.exists(nested_path)
@@ -68,12 +76,12 @@ class TestFileStateStoreErrorHandling:
         # Verify content
         with open(nested_path, "r") as f:
             saved_state = json.load(f)
-            assert saved_state == test_state
+            assert saved_state["_states"][STATE_KEY_PROVIDER] == test_state
 
     def test_load_state_file_not_found(self, file_state_store):
         """Test handling file not found when loading state."""
         # File doesn't exist yet
-        state = file_state_store.load_state()
+        state = file_state_store.load_state(STATE_KEY_PROVIDER)
 
         # Should return None, not raise an exception
         assert state is None
@@ -86,14 +94,14 @@ class TestFileStateStoreErrorHandling:
 
         # Should raise StateDeserializationError
         with pytest.raises(StateDeserializationError) as exc_info:
-            file_state_store.load_state()
+            file_state_store.load_state(STATE_KEY_PROVIDER)
 
         assert "Failed to deserialize state" in str(exc_info.value)
 
     def test_delete_state_file_not_found(self, file_state_store):
         """Test handling file not found when deleting state."""
         # File doesn't exist yet
-        file_state_store.delete_state()
+        file_state_store.delete_state(STATE_KEY_PROVIDER)
 
         # Should not raise an exception
         assert not os.path.exists(file_state_store.file_path)
@@ -101,17 +109,17 @@ class TestFileStateStoreErrorHandling:
     def test_delete_state_permission_error(self, file_state_store, test_state):
         """Test handling permission error when deleting state."""
         # Save state first
-        file_state_store.save_state(test_state)
+        file_state_store.save_state(STATE_KEY_PROVIDER, test_state)
 
         # Mock permission error on unlink
         with patch("os.remove", side_effect=PermissionError("Permission denied")):
-            with pytest.raises(StateError) as exc_info:
-                file_state_store.delete_state()
+            with pytest.raises(StateStoreError) as exc_info:
+                file_state_store.delete_state(STATE_KEY_PROVIDER)
 
             assert "Permission denied" in str(exc_info.value)
 
     def test_concurrent_write_scenario(self, temp_dir):
-        """Test a scenario mimicking concurrent writes."""
+        """Test a scenario mimicking concurrent writes to the same state key."""
         file_path = os.path.join(temp_dir, "shared_state.json")
 
         # Create two separate state store instances for the same file
@@ -120,16 +128,139 @@ class TestFileStateStoreErrorHandling:
 
         # First store saves state
         state1 = {"owner": "provider1", "data": [1, 2, 3]}
-        store1.save_state(state1)
+        store1.save_state(STATE_KEY_PROVIDER, state1)
 
         # Second store overwrites with its state
         state2 = {"owner": "provider2", "data": [4, 5, 6]}
-        store2.save_state(state2)
+        store2.save_state(STATE_KEY_PROVIDER, state2)
 
-        # Verify final state is from store2
-        loaded_state = store1.load_state()
+        # Verify final state is from store2 — sharing a path and a key means
+        # sharing a slot, which is what makes state hand-off possible.
+        loaded_state = store1.load_state(STATE_KEY_PROVIDER)
         assert loaded_state["owner"] == "provider2"
         assert loaded_state["data"] == [4, 5, 6]
+
+
+class TestFileStateStoreKeying:
+    """Tests for the keyed state interface in FileStateStore (#77, #78)."""
+
+    @pytest.fixture
+    def state_path(self):
+        """Path to a state file inside a temporary directory."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            yield os.path.join(tmp_dir, "state.json")
+
+    @pytest.fixture
+    def store(self, state_path):
+        """Create a FileStateStore instance."""
+        return FileStateStore(state_path, "test-provider")
+
+    def test_keys_do_not_clobber_each_other(self, store):
+        """Writing one key leaves the other key's document untouched (#78).
+
+        This is the regression: the provider and the mode persist different
+        field sets, and a full-document overwrite from either destroyed the
+        other's fields — the baked AMI ID and warm pool, or job_map.
+        """
+        mode_state = {"baked_ami_id": "ami-baked", "owns_baked_ami": True}
+        provider_state = {"job_map": {"job-1": "res-1"}}
+
+        store.save_state(STATE_KEY_MODE, mode_state)
+        store.save_state(STATE_KEY_PROVIDER, provider_state)
+        # A second mode write is where the provider's fields used to vanish.
+        store.save_state(STATE_KEY_MODE, mode_state)
+
+        assert store.load_state(STATE_KEY_MODE) == mode_state
+        assert store.load_state(STATE_KEY_PROVIDER) == provider_state
+
+    def test_missing_key_returns_none(self, store):
+        """A key that was never written reads back as None, not as another key."""
+        store.save_state(STATE_KEY_MODE, {"vpc_id": "vpc-12345"})
+
+        assert store.load_state(STATE_KEY_PROVIDER) is None
+
+    def test_delete_one_key_keeps_the_other(self, store):
+        """Deleting one key preserves the others and keeps the file."""
+        store.save_state(STATE_KEY_MODE, {"vpc_id": "vpc-12345"})
+        store.save_state(STATE_KEY_PROVIDER, {"job_map": {}})
+
+        store.delete_state(STATE_KEY_MODE)
+
+        assert store.load_state(STATE_KEY_MODE) is None
+        assert store.load_state(STATE_KEY_PROVIDER) == {"job_map": {}}
+        assert os.path.exists(store.file_path)
+
+    def test_file_removed_once_last_key_is_deleted(self, store):
+        """The state file itself goes away with the last key."""
+        store.save_state(STATE_KEY_PROVIDER, {"job_map": {}})
+
+        store.delete_state(STATE_KEY_PROVIDER)
+
+        assert not os.path.exists(store.file_path)
+
+    def test_delete_absent_key_is_not_an_error(self, store):
+        """Deleting a key that is not present succeeds, per the ABC contract."""
+        store.save_state(STATE_KEY_PROVIDER, {"job_map": {}})
+
+        store.delete_state(STATE_KEY_MODE)
+
+        assert store.load_state(STATE_KEY_PROVIDER) == {"job_map": {}}
+
+    def test_flat_document_is_readable_under_any_key(self, store):
+        """A pre-v0.7.0 flat document is handed to whichever key asks.
+
+        Both writers shared one slot before state keys, so each takes the
+        fields it recognises out of the same document.
+        """
+        flat = {
+            "provider_id": "test-provider",
+            "vpc_id": "vpc-12345",
+            "baked_ami_id": "ami-old",
+            "job_map": {"job-1": "res-1"},
+        }
+        with open(store.file_path, "w") as f:
+            json.dump(flat, f)
+
+        assert store.load_state(STATE_KEY_MODE) == flat
+        assert store.load_state(STATE_KEY_PROVIDER) == flat
+
+    def test_flat_document_upgrade_keeps_the_other_key(self, store):
+        """Upgrading a flat document seeds both keys, so no fields are lost.
+
+        Whichever writer goes first would otherwise erase the fields its
+        counterpart has not read yet.
+        """
+        flat = {
+            "provider_id": "test-provider",
+            "baked_ami_id": "ami-old",
+            "job_map": {"job-1": "res-1"},
+        }
+        with open(store.file_path, "w") as f:
+            json.dump(flat, f)
+
+        # The mode writes first, upgrading the file to the keyed layout.
+        store.save_state(STATE_KEY_MODE, {"baked_ami_id": "ami-new"})
+
+        assert store.load_state(STATE_KEY_MODE) == {"baked_ami_id": "ami-new"}
+        # The provider has not written yet; its fields must have survived.
+        assert store.load_state(STATE_KEY_PROVIDER)["job_map"] == {"job-1": "res-1"}
+
+        with open(store.file_path, "r") as f:
+            document = json.load(f)
+        assert document["_version"] == 2
+        assert set(document["_states"]) == {STATE_KEY_MODE, STATE_KEY_PROVIDER}
+
+    def test_serialization_failure_leaves_previous_state_intact(self, store):
+        """An unencodable document must not empty the file.
+
+        Serializing before truncating is what makes this hold.
+        """
+        store.save_state(STATE_KEY_PROVIDER, {"job_map": {"job-1": "res-1"}})
+
+        with pytest.raises(StateSerializationError):
+            store.save_state(STATE_KEY_MODE, {"handle": object()})
+
+        assert store.load_state(STATE_KEY_PROVIDER) == {"job_map": {"job-1": "res-1"}}
 
 
 @patch("boto3.Session")

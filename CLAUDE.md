@@ -15,6 +15,16 @@ All work tracking for this project uses GitHub. **Do not create standalone plann
   - A milestone assignment (`v0.1.0`, `v0.2.0`, or `v0.3.0`)
 - Reference issues in commit messages: `fix: correct spot fleet instance type generation (closes #N)`
 
+### Branches and Pull Requests
+- **All work goes on a feature branch and merges via a PR. Never commit directly
+  to `main`.**
+- Branch per phase or task group, named for the work: `fix/phase-1-correctness`,
+  `feat/launch-templates`.
+- Open the PR with `gh pr create`; the PR body should summarise the defects fixed
+  and how each was verified.
+- `closes #N` only closes the issue once the commit reaches `main`, so issues stay
+  open until the PR merges. That is intended — don't close them by hand.
+
 ### Milestones
 - **v0.1.0** — Critical bugs and broken functionality; minimum viable provider
 - **v0.2.0** — Stability: race conditions, resource leaks, error handling, core test coverage

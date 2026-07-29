@@ -137,77 +137,19 @@ class EC2Manager:
     def _get_or_create_instance_profile(self) -> Optional[str]:
         """Return an IAM instance profile ARN for SSM access, or None.
 
-        Resolution order:
-        1. ``provider.iam_instance_profile_arn`` if set → use directly.
-        2. ``provider.auto_create_instance_profile`` → get-or-create a
-           profile that has the AmazonSSMManagedInstanceCore policy.
-        3. Otherwise → return None (EC2 instances launch without a profile).
+        Thin wrapper over ``utils.aws.get_or_create_ssm_instance_profile``, which
+        the operating modes call directly.
         """
-        profile_arn: Optional[str] = getattr(
-            self.provider, "iam_instance_profile_arn", None
+        from ..utils.aws import get_or_create_ssm_instance_profile
+
+        return get_or_create_ssm_instance_profile(
+            session=self.aws_session,
+            name_suffix=self.provider.workflow_id,
+            iam_instance_profile_arn=getattr(
+                self.provider, "iam_instance_profile_arn", None
+            ),
+            auto_create=getattr(self.provider, "auto_create_instance_profile", False),
         )
-        if profile_arn:
-            return profile_arn
-
-        if not getattr(self.provider, "auto_create_instance_profile", False):
-            return None
-
-        iam = self.aws_session.client("iam")
-        workflow_id = self.provider.workflow_id
-        role_name = f"parsl-ephemeral-ssm-role-{workflow_id}"
-        profile_name = f"parsl-ephemeral-ssm-profile-{workflow_id}"
-
-        # Ensure the IAM role exists
-        from ..utils.aws import get_or_create_iam_role
-
-        get_or_create_iam_role(
-            iam_client=iam,
-            role_name=role_name,
-            assume_role_policy={
-                "Version": "2012-10-17",
-                "Statement": [
-                    {
-                        "Effect": "Allow",
-                        "Principal": {"Service": "ec2.amazonaws.com"},
-                        "Action": "sts:AssumeRole",
-                    }
-                ],
-            },
-            policy_arns=["arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"],
-            description=f"SSM instance role for Parsl ({workflow_id})",
-        )
-
-        # Ensure the instance profile exists and has the role attached
-        try:
-            response = iam.get_instance_profile(InstanceProfileName=profile_name)
-            return response["InstanceProfile"]["Arn"]
-        except ClientError as e:
-            if e.response["Error"]["Code"] not in (
-                "NoSuchEntity",
-                "NoSuchEntityException",
-            ):
-                raise ResourceCreationError(
-                    f"Failed to check instance profile {profile_name}: {e}"
-                ) from e
-
-        try:
-            response = iam.create_instance_profile(
-                InstanceProfileName=profile_name,
-            )
-            arn: str = response["InstanceProfile"]["Arn"]
-            iam.add_role_to_instance_profile(
-                InstanceProfileName=profile_name,
-                RoleName=role_name,
-            )
-            logger.info(f"Created IAM instance profile: {profile_name}")
-            return arn
-        except ClientError as e:
-            if e.response["Error"]["Code"] in ("EntityAlreadyExists",):
-                response = iam.get_instance_profile(InstanceProfileName=profile_name)
-                return response["InstanceProfile"]["Arn"]
-            raise ResourceCreationError(
-                f"Failed to create instance profile {profile_name}: {e}"
-            ) from e
 
     def _setup_security_config(self) -> None:
         """Set up security configuration from provider settings."""

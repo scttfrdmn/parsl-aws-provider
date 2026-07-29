@@ -18,9 +18,6 @@ import boto3
 from botocore.exceptions import ClientError
 
 from parsl_ephemeral_aws.constants import (
-    DEFAULT_SECURITY_GROUP_DESCRIPTION,
-    DEFAULT_SECURITY_GROUP_NAME,
-    DEFAULT_OUTBOUND_RULES,
     RESOURCE_TYPE_LAMBDA_FUNCTION,
     RESOURCE_TYPE_ECS_TASK,
     WORKER_TYPE_LAMBDA,
@@ -44,20 +41,16 @@ from parsl_ephemeral_aws.constants import (
 from parsl_ephemeral_aws.exceptions import (
     ConfigurationError,
     JobSubmissionError,
-    NetworkCreationError,
     OperatingModeError,
     ResourceCreationError,
 )
 from parsl_ephemeral_aws.modes.base import OperatingMode
+from parsl_ephemeral_aws.state.base import STATE_KEY_MODE
 from parsl_ephemeral_aws.compute.lambda_func import LambdaManager
 from parsl_ephemeral_aws.compute.ecs import ECSManager
 from parsl_ephemeral_aws.compute.spot_interruption import (
     SpotInterruptionMonitor,
     ParslSpotInterruptionHandler,
-)
-from parsl_ephemeral_aws.utils.aws import (
-    create_tags,
-    wait_for_resource,
 )
 
 
@@ -118,7 +111,6 @@ class ServerlessMode(OperatingMode):
         subnet_id: Optional[str] = None,
         security_group_id: Optional[str] = None,
         use_public_ips: bool = True,
-        create_vpc: bool = True,
         use_spot: bool = False,
         use_spot_fleet: bool = False,
         instance_types: Optional[List[str]] = None,
@@ -126,6 +118,9 @@ class ServerlessMode(OperatingMode):
         spot_max_price_percentage: Optional[float] = None,
         additional_tags: Optional[Dict[str, str]] = None,
         debug: bool = False,
+        compute_type: Optional[str] = None,
+        memory_size: Optional[int] = None,
+        timeout: Optional[int] = None,
         **kwargs: Any,
     ) -> None:
         """Initialize the serverless mode.
@@ -160,8 +155,6 @@ class ServerlessMode(OperatingMode):
             Existing security group ID to use, by default None
         use_public_ips : bool, optional
             Whether to assign public IPs to ECS tasks, by default True
-        create_vpc : bool, optional
-            Whether to create a new VPC if vpc_id is not provided, by default True
         use_spot : bool, optional
             Whether to use spot instances for ECS tasks (Fargate Spot), by default False
         use_spot_fleet : bool, optional
@@ -181,7 +174,40 @@ class ServerlessMode(OperatingMode):
             Tags to apply to created resources, by default None
         debug : bool, optional
             Whether to enable debug logging, by default False
+        compute_type : Optional[str], optional
+            Compute type forwarded by ``EphemeralAWSProvider`` ("lambda" or "ecs").
+            When supplied it takes precedence over ``worker_type``; "ec2" is
+            treated as unset since it has no meaning for serverless mode.
+        memory_size : Optional[int], optional
+            Lambda memory in MB, forwarded by ``EphemeralAWSProvider``. Overrides
+            ``lambda_memory`` when supplied.
+        timeout : Optional[int], optional
+            Lambda timeout in seconds, forwarded by ``EphemeralAWSProvider``.
+            Overrides ``lambda_timeout`` when supplied.
         """
+        # compute_type is the provider-facing name for worker_type. Map it before
+        # validating so an invalid value is reported against the real input.
+        # It arrives as a ComputeType enum member, whose str() is the qualified
+        # name rather than the value — read .value when present.
+        if compute_type is not None:
+            compute_type = str(getattr(compute_type, "value", compute_type)).lower()
+            if compute_type != "ec2":
+                worker_type = compute_type
+
+        # Validate worker type before calling super(), so a bad value is reported
+        # even when the network guard below would also have failed.
+        if worker_type not in [WORKER_TYPE_LAMBDA, WORKER_TYPE_ECS, WORKER_TYPE_AUTO]:
+            raise ConfigurationError(
+                f"Serverless mode requires worker_type to be '{WORKER_TYPE_LAMBDA}', "
+                f"'{WORKER_TYPE_ECS}', or '{WORKER_TYPE_AUTO}'"
+            )
+
+        # Lambda runs in the Lambda-managed VPC and needs none of the three
+        # network IDs; ECS/Fargate requires a subnet and security group for its
+        # mandatory awsvpcConfiguration. Only enforce the base-class requirement
+        # when ECS is reachable.
+        requires_network = worker_type in [WORKER_TYPE_ECS, WORKER_TYPE_AUTO]
+
         super().__init__(
             provider_id=provider_id,
             session=session,
@@ -190,23 +216,16 @@ class ServerlessMode(OperatingMode):
             subnet_id=subnet_id,
             security_group_id=security_group_id,
             use_public_ips=use_public_ips,
-            create_vpc=create_vpc,
             additional_tags=additional_tags,
             debug=debug,
+            require_network_resources=requires_network,
             **kwargs,
         )
 
-        # Validate worker type
-        if worker_type not in [WORKER_TYPE_LAMBDA, WORKER_TYPE_ECS, WORKER_TYPE_AUTO]:
-            raise ConfigurationError(
-                f"Serverless mode requires worker_type to be '{WORKER_TYPE_LAMBDA}', "
-                f"'{WORKER_TYPE_ECS}', or '{WORKER_TYPE_AUTO}'"
-            )
-
         # Set serverless mode specific attributes
         self.worker_type = worker_type
-        self.lambda_timeout = lambda_timeout
-        self.lambda_memory = lambda_memory
+        self.lambda_timeout = timeout if timeout is not None else lambda_timeout
+        self.lambda_memory = memory_size if memory_size is not None else lambda_memory
         self.lambda_runtime = lambda_runtime
         self.ecs_task_cpu = ecs_task_cpu
         self.ecs_task_memory = ecs_task_memory
@@ -228,9 +247,27 @@ class ServerlessMode(OperatingMode):
         self.nodes_per_block = nodes_per_block
         self.spot_max_price_percentage = spot_max_price_percentage
 
+        # LambdaManager and ECSManager were written against EphemeralAWSProvider
+        # and are handed this mode as their `provider`. Define the attributes they
+        # read so the contract is satisfied without duplicating the mode.
+        #
+        # Credentials are deliberately left as None: self.session is already
+        # fully authenticated by the provider via create_session(), and the
+        # managers fall back to the ambient credential chain when these are unset.
+        self.workflow_id = self.provider_id
+        self.aws_access_key_id: Optional[str] = None
+        self.aws_secret_access_key: Optional[str] = None
+        self.aws_session_token: Optional[str] = None
+        self.aws_profile: Optional[str] = None
+        self.security_config: Optional[Any] = None
+        # ECSManager reads this to decide whether to request Fargate Spot.
+        self.use_spot_instances = use_spot
+        # ECSManager prefers a subnet_ids list and falls back to subnet_id.
+        self.subnet_ids = [self.subnet_id] if self.subnet_id else None
+
         # Initialize compute managers
-        self.lambda_manager = None
-        self.ecs_manager = None
+        self.lambda_manager: Optional[LambdaManager] = None
+        self.ecs_manager: Optional[ECSManager] = None
         self.cf_client = self.session.client("cloudformation")
 
         # Initialize spot interruption handling if enabled
@@ -255,15 +292,16 @@ class ServerlessMode(OperatingMode):
                 self.spot_interruption_monitor.start_monitoring()
 
     def initialize(self) -> None:
-        """Initialize serverless mode infrastructure.
+        """Initialize serverless mode.
 
-        Creates the necessary network resources if they don't already exist.
-        Initializes Lambda and/or ECS managers based on the worker type.
+        Verifies the caller-supplied network resources (when the worker type
+        needs them) and initializes the Lambda and/or ECS managers. Network
+        resources are never created by this mode.
 
         Raises
         ------
         ResourceCreationError
-            If resource creation fails
+            If initialization fails
         """
         # Idempotent: if already initialized, do nothing.
         if self.initialized:
@@ -276,54 +314,37 @@ class ServerlessMode(OperatingMode):
             self._verify_resources()
             # Initialize compute managers
             self._initialize_compute_managers()
+            self.initialized = True
             return
 
-        logger.debug("Initializing serverless mode infrastructure")
+        logger.debug("Initializing serverless mode")
 
-        # Create AWS resources
         try:
-            # Create VPC if needed (for ECS tasks)
-            if (
-                not self.vpc_id
-                and self.create_vpc
-                and (self.worker_type in [WORKER_TYPE_ECS, WORKER_TYPE_AUTO])
-            ):
-                self.vpc_id = self._create_vpc()
-
-            # Create subnet if needed (for ECS tasks)
-            if (
-                not self.subnet_id
-                and self.vpc_id
-                and (self.worker_type in [WORKER_TYPE_ECS, WORKER_TYPE_AUTO])
-            ):
-                self.subnet_id = self._create_subnet()
-
-            # Create security group if needed (for ECS tasks)
-            if (
-                not self.security_group_id
-                and self.vpc_id
-                and (self.worker_type in [WORKER_TYPE_ECS, WORKER_TYPE_AUTO])
-            ):
-                self.security_group_id = self._create_security_group()
+            # Confirm the caller-supplied network resources exist before we rely
+            # on them. Lambda-only deployments have nothing to verify.
+            self._verify_resources()
 
             # Initialize compute managers
             self._initialize_compute_managers()
+
+            self.initialized = True
 
             # Save state
             self.save_state()
 
             logger.info(
-                f"Initialized serverless mode infrastructure: "
+                f"Initialized serverless mode: "
                 f"worker_type={self.worker_type}, "
                 f"vpc_id={self.vpc_id}, subnet_id={self.subnet_id}, "
                 f"security_group_id={self.security_group_id}"
             )
         except Exception as e:
-            logger.error(f"Failed to initialize serverless mode infrastructure: {e}")
-            # Try to clean up any resources we created
+            logger.error(f"Failed to initialize serverless mode: {e}")
+            # Release anything we did stand up. Network resources belong to the
+            # caller and are left untouched.
             self.cleanup_infrastructure()
             raise ResourceCreationError(
-                f"Failed to initialize serverless mode infrastructure: {e}"
+                f"Failed to initialize serverless mode: {e}"
             ) from e
 
     def _initialize_compute_managers(self) -> None:
@@ -335,236 +356,6 @@ class ServerlessMode(OperatingMode):
         if self.worker_type in [WORKER_TYPE_ECS, WORKER_TYPE_AUTO]:
             logger.debug("Initializing ECS manager")
             self.ecs_manager = ECSManager(self)
-
-    def _verify_resources(self) -> None:
-        """Verify that the required resources exist.
-
-        Raises
-        ------
-        ResourceNotFoundError
-            If a required resource does not exist
-        """
-        ec2 = self.session.client("ec2")
-
-        # Verify VPC (if needed)
-        if self.vpc_id:
-            try:
-                ec2.describe_vpcs(VpcIds=[self.vpc_id])
-                logger.debug(f"Verified VPC {self.vpc_id} exists")
-            except ClientError as e:
-                if "InvalidVpcID.NotFound" in str(e):
-                    logger.warning(f"VPC {self.vpc_id} does not exist")
-                    self.vpc_id = None
-                else:
-                    raise
-
-        # Verify subnet (if needed)
-        if self.subnet_id:
-            try:
-                ec2.describe_subnets(SubnetIds=[self.subnet_id])
-                logger.debug(f"Verified subnet {self.subnet_id} exists")
-            except ClientError as e:
-                if "InvalidSubnetID.NotFound" in str(e):
-                    logger.warning(f"Subnet {self.subnet_id} does not exist")
-                    self.subnet_id = None
-                else:
-                    raise
-
-        # Verify security group (if needed)
-        if self.security_group_id:
-            try:
-                ec2.describe_security_groups(GroupIds=[self.security_group_id])
-                logger.debug(f"Verified security group {self.security_group_id} exists")
-            except ClientError as e:
-                if "InvalidGroup.NotFound" in str(e):
-                    logger.warning(
-                        f"Security group {self.security_group_id} does not exist"
-                    )
-                    self.security_group_id = None
-                else:
-                    raise
-
-    def _create_vpc(self) -> str:
-        """Create a VPC for ECS tasks.
-
-        Returns
-        -------
-        str
-            VPC ID
-
-        Raises
-        ------
-        NetworkCreationError
-            If VPC creation fails
-        """
-        logger.info("Creating VPC for serverless resources")
-
-        try:
-            # Create CloudFormation stack with VPC
-            stack_name = f"parsl-vpc-{self.provider_id[:8]}"
-            template_path = os.path.join(
-                os.path.dirname(os.path.dirname(__file__)),
-                "templates/cloudformation/vpc.yml",
-            )
-
-            with open(template_path, "r") as f:
-                template_body = f.read()
-
-            # Create stack
-            self.cf_client.create_stack(
-                StackName=stack_name,
-                TemplateBody=template_body,
-                Parameters=[
-                    {"ParameterKey": "VpcCidr", "ParameterValue": "10.0.0.0/16"},
-                    {
-                        "ParameterKey": "PublicSubnetCidr",
-                        "ParameterValue": "10.0.0.0/24",
-                    },
-                    {"ParameterKey": "WorkflowId", "ParameterValue": self.provider_id},
-                ],
-                Tags=[
-                    {"Key": "CreatedBy", "Value": "ParslEphemeralAWSProvider"},
-                    {"Key": "ProviderId", "Value": self.provider_id},
-                ],
-            )
-
-            # Wait for stack creation to complete
-            logger.debug(f"Waiting for VPC stack {stack_name} to complete")
-            waiter = self.cf_client.get_waiter("stack_create_complete")
-            waiter.wait(
-                StackName=stack_name, WaiterConfig={"Delay": 5, "MaxAttempts": 60}
-            )
-
-            # Get VPC ID from stack outputs
-            response = self.cf_client.describe_stacks(StackName=stack_name)
-            outputs = response["Stacks"][0]["Outputs"]
-            vpc_id = None
-
-            for output in outputs:
-                if output["OutputKey"] == "VpcId":
-                    vpc_id = output["OutputValue"]
-                    break
-
-            if not vpc_id:
-                raise NetworkCreationError("VPC ID not found in stack outputs")
-
-            logger.info(f"Created VPC {vpc_id} using CloudFormation stack")
-            return vpc_id
-
-        except ClientError as e:
-            logger.error(f"Failed to create VPC: {e}")
-            raise NetworkCreationError(f"Failed to create VPC: {e}") from e
-
-    def _create_subnet(self) -> str:
-        """Create a subnet for ECS tasks.
-
-        Returns
-        -------
-        str
-            Subnet ID
-
-        Raises
-        ------
-        NetworkCreationError
-            If subnet creation fails
-        """
-        # When using CloudFormation for VPC creation, subnet is already created
-        # We just need to get it from the stack outputs
-        logger.info("Getting subnet from VPC stack")
-
-        try:
-            stack_name = f"parsl-vpc-{self.provider_id[:8]}"
-            response = self.cf_client.describe_stacks(StackName=stack_name)
-            outputs = response["Stacks"][0]["Outputs"]
-            subnet_id = None
-
-            for output in outputs:
-                if output["OutputKey"] == "PublicSubnetId":
-                    subnet_id = output["OutputValue"]
-                    break
-
-            if not subnet_id:
-                raise NetworkCreationError("Subnet ID not found in stack outputs")
-
-            logger.info(f"Found subnet {subnet_id} from CloudFormation stack")
-            return subnet_id
-
-        except ClientError as e:
-            logger.error(f"Failed to get subnet: {e}")
-            raise NetworkCreationError(f"Failed to get subnet: {e}") from e
-
-    def _create_security_group(self) -> str:
-        """Create a security group for ECS tasks.
-
-        Returns
-        -------
-        str
-            Security group ID
-
-        Raises
-        ------
-        NetworkCreationError
-            If security group creation fails
-        """
-        if not self.vpc_id:
-            raise NetworkCreationError("VPC ID is required to create a security group")
-
-        logger.info(f"Creating security group in VPC {self.vpc_id}")
-        ec2 = self.session.client("ec2")
-
-        try:
-            # Create security group
-            response = ec2.create_security_group(
-                GroupName=f"{DEFAULT_SECURITY_GROUP_NAME}-{self.provider_id[:8]}",
-                Description=f"{DEFAULT_SECURITY_GROUP_DESCRIPTION} (Serverless)",
-                VpcId=self.vpc_id,
-                TagSpecifications=[
-                    {
-                        "ResourceType": "security-group",
-                        "Tags": [
-                            {
-                                "Key": "Name",
-                                "Value": f"parsl-ephemeral-sg-{self.provider_id[:8]}",
-                            },
-                            {"Key": "CreatedBy", "Value": "ParslEphemeralAWSProvider"},
-                            {"Key": "ProviderId", "Value": self.provider_id},
-                        ],
-                    }
-                ],
-            )
-
-            security_group_id = response["GroupId"]
-            logger.debug(
-                f"Created security group {security_group_id} in VPC {self.vpc_id}"
-            )
-
-            # Add outbound rules (allow all outbound traffic)
-            if DEFAULT_OUTBOUND_RULES:
-                ec2.authorize_security_group_egress(
-                    GroupId=security_group_id, IpPermissions=DEFAULT_OUTBOUND_RULES
-                )
-                logger.debug(
-                    f"Added outbound rules to security group {security_group_id}"
-                )
-
-            # Add tags
-            if self.additional_tags:
-                create_tags(security_group_id, self.additional_tags, self.session)
-
-            # Wait for security group to be available
-            wait_for_resource(
-                security_group_id,
-                "security_group_exists",
-                ec2,
-                resource_name="security group",
-            )
-
-            return security_group_id
-        except Exception as e:
-            logger.error(f"Failed to create security group in VPC {self.vpc_id}: {e}")
-            raise NetworkCreationError(
-                f"Failed to create security group in VPC {self.vpc_id}: {e}"
-            ) from e
 
     def _select_worker_type(self, command: str, tasks_per_node: int) -> str:
         """Select the appropriate worker type for a job.
@@ -1480,7 +1271,9 @@ class ServerlessMode(OperatingMode):
     def cleanup_infrastructure(self) -> None:
         """Clean up infrastructure created by this mode.
 
-        This cleans up the VPC, subnet, and security group if they were created by the provider.
+        The VPC, subnet, and security group are supplied by the caller and are
+        never created — or deleted — by this mode.  Only the Lambda functions,
+        ECS tasks, and Spot Fleet resources created here are removed.
         """
         logger.info("Cleaning up serverless mode infrastructure")
 
@@ -1497,59 +1290,6 @@ class ServerlessMode(OperatingMode):
                 logger.error(f"Failed to stop spot interruption monitoring: {e}")
             self.spot_interruption_monitor = None
             self.spot_interruption_handler = None
-
-        # Check if we created a VPC using CloudFormation
-        stack_name = f"parsl-vpc-{self.provider_id[:8]}"
-        try:
-            self.cf_client.describe_stacks(StackName=stack_name)
-
-            # Stack exists, delete it
-            logger.info(f"Deleting VPC stack {stack_name}")
-            self.cf_client.delete_stack(StackName=stack_name)
-
-            # Wait for deletion to complete (with timeout)
-            start_time = time.time()
-            while time.time() - start_time < 300:  # 5 minute timeout
-                try:
-                    response = self.cf_client.describe_stacks(StackName=stack_name)
-                    status = response["Stacks"][0]["StackStatus"]
-
-                    if status == "DELETE_COMPLETE":
-                        logger.info(f"VPC stack {stack_name} deleted successfully")
-                        break
-                    elif status == "DELETE_FAILED":
-                        logger.error(f"Failed to delete VPC stack {stack_name}")
-                        break
-
-                    time.sleep(10)
-                except ClientError as e:
-                    if "does not exist" in str(e):
-                        logger.info(f"VPC stack {stack_name} deleted successfully")
-                        break
-                    raise
-
-            # Reset IDs
-            self.vpc_id = None
-            self.subnet_id = None
-
-        except ClientError as e:
-            # If stack doesn't exist, that's fine
-            if "does not exist" not in str(e):
-                logger.error(f"Error checking VPC stack {stack_name}: {e}")
-
-        # Delete security group if we created it directly
-        if self.security_group_id:
-            try:
-                ec2 = self.session.client("ec2")
-                ec2.delete_security_group(GroupId=self.security_group_id)
-                logger.info(f"Deleted security group {self.security_group_id}")
-                self.security_group_id = None
-            except ClientError as e:
-                if "InvalidGroup.NotFound" not in str(e):
-                    logger.error(
-                        f"Failed to delete security group {self.security_group_id}: {e}"
-                    )
-                self.security_group_id = None
 
         # Clean up compute managers
         if self.lambda_manager:
@@ -1722,7 +1462,7 @@ class ServerlessMode(OperatingMode):
         }
 
         try:
-            self.state_store.save_state(state)
+            self.state_store.save_state(STATE_KEY_MODE, state)
         except Exception as e:
             logger.error(f"Failed to save state: {e}")
 
@@ -1735,14 +1475,10 @@ class ServerlessMode(OperatingMode):
             True if state was loaded successfully, False otherwise
         """
         try:
-            state = self.state_store.load_state()
+            state = self.state_store.load_state(STATE_KEY_MODE)
             if state and state.get("provider_id") == self.provider_id:
                 self.resources = state.get("resources", {})
-                self.vpc_id = state.get("vpc_id", self.vpc_id)
-                self.subnet_id = state.get("subnet_id", self.subnet_id)
-                self.security_group_id = state.get(
-                    "security_group_id", self.security_group_id
-                )
+                self._restore_network_ids(state)
                 self.initialized = state.get("initialized", False)
 
                 # Check if spot interruption handling was previously enabled

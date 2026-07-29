@@ -408,8 +408,7 @@ def delete_resource(
                         logger.debug(f"Deleting NAT gateway {ngw['NatGatewayId']}")
                     except ClientError as e:
                         logger.warning(
-                            f"Could not delete NAT gateway "
-                            f"{ngw['NatGatewayId']}: {e}"
+                            f"Could not delete NAT gateway {ngw['NatGatewayId']}: {e}"
                         )
                 # Poll until all NAT gateways have finished deleting (max ~2 min).
                 # Only enter the loop if we actually submitted deletion requests.
@@ -445,8 +444,7 @@ def delete_resource(
                             logger.debug(f"Deleted ENI {eni['NetworkInterfaceId']}")
                         except ClientError as e:
                             logger.warning(
-                                f"Could not delete ENI "
-                                f"{eni['NetworkInterfaceId']}: {e}"
+                                f"Could not delete ENI {eni['NetworkInterfaceId']}: {e}"
                             )
 
                 # Get all subnets in the VPC
@@ -507,8 +505,7 @@ def delete_resource(
                         logger.debug(f"Deleted route table {rt['RouteTableId']}")
                     except ClientError as e:
                         logger.warning(
-                            f"Could not delete route table "
-                            f"{rt['RouteTableId']}: {e}"
+                            f"Could not delete route table {rt['RouteTableId']}: {e}"
                         )
 
             # Delete the VPC
@@ -726,4 +723,189 @@ def get_or_create_iam_role(
                 ) from inner_e
         raise ResourceCreationError(
             f"Failed to create IAM role {role_name}: {e}"
+        ) from e
+
+
+def get_or_create_ssm_instance_profile(
+    session: boto3.Session,
+    name_suffix: str,
+    iam_instance_profile_arn: Optional[str] = None,
+    auto_create: bool = False,
+) -> Optional[str]:
+    """Resolve an IAM instance profile ARN granting SSM access, or None.
+
+    SSM ``SendCommand`` — used by warm-pool and one-shot dispatch — needs the
+    instance to carry a profile with the ``AmazonSSMManagedInstanceCore`` policy.
+    Without it the SSM agent never registers and every command dispatch times out.
+
+    Resolution order:
+
+    1. ``iam_instance_profile_arn`` if supplied → used directly.
+    2. ``auto_create`` → get-or-create a profile holding
+       ``AmazonSSMManagedInstanceCore``.
+    3. Otherwise → ``None``; the caller launches instances without a profile.
+
+    Both the create and the attach steps are idempotent, so concurrent callers
+    sharing a ``name_suffix`` converge on the same profile.
+
+    Parameters
+    ----------
+    session : boto3.Session
+        AWS session used to build the IAM client.
+    name_suffix : str
+        Discriminator appended to the role and profile names — normally the
+        provider ID, so resources are traceable back to their provider.
+    iam_instance_profile_arn : Optional[str], optional
+        Pre-existing profile ARN to use verbatim, by default None.
+    auto_create : bool, optional
+        Whether to create a profile when none was supplied, by default False.
+
+    Returns
+    -------
+    Optional[str]
+        ARN of the resolved instance profile, or None when neither an explicit
+        ARN was given nor auto-creation requested.
+
+    Raises
+    ------
+    ResourceCreationError
+        If the profile cannot be created or retrieved.
+    """
+    if iam_instance_profile_arn:
+        return iam_instance_profile_arn
+
+    if not auto_create:
+        return None
+
+    iam = session.client("iam")
+    role_name = f"parsl-ephemeral-ssm-role-{name_suffix}"
+    profile_name = f"parsl-ephemeral-ssm-profile-{name_suffix}"
+
+    get_or_create_iam_role(
+        iam_client=iam,
+        role_name=role_name,
+        assume_role_policy={
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Effect": "Allow",
+                    "Principal": {"Service": "ec2.amazonaws.com"},
+                    "Action": "sts:AssumeRole",
+                }
+            ],
+        },
+        policy_arns=["arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"],
+        description=f"SSM instance role for Parsl ({name_suffix})",
+    )
+
+    # Ensure the instance profile exists and has the role attached
+    try:
+        response = iam.get_instance_profile(InstanceProfileName=profile_name)
+        existing_arn: str = response["InstanceProfile"]["Arn"]
+        _attach_role_to_instance_profile(iam, profile_name, role_name)
+        return existing_arn
+    except ClientError as e:
+        if e.response["Error"]["Code"] not in ("NoSuchEntity", "NoSuchEntityException"):
+            raise ResourceCreationError(
+                f"Failed to check instance profile {profile_name}: {e}"
+            ) from e
+
+    try:
+        response = iam.create_instance_profile(InstanceProfileName=profile_name)
+        arn: str = response["InstanceProfile"]["Arn"]
+        _attach_role_to_instance_profile(iam, profile_name, role_name)
+        logger.info(f"Created IAM instance profile: {profile_name}")
+        _wait_for_instance_profile(session, arn)
+        return arn
+    except ClientError as e:
+        if e.response["Error"]["Code"] == "EntityAlreadyExists":
+            # Race condition — another caller created it; fetch the ARN
+            response = iam.get_instance_profile(InstanceProfileName=profile_name)
+            raced_arn: str = response["InstanceProfile"]["Arn"]
+            _attach_role_to_instance_profile(iam, profile_name, role_name)
+            _wait_for_instance_profile(session, raced_arn)
+            return raced_arn
+        raise ResourceCreationError(
+            f"Failed to create instance profile {profile_name}: {e}"
+        ) from e
+
+
+#: How long to wait for a new instance profile to become visible to EC2.
+_PROFILE_PROPAGATION_TIMEOUT_S = 60
+_PROFILE_PROPAGATION_DELAY_S = 2
+
+
+def _wait_for_instance_profile(
+    session: boto3.Session,
+    profile_arn: str,
+    timeout: int = _PROFILE_PROPAGATION_TIMEOUT_S,
+) -> None:
+    """Block until EC2 will accept *profile_arn*, or give up after *timeout*.
+
+    IAM is eventually consistent with respect to EC2: a profile that
+    ``create_instance_profile`` has already returned an ARN for is rejected by
+    ``RunInstances`` with ``InvalidParameterValue: Invalid IAM Instance Profile
+    ARN`` for the first several seconds (measured at ~10s). A dry-run
+    ``RunInstances`` is the only check that exercises the path that matters —
+    ``get_instance_profile`` succeeds immediately and so proves nothing.
+
+    A timeout is logged rather than raised: the launch that follows will report
+    the real error, and failing here would turn a slow propagation into a hard
+    error on a profile that is about to work.
+    """
+    ec2 = session.client("ec2")
+    image_id = get_default_ami(session.region_name or DEFAULT_REGION)
+    deadline = time.time() + timeout
+
+    while time.time() < deadline:
+        try:
+            ec2.run_instances(
+                ImageId=image_id,
+                MinCount=1,
+                MaxCount=1,
+                InstanceType="t3.micro",
+                IamInstanceProfile={"Arn": profile_arn},
+                DryRun=True,
+            )
+            return
+        except ClientError as e:
+            code = e.response["Error"]["Code"]
+            if code == "DryRunOperation":
+                # EC2 validated everything including the profile.
+                logger.debug(f"Instance profile {profile_arn} is visible to EC2")
+                return
+            if code != "InvalidParameterValue":
+                # Anything else (an unusable AMI here, say) is not what this
+                # check is for; let the real launch report it.
+                logger.debug(f"Instance profile propagation check skipped: {e}")
+                return
+            time.sleep(_PROFILE_PROPAGATION_DELAY_S)
+
+    logger.warning(
+        f"Instance profile {profile_arn} still not visible to EC2 after "
+        f"{timeout}s; launching anyway"
+    )
+
+
+def _attach_role_to_instance_profile(
+    iam_client: Any, profile_name: str, role_name: str
+) -> None:
+    """Attach a role to an instance profile, tolerating an existing attachment.
+
+    A profile holds at most one role, so re-attaching the same role is a no-op
+    that AWS reports as ``LimitExceeded``. Any other role already present is
+    left alone: the caller supplied the profile name, so its contents are
+    theirs to manage.
+    """
+    try:
+        iam_client.add_role_to_instance_profile(
+            InstanceProfileName=profile_name, RoleName=role_name
+        )
+    except ClientError as e:
+        code = e.response["Error"]["Code"]
+        if code in ("LimitExceeded", "LimitExceededException"):
+            logger.debug(f"Instance profile {profile_name} already holds a role")
+            return
+        raise ResourceCreationError(
+            f"Failed to attach role {role_name} to profile {profile_name}: {e}"
         ) from e

@@ -34,6 +34,7 @@ from parsl_ephemeral_aws.exceptions import (
     SpotFleetError,
 )
 from parsl_ephemeral_aws.modes.base import OperatingMode
+from parsl_ephemeral_aws.state.base import STATE_KEY_MODE
 from parsl_ephemeral_aws.compute.spot_fleet import SpotFleetManager
 from parsl_ephemeral_aws.compute.spot_interruption import (
     SpotInterruptionMonitor,
@@ -41,6 +42,7 @@ from parsl_ephemeral_aws.compute.spot_interruption import (
 )
 from parsl_ephemeral_aws.utils.aws import (
     get_default_ami,
+    get_or_create_ssm_instance_profile,
     wait_for_resource,
 )
 
@@ -86,6 +88,7 @@ class StandardMode(OperatingMode):
         warm_pool_size: int = 0,
         warm_pool_ttl: int = 600,
         iam_instance_profile_arn: Optional[str] = None,
+        auto_create_instance_profile: bool = False,
         bake_ami: bool = False,
         baked_ami_id: Optional[str] = None,
         one_shot: bool = False,
@@ -141,6 +144,24 @@ class StandardMode(OperatingMode):
             Number of nodes per block, by default 1
         spot_max_price_percentage : Optional[int], optional
             Maximum spot price as a percentage of on-demand price, by default None
+        warm_pool_size : int, optional
+            Number of idle instances to keep for reuse, by default 0 (disabled)
+        warm_pool_ttl : int, optional
+            Seconds a warm instance is kept before termination, by default 600
+        iam_instance_profile_arn : Optional[str], optional
+            Instance profile ARN granting SSM access, by default None
+        auto_create_instance_profile : bool, optional
+            Whether to create an instance profile with the
+            ``AmazonSSMManagedInstanceCore`` policy when
+            ``iam_instance_profile_arn`` is not supplied, by default False.
+            SSM ``SendCommand`` dispatch cannot work without one of the two.
+        bake_ami : bool, optional
+            Whether to pre-install ``worker_init`` into a custom AMI, by default False
+        baked_ami_id : Optional[str], optional
+            Pre-baked AMI to use instead of baking one, by default None
+        one_shot : bool, optional
+            Whether to dispatch a single command per instance and terminate,
+            by default False
         """
         # Call parent __init__ with standard params
         super().__init__(
@@ -176,6 +197,7 @@ class StandardMode(OperatingMode):
         self.warm_pool_size = warm_pool_size
         self.warm_pool_ttl = warm_pool_ttl
         self.iam_instance_profile_arn = iam_instance_profile_arn
+        self.auto_create_instance_profile = auto_create_instance_profile
         # List of instance IDs currently in the warm pool (ready for reuse, FIFO)
         self._warm_instances: List[str] = []
 
@@ -445,7 +467,7 @@ class StandardMode(OperatingMode):
             state["spot_fleet_state"] = spot_fleet_state
 
             try:
-                self.state_store.save_state(state)
+                self.state_store.save_state(STATE_KEY_MODE, state)
                 logger.debug(
                     f"Saved state including SpotFleetManager with {len(self.spot_fleet_manager.blocks)} blocks"
                 )
@@ -454,7 +476,7 @@ class StandardMode(OperatingMode):
         else:
             # Save directly (includes baked AMI fields not in the base class state)
             try:
-                self.state_store.save_state(state)
+                self.state_store.save_state(STATE_KEY_MODE, state)
             except Exception as e:
                 logger.error(f"Failed to save state: {e}")
 
@@ -467,14 +489,10 @@ class StandardMode(OperatingMode):
             True if state was loaded successfully, False otherwise
         """
         try:
-            state = self.state_store.load_state()
+            state = self.state_store.load_state(STATE_KEY_MODE)
             if state and state.get("provider_id") == self.provider_id:
                 self.resources = state.get("resources", {})
-                self.vpc_id = state.get("vpc_id", self.vpc_id)
-                self.subnet_id = state.get("subnet_id", self.subnet_id)
-                self.security_group_id = state.get(
-                    "security_group_id", self.security_group_id
-                )
+                self._restore_network_ids(state)
                 self.initialized = state.get("initialized", False)
                 # Restore warm pool list; fall back to scanning resources for
                 # STATUS_WARM entries in case the key is absent (older state files)
@@ -595,11 +613,20 @@ class StandardMode(OperatingMode):
         if self.initialized:
             return
 
+        # Resolve the SSM instance profile before either path below, so a
+        # resumed provider gets an ARN too — it is not persisted in state.
+        self._resolve_instance_profile()
+
+        # Confirm the caller-supplied network resources exist. This runs on both
+        # paths: verification used to sit inside the resume branch only, so a
+        # first-run provider — the common case — never checked at all, and a
+        # mistyped or cross-region ID surfaced much later as an opaque
+        # InvalidParameterValue from inside run_instances.
+        self._verify_resources()
+
         # Try to load state first
         if self.load_state():
-            logger.debug("Loaded state, checking resources")
-            # Verify that the loaded resources exist
-            self._verify_resources()
+            logger.debug("Loaded state, resources already verified")
             return
 
         logger.debug("Initializing standard mode infrastructure")
@@ -658,53 +685,36 @@ class StandardMode(OperatingMode):
                 f"Failed to initialize standard mode infrastructure: {e}"
             ) from e
 
-    def _verify_resources(self) -> None:
-        """Verify that the required resources exist.
+    def _resolve_instance_profile(self) -> None:
+        """Resolve ``iam_instance_profile_arn``, creating a profile if asked.
 
-        Raises
-        ------
-        ResourceNotFoundError
-            If a required resource does not exist
+        Warm-pool and one-shot dispatch both go through SSM ``SendCommand``,
+        which only works if the instance carries a profile holding the
+        ``AmazonSSMManagedInstanceCore`` policy. With no ARN, ``_create_instance``
+        attaches no profile, the SSM agent never registers, and every dispatch
+        times out and silently falls back to UserData.
+
+        A failure here is not fatal: dispatch degrades to UserData rather than
+        the whole provider failing to start.
         """
-        ec2 = self.session.client("ec2")
+        if self.iam_instance_profile_arn or not self.auto_create_instance_profile:
+            return
 
-        # Verify VPC
-        if self.vpc_id:
-            try:
-                ec2.describe_vpcs(VpcIds=[self.vpc_id])
-                logger.debug(f"Verified VPC {self.vpc_id} exists")
-            except ClientError as e:
-                if "InvalidVpcID.NotFound" in str(e):
-                    logger.warning(f"VPC {self.vpc_id} does not exist")
-                    self.vpc_id = None
-                else:
-                    raise
-
-        # Verify subnet
-        if self.subnet_id:
-            try:
-                ec2.describe_subnets(SubnetIds=[self.subnet_id])
-                logger.debug(f"Verified subnet {self.subnet_id} exists")
-            except ClientError as e:
-                if "InvalidSubnetID.NotFound" in str(e):
-                    logger.warning(f"Subnet {self.subnet_id} does not exist")
-                    self.subnet_id = None
-                else:
-                    raise
-
-        # Verify security group
-        if self.security_group_id:
-            try:
-                ec2.describe_security_groups(GroupIds=[self.security_group_id])
-                logger.debug(f"Verified security group {self.security_group_id} exists")
-            except ClientError as e:
-                if "InvalidGroup.NotFound" in str(e):
-                    logger.warning(
-                        f"Security group {self.security_group_id} does not exist"
-                    )
-                    self.security_group_id = None
-                else:
-                    raise
+        try:
+            self.iam_instance_profile_arn = get_or_create_ssm_instance_profile(
+                session=self.session,
+                name_suffix=self.provider_id,
+                auto_create=True,
+            )
+            logger.info(
+                f"Resolved IAM instance profile {self.iam_instance_profile_arn} "
+                "for SSM command dispatch"
+            )
+        except Exception as e:
+            logger.error(
+                f"Failed to create IAM instance profile: {e}. SSM command "
+                "dispatch will not be available."
+            )
 
     def submit_job(
         self,
@@ -801,9 +811,13 @@ class StandardMode(OperatingMode):
                 "tasks_per_node": tasks_per_node,
             }
 
-            if self.warm_pool_size > 0:
-                # Warm pool cold start: wait for SSM then dispatch command
-                resource_data["warm_pool"] = True
+            if self._uses_ssm_dispatch():
+                # Cold start for the SSM paths: wait for SSM, then dispatch. The
+                # UserData carries no command, so this is the only way the job runs.
+                if self.warm_pool_size > 0:
+                    resource_data["warm_pool"] = True
+                else:
+                    resource_data["one_shot"] = True
                 self.resources[instance_id] = resource_data
                 try:
                     self._wait_for_ssm_online(instance_id)
@@ -815,12 +829,17 @@ class StandardMode(OperatingMode):
                     self.resources[instance_id]["status"] = STATUS_RUNNING
                     self.resources[instance_id]["warm_since"] = None
                 except Exception as ssm_err:
+                    # The command is not in the UserData, so there is nothing to
+                    # fall back to — the instance would idle until max_idle_time
+                    # while reporting RUNNING. Terminate it and fail the submit.
                     logger.error(
-                        f"SSM setup failed for warm pool instance {instance_id}: "
-                        f"{ssm_err}. Falling back to UserData execution."
+                        f"SSM dispatch failed for instance {instance_id}: {ssm_err}. "
+                        "Terminating it; the command was never delivered."
                     )
-                    # Remove warm_pool flag so status is tracked via EC2 state
-                    self.resources[instance_id].pop("warm_pool", None)
+                    self._force_terminate(instance_id)
+                    self.resources.pop(instance_id, None)
+                    self.save_state()
+                    raise
             else:
                 self.resources[instance_id] = resource_data
 
@@ -839,7 +858,8 @@ class StandardMode(OperatingMode):
         Parameters
         ----------
         command : str
-            Command to execute (ignored when warm_pool_size > 0; dispatched via SSM)
+            Command to execute. Ignored when the command is dispatched over SSM
+            instead — see :meth:`_uses_ssm_dispatch`.
         job_id : str
             Job ID
 
@@ -853,10 +873,13 @@ class StandardMode(OperatingMode):
         if self.worker_init:
             init_script += f"{self.worker_init}\n"
 
-        if self.warm_pool_size > 0:
-            # Warm pool: UserData only runs worker_init and drops a ready marker.
-            # The actual command is dispatched later via SSM SendCommand so the
-            # instance can be reused across multiple jobs without re-installing.
+        if self._uses_ssm_dispatch():
+            # UserData only runs worker_init and drops a ready marker. The command
+            # is dispatched later via SSM SendCommand, which reports its exit code
+            # — and for the warm pool, lets the instance serve several jobs without
+            # re-running worker_init. No shutdown is appended: the provider
+            # terminates the instance through cleanup_resources() once the command
+            # reaches a terminal state.
             init_script += "mkdir -p /var/run/parsl\n"
             init_script += "touch /var/run/parsl_worker_ready\n"
             return init_script
@@ -879,8 +902,36 @@ class StandardMode(OperatingMode):
         return init_script
 
     # ------------------------------------------------------------------
-    # Warm pool helpers
+    # SSM dispatch helpers (shared by the warm pool and one-shot mode)
     # ------------------------------------------------------------------
+
+    def _uses_ssm_dispatch(self) -> bool:
+        """Whether the command is delivered by SSM rather than embedded in UserData.
+
+        Both the warm pool and one-shot mode need the command's exit code, which
+        UserData cannot report — the instance state is identical whether the
+        command succeeded or failed. SSM ``SendCommand`` reports it, so both
+        launch with a marker-only UserData and dispatch afterwards.
+        """
+        return self.warm_pool_size > 0 or self.one_shot
+
+    def _force_terminate(self, instance_id: str) -> None:
+        """Terminate an instance best-effort, swallowing any error.
+
+        Used on the SSM-dispatch failure path, where the caller is already
+        raising and must not have that exception masked by a cleanup failure.
+        The provider's ``cleanup_stray_instances`` safety net and the
+        ``ProviderId`` tag both cover the case where this does not succeed.
+        """
+        try:
+            self.session.client("ec2").terminate_instances(InstanceIds=[instance_id])
+            logger.info(f"Terminated instance {instance_id} after failed dispatch")
+        except Exception as e:
+            logger.error(
+                f"Could not terminate instance {instance_id} after failed "
+                f"dispatch: {e}. It may still be running — check the "
+                f"ProviderId={self.provider_id} tag."
+            )
 
     def _get_warm_instance(self) -> Optional[str]:
         """Pop the oldest available warm instance from the pool (FIFO).
@@ -932,8 +983,7 @@ class StandardMode(OperatingMode):
                 logger.debug(f"SSM describe_instance_information: {e}")
             time.sleep(10)
         raise OperatingModeError(
-            f"Instance {instance_id} did not become available in SSM "
-            f"within {timeout}s"
+            f"Instance {instance_id} did not become available in SSM within {timeout}s"
         )
 
     def _wait_for_worker_ready(self, instance_id: str, timeout: int = 600) -> None:
@@ -997,6 +1047,15 @@ class StandardMode(OperatingMode):
         -------
         str
             SSM CommandId for later status polling via ``get_command_invocation``.
+
+        Notes
+        -----
+        In one-shot mode a self-shutdown backstop is appended. The provider
+        normally terminates the instance from ``_cleanup_resources()`` once the
+        command reaches a terminal state, but that requires the driver process to
+        still be alive to poll. The backstop bounds the cost of a driver that
+        dies mid-job; it is scheduled after the command's exit status is captured
+        so it cannot mask a non-zero exit.
         """
         ssm = self.session.client("ssm")
         env_setup = (
@@ -1004,10 +1063,19 @@ class StandardMode(OperatingMode):
             f"export PARSL_PROVIDER_ID={self.provider_id}\n"
             "export PARSL_WORKER_ID=$(hostname)\n"
         )
+        script = env_setup + command
+        if self.one_shot:
+            # Detach the shutdown so SSM sees the command finish and reports the
+            # real exit code, then exit with that same code.
+            script += (
+                "\n_parsl_rc=$?\n"
+                "nohup sh -c 'sleep 30; shutdown -h now' >/dev/null 2>&1 &\n"
+                "exit $_parsl_rc\n"
+            )
         response = ssm.send_command(
             InstanceIds=[instance_id],
             DocumentName="AWS-RunShellScript",
-            Parameters={"commands": [env_setup + command]},
+            Parameters={"commands": [script]},
             Comment=f"Parsl job {job_id[:16]}",
         )
         command_id = response["Command"]["CommandId"]
@@ -1079,6 +1147,14 @@ class StandardMode(OperatingMode):
             "MinCount": 1,
             "UserData": init_script,
             "TagSpecifications": [{"ResourceType": "instance", "Tags": tags}],
+            # The init script runs `shutdown -h now` when auto_shutdown or
+            # one_shot is set, and EC2's default for an instance-initiated
+            # shutdown is *stop*, not terminate — leaving a stopped instance
+            # with a billed EBS volume. Worse, EC2_STATUS_MAPPING maps
+            # "stopped" to COMPLETED, so the provider drops the tracking record
+            # and the volume is orphaned as well as billed. DetachedMode already
+            # sets this on all of its launch paths.
+            "InstanceInitiatedShutdownBehavior": "terminate",
         }
 
         # Add network configuration if available
@@ -1091,8 +1167,9 @@ class StandardMode(OperatingMode):
         if self.key_name:
             run_args["KeyName"] = self.key_name
 
-        # Attach IAM instance profile when warm pool is enabled (SSM requires it)
-        if self.warm_pool_size > 0 and self.iam_instance_profile_arn:
+        # Attach the IAM instance profile whenever one is available. SSM
+        # SendCommand needs it, and an unused profile costs nothing.
+        if self.iam_instance_profile_arn:
             run_args["IamInstanceProfile"] = {"Arn": self.iam_instance_profile_arn}
 
         # Use spot instances if requested
@@ -1145,6 +1222,20 @@ class StandardMode(OperatingMode):
 
         # Extract tags
         tags = run_args.pop("TagSpecifications", [{}])[0].get("Tags", [])
+
+        # RunInstances-only keys that RequestSpotInstances rejects in a
+        # LaunchSpecification. MinCount/MaxCount become InstanceCount, and
+        # InstanceInitiatedShutdownBehavior has no spot equivalent — a spot
+        # instance that shuts itself down is stopped, then reclaimed by EC2
+        # when the one-time request is already closed, so the provider's own
+        # terminate_instances in cleanup_resources() is what reclaims the EBS
+        # volume here.
+        for run_only_key in (
+            "InstanceInitiatedShutdownBehavior",
+            "MinCount",
+            "MaxCount",
+        ):
+            run_args.pop(run_only_key, None)
 
         # Prepare spot request
         spot_args = {
@@ -1341,7 +1432,7 @@ class StandardMode(OperatingMode):
         # Group IDs by resource type / tracking method
         ec2_instances = []
         spot_fleet_blocks = []
-        warm_pool_instances = []  # tracked via SSM command invocation
+        ssm_instances = []  # tracked via SSM command invocation
 
         for resource_id in resource_ids:
             resource = self.resources.get(resource_id)
@@ -1349,8 +1440,11 @@ class StandardMode(OperatingMode):
                 status_map[resource_id] = STATUS_UNKNOWN
                 continue
 
-            if resource.get("warm_pool") and resource.get("ssm_command_id"):
-                warm_pool_instances.append(resource_id)
+            # Any resource carrying an SSM command ID — warm pool or one-shot —
+            # is tracked by the command's own status, which reports the exit code.
+            # EC2 instance state cannot: it looks the same either way.
+            if resource.get("ssm_command_id"):
+                ssm_instances.append(resource_id)
             elif resource.get("type") == RESOURCE_TYPE_EC2:
                 ec2_instances.append(resource_id)
             elif resource.get("type") == RESOURCE_TYPE_SPOT_FLEET:
@@ -1358,10 +1452,10 @@ class StandardMode(OperatingMode):
             else:
                 status_map[resource_id] = STATUS_UNKNOWN
 
-        # --- Warm pool: poll SSM command invocation status ---
-        if warm_pool_instances:
+        # --- SSM dispatch: poll command invocation status for the exit code ---
+        if ssm_instances:
             ssm = self.session.client("ssm")
-            for instance_id in warm_pool_instances:
+            for instance_id in ssm_instances:
                 resource = self.resources[instance_id]
                 command_id = resource["ssm_command_id"]
                 try:
@@ -1386,6 +1480,18 @@ class StandardMode(OperatingMode):
                         status = STATUS_RUNNING
                     status_map[instance_id] = status
                     self.resources[instance_id]["status"] = status
+
+                    # Record the exit code so a FAILED job is diagnosable
+                    # without a second SSM round-trip.
+                    exit_code = response.get("ResponseCode")
+                    if exit_code is not None and exit_code >= 0:
+                        self.resources[instance_id]["exit_code"] = exit_code
+                    if status == STATUS_FAILED:
+                        logger.error(
+                            f"Command on {instance_id} reported {ssm_status} "
+                            f"(exit code {exit_code}): "
+                            f"{response.get('StandardErrorContent', '')[:500]}"
+                        )
                 except ClientError as e:
                     if "InvocationDoesNotExist" in str(e):
                         # Command not yet received by the instance

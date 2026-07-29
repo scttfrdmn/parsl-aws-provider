@@ -25,6 +25,8 @@ import time
 import pytest
 from botocore.exceptions import ClientError
 
+from parsl.jobs.states import JobState
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -36,13 +38,18 @@ MAX_WAIT_S = 600  # 10 minutes
 
 
 def _poll_until(
-    provider, job_id: str, target_status: str, timeout: int = MAX_WAIT_S
+    provider, job_id: str, target_state: JobState, timeout: int = MAX_WAIT_S
 ) -> bool:
-    """Poll provider.status() until the job reaches *target_status* or timeout."""
+    """Poll provider.status() until the job reaches *target_state* or timeout.
+
+    ``status()`` returns ``List[JobStatus]``, not the ``List[Dict[str, str]]``
+    this suite was written against, and ``JobStatus`` is not subscriptable —
+    see #102.
+    """
     deadline = time.time() + timeout
     while time.time() < deadline:
         result = provider.status([job_id])
-        if result and result[0]["status"] == target_status:
+        if result and result[0].state == target_state:
             return True
         time.sleep(POLL_INTERVAL_S)
     return False
@@ -168,7 +175,7 @@ class TestLambdaLifecycle:
         """A short Lambda command transitions to COMPLETED within the timeout."""
         job_id = serverless_provider.submit("echo hello-from-lambda", tasks_per_node=1)
 
-        reached = _poll_until(serverless_provider, job_id, "COMPLETED")
+        reached = _poll_until(serverless_provider, job_id, JobState.COMPLETED)
         assert reached, f"Job {job_id} did not reach COMPLETED within {MAX_WAIT_S}s"
 
     def test_lambda_cancel_removes_function(

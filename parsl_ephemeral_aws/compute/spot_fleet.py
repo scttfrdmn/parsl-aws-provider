@@ -235,483 +235,53 @@ class SpotFleetManager:
 
         return config
 
-    @retry_with_backoff()
     def _setup_network_resources(self) -> Dict[str, str]:
-        """Set up VPC, subnet, and security group for Spot Fleet instances.
+        """Resolve the caller-supplied VPC, subnet, and security group.
 
-        This method creates or gets existing network infrastructure for the Spot Fleet.
+        Network resources are pre-provisioned by the caller and passed in via
+        the provider; this manager never creates or deletes them.
 
         Returns
         -------
         Dict[str, str]
             Dictionary containing VPC ID, subnet ID, and security group ID
-        """
-        # Check if we already have network resources
-        if self.vpc_id and self.subnet_id and self.security_group_id:
-            return {
-                "vpc_id": self.vpc_id,
-                "subnet_id": self.subnet_id,
-                "security_group_id": self.security_group_id,
-            }
 
-        context = ErrorContext(
-            operation="setup_network_resources",
-            resource_type="spot_fleet_network",
-            resource_id=f"workflow-{self.provider.workflow_id}",
-            region=self.provider.region,
+        Raises
+        ------
+        ResourceCreationError
+            If the provider is missing any of the three required IDs
+        """
+        self.vpc_id = self.vpc_id or self.provider.vpc_id
+        self.subnet_id = self.subnet_id or self.provider.subnet_id
+        self.security_group_id = (
+            self.security_group_id or self.provider.security_group_id
         )
 
-        try:
-            # Use existing network resources from provider if available
-            if self.provider.vpc_id:
-                self.vpc_id = self.provider.vpc_id
-                logger.info(f"Using existing VPC: {self.vpc_id}")
-
-                if self.provider.subnet_id:
-                    self.subnet_id = self.provider.subnet_id
-                    logger.info(f"Using existing subnet: {self.subnet_id}")
-                else:
-                    # Find a suitable subnet in the VPC
-                    response = self.ec2_client.describe_subnets(
-                        Filters=[{"Name": "vpc-id", "Values": [self.vpc_id]}]
-                    )
-
-                    if response["Subnets"]:
-                        self.subnet_id = response["Subnets"][0]["SubnetId"]
-                        logger.info(
-                            f"Found existing subnet {self.subnet_id} in VPC {self.vpc_id}"
-                        )
-                    else:
-                        # Create a new subnet
-                        self.subnet_id = self._create_subnet()
-
-                if self.provider.security_group_id:
-                    self.security_group_id = self.provider.security_group_id
-                    logger.info(
-                        f"Using existing security group: {self.security_group_id}"
-                    )
-                else:
-                    # Create a new security group
-                    self.security_group_id = self._create_security_group()
-            else:
-                # Create new VPC and associated resources
-                self.vpc_id = self._create_vpc()
-                self.subnet_id = self._create_subnet()
-                self.security_group_id = self._create_security_group()
-
-            return {
-                "vpc_id": self.vpc_id,
-                "subnet_id": self.subnet_id,
-                "security_group_id": self.security_group_id,
-            }
-
-        except Exception as e:
-            # Record error for analysis
-            error_record = self.error_handler.handle_error(e, context)
-            logger.error(f"Error setting up network resources: {e}")
-
-            # Attempt to clean up any created resources
-            self._cleanup_network_resources()
-
-            raise ResourceCreationError(f"Failed to set up network resources: {e}")
-
-    def _create_vpc(self) -> str:
-        """Create a VPC for the Spot Fleet instances.
-
-        Returns
-        -------
-        str
-            VPC ID
-        """
-        try:
-            # Create VPC with configured CIDR
-            response = self.ec2_client.create_vpc(
-                CidrBlock=self.security_config.vpc_cidr,
-                TagSpecifications=[
-                    {
-                        "ResourceType": "vpc",
-                        "Tags": [
-                            {
-                                "Key": "Name",
-                                "Value": f"{TAG_PREFIX}-vpc-{self.provider.workflow_id}",
-                            },
-                            {"Key": TAG_NAME, "Value": "true"},
-                            {
-                                "Key": TAG_WORKFLOW_ID,
-                                "Value": self.provider.workflow_id,
-                            },
-                        ],
-                    }
-                ],
+        missing = [
+            name
+            for name, value in (
+                ("vpc_id", self.vpc_id),
+                ("subnet_id", self.subnet_id),
+                ("security_group_id", self.security_group_id),
+            )
+            if not value
+        ]
+        if missing:
+            raise ResourceCreationError(
+                "Spot Fleet requires pre-provisioned network resources; "
+                f"missing: {', '.join(missing)}"
             )
 
-            vpc_id = response["Vpc"]["VpcId"]
-            logger.info(f"Created VPC: {vpc_id}")
+        logger.info(
+            f"Using network resources: vpc={self.vpc_id}, subnet={self.subnet_id}, "
+            f"sg={self.security_group_id}"
+        )
 
-            # Wait for VPC to be available
-            self.ec2_client.get_waiter("vpc_available").wait(VpcIds=[vpc_id])
-
-            # Enable DNS hostnames in VPC
-            self.ec2_client.modify_vpc_attribute(
-                VpcId=vpc_id, EnableDnsHostnames={"Value": True}
-            )
-
-            # Create and attach internet gateway
-            igw_response = self.ec2_client.create_internet_gateway(
-                TagSpecifications=[
-                    {
-                        "ResourceType": "internet-gateway",
-                        "Tags": [
-                            {
-                                "Key": "Name",
-                                "Value": f"{TAG_PREFIX}-igw-{self.provider.workflow_id}",
-                            },
-                            {"Key": TAG_NAME, "Value": "true"},
-                            {
-                                "Key": TAG_WORKFLOW_ID,
-                                "Value": self.provider.workflow_id,
-                            },
-                        ],
-                    }
-                ]
-            )
-
-            igw_id = igw_response["InternetGateway"]["InternetGatewayId"]
-
-            self.ec2_client.attach_internet_gateway(
-                InternetGatewayId=igw_id, VpcId=vpc_id
-            )
-
-            logger.info(f"Created and attached internet gateway: {igw_id}")
-
-            return vpc_id
-
-        except ClientError as e:
-            logger.error(f"Error creating VPC: {e}")
-            raise ResourceCreationError(f"Failed to create VPC: {e}")
-
-    def _create_subnet(self) -> str:
-        """Create a subnet for the Spot Fleet instances.
-
-        Returns
-        -------
-        str
-            Subnet ID
-        """
-        if not self.vpc_id:
-            raise ResourceCreationError("VPC ID required to create subnet")
-
-        try:
-            # Create subnet in the first availability zone
-            az_response = self.ec2_client.describe_availability_zones()
-            first_az = az_response["AvailabilityZones"][0]["ZoneName"]
-
-            # Create subnet using CIDR manager
-            from ..security.cidr_manager import CIDRManager
-
-            cidr_manager = CIDRManager()
-            subnet_cidrs = cidr_manager.get_subnet_cidrs(
-                self.security_config.vpc_cidr, 1
-            )
-
-            response = self.ec2_client.create_subnet(
-                VpcId=self.vpc_id,
-                CidrBlock=subnet_cidrs[0],
-                AvailabilityZone=first_az,
-                TagSpecifications=[
-                    {
-                        "ResourceType": "subnet",
-                        "Tags": [
-                            {
-                                "Key": "Name",
-                                "Value": f"{TAG_PREFIX}-subnet-{self.provider.workflow_id}",
-                            },
-                            {"Key": TAG_NAME, "Value": "true"},
-                            {
-                                "Key": TAG_WORKFLOW_ID,
-                                "Value": self.provider.workflow_id,
-                            },
-                        ],
-                    }
-                ],
-            )
-
-            subnet_id = response["Subnet"]["SubnetId"]
-            logger.info(f"Created subnet: {subnet_id} in AZ: {first_az}")
-
-            # Create route table
-            rt_response = self.ec2_client.create_route_table(
-                VpcId=self.vpc_id,
-                TagSpecifications=[
-                    {
-                        "ResourceType": "route-table",
-                        "Tags": [
-                            {
-                                "Key": "Name",
-                                "Value": f"{TAG_PREFIX}-rt-{self.provider.workflow_id}",
-                            },
-                            {"Key": TAG_NAME, "Value": "true"},
-                            {
-                                "Key": TAG_WORKFLOW_ID,
-                                "Value": self.provider.workflow_id,
-                            },
-                        ],
-                    }
-                ],
-            )
-
-            route_table_id = rt_response["RouteTable"]["RouteTableId"]
-
-            # Associate route table with subnet
-            self.ec2_client.associate_route_table(
-                RouteTableId=route_table_id, SubnetId=subnet_id
-            )
-
-            # Add route to internet via internet gateway
-            igw_response = self.ec2_client.describe_internet_gateways(
-                Filters=[{"Name": "attachment.vpc-id", "Values": [self.vpc_id]}]
-            )
-
-            if igw_response["InternetGateways"]:
-                igw_id = igw_response["InternetGateways"][0]["InternetGatewayId"]
-
-                self.ec2_client.create_route(
-                    RouteTableId=route_table_id,
-                    DestinationCidrBlock="0.0.0.0/0",
-                    GatewayId=igw_id,
-                )
-
-                logger.info(f"Created route to internet via gateway {igw_id}")
-
-            # Enable public IP assignment if requested
-            if self.provider.use_public_ips:
-                self.ec2_client.modify_subnet_attribute(
-                    SubnetId=subnet_id, MapPublicIpOnLaunch={"Value": True}
-                )
-                logger.info(f"Enabled public IP assignment for subnet: {subnet_id}")
-
-            return subnet_id
-
-        except ClientError as e:
-            logger.error(f"Error creating subnet: {e}")
-            raise ResourceCreationError(f"Failed to create subnet: {e}")
-
-    def _create_security_group(self) -> str:
-        """Create a security group for the Spot Fleet instances.
-
-        Returns
-        -------
-        str
-            Security group ID
-        """
-        if not self.vpc_id:
-            raise ResourceCreationError("VPC ID required to create security group")
-
-        try:
-            # Create security group
-            response = self.ec2_client.create_security_group(
-                GroupName=f"{TAG_PREFIX}-sg-{self.provider.workflow_id[:8]}",
-                Description=f"Security group for Parsl Spot Fleet ({self.provider.workflow_id})",
-                VpcId=self.vpc_id,
-                TagSpecifications=[
-                    {
-                        "ResourceType": "security-group",
-                        "Tags": [
-                            {
-                                "Key": "Name",
-                                "Value": f"{TAG_PREFIX}-sg-{self.provider.workflow_id}",
-                            },
-                            {"Key": TAG_NAME, "Value": "true"},
-                            {
-                                "Key": TAG_WORKFLOW_ID,
-                                "Value": self.provider.workflow_id,
-                            },
-                        ],
-                    }
-                ],
-            )
-
-            security_group_id = response["GroupId"]
-            logger.info(f"Created security group: {security_group_id}")
-
-            # Add inbound rules using security configuration
-            security_rules = self.security_config.get_security_group_rules(
-                "compute_worker"
-            )
-
-            # Convert to EC2 IpPermissions format
-            ip_permissions = []
-            for rule in security_rules:
-                ip_permission = {
-                    "IpProtocol": rule["IpProtocol"],
-                    "FromPort": rule["FromPort"],
-                    "ToPort": rule["ToPort"],
-                    "IpRanges": rule["IpRanges"],
-                }
-                if "Description" in rule:
-                    # Note: Description goes in IpRanges for ingress rules
-                    for ip_range in ip_permission["IpRanges"]:
-                        ip_range["Description"] = rule["Description"]
-
-                ip_permissions.append(ip_permission)
-
-            # Add self-referencing rule for internal communication
-            ip_permissions.append(
-                {
-                    "IpProtocol": "-1",
-                    "UserIdGroupPairs": [
-                        {
-                            "GroupId": security_group_id,
-                            "Description": "Allow all traffic within security group",
-                        }
-                    ],
-                }
-            )
-
-            if ip_permissions:
-                self.ec2_client.authorize_security_group_ingress(
-                    GroupId=security_group_id, IpPermissions=ip_permissions
-                )
-                logger.info(
-                    f"Configured Spot Fleet security group rules: {security_group_id} "
-                    f"({len(ip_permissions)} rules)"
-                )
-
-                # Log security rule summary
-                for rule in security_rules:
-                    logger.debug(
-                        f"Applied Spot Fleet security rule: {rule['IpProtocol']}:"
-                        f"{rule['FromPort']}-{rule['ToPort']} from "
-                        f"{[r['CidrIp'] for r in rule['IpRanges']]}"
-                    )
-            else:
-                logger.warning(
-                    "No Spot Fleet security rules configured - instances may be unreachable"
-                )
-
-            # Add outbound rule
-            self.ec2_client.authorize_security_group_egress(
-                GroupId=security_group_id,
-                IpPermissions=[
-                    {
-                        "IpProtocol": "-1",  # All protocols
-                        "FromPort": -1,  # All ports
-                        "ToPort": -1,  # All ports
-                        "IpRanges": [{"CidrIp": "0.0.0.0/0"}],  # All destinations
-                    }
-                ],
-            )
-
-            logger.info(f"Configured security group rules: {security_group_id}")
-
-            return security_group_id
-
-        except ClientError as e:
-            logger.error(f"Error creating security group: {e}")
-            raise ResourceCreationError(f"Failed to create security group: {e}")
-
-    def _cleanup_network_resources(self) -> None:
-        """Clean up VPC, subnet, and security group."""
-        try:
-            # Delete security group
-            if self.security_group_id:
-                try:
-                    self.ec2_client.delete_security_group(
-                        GroupId=self.security_group_id
-                    )
-                    logger.info(f"Deleted security group: {self.security_group_id}")
-                except ClientError as e:
-                    logger.error(
-                        f"Error deleting security group {self.security_group_id}: {e}"
-                    )
-                self.security_group_id = None
-
-            # Delete subnet
-            if self.subnet_id:
-                try:
-                    self.ec2_client.delete_subnet(SubnetId=self.subnet_id)
-                    logger.info(f"Deleted subnet: {self.subnet_id}")
-                except ClientError as e:
-                    logger.error(f"Error deleting subnet {self.subnet_id}: {e}")
-                self.subnet_id = None
-
-            # Detach and delete internet gateways
-            if self.vpc_id:
-                try:
-                    # Find internet gateways attached to VPC
-                    igws = self.ec2_client.describe_internet_gateways(
-                        Filters=[{"Name": "attachment.vpc-id", "Values": [self.vpc_id]}]
-                    )
-
-                    # Detach and delete each internet gateway
-                    for igw in igws.get("InternetGateways", []):
-                        igw_id = igw["InternetGatewayId"]
-                        try:
-                            self.ec2_client.detach_internet_gateway(
-                                InternetGatewayId=igw_id, VpcId=self.vpc_id
-                            )
-                            self.ec2_client.delete_internet_gateway(
-                                InternetGatewayId=igw_id
-                            )
-                            logger.info(f"Deleted internet gateway: {igw_id}")
-                        except ClientError as e:
-                            logger.error(
-                                f"Error deleting internet gateway {igw_id}: {e}"
-                            )
-                except ClientError as e:
-                    logger.error(
-                        f"Error finding internet gateways for VPC {self.vpc_id}: {e}"
-                    )
-
-            # Delete route tables
-            if self.vpc_id:
-                try:
-                    # Find route tables associated with VPC
-                    route_tables = self.ec2_client.describe_route_tables(
-                        Filters=[{"Name": "vpc-id", "Values": [self.vpc_id]}]
-                    )
-
-                    # Delete each custom route table (skip main route table)
-                    for rt in route_tables.get("RouteTables", []):
-                        rt_id = rt["RouteTableId"]
-                        # Skip main route table
-                        if any(
-                            assoc.get("Main", False)
-                            for assoc in rt.get("Associations", [])
-                        ):
-                            continue
-
-                        # Delete route table
-                        try:
-                            # First disassociate all subnets
-                            for assoc in rt.get("Associations", []):
-                                if "SubnetId" in assoc:
-                                    self.ec2_client.disassociate_route_table(
-                                        AssociationId=assoc["RouteTableAssociationId"]
-                                    )
-
-                            # Then delete the route table
-                            self.ec2_client.delete_route_table(RouteTableId=rt_id)
-                            logger.info(f"Deleted route table: {rt_id}")
-                        except ClientError as e:
-                            logger.error(f"Error deleting route table {rt_id}: {e}")
-                except ClientError as e:
-                    logger.error(
-                        f"Error finding route tables for VPC {self.vpc_id}: {e}"
-                    )
-
-            # Delete VPC
-            if self.vpc_id:
-                try:
-                    self.ec2_client.delete_vpc(VpcId=self.vpc_id)
-                    logger.info(f"Deleted VPC: {self.vpc_id}")
-                except ClientError as e:
-                    logger.error(f"Error deleting VPC {self.vpc_id}: {e}")
-                self.vpc_id = None
-
-        except Exception as e:
-            logger.error(f"Error cleaning up network resources: {e}")
-            raise ResourceCleanupError(f"Failed to clean up network resources: {e}")
+        return {
+            "vpc_id": self.vpc_id,
+            "subnet_id": self.subnet_id,
+            "security_group_id": self.security_group_id,
+        }
 
     def _get_iam_fleet_role(self) -> str:
         """Get or create an IAM role for the Spot Fleet.
@@ -1623,8 +1193,8 @@ class SpotFleetManager:
                 except Exception as e:
                     logger.error(f"Error cleaning up IAM role {role_name}: {e}")
 
-            # Clean up network resources (this will handle VPC, subnets, security groups, etc.)
-            self._cleanup_network_resources()
+            # The VPC, subnet, and security group are supplied by the caller and
+            # are deliberately left untouched.
 
         except Exception as e:
             logger.error(f"Error cleaning up resources: {e}")

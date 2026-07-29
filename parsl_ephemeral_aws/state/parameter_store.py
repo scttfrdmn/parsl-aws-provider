@@ -8,11 +8,10 @@ import json
 import logging
 from typing import Dict, Any, Optional
 
-import boto3
 from botocore.exceptions import ClientError
 
 from ..exceptions import StateError
-from .base import StateStore
+from .base import StateStore, get_provider_id, get_workflow_id, resolve_session
 from ..security import SecurityEventType, SecurityEventSeverity, SecurityEvent
 
 
@@ -39,27 +38,13 @@ class ParameterStoreState(StateStore):
         use_secure_string : bool, optional
             Whether to use SecureString parameter type, by default False
         """
+        super().__init__(get_provider_id(provider))
         self.provider = provider
         self.prefix = prefix.rstrip("/")
         self.use_secure_string = use_secure_string
+        self.workflow_id = get_workflow_id(provider)
 
-        # Initialize AWS session
-        session_kwargs = {}
-        if self.provider.aws_access_key_id and self.provider.aws_secret_access_key:
-            session_kwargs["aws_access_key_id"] = self.provider.aws_access_key_id
-            session_kwargs[
-                "aws_secret_access_key"
-            ] = self.provider.aws_secret_access_key
-
-        if self.provider.aws_session_token:
-            session_kwargs["aws_session_token"] = self.provider.aws_session_token
-
-        if self.provider.aws_profile:
-            session_kwargs["profile_name"] = self.provider.aws_profile
-
-        self.aws_session = boto3.Session(
-            region_name=self.provider.region, **session_kwargs
-        )
+        self.aws_session = resolve_session(provider)
 
         # Initialize clients
         self.ssm_client = self.aws_session.client("ssm")
@@ -134,7 +119,7 @@ class ParameterStoreState(StateStore):
                         Tags=[
                             {
                                 "Key": "ParslWorkflowId",
-                                "Value": self.provider.workflow_id,
+                                "Value": self.workflow_id,
                             }
                         ],
                     )
@@ -271,7 +256,7 @@ class ParameterStoreState(StateStore):
                 ParameterFilters=[
                     {
                         "Key": "tag:ParslWorkflowId",
-                        "Values": [self.provider.workflow_id],
+                        "Values": [self.workflow_id],
                     }
                 ]
             )

@@ -11,6 +11,7 @@ import time
 import json
 
 from parsl_ephemeral_aws.modes.detached import DetachedMode
+from parsl_ephemeral_aws.state.base import STATE_KEY_MODE
 from parsl_ephemeral_aws.exceptions import (
     OperatingModeError,
     ResourceCreationError,
@@ -597,8 +598,11 @@ class TestDetachedMode:
         # Verify state_store.save_state was called
         mock_state_store.save_state.assert_called_once()
 
+        # The mode writes its own state key, so the provider's document survives
+        state_key, state = mock_state_store.save_state.call_args[0]
+        assert state_key == STATE_KEY_MODE
+
         # Verify state content
-        state = mock_state_store.save_state.call_args[0][0]
         assert state["provider_id"] == "test-provider"
         assert state["mode"] == "DetachedMode"
         assert state["vpc_id"] == "vpc-12345"

@@ -5,15 +5,13 @@ AWS Parameter Store (SSM) and S3, exercising the full state round-trip:
 
     initialise → state saved → re-create provider → state loaded → shutdown → state deleted
 
-NOTE on known bugs
-------------------
-As of v0.3.0 the ``ParameterStoreStateStore`` and ``S3StateStore`` classes were
-implemented with a different constructor signature than what ``EphemeralAWSProvider``
-passes when creating them (``session``, ``path``/``bucket``, ``provider_id`` vs
-the original ``provider`` object, ``prefix``/``bucket_name``).  These tests are
-written to exercise the **intended** behaviour; they will fail at provider
-construction time until those mismatches are resolved.  The failures serve as
-regression-test markers for issue #57.
+These tests were written against the **intended** behaviour while the AWS state
+backends could not be constructed at all: the provider passed ``session``,
+``path``/``bucket`` and ``provider_id``, while the stores took a ``provider``
+object plus ``prefix``/``bucket_name``, and both stores then read six credential
+attributes the provider does not define.  Fixed in v0.7.0 (#57, #77); state is
+now addressed by key so the provider and its mode no longer overwrite each
+other's document (#78).
 
 Run with::
 
@@ -42,14 +40,16 @@ MAX_WAIT_S = 600  # 10 minutes
 AWS_TEST_PROFILE = "aws"
 
 
-def _poll_until(
-    provider, job_id: str, target_status: str, timeout: int = MAX_WAIT_S
-) -> bool:
-    """Poll provider.status() until the job reaches *target_status* or timeout."""
+def _poll_until(provider, job_id: str, target_state, timeout: int = MAX_WAIT_S) -> bool:
+    """Poll provider.status() until the job reaches *target_state* or timeout.
+
+    ``status()`` returns Parsl ``JobStatus`` objects, so read ``.state`` rather
+    than subscripting.
+    """
     deadline = time.time() + timeout
     while time.time() < deadline:
         result = provider.status([job_id])
-        if result and result[0]["status"] == target_status:
+        if result and result[0].state == target_state:
             return True
         time.sleep(POLL_INTERVAL_S)
     return False
@@ -131,7 +131,7 @@ class TestParameterStoreState:
                 logger.warning("teardown cancel raised (ignored): %s", exc)
 
     def test_state_round_trips_through_parameter_store(
-        self, aws_session, test_run_id, aws_region
+        self, aws_session, test_run_id, aws_region, network_ids
     ):
         """State saved by one provider instance can be loaded by a new instance.
 
@@ -158,6 +158,7 @@ class TestParameterStoreState:
             waiter_delay=15,
             waiter_max_attempts=40,
             debug=True,
+            **network_ids,
         )
         provider1.operating_mode.initialize()
         job_id = provider1.submit("echo round-trip-test", tasks_per_node=1)
@@ -182,6 +183,7 @@ class TestParameterStoreState:
             waiter_delay=15,
             waiter_max_attempts=40,
             debug=True,
+            **network_ids,
         )
         try:
             provider2.operating_mode.initialize()  # should load saved state
@@ -292,7 +294,7 @@ class TestS3State:
                 logger.warning("teardown cancel raised (ignored): %s", exc)
 
     def test_state_round_trips_through_s3(
-        self, aws_session, test_run_id, aws_region, s3_state_bucket
+        self, aws_session, test_run_id, aws_region, s3_state_bucket, network_ids
     ):
         """State saved by one provider can be loaded by a new provider from S3.
 
@@ -317,6 +319,7 @@ class TestS3State:
             waiter_delay=15,
             waiter_max_attempts=40,
             debug=True,
+            **network_ids,
         )
         provider1.operating_mode.initialize()
         job_id = provider1.submit("echo round-trip-s3", tasks_per_node=1)
@@ -340,6 +343,7 @@ class TestS3State:
             waiter_delay=15,
             waiter_max_attempts=40,
             debug=True,
+            **network_ids,
         )
         try:
             provider2.operating_mode.initialize()

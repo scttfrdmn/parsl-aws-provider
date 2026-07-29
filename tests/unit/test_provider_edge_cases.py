@@ -14,8 +14,9 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from parsl_ephemeral_aws.exceptions import ProviderError
+from parsl_ephemeral_aws.exceptions import ProviderConfigurationError, ProviderError
 from parsl_ephemeral_aws.provider import EphemeralAWSProvider
+from parsl_ephemeral_aws.state.base import STATE_KEY_MODE, STATE_KEY_PROVIDER
 from parsl_ephemeral_aws.state.file import FileStateStore
 
 
@@ -366,9 +367,11 @@ class TestAMIBaking:
             security_group_id="sg-123",
         )
         # Run just the baking branch by calling initialize() with network already set
-        with patch.object(mode, "save_state"), patch.object(
-            mode, "load_state", return_value=False
-        ), patch.object(mode, "_verify_resources"):
+        with (
+            patch.object(mode, "save_state"),
+            patch.object(mode, "load_state", return_value=False),
+            patch.object(mode, "_verify_resources"),
+        ):
             mode.initialize()
 
         assert mode.image_id == "ami-prefab"
@@ -454,13 +457,16 @@ class TestAMIBaking:
         mode._owns_baked_ami = True
 
         saved = {}
+        keys_written = []
 
-        def _capture_state(state):
+        def _capture_state(state_key, state):
+            keys_written.append(state_key)
             saved.update(state)
 
         with patch.object(state_store, "save_state", side_effect=_capture_state):
             mode.save_state()
 
+        assert keys_written == [STATE_KEY_MODE]
         assert saved.get("baked_ami_id") == "ami-saved001"
         assert saved.get("owns_baked_ami") is True
 
@@ -592,21 +598,37 @@ class TestOneShotMode:
 
     def test_one_shot_compatible_with_zero_warm_pool(self, tmp_dir):
         """one_shot=True with warm_pool_size=0 (default) constructs without error."""
-        provider, _ = _make_provider(tmp_dir, one_shot=True, warm_pool_size=0)
+        provider, _ = _make_provider(
+            tmp_dir,
+            one_shot=True,
+            warm_pool_size=0,
+            iam_instance_profile_arn=_FAKE_IAM_ARN,
+        )
         assert provider.one_shot is True
 
-    def test_one_shot_enforces_shutdown_in_init_script(self, tmp_dir):
-        """_prepare_init_script includes 'shutdown -h now' when one_shot=True, auto_shutdown=False."""
+    def test_one_shot_iam_guard_raises(self, tmp_dir):
+        """One-shot dispatches over SSM, so it needs an instance profile too."""
+        with pytest.raises(ValueError, match="one_shot=True requires"):
+            _make_provider(tmp_dir, one_shot=True)
+
+    def test_one_shot_iam_guard_passes_with_auto_create(self, tmp_dir):
+        """auto_create_instance_profile=True satisfies the one-shot IAM guard."""
+        provider, _ = _make_provider(
+            tmp_dir, one_shot=True, auto_create_instance_profile=True
+        )
+        assert provider.one_shot is True
+
+    def _one_shot_mode(self, tmp_dir, **overrides):
+        """Build a StandardMode with one_shot=True and a mocked session."""
         from parsl_ephemeral_aws.modes.standard import StandardMode
 
         provider_id = f"test-{uuid.uuid4().hex[:8]}"
         state_file = os.path.join(tmp_dir, f"{provider_id}.json")
         state_store = FileStateStore(file_path=state_file, provider_id=provider_id)
-        session_mock = MagicMock()
 
-        mode = StandardMode(
+        params = dict(
             provider_id=provider_id,
-            session=session_mock,
+            session=MagicMock(),
             state_store=state_store,
             image_id="ami-12345678",
             auto_shutdown=False,
@@ -615,6 +637,550 @@ class TestOneShotMode:
             subnet_id="subnet-test001",
             security_group_id="sg-test00001",
         )
+        params.update(overrides)
+        return StandardMode(**params)
+
+    def test_one_shot_dispatches_over_ssm_not_userdata(self, tmp_dir):
+        """One-shot uses SSM so the command's exit code is observable.
+
+        UserData cannot report an exit code — the instance state is identical
+        whether the command succeeded or failed (#76).
+        """
+        mode = self._one_shot_mode(tmp_dir)
+
+        assert mode._uses_ssm_dispatch() is True
 
         script = mode._prepare_init_script("echo hi", "job-1")
+        assert "echo hi" not in script
+        assert "/var/run/parsl_worker_ready" in script
+        # No UserData shutdown: it would race the SSM dispatch and kill the
+        # instance before the command was ever delivered.
+        assert "shutdown -h now" not in script
+
+    def test_one_shot_ssm_command_carries_shutdown_backstop(self, tmp_dir):
+        """The dispatched command shuts the instance down if the driver dies."""
+        mode = self._one_shot_mode(tmp_dir)
+        ssm = mode.session.client.return_value
+        ssm.send_command.return_value = {"Command": {"CommandId": "cmd-1"}}
+
+        mode._dispatch_ssm_command("i-123", "echo hi", "job-1")
+
+        script = ssm.send_command.call_args.kwargs["Parameters"]["commands"][0]
+        assert "echo hi" in script
         assert "shutdown -h now" in script
+        # The exit code is captured before the shutdown is scheduled, and
+        # re-raised, so a failing command still reports FAILED.
+        assert "_parsl_rc=$?" in script
+        assert "exit $_parsl_rc" in script
+
+    def test_non_one_shot_ssm_command_has_no_shutdown(self, tmp_dir):
+        """Warm-pool instances must survive the command for reuse."""
+        mode = self._one_shot_mode(
+            tmp_dir, one_shot=False, warm_pool_size=2, auto_shutdown=True
+        )
+        ssm = mode.session.client.return_value
+        ssm.send_command.return_value = {"Command": {"CommandId": "cmd-1"}}
+
+        mode._dispatch_ssm_command("i-123", "echo hi", "job-1")
+
+        script = ssm.send_command.call_args.kwargs["Parameters"]["commands"][0]
+        assert "shutdown" not in script
+
+    def test_instances_terminate_rather_than_stop_on_shutdown(self, tmp_dir):
+        """EC2 defaults an instance-initiated shutdown to *stop*, billing EBS.
+
+        Regression for #76: a stopped instance keeps a billed volume, and
+        EC2_STATUS_MAPPING maps "stopped" to COMPLETED, so the provider drops
+        the tracking record and the volume is orphaned as well as billed.
+        """
+        mode = self._one_shot_mode(tmp_dir)
+        ec2 = mode.session.client.return_value
+        ec2.run_instances.return_value = {"Instances": [{"InstanceId": "i-123"}]}
+
+        mode._create_instance("#!/bin/bash\n", "job-1")
+
+        run_args = ec2.run_instances.call_args.kwargs
+        assert run_args["InstanceInitiatedShutdownBehavior"] == "terminate"
+
+    def test_spot_launch_spec_omits_run_instances_only_keys(self, tmp_dir):
+        """RequestSpotInstances rejects RunInstances-only keys (#97).
+
+        ``run_args`` is built for ``run_instances`` and reused as the spot
+        ``LaunchSpecification``; boto3 validates parameter names client-side, so
+        leaving any of these in makes every spot request raise before it reaches
+        AWS.
+        """
+        mode = self._one_shot_mode(tmp_dir, use_spot=True)
+        ec2 = mode.session.client.return_value
+        ec2.request_spot_instances.return_value = {
+            "SpotInstanceRequests": [{"SpotInstanceRequestId": "sir-1"}]
+        }
+        ec2.describe_spot_instance_requests.return_value = {
+            "SpotInstanceRequests": [{"InstanceId": "i-123"}]
+        }
+
+        mode._create_instance("#!/bin/bash\n", "job-1")
+
+        spec = ec2.request_spot_instances.call_args.kwargs["LaunchSpecification"]
+        for key in ("MinCount", "MaxCount", "InstanceInitiatedShutdownBehavior"):
+            assert key not in spec, f"{key} is not valid in a LaunchSpecification"
+
+    def test_one_shot_status_comes_from_the_ssm_exit_code(self, tmp_dir):
+        """A non-zero exit must report FAILED, not COMPLETED."""
+        from parsl_ephemeral_aws.constants import STATUS_COMPLETED, STATUS_FAILED
+
+        mode = self._one_shot_mode(tmp_dir)
+        mode.resources["i-123"] = {
+            "type": "ec2",
+            "one_shot": True,
+            "ssm_command_id": "cmd-1",
+            "status": "RUNNING",
+        }
+        ssm = mode.session.client.return_value
+        ssm.get_command_invocation.return_value = {
+            "Status": "Failed",
+            "ResponseCode": 1,
+            "StandardErrorContent": "boom",
+        }
+
+        assert mode.get_job_status(["i-123"]) == {"i-123": STATUS_FAILED}
+        assert mode.resources["i-123"]["exit_code"] == 1
+
+        ssm.get_command_invocation.return_value = {
+            "Status": "Success",
+            "ResponseCode": 0,
+        }
+        assert mode.get_job_status(["i-123"]) == {"i-123": STATUS_COMPLETED}
+        assert mode.resources["i-123"]["exit_code"] == 0
+
+    def test_failed_dispatch_terminates_the_instance(self, tmp_dir):
+        """With no command in UserData there is nothing to fall back to.
+
+        Leaving the instance up would idle it until max_idle_time while
+        reporting RUNNING, so the submit fails loudly and the instance goes.
+        """
+        mode = self._one_shot_mode(tmp_dir)
+        mode.initialized = True
+        ec2 = mode.session.client.return_value
+        ec2.run_instances.return_value = {"Instances": [{"InstanceId": "i-123"}]}
+
+        with patch.object(
+            mode, "_wait_for_ssm_online", side_effect=RuntimeError("no SSM")
+        ):
+            with pytest.raises(Exception, match="no SSM"):
+                mode.submit_job(job_id="job-1", command="echo hi", tasks_per_node=1)
+
+        ec2.terminate_instances.assert_called_once_with(InstanceIds=["i-123"])
+        assert "i-123" not in mode.resources
+
+
+# ---------------------------------------------------------------------------
+# TestStateKeySeparation
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestStateKeySeparation:
+    """The provider and its mode must not overwrite each other's state (#78)."""
+
+    @pytest.fixture
+    def tmp_dir(self):
+        with tempfile.TemporaryDirectory() as d:
+            yield d
+
+    @staticmethod
+    def _mode(provider_id, state_store):
+        """Return a StandardMode sharing *state_store* with the provider."""
+        from parsl_ephemeral_aws.modes.standard import StandardMode
+
+        return StandardMode(
+            provider_id=provider_id,
+            session=MagicMock(),
+            state_store=state_store,
+            image_id="ami-base",
+            vpc_id="vpc-test00001",
+            subnet_id="subnet-test001",
+            security_group_id="sg-test00001",
+        )
+
+    def test_provider_and_mode_writes_coexist(self, tmp_dir):
+        """A mode write must not destroy job_map, nor a provider write the baked AMI.
+
+        Both writers previously issued full-document overwrites into one slot, so
+        whichever went last erased the other's fields: the baked AMI ID (leaking
+        the AMI and its snapshots, since cleanup could no longer see it) or
+        job_map (losing the job-to-resource mapping across restart).
+        """
+        provider, _ = _make_provider(tmp_dir)
+        state_store = provider.state_store
+        mode = self._mode(provider.provider_id, state_store)
+        mode._baked_ami_id = "ami-baked001"
+        mode._owns_baked_ami = True
+
+        mode.save_state()
+        provider.job_map["job-1"] = "resource-1"
+        provider._save_state()
+        # A second mode write is the point at which the provider's fields used
+        # to disappear.
+        mode.save_state()
+
+        mode_state = state_store.load_state(STATE_KEY_MODE)
+        provider_state = state_store.load_state(STATE_KEY_PROVIDER)
+
+        assert mode_state["baked_ami_id"] == "ami-baked001"
+        assert mode_state["owns_baked_ami"] is True
+        assert provider_state["job_map"] == {"job-1": "resource-1"}
+
+    def test_both_writers_survive_a_round_trip(self, tmp_dir):
+        """Reloading restores the mode's baked AMI and the provider's job_map."""
+        provider, _ = _make_provider(tmp_dir)
+        state_store = provider.state_store
+        mode = self._mode(provider.provider_id, state_store)
+        mode._baked_ami_id = "ami-baked001"
+        mode._owns_baked_ami = True
+        mode.initialized = True
+
+        mode.save_state()
+        provider.job_map["job-1"] = "resource-1"
+        provider._save_state()
+
+        # A fresh mode and provider reading the same file, as after a restart.
+        reloaded_mode = self._mode(provider.provider_id, state_store)
+        assert reloaded_mode.load_state() is True
+        assert reloaded_mode._baked_ami_id == "ami-baked001"
+        assert reloaded_mode._owns_baked_ami is True
+        assert reloaded_mode.image_id == "ami-baked001"
+
+        provider.job_map.clear()
+        provider._load_state()
+        assert provider.job_map == {"job-1": "resource-1"}
+
+    def test_mode_load_ignores_the_provider_document(self, tmp_dir):
+        """The mode must not pick up the provider's document as its own.
+
+        The provider writes provider_id too, so an unkeyed read would match the
+        mode's own provider_id check and load the wrong shape.
+        """
+        provider, _ = _make_provider(tmp_dir)
+        provider.job_map["job-1"] = "resource-1"
+        provider._save_state()
+
+        mode = self._mode(provider.provider_id, provider.state_store)
+        assert mode.load_state() is False
+        assert mode.initialized is False
+
+    def test_shutdown_deletes_both_documents(self, tmp_dir):
+        """shutdown() must delete both keys, not save an empty document.
+
+        ``delete_state`` was implemented in all three stores and the ABC but
+        called from nowhere; shutdown wrote an empty document instead, which on
+        the AWS backends left SSM parameters and S3 objects behind and on any
+        backend left a document describing resources that no longer exist.
+        """
+        provider, _ = _make_provider(tmp_dir)
+        state_store = provider.state_store
+        mode = self._mode(provider.provider_id, state_store)
+        mode._baked_ami_id = "ami-baked001"
+
+        mode.save_state()
+        provider.job_map["job-1"] = "resource-1"
+        provider._save_state()
+        assert state_store.load_state(STATE_KEY_MODE) is not None
+        assert state_store.load_state(STATE_KEY_PROVIDER) is not None
+
+        # The provider's operating_mode is a MagicMock, so route the mode
+        # deletion at the real store the way the live mode would.
+        provider.operating_mode.delete_state.side_effect = mode.delete_state
+
+        provider.shutdown()
+
+        assert state_store.load_state(STATE_KEY_MODE) is None
+        assert state_store.load_state(STATE_KEY_PROVIDER) is None
+
+    @staticmethod
+    def _provider_sharing(state_file, **extra):
+        """Build a provider at *state_file* without passing a provider_id.
+
+        ``_make_provider`` always supplies one, which is exactly the case that
+        skips adoption — so restart has to be modelled with a provider that lets
+        the ID default, as a real successor process would.
+        """
+        with (
+            patch(
+                "parsl_ephemeral_aws.provider.create_session"
+            ) as mock_session_factory,
+            patch.object(
+                EphemeralAWSProvider,
+                "_initialize_operating_mode",
+                return_value=MagicMock(),
+            ),
+        ):
+            mock_session_factory.return_value = MagicMock()
+            return EphemeralAWSProvider(
+                region="us-east-1",
+                image_id="ami-12345678",
+                instance_type="t3.micro",
+                mode="standard",
+                state_store_type="file",
+                state_file_path=state_file,
+                min_blocks=0,
+                init_blocks=0,
+                vpc_id="vpc-test00001",
+                subnet_id="subnet-test001",
+                security_group_id="sg-test00001",
+                **extra,
+            )
+
+    def test_a_successor_provider_loads_state_from_the_same_path(self, tmp_dir):
+        """Restart must restore job_map given nothing but a shared state path.
+
+        Two independent defects made this impossible: ``_load_state()`` was
+        never called from ``__init__`` at all, and it refuses a document whose
+        ``provider_id`` differs from its own -- while ``provider_id`` defaults to
+        a fresh UUID and does not affect *where* state is stored. So a successor
+        rejected the very state it was pointed at.
+        """
+        state_file = os.path.join(tmp_dir, "shared.json")
+
+        first = self._provider_sharing(state_file)
+        first.job_map["job-1"] = {"resource_id": "resource-1"}
+        first._save_state()
+
+        second = self._provider_sharing(state_file)
+
+        assert second.provider_id == first.provider_id
+        assert second.job_map == {"job-1": {"resource_id": "resource-1"}}
+
+    def test_the_id_is_adopted_from_mode_state_when_no_provider_state_exists(
+        self, tmp_dir
+    ):
+        """Only the mode key exists until a job is submitted.
+
+        The provider writes its own key from ``_save_state()``, which runs on
+        submit/status/cancel — so a provider that constructed and exited without
+        submitting leaves *only* the mode document behind. Adoption originally
+        read the provider key alone and found nothing, so the successor kept its
+        fresh UUID and ``OperatingMode.load_state()`` rejected the mode document
+        on the ID gate. Found against real AWS: a resumed provider silently took
+        the create path and never noticed its security group had been deleted.
+        """
+        state_file = os.path.join(tmp_dir, "mode-only.json")
+
+        first = self._provider_sharing(state_file)
+        mode = self._mode(first.provider_id, first.state_store)
+        mode.save_state()
+
+        # Only the mode key is present — exactly the no-submit case.
+        assert first.state_store.load_state(STATE_KEY_PROVIDER) is None
+        assert first.state_store.load_state(STATE_KEY_MODE) is not None
+
+        second = self._provider_sharing(state_file)
+
+        assert second.provider_id == first.provider_id
+        # And with the ID adopted, the mode's own load now clears its gate.
+        successor_mode = self._mode(second.provider_id, second.state_store)
+        assert successor_mode.load_state() is True
+
+    def test_an_explicit_provider_id_is_never_overridden(self, tmp_dir):
+        """A caller-supplied ID is a deliberate choice; adoption must skip it.
+
+        Otherwise a provider asked for a specific identity would silently answer
+        to whichever ID happened to be sitting at that state location.
+        """
+        state_file = os.path.join(tmp_dir, "shared.json")
+
+        first = self._provider_sharing(state_file)
+        first._save_state()
+
+        second = self._provider_sharing(state_file, provider_id="explicit-id")
+
+        assert second.provider_id == "explicit-id"
+        # And it declines the other provider's state rather than adopting it.
+        assert second.job_map == {}
+
+    def test_a_fresh_path_leaves_the_generated_id_alone(self, tmp_dir):
+        """With nothing persisted there is no ID to adopt and no state to load."""
+        provider = self._provider_sharing(os.path.join(tmp_dir, "empty.json"))
+
+        assert provider.provider_id
+        assert provider.job_map == {}
+
+    def test_shutdown_survives_a_mode_without_delete_state(self, tmp_dir):
+        """A mode that predates delete_state must not break shutdown.
+
+        ``_delete_state`` guards with ``callable(getattr(...))``; without it a
+        third-party mode -- or a test double built with ``spec=`` -- would turn
+        shutdown into an error path.
+        """
+        provider, _ = _make_provider(tmp_dir)
+        provider.job_map["job-1"] = "resource-1"
+        provider._save_state()
+        del provider.operating_mode.delete_state
+
+        provider.shutdown()
+
+        assert provider.state_store.load_state(STATE_KEY_PROVIDER) is None
+
+
+# ---------------------------------------------------------------------------
+# TestStandardOnlyOptionGuard
+# ---------------------------------------------------------------------------
+
+
+#: The options StandardMode alone implements, with a non-default value for each.
+#: ``_initialize_operating_mode()`` forwards them only on the STANDARD branch --
+#: correct -- but the provider acts on them regardless of mode, which is what
+#: makes the mismatch leak rather than merely no-op. See #80.
+STANDARD_ONLY_OPTIONS = [
+    ("warm_pool_size", 2),
+    ("warm_pool_ttl", 900),
+    ("bake_ami", True),
+    ("baked_ami_id", "ami-prebaked01"),
+    ("one_shot", True),
+]
+
+NON_STANDARD_MODES = ["detached", "serverless"]
+
+
+def _construct(mode, **extra_kwargs):
+    """Construct a provider in *mode*, with AWS and the operating mode mocked.
+
+    Unlike ``_make_provider`` this does not pin ``mode="standard"``, and it
+    patches ``initialize`` so construction does not reach AWS. The guard under
+    test runs in ``__init__`` before either the state store or the mode is
+    built, so nothing here can mask it.
+    """
+    with (
+        patch("parsl_ephemeral_aws.provider.create_session") as mock_session_factory,
+        patch.object(
+            EphemeralAWSProvider, "_initialize_state_store", return_value=MagicMock()
+        ),
+        patch.object(
+            EphemeralAWSProvider, "_initialize_operating_mode", return_value=MagicMock()
+        ),
+        patch.object(EphemeralAWSProvider, "_load_state", return_value=None),
+    ):
+        mock_session_factory.return_value = MagicMock()
+        return EphemeralAWSProvider(
+            region="us-east-1",
+            image_id="ami-12345678",
+            mode=mode,
+            vpc_id="vpc-test00001",
+            subnet_id="subnet-test001",
+            security_group_id="sg-test00001",
+            **extra_kwargs,
+        )
+
+
+@pytest.mark.unit
+class TestStandardOnlyOptionGuard:
+    """StandardMode-only options must be refused on other modes (#80)."""
+
+    @pytest.mark.parametrize("mode", NON_STANDARD_MODES)
+    @pytest.mark.parametrize("option,value", STANDARD_ONLY_OPTIONS)
+    def test_the_option_is_refused_on_a_non_standard_mode(self, mode, option, value):
+        """Each option, on each mode that cannot honour it, must raise.
+
+        Silently ignoring it is what #80 is about: with
+        ``mode="detached", warm_pool_size=2`` the provider tagged resources
+        ``warm_pool=True``, took the warm-pool branch in ``_cleanup_resources()``,
+        and set ``STATUS_WARM`` -- a status no other mode's
+        ``get_job_status()`` recognises -- so the instances were never cleaned
+        up and leaked with no error at all.
+        """
+        extra = {option: value}
+        # warm_pool_size and one_shot also trip the SSM IAM guard; supply a
+        # profile so a pass here cannot be the wrong guard firing.
+        extra["iam_instance_profile_arn"] = _FAKE_IAM_ARN
+
+        with pytest.raises(ProviderConfigurationError, match=option):
+            _construct(mode, **extra)
+
+    @pytest.mark.parametrize("option,value", STANDARD_ONLY_OPTIONS)
+    def test_the_option_is_accepted_on_standard_mode(self, option, value):
+        """The same option must still be accepted where it is implemented.
+
+        A guard that rejected these everywhere would pass the test above while
+        breaking the feature.
+        """
+        extra = {option: value, "iam_instance_profile_arn": _FAKE_IAM_ARN}
+
+        provider = _construct("standard", **extra)
+
+        assert getattr(provider, option) == value
+
+    @pytest.mark.parametrize("mode", NON_STANDARD_MODES)
+    def test_a_non_standard_mode_with_no_such_option_constructs(self, mode):
+        """The guard must not fire on the defaults.
+
+        Every provider passes through it, so a wrong comparison here would
+        break detached and serverless mode outright.
+        """
+        provider = _construct(mode)
+
+        assert provider.mode_type.value == mode
+
+    @pytest.mark.parametrize("mode", NON_STANDARD_MODES)
+    def test_explicitly_passing_a_default_is_not_refused(self, mode):
+        """Passing the documented default is a no-op, not a misconfiguration.
+
+        The guard compares against the default rather than testing presence, so
+        ``warm_pool_size=0`` -- which asks for nothing -- must be allowed.
+        """
+        provider = _construct(
+            mode,
+            warm_pool_size=0,
+            warm_pool_ttl=600,
+            bake_ami=False,
+            baked_ami_id=None,
+            one_shot=False,
+        )
+
+        assert provider.warm_pool_size == 0
+
+    def test_every_offending_option_is_named_at_once(self):
+        """The message must list all of them, not just the first found.
+
+        Reporting one at a time means a caller who set three fixes them one
+        construction at a time.
+        """
+        with pytest.raises(ProviderConfigurationError) as excinfo:
+            _construct(
+                "detached",
+                warm_pool_size=2,
+                bake_ami=True,
+                one_shot=True,
+                iam_instance_profile_arn=_FAKE_IAM_ARN,
+            )
+
+        message = str(excinfo.value)
+        for option in ("warm_pool_size", "bake_ami", "one_shot"):
+            assert option in message
+
+    def test_the_message_names_the_mode_that_was_asked_for(self):
+        """Naming the mode is what makes the error actionable."""
+        with pytest.raises(ProviderConfigurationError, match="serverless"):
+            _construct("serverless", bake_ami=True)
+
+    def test_the_mode_guard_precedes_the_ssm_iam_guard(self):
+        """Mode rejection must come first, or the error misdirects.
+
+        ``one_shot=True`` on detached mode with no IAM profile trips two guards.
+        The IAM one would tell the caller to set
+        ``auto_create_instance_profile`` -- which cannot help, because detached
+        mode does not implement one-shot at all.
+        """
+        with pytest.raises(ProviderConfigurationError, match="one_shot"):
+            _construct("detached", one_shot=True)
+
+    def test_a_standard_only_option_does_not_leak_through_kwargs(self):
+        """The guard must catch the option itself, not just the named parameter.
+
+        All five are real ``__init__`` parameters today, so this is a
+        regression fence: were one ever demoted to ``**kwargs`` it would reach
+        the mode silently again.
+        """
+        with pytest.raises(ProviderConfigurationError, match="warm_pool_size"):
+            _construct(
+                "detached", warm_pool_size=1, iam_instance_profile_arn=_FAKE_IAM_ARN
+            )

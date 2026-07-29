@@ -8,11 +8,10 @@ import json
 import logging
 from typing import Dict, Any, Optional
 
-import boto3
 from botocore.exceptions import ClientError
 
 from ..exceptions import StateError
-from .base import StateStore
+from .base import StateStore, get_provider_id, get_workflow_id, resolve_session
 
 
 logger = logging.getLogger(__name__)
@@ -41,28 +40,15 @@ class S3State(StateStore):
         create_bucket_if_not_exists : bool, optional
             Whether to create the bucket if it doesn't exist, by default False
         """
+        super().__init__(get_provider_id(provider))
         self.provider = provider
         self.bucket_name = bucket_name
         self.key_prefix = key_prefix.rstrip("/")
         self.create_bucket_if_not_exists = create_bucket_if_not_exists
+        self.workflow_id = get_workflow_id(provider)
+        self.region = getattr(provider, "region", None)
 
-        # Initialize AWS session
-        session_kwargs = {}
-        if self.provider.aws_access_key_id and self.provider.aws_secret_access_key:
-            session_kwargs["aws_access_key_id"] = self.provider.aws_access_key_id
-            session_kwargs[
-                "aws_secret_access_key"
-            ] = self.provider.aws_secret_access_key
-
-        if self.provider.aws_session_token:
-            session_kwargs["aws_session_token"] = self.provider.aws_session_token
-
-        if self.provider.aws_profile:
-            session_kwargs["profile_name"] = self.provider.aws_profile
-
-        self.aws_session = boto3.Session(
-            region_name=self.provider.region, **session_kwargs
-        )
+        self.aws_session = resolve_session(provider)
 
         # Initialize clients
         self.s3_client = self.aws_session.client("s3")
@@ -83,16 +69,16 @@ class S3State(StateStore):
             if error_code == "404":
                 # Bucket doesn't exist, create it
                 try:
-                    # Create bucket in the current region
-                    if self.provider.region == "us-east-1":
-                        # us-east-1 requires special handling (no LocationConstraint)
+                    # Create bucket in the current region. us-east-1 rejects a
+                    # LocationConstraint; so does an unset region, where the
+                    # session's own default applies.
+                    region = self.region or self.aws_session.region_name
+                    if not region or region == "us-east-1":
                         self.s3_client.create_bucket(Bucket=self.bucket_name)
                     else:
                         self.s3_client.create_bucket(
                             Bucket=self.bucket_name,
-                            CreateBucketConfiguration={
-                                "LocationConstraint": self.provider.region
-                            },
+                            CreateBucketConfiguration={"LocationConstraint": region},
                         )
 
                     # Block all public access (replaces deprecated ACL="private")
@@ -114,7 +100,7 @@ class S3State(StateStore):
                                 {"Key": "ParslManagedBucket", "Value": "true"},
                                 {
                                     "Key": "ParslWorkflowId",
-                                    "Value": self.provider.workflow_id,
+                                    "Value": self.workflow_id,
                                 },
                             ]
                         },
@@ -169,7 +155,7 @@ class S3State(StateStore):
                 Key=object_key,
                 Body=state_json,
                 ContentType="application/json",
-                Metadata={"ParslWorkflowId": self.provider.workflow_id},
+                Metadata={"ParslWorkflowId": self.workflow_id},
             )
 
             logger.debug(f"Saved state to S3: {object_key}")
@@ -303,7 +289,7 @@ class S3State(StateStore):
         """Clean up all states for the current workflow."""
         try:
             # List objects with the workflow prefix
-            workflow_prefix = f"{self.key_prefix}/{self.provider.workflow_id}"
+            workflow_prefix = f"{self.key_prefix}/{self.workflow_id}"
 
             objects_to_delete = []
 

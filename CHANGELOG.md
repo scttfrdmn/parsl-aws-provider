@@ -7,32 +7,328 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Removed
-- `create_vpc` parameter — VPC/subnet/security-group creation removed from the
-  provider entirely (closes #69).
-- `_create_vpc()`, `_create_subnet()`, `_create_security_group()`, and
-  `_find_available_vpc_cidr()` helpers deleted from `StandardMode` and
-  `DetachedMode`.
+### Security
+- `ServerlessMode.cleanup_infrastructure()` no longer deletes the caller's
+  security group. The code was guarded only by a comment claiming "if we created
+  it directly" — nothing verified ownership, and after #69 the ID is always
+  user-supplied. It was reached from the `except` handler on every failed
+  `initialize()`. The unconditional `parsl-vpc-<provider_id[:8]}` CloudFormation
+  stack deletion (whose 8-character truncated IDs can collide across providers)
+  was removed with it (closes #70).
+- `SpotFleetManager._cleanup_network_resources()` removed. It unconditionally
+  deleted the caller's security group, subnet, **every internet gateway attached
+  to the VPC**, every non-main route table, and the VPC itself — with no
+  ownership check, on IDs that `_setup_network_resources()` had adopted from the
+  provider. It ran as the last step of `cleanup_all_resources()`, so with
+  `use_spot_fleet=True` every normal provider shutdown attempted to destroy the
+  caller's pre-provisioned network; a second path invoked it from the setup
+  `except` handler. `delete_vpc`/`delete_subnet` usually failed with
+  `DependencyViolation`, but the internet-gateway detach could succeed against a
+  live VPC and blackhole egress for unrelated workloads (closes #94).
+
+### Fixed
+- `ECSManager._get_or_create_network_resources()` raised
+  `UnboundLocalError: cannot access local variable 'subnet_response'` on every
+  ECS/Fargate submission. A leftover line dereferenced `subnet_response`, which
+  is bound only in the subnet-discovery branch; once `subnet_id` became required
+  in #69 the explicit-subnet branch always ran, so the line always raised. It
+  also overwrote the caller's explicit subnet with every subnet discovered in the
+  VPC (closes #71).
+- `ServerlessMode` could never be constructed. `LambdaManager` and `ECSManager`
+  were written against `EphemeralAWSProvider` but are handed the mode as their
+  `provider`, and the mode defined none of the attributes they read — so
+  `_initialize_compute_managers()` raised
+  `AttributeError: 'ServerlessMode' object has no attribute 'workflow_id'`.
+  Since `EphemeralAWSProvider.__init__` calls `initialize()` unconditionally,
+  `EphemeralAWSProvider(mode="serverless")` always raised. The mode now defines
+  `workflow_id`, `subnet_ids`, `use_spot_instances`, `security_config`, and the
+  four credential attributes (closes #72).
+- `compute_type`, `memory_size`, and `timeout` were forwarded by the provider but
+  accepted by no `ServerlessMode` parameter, so they vanished into `**kwargs`:
+  `worker_type` was always `auto` regardless of `compute_type`, and Lambda memory
+  and timeout were always the defaults (closes #73).
+- `ServerlessMode.initialize()` never set `self.initialized`, so every
+  `submit_job()` re-ran `ensure_initialized()` and rebuilt both compute managers
+  (closes #73).
+- `LambdaManager._generate_lambda_code()` raised
+  `ValueError: Invalid format specifier` on every call. The generated handler was
+  built as an f-string whose literal dict braces were read as replacement fields,
+  so no Lambda job could ever be submitted. All six test call sites patch the
+  method with a stub, so the real body had never run. It is now a plain template
+  with a single JSON-encoded substitution for the command (closes #96).
+- `LambdaManager._create_credential_config_from_provider()` raised
+  `TypeError: CredentialConfiguration.__init__() got an unexpected keyword
+  argument 'aws_access_key_id'` on every construction — none of the three
+  `aws_*` kwargs it passed are fields on the dataclass. It now matches the
+  `EC2Manager`/`ECSManager`/`SpotFleetManager` implementations, and no longer
+  defaults `use_profile` to a profile literally named `aws` (closes #95).
+- `auto_create_instance_profile` was accepted by `EphemeralAWSProvider` but never
+  forwarded to `StandardMode`, so the documented warm-pool configuration could
+  never work. Instances launched with no IAM instance profile, SSM never came
+  online, `_wait_for_ssm_online()` timed out, and every submission silently fell
+  back to UserData dispatch — losing both instance reuse and exit-code
+  reporting. `StandardMode` now accepts the flag and resolves an ARN in
+  `initialize()`, on both the fresh and resumed paths (the ARN is not persisted
+  in state). A failure to create the profile is logged, not fatal: dispatch
+  degrades to UserData rather than the provider failing to start (closes #75).
+- One-shot instances stopped instead of terminating, leaving a billed EBS volume.
+  `StandardMode._create_instance()` never set
+  `InstanceInitiatedShutdownBehavior`, and EC2 defaults an instance-initiated
+  shutdown to *stop* — so the `shutdown -h now` appended by
+  `_prepare_init_script()` stopped the instance. Because `EC2_STATUS_MAPPING`
+  maps `stopped` to `COMPLETED`, the provider then dropped the tracking record,
+  orphaning the volume as well as billing for it. `DetachedMode` had set
+  `terminate` on all three of its launch paths since v0.2.0 (closes #76).
+- One-shot command failures reported `COMPLETED`. #66 specified "command exits
+  non-zero → FAILED", but status was derived purely from EC2 instance state,
+  which is identical whether the command succeeded or failed. One-shot dispatch
+  now goes through the same SSM `SendCommand` path the warm pool uses, so the
+  exit code is reported; it is also recorded on the resource as `exit_code`, and
+  a failure logs the command's stderr (closes #76).
+- `StandardMode._create_spot_instance()` raised
+  `ParamValidationError: Unknown parameter in LaunchSpecification: "MinCount"`
+  on every call. `run_args` is built for `run_instances` and reused as the spot
+  `LaunchSpecification`, which expresses count as the top-level `InstanceCount`;
+  boto3 validates parameter names client-side, so `use_spot=True` could never
+  submit a job unless `use_spot_fleet=True` routed around it. The
+  `RunInstances`-only keys are now stripped (closes #97).
+- Instance-profile resolution no longer leaves a profile permanently empty. The
+  previous implementation returned early when `get_instance_profile` succeeded,
+  so a profile whose role attachment had failed midway kept being reused with no
+  role attached and SSM never came online. The role is now attached on all three
+  paths (pre-existing profile, freshly created, and lost creation race).
+- `state_store_type="s3"` and `"parameter_store"` could not be constructed at
+  all — three stacked defects, each hidden behind the previous one. The provider
+  passed `session=`/`path=`/`bucket=`/`key=`/`provider_id=`, none of which are
+  parameters of `S3State` or `ParameterStoreState` (`TypeError`); the AWS stores
+  implement a *keyed* three-method interface while the provider and
+  `FileStateStore` used an unkeyed one; and both stores unguardedly read six
+  credential attributes that `EphemeralAWSProvider` does not define, building
+  their own `boto3.Session` and ignoring `provider.session` entirely
+  (`AttributeError`). The `session=` kwarg exists nowhere else in the codebase —
+  this path had never been executed. The stores' provider-object contract is
+  kept; the provider and `FileStateStore` were adapted to it (closes #57, #77).
+- The provider and its operating mode no longer overwrite each other's state.
+  Both wrote full-document overwrites, with different field sets, into the same
+  slot, so whichever wrote last erased the other's fields. Losing the mode's
+  `baked_ami_id`/`owns_baked_ami` meant `cleanup_infrastructure()` could no
+  longer see the AMI it owned — **leaking the AMI and its EBS snapshots**, and
+  silently re-baking on restart. Losing the provider's `job_map` lost the
+  job-to-resource mapping. State is now addressed by key, one per writer
+  (closes #78).
+- Auto-created IAM instance profiles were handed to `RunInstances` before EC2
+  could see them, failing every launch with `InvalidParameterValue: Invalid IAM
+  Instance Profile ARN`. IAM is eventually consistent with respect to EC2:
+  measured against real AWS, `create_instance_profile` returned the ARN at
+  t+4.1s but `RunInstances` did not accept it until t+14.5s. This was
+  unreachable until `auto_create_instance_profile` began to take effect (#75).
+  `get_or_create_ssm_instance_profile()` now waits for the profile to become
+  visible on both its create and creation-race paths, polling a dry-run
+  `RunInstances` — `get_instance_profile` succeeds immediately and so proves
+  nothing about the path that matters. A timeout warns rather than raising, since
+  the launch that follows reports any real error (closes #98).
+- The provider never restored persisted state, so nothing survived a restart on
+  any backend. Two independent defects: `_load_state()` was not called from
+  `__init__` at all (only tests called it), and it refuses a document whose
+  `provider_id` differs from its own — while `provider_id` defaults to a fresh
+  UUID and does **not** affect where state is stored (only `state_file_path` /
+  `parameter_store_path` / `s3_key` do). A successor therefore generated a new
+  ID and discarded the very document it was pointed at. `__init__` now loads
+  state, and adopts the `provider_id` recorded at that location unless the caller
+  supplied one explicitly. Wiring this up was only safe once the provider and its
+  mode stopped sharing a slot (#78) (closes #100).
+- Provider-ID adoption consulted only the provider's own state key, which does not
+  exist until a job has been submitted — the provider writes it from
+  `_save_state()`, on submit/status/cancel. A provider that constructed and
+  exited without submitting therefore left *only* the mode document behind, the
+  successor kept its fresh UUID, and `OperatingMode.load_state()` rejected that
+  document on the ID gate. Both keys are now consulted, provider key first. The
+  mode document is the one that matters here: it holds the network IDs and the
+  baked-AMI ownership flag. Found against real AWS while probing #79 — a resumed
+  provider silently took the create path and never noticed its security group had
+  been deleted (closes #101).
+- `warm_pool_size`, `warm_pool_ttl`, `bake_ami`, `baked_ami_id`, and `one_shot`
+  are implemented only by `StandardMode`, and were forwarded only on that branch
+  — but the provider acted on them regardless of mode, which made the mismatch
+  leak rather than merely no-op. With `mode="detached", warm_pool_size=2` every
+  resource was tagged `warm_pool=True`, `_cleanup_resources()` took the warm-pool
+  branch, and jobs were set to `STATUS_WARM` — a status no other mode's
+  `get_job_status()` recognises — so those instances were **never cleaned up** and
+  leaked with no error or warning. `__init__` now raises
+  `ProviderConfigurationError` naming every offending option and the mode asked
+  for. It is ordered before the SSM instance-profile guard, which would otherwise
+  answer `one_shot=True` on detached mode by advising
+  `auto_create_instance_profile` — advice that cannot help, since detached mode
+  does not implement one-shot at all (closes #80).
+- Real-AWS E2E tests read `provider.status(...)[0]["status"]` in 14 places, but
+  `status()` has returned `List[JobStatus]` since v0.5.0 and `JobStatus` is not
+  subscriptable, so each raised `TypeError`. The pattern dates to when the suite
+  was written, against the old `List[Dict[str, str]]`. This mattered more than
+  the three visible failures suggest: a polling helper that raises on its first
+  call cannot time out — it aborts the test — so no spot, detached, serverless,
+  or Globus lifecycle assertion downstream of a `_poll_until` had ever run. All
+  call sites now compare `statuses[0].state` against `JobState` (closes #102).
+- `_verify_resources()` nulled the network ID it had just found missing instead of
+  reporting it. The nulling is a leftover from the create-on-demand era — since
+  #69 nothing creates a replacement, so the `None` reached `run_instances` as an
+  opaque `InvalidParameterValue` far from the missing resource, and in serverless
+  mode re-entered a guard that read a `create_vpc` attribute which no longer
+  exists. It now raises `ResourceNotFoundError` naming the offending ID.
+  `load_state()` also no longer restores a `None` from a pre-#69 state document
+  over a validated ID. The network half of the method was byte-identical in all
+  three modes — the condition that let them drift — and now lives once on
+  `OperatingMode`; `DetachedMode` still adds its bastion check on top, where a
+  missing bastion is correctly *not* an error, since that resource is one the
+  mode does create (closes #79).
+- Network resources were verified only when resuming from state, so a first-run
+  provider — the common case — never checked its IDs at all. `initialize()` now
+  verifies on both paths in all three modes. Found by probing #79's fix against
+  real AWS: the expected `ResourceNotFoundError` never fired.
+- A syntactically invalid network ID escaped as a raw `ClientError`. EC2 answers
+  a malformed ID with a distinct code rather than `NotFound` — verified against
+  real AWS, where `sg-00000000000000000` yields `InvalidGroupId.Malformed` while
+  a subnet or VPC ID of the same shape yields `NotFound`, and the suffix casing
+  differs per resource. All six codes are now matched, on the `Error.Code` field
+  rather than the rendered message.
+- `DetachedMode.initialize()` returned unconditionally when it loaded state, so a
+  resumed provider whose bastion had been terminated never rebuilt it — every job
+  was dispatched into an SSM path nothing was reading. It also ran its bastion
+  check before `load_state()`, which is where `bastion_id` comes from, so on a
+  fresh process there was nothing to check.
+- `shutdown()` saved an **empty** state document instead of deleting it, so SSM
+  parameters and S3 objects survived every shutdown and accumulated per run
+  (Parameter Store has an account quota). On any backend the surviving document
+  described network IDs — and, for the mode, a baked AMI — that shutdown had just
+  released. `delete_state` was implemented in all three stores and declared on
+  the ABC, but called from nowhere in the package (closes #99).
+
+### Added
+- **One-shot mode** for `StandardMode`: set `one_shot=True` to declare that each
+  EC2 instance runs a single command and then terminates, regardless of the
+  `auto_shutdown` setting (closes #66).
+  - The command is dispatched over SSM `SendCommand` after the instance reports
+    ready, so its exit code determines the job status. UserData carries only
+    `worker_init` and the readiness marker.
+  - The instance is terminated by `_cleanup_resources()` once the command
+    reaches a terminal state; a detached `shutdown -h now` in the dispatched
+    script bounds the cost if the driver process dies first. It is scheduled
+    after the exit code is captured, so it cannot mask a non-zero exit.
+  - Raises `ValueError` at construction time if combined with
+    `warm_pool_size > 0` (one-shot instances are terminated and cannot be
+    reused), or if no instance profile is available.
+  - `one_shot=False` (default): zero code-path changes for existing users.
+- `tests/aws/test_one_shot_e2e.py` — 8 real-AWS tests covering exit-code
+  propagation (`exit 0` → COMPLETED, `exit 1` → FAILED, `exit 42` recorded),
+  termination rather than stopping, no leftover billable EBS volume, the
+  instance-profile guard, and the absence of the command from UserData.
+  Specified in #66 and never written.
+- 8 tests in `TestOneShotMode` covering SSM dispatch, the shutdown backstop,
+  `InstanceInitiatedShutdownBehavior`, the spot `LaunchSpecification` key
+  stripping, exit-code-derived status, dispatch-failure termination, and the
+  instance-profile guard.
+- `docs/network-prerequisites.md` with Terraform and CloudFormation snippets for
+  provisioning the required network resources.
+- `tests/unit/test_ecs_manager.py` — 6 tests covering explicit `subnet_id`,
+  explicit `subnet_ids` precedence, subnet discovery, default-VPC fallback, and
+  both empty-result error paths.
+- `tests/unit/test_serverless_mode_contract.py` — 30 tests covering the
+  compute-manager attribute contract, the conditional network guard, provider
+  parameter plumbing, and the absence of the network-creation helpers.
+- `tests/unit/test_lambda_manager.py` — 13 tests that execute the real
+  `_generate_lambda_code()` body and compile its output.
+- `tests/unit/test_instance_profile.py` — 10 tests covering SSM instance-profile
+  resolution against moto and `StandardMode`'s resolution behaviour.
+- `STATE_KEY_PROVIDER` and `STATE_KEY_MODE` in `state/base.py`, and
+  `OperatingMode.delete_state()` — one state document per writer.
+- `FileStateStore` keyed layout: a single file holding one sub-document per key
+  under `_states`, versioned with `_version`, read-modify-written under the
+  existing `fcntl.flock`. A flat pre-v0.7.0 document is still readable under any
+  key and is seeded into both keys on first write.
+- `resolve_session(provider)` in `state/base.py` — prefers `provider.session`
+  before assembling one from credential fields, so the AWS stores stop
+  duplicating the credential plumbing the provider already does via
+  `create_session()`.
+- 8 tests in `TestFileStateStoreKeying` and 5 in `TestStateKeySeparation`
+  covering key isolation, per-key deletion, flat-document upgrade, serialization
+  failure leaving prior state intact, and shutdown deleting both documents. The
+  key-isolation tests were mutation-checked: collapsing `STATE_KEY_MODE` onto the
+  provider's key fails all three separation tests.
+- 23 tests in `TestStandardOnlyOptionGuard` covering each StandardMode-only
+  option against each mode that cannot honour it, acceptance on standard mode,
+  explicitly-passed defaults, multi-option messages, and guard ordering.
+  Mutation-checked: disabling the guard fails 14, comparing presence instead of
+  the default fails 4, and reordering it after the IAM guard fails 2.
+- `one_shot` is now documented on `EphemeralAWSProvider`; it had been accepted
+  but absent from the docstring. The four warm-pool and AMI-baking parameters
+  are now marked `mode="standard"` only.
+- 5 tests in `TestWaitForInstanceProfile` covering the IAM propagation wait —
+  including a fake clock driven through `sleep` so the retry-then-give-up path
+  genuinely iterates.
+- The `tests/aws` `network_ids` fixture now validates the supplied IDs against
+  `AWS_TEST_REGION` before any test runs. IDs from another region were not an
+  error until a launch was attempted, surfacing minutes in as
+  `InvalidSubnetID.NotFound` from inside `RunInstances` — after real instances had
+  been billed. `AWS_TEST_REGION` defaults to `us-west-2`, so supplying the IDs
+  alone is easy to get wrong; the check now fails in seconds with the region named.
+- `get_or_create_ssm_instance_profile()` in `utils/aws.py` — promoted from
+  `EC2Manager._get_or_create_instance_profile()` so `StandardMode` and
+  `EC2Manager` share one implementation. Resolution order is explicit ARN, then
+  auto-creation, then `None`.
 
 ### Changed
+- `vpc_id`, `subnet_id`, and `security_group_id` are no longer required for
+  Lambda-only serverless mode. `compute/lambda_func.py` references none of them
+  and `create_function` passes no `VpcConfig`, so functions run in the
+  Lambda-managed VPC. ECS/Fargate still requires them — `awsvpcConfiguration` is
+  mandatory — so the guard now keys off the resolved worker type in both
+  `EphemeralAWSProvider` and `OperatingMode` (new `require_network_resources`
+  flag) (closes #74).
+- `EphemeralAWSProvider` now passes `region` explicitly to the operating mode
+  rather than letting it fall back to `session.region_name`.
+- **`StateStore` is now a keyed interface**: `save_state(state_key, state_data)`,
+  `load_state(state_key)`, `delete_state(state_key)`. `FileStateStore` gained the
+  key parameter; the two AWS stores already had it and now call
+  `super().__init__()`. Callers holding a store directly must pass a key.
+- `OperatingMode.load_state()` no longer restores a `None` network ID over a
+  validated constructor value. A state document written before these IDs became
+  required can carry nulls, which previously surfaced much later as an opaque
+  boto3 `InvalidParameterValue` at launch.
+- `StandardMode._create_instance()` attaches the IAM instance profile whenever
+  one is available, not only when `warm_pool_size > 0`. One-shot dispatch needs
+  it too, and an unused profile costs nothing.
+- `EC2Manager._get_or_create_instance_profile()` now delegates to
+  `utils.aws.get_or_create_ssm_instance_profile()`.
+- One-shot mode now requires `auto_create_instance_profile=True` or
+  `iam_instance_profile_arn`, because its command is delivered by SSM
+  `SendCommand`. The requirement was previously warm-pool-only.
+- A failed SSM dispatch now terminates the instance and re-raises instead of
+  logging "falling back to UserData execution". There was nothing to fall back
+  to — the command is not in the UserData, so the instance would have idled
+  until `max_idle_time` while reporting `RUNNING`.
+- `EphemeralAWSProvider.status()` runs `_cleanup_resources()` when `one_shot` is
+  set, not only when a warm pool is configured; a one-shot instance has no
+  UserData shutdown to end it.
 - `vpc_id`, `subnet_id`, and `security_group_id` are now **required** constructor
   arguments; a `ValueError` is raised at init if any are missing.
 - `cleanup_infrastructure()` no longer destroys network resources — VPC,
   subnet, and security group are now the caller's responsibility.
 - E2E tests read `AWS_TEST_VPC_ID`, `AWS_TEST_SUBNET_ID`, and `AWS_TEST_SG_ID`
   from the environment; tests are skipped (not failed) when these are unset.
-- Added `docs/network-prerequisites.md` with Terraform and CloudFormation
-  snippets for provisioning the required network resources.
 
-### Added
-- **One-shot mode** for `StandardMode`: set `one_shot=True` to explicitly declare
-  that each EC2 instance runs a single command then terminates, regardless of the
-  `auto_shutdown` setting (closes #66).
-  - `one_shot=True` unconditionally appends `shutdown -h now` to the UserData
-    init script even when `auto_shutdown=False`.
-  - Raises `ValueError` at construction time if combined with `warm_pool_size > 0`
-    (incompatible: one-shot instances are terminated immediately and cannot be reused).
-  - `one_shot=False` (default): zero code-path changes for existing users.
+### Removed
+- `SpotFleetManager._create_vpc()`, `_create_subnet()`, `_create_security_group()`,
+  and `_cleanup_network_resources()`. `_setup_network_resources()` now only
+  resolves the caller-supplied IDs and raises `ResourceCreationError` if any are
+  missing (closes #94).
+- `create_vpc` parameter — VPC/subnet/security-group creation removed from the
+  provider entirely (closes #69).
+- `_create_vpc()`, `_create_subnet()`, `_create_security_group()`, and
+  `_find_available_vpc_cidr()` helpers deleted from `StandardMode` and
+  `DetachedMode`.
+- `ServerlessMode._create_vpc()`, `_create_subnet()`, and
+  `_create_security_group()` (182 LOC). These built the VPC through
+  CloudFormation rather than direct EC2 calls, which is why #69's pass missed
+  them; `create_vpc` is gone from `ServerlessMode` as well (closes #73).
 
 ## [0.6.0] - 2026-03-02
 

@@ -42,7 +42,11 @@ from parsl_ephemeral_aws.modes.base import OperatingMode
 from parsl_ephemeral_aws.modes.detached import DetachedMode
 from parsl_ephemeral_aws.modes.serverless import ServerlessMode
 from parsl_ephemeral_aws.modes.standard import StandardMode
-from parsl_ephemeral_aws.state.base import StateStore
+from parsl_ephemeral_aws.state.base import (
+    STATE_KEY_MODE,
+    STATE_KEY_PROVIDER,
+    StateStore,
+)
 from parsl_ephemeral_aws.state.file import FileStateStore
 from parsl_ephemeral_aws.state.parameter_store import ParameterStoreStateStore
 from parsl_ephemeral_aws.state.s3 import S3StateStore
@@ -198,19 +202,31 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
         ready for immediate reuse without re-running worker_init.
         Requires ``auto_create_instance_profile=True`` or
         ``iam_instance_profile_arn`` (SSM SendCommand needs an IAM role).
-        Default is 0 (disabled).
+        Default is 0 (disabled).  ``mode="standard"`` only.
     warm_pool_ttl : int, optional
         Seconds a warm idle instance stays alive before being terminated.
-        Default is 600 (10 minutes).
+        Default is 600 (10 minutes).  ``mode="standard"`` only.
     bake_ami : bool, optional
         When True, run ``worker_init`` on a builder instance during
         ``initialize()``, snapshot it into a custom AMI, and use that AMI for
         all subsequent instance launches.  Eliminates the per-boot install
         overhead for new instances.  Default is False.
+        ``mode="standard"`` only.
     baked_ami_id : str, optional
         Pre-existing baked AMI ID to use instead of baking a new one.  When
         supplied, ``initialize()`` skips the baking step and uses this AMI
-        directly for all instance launches.
+        directly for all instance launches.  ``mode="standard"`` only.
+    one_shot : bool, optional
+        When True, each instance runs a single command over SSM and then
+        terminates, so the command's exit code determines the job status.
+        Default is False.  ``mode="standard"`` only.
+
+    Raises
+    ------
+    ProviderConfigurationError
+        If ``warm_pool_size``, ``warm_pool_ttl``, ``bake_ami``,
+        ``baked_ami_id``, or ``one_shot`` is set on any mode other than
+        ``"standard"`` — no other mode implements them.
     """
 
     @typechecked
@@ -351,11 +367,46 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
         self.one_shot = one_shot
         self.kwargs = kwargs
 
-        # Guard: network IDs are required (provider no longer creates VPC/subnet/SG)
-        if not vpc_id or not subnet_id or not security_group_id:
+        # Guard: network IDs are required (provider no longer creates VPC/subnet/SG).
+        # Lambda-only serverless is the one exception: functions run in the
+        # Lambda-managed VPC, so there is nothing for the caller to pre-provision.
+        lambda_only = (
+            self.mode_type == OperatingModeType.SERVERLESS
+            and self.compute_type == ComputeType.LAMBDA
+        )
+        if not lambda_only and (not vpc_id or not subnet_id or not security_group_id):
             raise ValueError(
                 "vpc_id, subnet_id, and security_group_id are required. "
                 "Pre-provision network resources outside the provider."
+            )
+
+        # Guard: the warm pool, AMI baking, and one-shot dispatch are implemented
+        # only by StandardMode, and _initialize_operating_mode() forwards them
+        # only on that branch. The provider itself, however, acts on them
+        # regardless of mode: it tags resources warm_pool=True, takes the
+        # warm-pool branch in _cleanup_resources(), and reports STATUS_WARM. No
+        # other mode's get_job_status() knows that status, so those instances are
+        # never cleaned up and leak with no error or warning. Refuse the
+        # combination rather than silently half-honouring it.
+        standard_only = [
+            name
+            for name, value, default in (
+                ("warm_pool_size", warm_pool_size, DEFAULT_WARM_POOL_SIZE),
+                ("warm_pool_ttl", warm_pool_ttl, DEFAULT_WARM_POOL_TTL),
+                ("bake_ami", bake_ami, DEFAULT_BAKE_AMI),
+                ("baked_ami_id", baked_ami_id, None),
+                ("one_shot", one_shot, DEFAULT_ONE_SHOT),
+            )
+            if value != default
+        ]
+        if standard_only and self.mode_type != OperatingModeType.STANDARD:
+            raise ProviderConfigurationError(
+                f"{', '.join(standard_only)} "
+                f"{'are' if len(standard_only) > 1 else 'is'} supported only by "
+                f"mode='standard', not mode='{self.mode_type.value}'. "
+                "The option would be silently ignored by the mode while the "
+                "provider still acted on it, leaking instances that no mode "
+                "would clean up."
             )
 
         # Guard: one_shot is incompatible with warm pool (instances are terminated immediately)
@@ -365,14 +416,19 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
                 "one-shot instances are terminated immediately and cannot be reused"
             )
 
-        # Guard: warm pool uses SSM SendCommand which requires an IAM instance profile
+        # Guard: the warm pool and one-shot mode both dispatch over SSM
+        # SendCommand, which needs the instance to carry an IAM instance profile
+        # holding AmazonSSMManagedInstanceCore. Without one the agent never
+        # registers and the command is never delivered.
+        needs_ssm = warm_pool_size > 0 or one_shot
         if (
-            warm_pool_size > 0
+            needs_ssm
             and not auto_create_instance_profile
             and not iam_instance_profile_arn
         ):
+            trigger = "warm_pool_size > 0" if warm_pool_size > 0 else "one_shot=True"
             raise ValueError(
-                "warm_pool_size > 0 requires either auto_create_instance_profile=True "
+                f"{trigger} requires either auto_create_instance_profile=True "
                 "or iam_instance_profile_arn to be set (SSM SendCommand needs IAM permissions)"
             )
 
@@ -381,11 +437,22 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
             region=self.region, profile_name=self.profile_name
         )
         self.state_store = self._initialize_state_store()
+
+        # Adopt any provider_id already recorded at this state location, before
+        # the operating mode is built with it.
+        if provider_id is None:
+            self._adopt_persisted_provider_id()
+
         self.operating_mode = self._initialize_operating_mode()
         self.resources: Dict[str, Dict[str, Any]] = {}
         self.job_map: Dict[str, Dict[str, Any]] = {}
         # Re-entrant lock so cancel() → _cleanup_resources() doesn't deadlock
         self._lock = threading.RLock()
+
+        # Restore whatever was persisted at this state location. Safe only now
+        # that the provider and its mode write separate keys (#78) — before
+        # that, loading here would have activated the mutual clobbering.
+        self._load_state()
 
         logger.info(f"Initialized EphemeralAWSProvider in {self.mode_type.value} mode")
 
@@ -457,6 +524,28 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
                 f"{', '.join([c.value for c in ComputeType])}"
             )
 
+    def _parameter_store_prefix(self) -> str:
+        """Return the SSM parameter prefix the state keys hang off.
+
+        Each state key becomes ``{prefix}/{key}``, so two providers sharing a
+        path share a slot — the same semantics as two ``FileStateStore``
+        instances on one file path, which is what makes state hand-off between
+        provider instances possible.
+        """
+        return self.parameter_store_path.rstrip("/")
+
+    def _s3_key_prefix(self) -> str:
+        """Return the S3 key prefix the state keys hang off.
+
+        ``s3_key`` predates state keys and defaults to a file name, which would
+        yield the odd ``ephemeral_aws_state.json/provider``. A ``.json`` suffix
+        is dropped so the prefix reads as the directory it now is.
+        """
+        prefix = self.s3_key.rstrip("/")
+        if prefix.endswith(".json"):
+            prefix = prefix[: -len(".json")]
+        return prefix
+
     def _initialize_state_store(self) -> StateStore:
         """Initialize the state store based on configuration.
 
@@ -470,10 +559,11 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
                 file_path=self.state_file_path, provider_id=self.provider_id
             )
         elif self.state_store_type == StateStoreType.PARAMETER_STORE:
+            # The AWS stores take the provider itself: they read its region and
+            # credentials, and Parameter Store also reads its audit_logger.
             return ParameterStoreStateStore(
-                session=self.session,
-                path=self.parameter_store_path,
-                provider_id=self.provider_id,
+                provider=self,
+                prefix=self._parameter_store_prefix(),
             )
         elif self.state_store_type == StateStoreType.S3:
             if not self.s3_bucket:
@@ -481,10 +571,9 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
                     "s3_bucket is required when using 's3' state store"
                 )
             return S3StateStore(
-                session=self.session,
-                bucket=self.s3_bucket,
-                key=self.s3_key,
-                provider_id=self.provider_id,
+                provider=self,
+                bucket_name=self.s3_bucket,
+                key_prefix=self._s3_key_prefix(),
             )
         else:
             raise ProviderConfigurationError(
@@ -523,11 +612,13 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
             "use_public_ips": self.use_public_ips,
             "custom_ami": self.custom_ami,
             "debug": self.debug,
+            "region": self.region,
         }
 
         if self.mode_type == OperatingModeType.STANDARD:
             return StandardMode(
                 iam_instance_profile_arn=self.iam_instance_profile_arn,
+                auto_create_instance_profile=self.auto_create_instance_profile,
                 warm_pool_size=self.warm_pool_size,
                 warm_pool_ttl=self.warm_pool_ttl,
                 bake_ami=self.bake_ami,
@@ -688,9 +779,11 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
             for job_id in job_ids:
                 internal_statuses.setdefault(job_id, "UNKNOWN")
 
-        # Trigger cleanup to process warm-pool transitions and TTL evictions.
+        # Trigger cleanup to process warm-pool transitions and TTL evictions, and
+        # to terminate finished one-shot instances — their command is delivered
+        # over SSM rather than UserData, so nothing on the instance shuts it down.
         # _cleanup_resources() is idempotent and handles its own errors.
-        if self.warm_pool_size > 0:
+        if self.warm_pool_size > 0 or self.one_shot:
             self._cleanup_resources()
 
         return [
@@ -755,7 +848,13 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
         return [cancel_results[jid] for jid in job_ids]
 
     def _save_state(self) -> None:
-        """Save the current state to the state store."""
+        """Save the current state under the provider's own state key.
+
+        The operating mode writes ``STATE_KEY_MODE`` from its own
+        ``save_state()``. Both used to write the whole document to one slot with
+        different key sets, so each overwrite destroyed the other's fields —
+        losing ``job_map`` here and the baked AMI ID there (#78).
+        """
         with self._lock:
             state = {
                 "provider_id": self.provider_id,
@@ -769,15 +868,54 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
             }
 
         try:
-            self.state_store.save_state(state)
+            self.state_store.save_state(STATE_KEY_PROVIDER, state)
             logger.debug("Saved provider state")
         except Exception as e:
             logger.error(f"Failed to save provider state: {e}")
 
+    def _adopt_persisted_provider_id(self) -> None:
+        """Take over the provider_id recorded at this state location, if any.
+
+        Nothing about *where* state is stored depends on ``provider_id`` — the
+        file path, SSM prefix, and S3 key prefix are the only scoping. So two
+        providers sharing a path share a slot, which is exactly how state is
+        handed from one provider instance to its successor.
+
+        But ``provider_id`` defaults to a fresh UUID, and both this class and
+        ``OperatingMode.load_state()`` refuse to load a document whose
+        ``provider_id`` differs from their own. A successor therefore rejected
+        the very state it was pointed at, unless the caller happened to pass the
+        original ID back in. Adopting the persisted ID makes restart work with
+        nothing but a shared state location.
+
+        Only called when the caller did not pass ``provider_id`` explicitly; an
+        explicit ID is a deliberate choice and is left alone.
+
+        Both keys are consulted. The provider writes its own key only once a job
+        has been submitted, so a provider that constructed and exited without
+        submitting leaves the mode key alone at the location — and that is
+        precisely the state a successor needs, since it holds the network IDs and
+        the baked-AMI ownership flag.
+        """
+        for state_key in (STATE_KEY_PROVIDER, STATE_KEY_MODE):
+            try:
+                state = self.state_store.load_state(state_key)
+            except Exception as e:
+                logger.debug(f"No {state_key} state to adopt an ID from: {e}")
+                continue
+
+            persisted_id = (state or {}).get("provider_id")
+            if persisted_id and persisted_id != self.provider_id:
+                logger.info(
+                    f"Adopting provider_id {persisted_id} from {state_key} state"
+                )
+                self.provider_id = persisted_id
+                return
+
     def _load_state(self) -> None:
-        """Load the state from the state store."""
+        """Load the state stored under the provider's own state key."""
         try:
-            state = self.state_store.load_state()
+            state = self.state_store.load_state(STATE_KEY_PROVIDER)
             if state and state.get("provider_id") == self.provider_id:
                 with self._lock:
                     self.resources = state.get("resources", {})
@@ -792,6 +930,24 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
                 logger.info(f"Loaded state with {len(self.resources)} resources")
         except Exception as e:
             logger.error(f"Failed to load provider state: {e}")
+
+    def _delete_state(self) -> None:
+        """Delete the persisted state for both the provider and its mode.
+
+        Both keys go: a mode document that outlives the provider's still
+        describes network IDs and a baked AMI that shutdown has just released.
+        """
+        try:
+            self.state_store.delete_state(STATE_KEY_PROVIDER)
+        except Exception as e:
+            logger.error(f"Failed to delete provider state: {e}")
+
+        delete_mode_state = getattr(self.operating_mode, "delete_state", None)
+        if callable(delete_mode_state):
+            try:
+                delete_mode_state()
+            except Exception as e:
+                logger.error(f"Failed to delete mode state: {e}")
 
     def _cleanup_resources(self) -> None:
         """Clean up resources that are completed or failed.
@@ -1000,8 +1156,11 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
                 self.resources = {}
                 self.job_map = {}
 
-            # Save the empty state
-            self._save_state()
+            # Delete the persisted state rather than saving an empty document.
+            # The resources it describes are gone, so a surviving document only
+            # misleads the next provider that reads the same slot — and for the
+            # AWS backends it also leaves parameters and objects behind.
+            self._delete_state()
 
             logger.info("Provider shutdown complete")
         except Exception as e:
