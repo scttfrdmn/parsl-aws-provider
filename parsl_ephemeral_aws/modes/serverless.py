@@ -300,6 +300,8 @@ class ServerlessMode(OperatingMode):
 
         Raises
         ------
+        ResourceNotFoundError
+            If a configured VPC, subnet, or security group is missing.
         ResourceCreationError
             If initialization fails
         """
@@ -307,11 +309,18 @@ class ServerlessMode(OperatingMode):
         if self.initialized:
             return
 
+        # Confirm the caller-supplied network resources exist before we rely on
+        # them; Lambda-only deployments have nothing to verify. This runs ahead
+        # of the try block, as in the other two modes, so ResourceNotFoundError
+        # reaches the caller naming the unusable resource instead of being
+        # re-wrapped as a generic ResourceCreationError. Verifying inside the try
+        # also triggered cleanup_infrastructure() before anything had been
+        # created.
+        self._verify_resources()
+
         # Try to load state first
         if self.load_state():
-            logger.debug("Loaded state, checking resources")
-            # Verify that the loaded resources exist
-            self._verify_resources()
+            logger.debug("Loaded state, resources verified")
             # Initialize compute managers
             self._initialize_compute_managers()
             self.initialized = True
@@ -320,10 +329,6 @@ class ServerlessMode(OperatingMode):
         logger.debug("Initializing serverless mode")
 
         try:
-            # Confirm the caller-supplied network resources exist before we rely
-            # on them. Lambda-only deployments have nothing to verify.
-            self._verify_resources()
-
             # Initialize compute managers
             self._initialize_compute_managers()
 

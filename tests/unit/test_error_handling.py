@@ -28,13 +28,11 @@ from parsl_ephemeral_aws.exceptions import (
     JobSubmissionError,
     ResourceCreationError,
     ProviderConfigurationError,
-    NetworkCreationError,
+    ResourceNotFoundError,
     SpotFleetError,
     SpotFleetRequestError,
     SpotFleetThrottlingError,
-    LambdaFunctionError,
     CloudFormationError,
-    BastionHostError,
 )
 
 
@@ -225,40 +223,53 @@ class TestAWSConnectionErrors:
 
 
 class TestModeInitializationErrors:
-    """Tests for errors during operating mode initialization."""
+    """Tests for errors during operating mode initialization.
 
-    @pytest.fixture
-    def mock_provider(self):
-        """Create a mock provider."""
-        provider = MagicMock()
-        provider.region = "us-east-1"
-        provider.aws_access_key_id = None
-        provider.aws_secret_access_key = None
-        provider.aws_session_token = None
-        provider.aws_profile = None
-        provider.max_blocks = 1
-        return provider
+    These used to assert ``NetworkCreationError`` from ``StandardMode`` and
+    ``BastionHostError`` from ``DetachedMode`` while the modes created their own
+    VPC/subnet/SG. #69 removed that creation, and neither exception is raised
+    anywhere in the package any more. The successor contract is
+    ``_verify_resources()``: every mode now confirms the caller-supplied IDs
+    exist and raises ``ResourceNotFoundError`` naming the bad one.
+
+    That is worth covering in all three modes rather than deleting, because the
+    failure it replaced was the opaque one -- before #103 the modes silently
+    nulled the attribute out so ``initialize()`` could recreate the resource, and
+    since nothing recreates it the ``None`` surfaced much later as an
+    ``InvalidParameterValue`` from inside ``run_instances``.
+    """
 
     @pytest.fixture
     def mock_session(self):
-        """Create a mock boto3 session."""
+        """Create a mock boto3 session whose clients are all one MagicMock."""
         session = MagicMock()
+        session.client.return_value = MagicMock()
         return session
 
-    def test_standard_mode_vpc_creation_error(self, mock_provider, mock_session):
-        """Test error handling during VPC creation in StandardMode."""
-        mock_ec2_client = MagicMock()
-        mock_session.client.return_value = mock_ec2_client
-
-        # Simulate error creating VPC
-        error_response = {
-            "Error": {
-                "Code": "VpcLimitExceeded",
-                "Message": "The maximum number of VPCs has been reached",
-            }
+    @staticmethod
+    def _network_ids():
+        return {
+            "vpc_id": "vpc-12345",
+            "subnet_id": "subnet-12345",
+            "security_group_id": "sg-12345",
         }
-        mock_ec2_client.create_vpc.side_effect = ClientError(
-            error_response, "CreateVpc"
+
+    @pytest.mark.parametrize(
+        "describe_call,error_code,expected_in_message",
+        [
+            ("describe_vpcs", "InvalidVpcID.NotFound", "vpc-12345"),
+            ("describe_vpcs", "InvalidVpcID.Malformed", "vpc-12345"),
+            ("describe_subnets", "InvalidSubnetID.NotFound", "subnet-12345"),
+            ("describe_security_groups", "InvalidGroup.NotFound", "sg-12345"),
+        ],
+    )
+    def test_standard_mode_missing_network_resource(
+        self, mock_session, describe_call, error_code, expected_in_message
+    ):
+        """A missing or malformed network ID fails initialize(), naming the ID."""
+        ec2 = mock_session.client.return_value
+        getattr(ec2, describe_call).side_effect = ClientError(
+            {"Error": {"Code": error_code, "Message": "m"}}, describe_call
         )
 
         mode = StandardMode(
@@ -268,35 +279,50 @@ class TestModeInitializationErrors:
             region="us-east-1",
             instance_type="t3.micro",
             image_id="ami-12345678",
+            **self._network_ids(),
         )
 
-        with pytest.raises(NetworkCreationError):
+        with pytest.raises(ResourceNotFoundError) as exc_info:
             mode.initialize()
 
-    def test_detached_mode_bastion_error(self, mock_provider, mock_session):
-        """Test error handling during bastion host creation in DetachedMode."""
-        mock_ec2_client = MagicMock()
-        mock_session.client.return_value = mock_ec2_client
+        assert expected_in_message in str(exc_info.value)
 
-        # Mock successful VPC and subnet creation
-        mock_ec2_client.create_vpc.return_value = {"Vpc": {"VpcId": "vpc-12345"}}
-        mock_ec2_client.create_subnet.return_value = {
-            "Subnet": {"SubnetId": "subnet-12345"}
-        }
-        mock_ec2_client.create_security_group.return_value = {"GroupId": "sg-12345"}
+    def test_standard_mode_unrelated_client_error_propagates(self, mock_session):
+        """An error code outside the not-found set is re-raised, not reinterpreted.
 
-        # Simulate error creating bastion instance
-        error_response = {
-            "Error": {
-                "Code": "InsufficientInstanceCapacity",
-                "Message": "Insufficient capacity",
-            }
-        }
-        mock_ec2_client.run_instances.side_effect = ClientError(
-            error_response, "RunInstances"
+        Reporting a throttle or an authorization failure as "this VPC does not
+        exist" would send the caller looking for the wrong problem.
+        """
+        ec2 = mock_session.client.return_value
+        ec2.describe_vpcs.side_effect = ClientError(
+            {"Error": {"Code": "RequestLimitExceeded", "Message": "m"}}, "DescribeVpcs"
         )
 
-        workflow_id = f"test-workflow-{uuid.uuid4().hex[:8]}"
+        mode = StandardMode(
+            provider_id=str(uuid.uuid4()),
+            session=mock_session,
+            state_store=MagicMock(),
+            region="us-east-1",
+            instance_type="t3.micro",
+            image_id="ami-12345678",
+            **self._network_ids(),
+        )
+
+        with pytest.raises(ClientError):
+            mode.initialize()
+
+    def test_detached_mode_missing_network_resource(self, mock_session):
+        """DetachedMode verifies the network before it touches the bastion.
+
+        Its ``_verify_resources`` override calls ``super()`` first for exactly
+        this reason: a missing VPC must not be reported as a bastion problem.
+        """
+        ec2 = mock_session.client.return_value
+        ec2.describe_vpcs.side_effect = ClientError(
+            {"Error": {"Code": "InvalidVpcID.NotFound", "Message": "m"}},
+            "DescribeVpcs",
+        )
+
         mode = DetachedMode(
             provider_id=str(uuid.uuid4()),
             session=mock_session,
@@ -304,32 +330,47 @@ class TestModeInitializationErrors:
             region="us-east-1",
             instance_type="t3.micro",
             image_id="ami-12345678",
-            workflow_id=workflow_id,
+            workflow_id=f"test-workflow-{uuid.uuid4().hex[:8]}",
             bastion_instance_type="t3.micro",
             bastion_host_type="direct",
+            **self._network_ids(),
         )
 
-        with pytest.raises(BastionHostError):
-            # Mock tag creation to avoid errors
-            with patch.object(mode, "_create_tags"):
-                mode.initialize()
+        with pytest.raises(ResourceNotFoundError):
+            mode.initialize()
 
-    def test_serverless_mode_lambda_error(self, mock_provider, mock_session):
-        """Test error handling during Lambda function creation in ServerlessMode."""
-        mock_lambda_client = MagicMock()
-        mock_session.client.return_value = mock_lambda_client
+    def test_serverless_ecs_missing_network_resource(self, mock_session):
+        """An ECS-backed serverless mode verifies its subnet and SG.
 
-        # Simulate error creating Lambda function
-        error_response = {
-            "Error": {
-                "Code": "ResourceConflictException",
-                "Message": "Function already exists",
-            }
-        }
-        mock_lambda_client.create_function.side_effect = ClientError(
-            error_response, "CreateFunction"
+        Fargate's ``awsvpcConfiguration`` is mandatory, so unlike the Lambda-only
+        case below these IDs genuinely have to resolve.
+        """
+        ec2 = mock_session.client.return_value
+        ec2.describe_subnets.side_effect = ClientError(
+            {"Error": {"Code": "InvalidSubnetID.NotFound", "Message": "m"}},
+            "DescribeSubnets",
         )
 
+        mode = ServerlessMode(
+            provider_id=str(uuid.uuid4()),
+            session=mock_session,
+            state_store=MagicMock(),
+            region="us-east-1",
+            worker_type="ecs",
+            **self._network_ids(),
+        )
+
+        with pytest.raises(ResourceNotFoundError):
+            mode.initialize()
+
+    def test_serverless_lambda_only_needs_no_network(self, mock_session):
+        """Lambda-only serverless mode initializes with no network IDs at all.
+
+        Functions run in the Lambda-managed VPC -- ``lambda_func.py`` passes no
+        ``VpcConfig`` -- so there is nothing for the caller to pre-provision and
+        nothing to verify. Guarding this makes sure the #69 requirement is not
+        re-tightened onto the one worker type that does not need it.
+        """
         mode = ServerlessMode(
             provider_id=str(uuid.uuid4()),
             session=mock_session,
@@ -340,14 +381,10 @@ class TestModeInitializationErrors:
             lambda_timeout=30,
         )
 
-        # Mock Lambda manager to simulate error
-        mode.lambda_manager = MagicMock()
-        mode.lambda_manager._create_lambda_function.side_effect = LambdaFunctionError(
-            "Failed to create Lambda function"
-        )
-
-        with pytest.raises(LambdaFunctionError):
+        with patch.object(mode, "_initialize_compute_managers"):
             mode.initialize()
+
+        assert mode.initialized is True
 
 
 class TestEC2ManagerErrors:
