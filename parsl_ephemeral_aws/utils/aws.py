@@ -11,7 +11,14 @@ import time
 from typing import Any, Dict, List, Optional, Union
 
 import boto3
-from botocore.exceptions import ClientError
+from botocore.exceptions import (
+    ClientError,
+    CredentialRetrievalError,
+    NoCredentialsError,
+    PartialCredentialsError,
+    ProfileNotFound,
+    TokenRetrievalError,
+)
 
 from parsl_ephemeral_aws.constants import DEFAULT_AMI_MAPPING, DEFAULT_REGION
 from parsl_ephemeral_aws.exceptions import (
@@ -25,6 +32,37 @@ from parsl_ephemeral_aws.exceptions import (
 
 
 logger = logging.getLogger(__name__)
+
+# STS error codes that mean "your credentials are bad", as opposed to "AWS could
+# not be reached". Both map to AWSConnectionError subclasses, but only the former
+# is worth telling the user to go fix their credentials over — the latter is
+# worth retrying.
+_AUTH_ERROR_CODES = frozenset(
+    {
+        "AccessDenied",
+        "AccessDeniedException",
+        "AuthFailure",
+        "ExpiredToken",
+        "ExpiredTokenException",
+        "InvalidAccessKeyId",
+        "InvalidClientTokenId",
+        "MissingAuthenticationToken",
+        "SignatureDoesNotMatch",
+        "UnauthorizedOperation",
+        "UnrecognizedClientException",
+    }
+)
+
+# botocore exceptions raised when credentials are absent, incomplete, or
+# unresolvable. These are never transient, so they must not be reported as a
+# connection failure that a caller might retry.
+_CREDENTIAL_EXCEPTIONS = (
+    CredentialRetrievalError,
+    NoCredentialsError,
+    PartialCredentialsError,
+    ProfileNotFound,
+    TokenRetrievalError,
+)
 
 
 def create_session(
@@ -80,8 +118,19 @@ def create_session(
         logger.debug(f"Created AWS session for region {session.region_name}")
         return session
 
+    except _CREDENTIAL_EXCEPTIONS as e:
+        # Absent or unresolvable credentials. Not transient, so don't let this
+        # reach the generic handler and be reported as a connection failure the
+        # caller might retry.
+        logger.error(f"AWS authentication failed: {e}")
+        raise AWSAuthenticationError(f"AWS authentication failed: {e}") from e
     except ClientError as e:
-        if "InvalidClientTokenId" in str(e) or "AccessDenied" in str(e):
+        # Classify on the error *code*, not on str(e) -- a message that merely
+        # mentions AccessDenied is not an auth failure, and matching the string
+        # missed AuthFailure, SignatureDoesNotMatch, ExpiredToken, and
+        # UnrecognizedClientException, all of which plainly are.
+        error_code = e.response.get("Error", {}).get("Code", "")
+        if error_code in _AUTH_ERROR_CODES:
             logger.error(f"AWS authentication failed: {e}")
             raise AWSAuthenticationError(f"AWS authentication failed: {e}") from e
         else:

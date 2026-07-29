@@ -10,7 +10,8 @@ SPDX-FileCopyrightText: 2025 Scott Friedman and Project Contributors
 import pytest
 import uuid
 from unittest.mock import MagicMock, patch
-from botocore.exceptions import ClientError, NoCredentialsError
+from botocore.exceptions import ClientError, NoCredentialsError, ProfileNotFound
+from parsl.jobs.states import JobState
 
 from parsl_ephemeral_aws.provider import EphemeralAWSProvider
 from parsl_ephemeral_aws.compute.ec2 import EC2Manager
@@ -104,77 +105,123 @@ class TestAWSConnectionErrors:
             "instance_type": "t3.micro",
             "image_id": "ami-12345678",
             "max_blocks": 1,
+            # Required since #69 -- the provider no longer creates a network.
+            "vpc_id": "vpc-12345",
+            "subnet_id": "subnet-12345",
+            "security_group_id": "sg-12345",
         }
+
+    def _provider_with_failing_sts(self, provider_config, error_code):
+        """Construct a provider whose STS verification call raises *error_code*."""
+        mock_session = MagicMock()
+        mock_session.client.side_effect = ClientError(
+            {"Error": {"Code": error_code, "Message": "m"}}, "GetCallerIdentity"
+        )
+        with patch("boto3.Session", return_value=mock_session):
+            return EphemeralAWSProvider(**provider_config)
 
     def test_no_credentials_error(self, provider_config):
-        """Test handling of missing AWS credentials."""
-        # Simulate boto3 raising NoCredentialsError
+        """Absent credentials are an authentication failure, not a connection one.
+
+        ``NoCredentialsError`` used to fall through to the bare ``except
+        Exception`` in ``create_session`` and surface as ``AWSConnectionError``,
+        telling the caller to retry a network fault when the fix is to configure
+        credentials (#104).
+        """
         with patch("boto3.Session", side_effect=NoCredentialsError()):
             with pytest.raises(AWSAuthenticationError):
-                provider = EphemeralAWSProvider(**provider_config)
+                EphemeralAWSProvider(**provider_config)
 
-    def test_invalid_credentials_error(self, provider_config):
-        """Test handling of invalid AWS credentials."""
-        # Simulate boto3 client raising unauthorized error
-        mock_session = MagicMock()
-        error_response = {
-            "Error": {
-                "Code": "AuthFailure",
-                "Message": "AWS was not able to validate the provided credentials",
-            }
-        }
-        mock_session.client.side_effect = ClientError(error_response, "AssumeRole")
-
-        with patch("boto3.Session", return_value=mock_session):
+    def test_unknown_profile_is_an_authentication_error(self, provider_config):
+        """A mistyped profile name must not read as a connectivity fault."""
+        with patch("boto3.Session", side_effect=ProfileNotFound(profile="nope")):
             with pytest.raises(AWSAuthenticationError):
-                provider = EphemeralAWSProvider(**provider_config)
+                EphemeralAWSProvider(**provider_config)
+
+    @pytest.mark.parametrize(
+        "error_code",
+        [
+            "AuthFailure",
+            "InvalidClientTokenId",
+            "AccessDenied",
+            "ExpiredToken",
+            "SignatureDoesNotMatch",
+            "UnrecognizedClientException",
+        ],
+    )
+    def test_invalid_credentials_error(self, provider_config, error_code):
+        """Every STS auth-failure code maps to AWSAuthenticationError.
+
+        ``create_session`` classified on ``str(e)`` and matched only
+        ``InvalidClientTokenId``/``AccessDenied``, so the other four arrived as
+        the generic ``AWSConnectionError`` (#104).
+        """
+        with pytest.raises(AWSAuthenticationError):
+            self._provider_with_failing_sts(provider_config, error_code)
 
     def test_service_unavailable_error(self, provider_config):
-        """Test handling of AWS service unavailability."""
-        # Simulate boto3 client raising service unavailable error
-        mock_session = MagicMock()
-        error_response = {
-            "Error": {
-                "Code": "ServiceUnavailable",
-                "Message": "Service is currently unavailable",
-            }
-        }
-        mock_session.client.side_effect = ClientError(
-            error_response, "DescribeInstances"
-        )
+        """A genuine service outage stays AWSConnectionError, not the auth subclass.
 
-        with patch("boto3.Session", return_value=mock_session):
-            provider = EphemeralAWSProvider(**provider_config)
-            with pytest.raises(AWSConnectionError):
-                # Try to use the provider
-                with patch.object(provider, "_initialize_operating_mode"):
-                    provider.status([])
+        This is the negative half of the #104 fix: widening the auth set must not
+        swallow retryable failures. Asserted via ``type(...) is`` because
+        ``AWSAuthenticationError`` *subclasses* ``AWSConnectionError``, so
+        ``pytest.raises(AWSConnectionError)`` would pass either way.
+        """
+        with pytest.raises(AWSConnectionError) as exc_info:
+            self._provider_with_failing_sts(provider_config, "ServiceUnavailable")
+
+        assert type(exc_info.value) is AWSConnectionError
 
     def test_throttling_error(self, provider_config):
-        """Test handling of AWS API throttling."""
-        # Simulate boto3 client raising throttling error
+        """Throttling during status() degrades to UNKNOWN rather than raising.
+
+        ``status()`` is polled on every Parsl iteration and catches broadly on
+        purpose (provider.py) -- raising would abort the whole run over a
+        transient throttle. The old test asserted ``AWSConnectionError`` here,
+        which is the opposite of the contract.
+
+        The mode's ``get_job_status`` is stubbed to raise rather than letting the
+        throttle come from a mocked ``describe_instances``: registering a
+        resource well enough for the mode to actually reach that call takes more
+        setup than the assertion is worth, and without it the test passes
+        vacuously on the "resource not tracked" path instead of exercising the
+        handler.
+        """
         mock_session = MagicMock()
-        mock_client = MagicMock()
-        throttle_error = {
-            "Error": {
-                "Code": "RequestLimitExceeded",
-                "Message": "Request limit exceeded",
-            }
-        }
-        mock_client.describe_instances.side_effect = ClientError(
-            throttle_error, "DescribeInstances"
-        )
-        mock_session.client.return_value = mock_client
+        mock_session.client.return_value = MagicMock()
 
         with patch("boto3.Session", return_value=mock_session):
             provider = EphemeralAWSProvider(**provider_config)
-            # Initialize with our mock session
-            provider._session = mock_session
 
-            # The provider should handle the throttling error (log it, potentially retry, but not crash)
-            with patch.object(provider, "_initialize_operating_mode"):
-                with pytest.raises(AWSConnectionError):
-                    provider.status([])
+        provider.job_map["job-1"] = {"resource_id": "resource-1", "status": "RUNNING"}
+        throttle = ClientError(
+            {
+                "Error": {
+                    "Code": "RequestLimitExceeded",
+                    "Message": "Request limit exceeded",
+                }
+            },
+            "DescribeInstances",
+        )
+
+        with patch.object(
+            provider.operating_mode, "get_job_status", side_effect=throttle
+        ):
+            statuses = provider.status(["job-1"])
+
+        assert [s.state for s in statuses] == [JobState.UNKNOWN]
+
+    def test_status_of_an_unknown_job_is_reported_not_raised(self, provider_config):
+        """A job ID the provider has never seen reads as UNKNOWN."""
+        mock_session = MagicMock()
+        mock_session.client.return_value = MagicMock()
+
+        with patch("boto3.Session", return_value=mock_session):
+            provider = EphemeralAWSProvider(**provider_config)
+
+        statuses = provider.status(["never-submitted"])
+
+        assert [s.state for s in statuses] == [JobState.UNKNOWN]
 
 
 class TestModeInitializationErrors:
