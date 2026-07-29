@@ -20,23 +20,77 @@ from parsl_ephemeral_aws.modes.serverless import ServerlessMode
 from parsl_ephemeral_aws.compute.spot_fleet import SpotFleetManager
 from parsl_ephemeral_aws.compute.lambda_func import LambdaManager
 from parsl_ephemeral_aws.compute.ecs import ECSManager
+from parsl_ephemeral_aws.constants import STATUS_CANCELLED
 from parsl_ephemeral_aws.exceptions import (
     AWSAuthenticationError,
     AWSConnectionError,
-    EC2InstanceError,
+    JobSubmissionError,
     ResourceCreationError,
-    ResourceDeletionError,
-    ResourceNotFoundError,
     ProviderConfigurationError,
     NetworkCreationError,
     SpotFleetError,
+    SpotFleetRequestError,
+    SpotFleetThrottlingError,
     LambdaFunctionError,
-    ECSTaskError,
     CloudFormationError,
     BastionHostError,
-    TaskTimeoutError,
-    AMINotFoundError,
 )
+
+
+def _mock_provider(**overrides):
+    """Build a mock provider that satisfies every compute manager's ``__init__``.
+
+    All four managers are ``__init__(self, provider)`` and read a fixed set of
+    attributes off it -- ``workflow_id``/``region`` for audit events, the four
+    ``aws_*`` credential fields, and the security fields that
+    ``SecurityConfig``/``CredentialConfig`` require. A bare ``MagicMock`` is not
+    enough: those two read the attributes as *values*, so a MagicMock where a
+    CIDR string or a bool belongs raises during construction.
+    """
+    provider = MagicMock()
+    provider.workflow_id = "test-workflow"
+    provider.region = "us-east-1"
+    provider.aws_access_key_id = None
+    provider.aws_secret_access_key = None
+    provider.aws_session_token = None
+    provider.aws_profile = None
+    # Read as values by SecurityConfig / CredentialConfig, not just passed along.
+    provider.security_config = None
+    provider.security_environment = "dev"
+    provider.vpc_cidr = "10.0.0.0/16"
+    provider.admin_cidr_blocks = None
+    provider.strict_security_mode = None
+    provider.role_arn = None
+    provider.vpc_id = "vpc-12345"
+    provider.subnet_id = "subnet-12345"
+    provider.security_group_id = "sg-12345"
+    provider.subnet_ids = ["subnet-12345"]
+    provider.use_spot_instances = False
+    provider.nodes_per_block = 1
+    provider.tags = {}
+    for name, value in overrides.items():
+        setattr(provider, name, value)
+    return provider
+
+
+def _make_manager(manager_cls, module, **provider_overrides):
+    """Construct *manager_cls* against a mocked session, returning it.
+
+    Patches ``CredentialManager`` in the manager's own module so no real
+    credential resolution or boto3 session is attempted; every ``client()`` and
+    ``resource()`` call on the session returns the same MagicMock, so the tests
+    can set ``side_effect`` on whichever client attribute they name.
+    """
+    provider = _mock_provider(**provider_overrides)
+    client = MagicMock()
+    session = MagicMock()
+    session.client.return_value = client
+    session.resource.return_value = MagicMock()
+    session.region_name = "us-east-1"
+
+    with patch(f"parsl_ephemeral_aws.compute.{module}.CredentialManager") as mock_cm:
+        mock_cm.return_value.create_boto3_session.return_value = session
+        return manager_cls(provider=provider)
 
 
 class TestAWSConnectionErrors:
@@ -250,434 +304,527 @@ class TestModeInitializationErrors:
 
 
 class TestEC2ManagerErrors:
-    """Tests for error handling in EC2Manager."""
+    """Tests for error handling in EC2Manager.
+
+    These exercise ``create_blocks``/``terminate_instance``/``get_instance_status``
+    -- the manager's actual public surface. The suite previously called
+    ``create_instance(image_id=..., min_count=..., ...)``, which no commit in the
+    project's history has ever defined; the tests could only ever have raised
+    ``AttributeError``, and did so from setup once the fixture was repaired.
+    """
 
     @pytest.fixture
     def ec2_manager(self):
         """Create an EC2Manager with mock session."""
-        session = MagicMock()
-        ec2_client = MagicMock()
-        session.client.return_value = ec2_client
+        return _make_manager(EC2Manager, "ec2")
 
-        return EC2Manager(
-            session=session,
-            region="us-east-1",
-            vpc_id="vpc-12345",
-            subnet_id="subnet-12345",
-            security_group_id="sg-12345",
-        )
+    def _create_blocks(self, manager, count=1):
+        """Call create_blocks with the network lookup stubbed out."""
+        network = {
+            "vpc_id": "vpc-12345",
+            "subnet_id": "subnet-12345",
+            "security_group_id": "sg-12345",
+        }
+        with patch.object(manager, "_setup_network_resources", return_value=network):
+            return manager.create_blocks(count)
 
     def test_ami_not_found_error(self, ec2_manager):
-        """Test handling of AMI not found errors."""
-        # Simulate AMI not found
-        error_response = {
-            "Error": {
-                "Code": "InvalidAMIID.NotFound",
-                "Message": "The image id ami-12345 does not exist",
-            }
-        }
-        ec2_manager.ec2_client.describe_images.side_effect = ClientError(
-            error_response, "DescribeImages"
+        """An unusable AMI surfaces as ResourceCreationError from create_blocks.
+
+        ``AMINotFoundError`` is raised only by ``utils.aws.get_default_ami()``
+        for a region absent from the AMI table -- never by the manager, which
+        wraps every launch failure as ResourceCreationError. Both derive from
+        ResourceCreationError, so that is what a caller can actually catch.
+        """
+        ec2_manager.ec2_client.run_instances.side_effect = ClientError(
+            {
+                "Error": {
+                    "Code": "InvalidAMIID.NotFound",
+                    "Message": "The image id ami-12345 does not exist",
+                }
+            },
+            "RunInstances",
         )
 
-        with pytest.raises(AMINotFoundError):
-            ec2_manager.create_instance(
-                image_id="ami-12345",
-                instance_type="t3.micro",
-                min_count=1,
-                max_count=1,
-                key_name=None,
-                user_data=None,
-                tags={},
-            )
+        with pytest.raises(ResourceCreationError):
+            self._create_blocks(ec2_manager)
 
     def test_insufficient_capacity_error(self, ec2_manager):
         """Test handling of insufficient capacity errors."""
-        # Simulate insufficient capacity
-        error_response = {
-            "Error": {
-                "Code": "InsufficientInstanceCapacity",
-                "Message": "Insufficient capacity",
-            }
-        }
         ec2_manager.ec2_client.run_instances.side_effect = ClientError(
-            error_response, "RunInstances"
+            {
+                "Error": {
+                    "Code": "InsufficientInstanceCapacity",
+                    "Message": "Insufficient capacity",
+                }
+            },
+            "RunInstances",
         )
 
-        with pytest.raises(EC2InstanceError):
-            ec2_manager.create_instance(
-                image_id="ami-12345",
-                instance_type="t3.micro",
-                min_count=1,
-                max_count=1,
-                key_name=None,
-                user_data=None,
-                tags={},
-            )
+        with pytest.raises(ResourceCreationError):
+            self._create_blocks(ec2_manager)
 
     def test_instance_limit_exceeded_error(self, ec2_manager):
         """Test handling of instance limit exceeded errors."""
-        # Simulate instance limit exceeded
-        error_response = {
-            "Error": {
-                "Code": "InstanceLimitExceeded",
-                "Message": "You have requested more instances than your current instance limit",
-            }
-        }
         ec2_manager.ec2_client.run_instances.side_effect = ClientError(
-            error_response, "RunInstances"
+            {
+                "Error": {
+                    "Code": "InstanceLimitExceeded",
+                    "Message": "You have requested more instances than your limit",
+                }
+            },
+            "RunInstances",
         )
 
-        with pytest.raises(EC2InstanceError):
-            ec2_manager.create_instance(
-                image_id="ami-12345",
-                instance_type="t3.micro",
-                min_count=1,
-                max_count=1,
-                key_name=None,
-                user_data=None,
-                tags={},
-            )
+        with pytest.raises(ResourceCreationError):
+            self._create_blocks(ec2_manager)
 
-    def test_instance_not_found_error(self, ec2_manager):
-        """Test handling of instance not found errors."""
-        # Simulate instance not found
-        error_response = {
-            "Error": {
-                "Code": "InvalidInstanceID.NotFound",
-                "Message": "The instance ID i-12345 does not exist",
-            }
-        }
+    def test_instance_not_found_is_reported_as_terminated(self, ec2_manager):
+        """A vanished instance reads as 'terminated' rather than raising.
+
+        This is deliberate, not a gap: an instance EC2 no longer knows about has
+        finished, and ``get_instance_status`` special-cases
+        ``InvalidInstanceID.NotFound`` to say so (compute/ec2.py). The old test
+        expected ``ResourceNotFoundError``, which would make every completed
+        one-shot job look like a failure.
+        """
         ec2_manager.ec2_client.describe_instances.side_effect = ClientError(
-            error_response, "DescribeInstances"
+            {
+                "Error": {
+                    "Code": "InvalidInstanceID.NotFound",
+                    "Message": "The instance ID i-12345 does not exist",
+                }
+            },
+            "DescribeInstances",
         )
 
-        with pytest.raises(ResourceNotFoundError):
+        assert ec2_manager.get_instance_status("i-12345") == "terminated"
+
+    def test_instance_status_other_client_error_propagates(self, ec2_manager):
+        """Any error code other than NotFound is re-raised, not swallowed."""
+        ec2_manager.ec2_client.describe_instances.side_effect = ClientError(
+            {"Error": {"Code": "UnauthorizedOperation", "Message": "Denied"}},
+            "DescribeInstances",
+        )
+
+        with pytest.raises(ClientError):
             ec2_manager.get_instance_status("i-12345")
 
     def test_termination_error(self, ec2_manager):
-        """Test handling of instance termination errors."""
-        # Simulate termination error
-        error_response = {
-            "Error": {
-                "Code": "OperationNotPermitted",
-                "Message": "You are not authorized to terminate instances",
-            }
-        }
+        """A refused termination propagates rather than being reported as done."""
         ec2_manager.ec2_client.terminate_instances.side_effect = ClientError(
-            error_response, "TerminateInstances"
+            {
+                "Error": {
+                    "Code": "OperationNotPermitted",
+                    "Message": "You are not authorized to terminate instances",
+                }
+            },
+            "TerminateInstances",
         )
 
-        with pytest.raises(ResourceDeletionError):
+        with pytest.raises(ClientError):
             ec2_manager.terminate_instance("i-12345")
+
+    def test_failed_termination_does_not_mark_the_instance_terminated(
+        self, ec2_manager
+    ):
+        """The tracked status must not say 'terminated' when the call failed.
+
+        Otherwise cleanup drops the record and the instance bills on untracked.
+        """
+        ec2_manager.instances["i-12345"] = {"id": "i-12345", "status": "running"}
+        ec2_manager.ec2_client.terminate_instances.side_effect = ClientError(
+            {"Error": {"Code": "OperationNotPermitted", "Message": "Denied"}},
+            "TerminateInstances",
+        )
+
+        with pytest.raises(ClientError):
+            ec2_manager.terminate_instance("i-12345")
+
+        assert ec2_manager.instances["i-12345"]["status"] == "running"
 
 
 class TestSpotFleetManagerErrors:
-    """Tests for error handling in SpotFleetManager."""
+    """Tests for error handling in SpotFleetManager.
+
+    Driven through ``create_blocks``/``terminate_block``, the manager's real
+    surface. ``create_spot_fleet``/``cancel_spot_fleet``/
+    ``update_spot_fleet_capacity`` have never existed on this class.
+    """
 
     @pytest.fixture
     def spot_fleet_manager(self):
         """Create a SpotFleetManager with mock session."""
-        session = MagicMock()
-        ec2_client = MagicMock()
-        session.client.return_value = ec2_client
+        return _make_manager(
+            SpotFleetManager,
+            "spot_fleet",
+            instance_types=["t3.micro", "t3.small"],
+            spot_max_price_percentage=80,
+        )
 
-        return SpotFleetManager(
-            session=session,
-            region="us-east-1",
-            vpc_id="vpc-12345",
-            subnet_id="subnet-12345",
-            security_group_id="sg-12345",
+    def _request_fleet(self, manager):
+        """Call ``_create_spot_fleet_request`` -- the layer that classifies errors.
+
+        ``create_blocks`` deliberately wraps everything it catches as
+        ``ResourceCreationError``, and because ``SpotFleetError`` descends from
+        it (via ``EC2InstanceError``) the subclass is *erased* at that boundary.
+        So the subclass assertions have to run one level down; the wrapping
+        itself is asserted separately in
+        ``test_create_blocks_wraps_fleet_errors``.
+        """
+        return manager._create_spot_fleet_request(
+            block_id="block-1",
+            network={
+                "vpc_id": "vpc-12345",
+                "subnet_id": "subnet-12345",
+                "security_group_id": "sg-12345",
+            },
+            target_capacity=1,
+            fleet_role_arn="arn:aws:iam::123456789012:role/fleet",
         )
 
     def test_spot_fleet_request_error(self, spot_fleet_manager):
-        """Test handling of spot fleet request errors."""
-        # Simulate spot fleet request error
-        error_response = {
-            "Error": {
-                "Code": "InvalidSpotFleetRequestConfig",
-                "Message": "Invalid Spot Fleet request configuration",
-            }
-        }
+        """An invalid fleet configuration surfaces as SpotFleetError."""
         spot_fleet_manager.ec2_client.request_spot_fleet.side_effect = ClientError(
-            error_response, "RequestSpotFleet"
+            {
+                "Error": {
+                    "Code": "InvalidSpotFleetRequestConfig",
+                    "Message": "Invalid Spot Fleet request configuration",
+                }
+            },
+            "RequestSpotFleet",
         )
 
         with pytest.raises(SpotFleetError):
-            spot_fleet_manager.create_spot_fleet(
-                image_id="ami-12345",
-                instance_types=["t3.micro", "t3.small"],
-                target_capacity=1,
-                iam_fleet_role="arn:aws:iam::123456789012:role/aws-service-role/spotfleet.amazonaws.com/AWSServiceRoleForEC2SpotFleet",
-                allocation_strategy="lowestPrice",
-                user_data=None,
-                tags={},
-            )
+            self._request_fleet(spot_fleet_manager)
 
     def test_spot_fleet_throttling_error(self, spot_fleet_manager):
-        """Test handling of spot fleet throttling errors."""
-        # Simulate throttling error
-        error_response = {
-            "Error": {
-                "Code": "RequestLimitExceeded",
-                "Message": "Request limit exceeded",
-            }
-        }
+        """RequestLimitExceeded surfaces as the throttling subclass.
+
+        The subclass carries ``retry_after``, which is the whole point of
+        distinguishing it -- a caller can back off for the interval AWS named
+        instead of retrying blind.
+        """
         spot_fleet_manager.ec2_client.request_spot_fleet.side_effect = ClientError(
-            error_response, "RequestSpotFleet"
+            {
+                "Error": {
+                    "Code": "RequestLimitExceeded",
+                    "Message": "Request limit exceeded",
+                }
+            },
+            "RequestSpotFleet",
         )
 
-        with pytest.raises(SpotFleetError):
-            spot_fleet_manager.create_spot_fleet(
-                image_id="ami-12345",
-                instance_types=["t3.micro", "t3.small"],
-                target_capacity=1,
-                iam_fleet_role="arn:aws:iam::123456789012:role/aws-service-role/spotfleet.amazonaws.com/AWSServiceRoleForEC2SpotFleet",
-                allocation_strategy="lowestPrice",
-                user_data=None,
-                tags={},
-            )
+        with pytest.raises(SpotFleetThrottlingError):
+            self._request_fleet(spot_fleet_manager)
 
-    def test_spot_fleet_modification_error(self, spot_fleet_manager):
-        """Test handling of spot fleet modification errors."""
-        # Simulate modification error
-        error_response = {
-            "Error": {
-                "Code": "InvalidSpotFleetRequestId",
-                "Message": "The spot fleet request ID does not exist",
-            }
+    def test_spot_fleet_instance_limit_error(self, spot_fleet_manager):
+        """InstanceLimitExceeded surfaces as the request subclass."""
+        spot_fleet_manager.ec2_client.request_spot_fleet.side_effect = ClientError(
+            {
+                "Error": {
+                    "Code": "InstanceLimitExceeded",
+                    "Message": "You have reached your instance limit",
+                }
+            },
+            "RequestSpotFleet",
+        )
+
+        with pytest.raises(SpotFleetRequestError):
+            self._request_fleet(spot_fleet_manager)
+
+    def test_create_blocks_wraps_fleet_errors(self, spot_fleet_manager):
+        """create_blocks reports a fleet failure as ResourceCreationError.
+
+        Pinning the wrapping is what makes the subclass tests above meaningful:
+        callers of ``create_blocks`` get the generic type, callers of
+        ``_create_spot_fleet_request`` get the specific one.
+        """
+        spot_fleet_manager.ec2_client.request_spot_fleet.side_effect = ClientError(
+            {
+                "Error": {
+                    "Code": "InvalidSpotFleetRequestConfig",
+                    "Message": "Invalid Spot Fleet request configuration",
+                }
+            },
+            "RequestSpotFleet",
+        )
+        network = {
+            "vpc_id": "vpc-12345",
+            "subnet_id": "subnet-12345",
+            "security_group_id": "sg-12345",
         }
-        spot_fleet_manager.ec2_client.modify_spot_fleet_request.side_effect = (
-            ClientError(error_response, "ModifySpotFleetRequest")
-        )
 
-        with pytest.raises(SpotFleetError):
-            spot_fleet_manager.update_spot_fleet_capacity("sfr-12345", 2)
+        with (
+            patch.object(
+                spot_fleet_manager, "_setup_network_resources", return_value=network
+            ),
+            patch.object(
+                spot_fleet_manager,
+                "_get_iam_fleet_role",
+                return_value="arn:aws:iam::123456789012:role/fleet",
+            ),
+        ):
+            with pytest.raises(ResourceCreationError):
+                spot_fleet_manager.create_blocks(1)
 
     def test_spot_fleet_cancellation_error(self, spot_fleet_manager):
-        """Test handling of spot fleet cancellation errors."""
-        # Simulate cancellation error
-        error_response = {
-            "Error": {
-                "Code": "InvalidSpotFleetRequestId",
-                "Message": "The spot fleet request ID does not exist",
-            }
+        """A refused cancellation surfaces as SpotFleetError."""
+        spot_fleet_manager.blocks["block-1"] = {
+            "id": "block-1",
+            "fleet_request_id": "sfr-12345",
+            "status": "running",
+            "instance_ids": [],
         }
         spot_fleet_manager.ec2_client.cancel_spot_fleet_requests.side_effect = (
-            ClientError(error_response, "CancelSpotFleetRequests")
+            ClientError(
+                {
+                    "Error": {
+                        "Code": "UnauthorizedOperation",
+                        "Message": "You are not authorized to cancel this request",
+                    }
+                },
+                "CancelSpotFleetRequests",
+            )
         )
 
         with pytest.raises(SpotFleetError):
-            spot_fleet_manager.cancel_spot_fleet("sfr-12345")
+            spot_fleet_manager.terminate_block("block-1")
+
+    def test_cancelling_an_absent_fleet_is_not_an_error(self, spot_fleet_manager):
+        """A fleet AWS has already forgotten counts as cancelled, not as failure.
+
+        Termination has to be idempotent -- cleanup runs it on paths that may
+        have already run it.
+        """
+        spot_fleet_manager.blocks["block-1"] = {
+            "id": "block-1",
+            "fleet_request_id": "sfr-12345",
+            "status": "running",
+            "instance_ids": [],
+        }
+        spot_fleet_manager.ec2_client.cancel_spot_fleet_requests.side_effect = (
+            ClientError(
+                {
+                    "Error": {
+                        "Code": "InvalidSpotFleetRequestId.NotFound",
+                        "Message": "The spot fleet request does not exist",
+                    }
+                },
+                "CancelSpotFleetRequests",
+            )
+        )
+
+        spot_fleet_manager.terminate_block("block-1")
+
+        assert spot_fleet_manager.blocks["block-1"]["status"] == STATUS_CANCELLED
 
 
 class TestLambdaManagerErrors:
-    """Tests for error handling in LambdaManager."""
+    """Tests for error handling in LambdaManager.
+
+    Driven through ``submit_job``/``get_job_status``/``cleanup_all_resources``.
+    ``create_lambda_function``/``invoke_lambda_function``/
+    ``delete_lambda_function`` have never existed on this class -- the private
+    ``_create_lambda_function`` does.
+    """
 
     @pytest.fixture
     def lambda_manager(self):
         """Create a LambdaManager with mock session."""
-        session = MagicMock()
-        lambda_client = MagicMock()
-        session.client.return_value = lambda_client
-
-        return LambdaManager(session=session, region="us-east-1")
+        return _make_manager(
+            LambdaManager, "lambda_func", lambda_timeout=300, lambda_memory=512
+        )
 
     def test_lambda_creation_error(self, lambda_manager):
-        """Test handling of Lambda function creation errors."""
-        # Simulate creation error
-        error_response = {
-            "Error": {
-                "Code": "InvalidParameterValueException",
-                "Message": "Memory size must be between 128 and 10240 MB",
-            }
-        }
+        """A rejected create_function surfaces as JobSubmissionError.
+
+        ``_create_lambda_function`` raises ResourceCreationError, which
+        ``submit_job`` wraps as JobSubmissionError -- that is what a caller sees.
+        """
         lambda_manager.lambda_client.create_function.side_effect = ClientError(
-            error_response, "CreateFunction"
+            {
+                "Error": {
+                    "Code": "InvalidParameterValueException",
+                    "Message": "Memory size must be between 128 and 10240 MB",
+                }
+            },
+            "CreateFunction",
         )
 
-        with pytest.raises(LambdaFunctionError):
-            # Mock code generation to return bytes
-            with patch.object(
-                lambda_manager, "_generate_lambda_code", return_value=b"mock_code"
-            ):
-                lambda_manager.create_lambda_function(
-                    function_name="test-function",
-                    handler="index.handler",
-                    runtime="python3.8",
-                    role="arn:aws:iam::123456789012:role/lambda-role",
-                    memory_size=128,
-                    timeout=30,
-                    code_content="def handler(event, context): return {'statusCode': 200}",
-                    environment_variables={},
-                )
+        with patch.object(
+            lambda_manager, "_create_lambda_execution_role", return_value="arn:role"
+        ):
+            with pytest.raises(JobSubmissionError):
+                lambda_manager.submit_job("job-1", "echo hello")
 
     def test_lambda_invocation_error(self, lambda_manager):
-        """Test handling of Lambda function invocation errors."""
-        # Simulate invocation error
-        error_response = {
-            "Error": {
-                "Code": "ResourceNotFoundException",
-                "Message": "Function not found",
-            }
-        }
+        """A rejected invoke surfaces as JobSubmissionError."""
         lambda_manager.lambda_client.invoke.side_effect = ClientError(
-            error_response, "Invoke"
+            {
+                "Error": {
+                    "Code": "TooManyRequestsException",
+                    "Message": "Rate exceeded",
+                }
+            },
+            "Invoke",
         )
 
-        with pytest.raises(LambdaFunctionError):
-            lambda_manager.invoke_lambda_function(
-                function_name="test-function", payload={"key": "value"}
-            )
+        with patch.object(
+            lambda_manager, "_create_lambda_function", return_value="parsl-lambda-job-1"
+        ):
+            with pytest.raises(JobSubmissionError):
+                lambda_manager.submit_job("job-1", "echo hello")
 
-    def test_lambda_timeout_error(self, lambda_manager):
-        """Test handling of Lambda function timeout errors."""
-        # Simulate timeout error response from Lambda
-        mock_response = {
-            "StatusCode": 200,
-            "FunctionError": "Unhandled",
-            "Payload": MagicMock(),
-        }
-        mock_response[
-            "Payload"
-        ].read.return_value = (
-            b'{"errorType": "TimeoutError", "errorMessage": "Task timed out"}'
+    def test_non_accepted_async_invocation_is_a_failure(self, lambda_manager):
+        """An async invoke that is not 202 must not be reported as submitted.
+
+        ``invoke`` returns rather than raising when the request is rejected, so
+        without the status-code check the job would be tracked as PENDING
+        forever against a function that never ran.
+        """
+        lambda_manager.lambda_client.invoke.return_value = {"StatusCode": 400}
+
+        with patch.object(
+            lambda_manager, "_create_lambda_function", return_value="parsl-lambda-job-1"
+        ):
+            with pytest.raises(JobSubmissionError):
+                lambda_manager.submit_job("job-1", "echo hello")
+
+        assert "job-1" not in lambda_manager.jobs
+
+    def test_lambda_status_error_does_not_raise(self, lambda_manager):
+        """A failed status lookup degrades to UNKNOWN rather than raising.
+
+        ``status()`` is polled on every Parsl iteration; raising there would
+        abort the run over a transient throttle.
+        """
+        lambda_manager.lambda_client.get_function.side_effect = ClientError(
+            {"Error": {"Code": "TooManyRequestsException", "Message": "Rate exceeded"}},
+            "GetFunction",
         )
-        lambda_manager.lambda_client.invoke.return_value = mock_response
 
-        with pytest.raises(TaskTimeoutError):
-            lambda_manager.invoke_lambda_function(
-                function_name="test-function", payload={"key": "value"}
-            )
+        assert lambda_manager.get_job_status("parsl-lambda-job-1", "req-1") == "UNKNOWN"
 
-    def test_lambda_deletion_error(self, lambda_manager):
-        """Test handling of Lambda function deletion errors."""
-        # Simulate deletion error
-        error_response = {
-            "Error": {
-                "Code": "ResourceNotFoundException",
-                "Message": "Function not found",
-            }
-        }
+    def test_lambda_deletion_error_is_tolerated_during_cleanup(self, lambda_manager):
+        """One undeletable function must not abort the rest of the cleanup.
+
+        Cleanup is best-effort by design: aborting on the first failure would
+        strand every remaining function and IAM role.
+        """
+        lambda_manager.function_names.update({"fn-a", "fn-b"})
         lambda_manager.lambda_client.delete_function.side_effect = ClientError(
-            error_response, "DeleteFunction"
+            {"Error": {"Code": "AccessDeniedException", "Message": "Denied"}},
+            "DeleteFunction",
         )
 
-        # This should log the error but not raise an exception since we're trying to delete something that doesn't exist
-        lambda_manager.delete_lambda_function("test-function")
+        lambda_manager.cleanup_all_resources()
 
-        # Verify delete_function was called with the right function name
-        lambda_manager.lambda_client.delete_function.assert_called_with(
-            FunctionName="test-function"
-        )
+        assert lambda_manager.lambda_client.delete_function.call_count == 2
 
 
 class TestECSManagerErrors:
-    """Tests for error handling in ECSManager."""
+    """Tests for error handling in ECSManager.
+
+    Driven through construction, ``submit_job`` and ``cancel_job``.
+    ``create_cluster``/``run_task``/``stop_task``/``register_task_definition``
+    have never existed on this class -- ``_get_or_create_cluster`` and
+    ``_register_task_definition`` do, and the cluster one runs from
+    ``__init__``.
+    """
 
     @pytest.fixture
     def ecs_manager(self):
-        """Create an ECSManager with mock session."""
-        session = MagicMock()
+        """Create an ECSManager with mock session and cluster creation stubbed."""
+        with patch.object(
+            ECSManager, "_get_or_create_cluster", return_value="parsl-ecs-cluster-test"
+        ):
+            return _make_manager(ECSManager, "ecs", use_public_ips=False)
+
+    def test_cluster_creation_error(self):
+        """A rejected create_cluster surfaces as ResourceCreationError.
+
+        ``__init__`` calls ``_get_or_create_cluster``, so this fails
+        construction -- the manager is never handed back half-built.
+        """
+        provider = _mock_provider()
         ecs_client = MagicMock()
+        ecs_client.describe_clusters.return_value = {"clusters": []}
+        ecs_client.create_cluster.side_effect = ClientError(
+            {
+                "Error": {
+                    "Code": "InvalidParameterException",
+                    "Message": "Invalid parameter in request",
+                }
+            },
+            "CreateCluster",
+        )
+        session = MagicMock()
         session.client.return_value = ecs_client
+        session.region_name = "us-east-1"
 
-        return ECSManager(
-            session=session,
-            region="us-east-1",
-            vpc_id="vpc-12345",
-            subnet_id="subnet-12345",
-            security_group_id="sg-12345",
-        )
-
-    def test_cluster_creation_error(self, ecs_manager):
-        """Test handling of ECS cluster creation errors."""
-        # Simulate creation error
-        error_response = {
-            "Error": {
-                "Code": "InvalidParameterException",
-                "Message": "Invalid parameter in request",
-            }
-        }
-        ecs_manager.ecs_client.create_cluster.side_effect = ClientError(
-            error_response, "CreateCluster"
-        )
-
-        with pytest.raises(ECSTaskError):
-            ecs_manager.create_cluster("test-cluster")
+        with patch("parsl_ephemeral_aws.compute.ecs.CredentialManager") as mock_cm:
+            mock_cm.return_value.create_boto3_session.return_value = session
+            with pytest.raises(ResourceCreationError):
+                ECSManager(provider=provider)
 
     def test_task_definition_error(self, ecs_manager):
-        """Test handling of ECS task definition errors."""
-        # Simulate definition error
-        error_response = {
-            "Error": {
-                "Code": "InvalidParameterException",
-                "Message": "Invalid task definition parameters",
-            }
-        }
+        """A rejected register_task_definition surfaces as JobSubmissionError."""
         ecs_manager.ecs_client.register_task_definition.side_effect = ClientError(
-            error_response, "RegisterTaskDefinition"
+            {
+                "Error": {
+                    "Code": "ClientException",
+                    "Message": "Invalid task definition",
+                }
+            },
+            "RegisterTaskDefinition",
         )
 
-        with pytest.raises(ECSTaskError):
-            ecs_manager.register_task_definition(
-                family="test-task",
-                container_definitions=[
-                    {
-                        "name": "test-container",
-                        "image": "amazon/amazon-ecs-sample",
-                        "cpu": 256,
-                        "memory": 512,
-                        "essential": True,
-                    }
-                ],
-                requires_compatibilities=["FARGATE"],
-                network_mode="awsvpc",
-                cpu="256",
-                memory="512",
-                execution_role_arn="arn:aws:iam::123456789012:role/ecsTaskExecutionRole",
-            )
+        with pytest.raises(JobSubmissionError):
+            ecs_manager.submit_job("job-1", "echo hello", tasks_per_node=1)
 
     def test_run_task_error(self, ecs_manager):
-        """Test handling of ECS run task errors."""
-        # Simulate run task error
-        error_response = {
-            "Error": {
-                "Code": "ClientException",
-                "Message": "No container instances found",
-            }
-        }
+        """A rejected run_task surfaces as JobSubmissionError."""
         ecs_manager.ecs_client.run_task.side_effect = ClientError(
-            error_response, "RunTask"
+            {
+                "Error": {
+                    "Code": "InvalidParameterException",
+                    "Message": "Invalid parameter in request",
+                }
+            },
+            "RunTask",
         )
 
-        with pytest.raises(ECSTaskError):
-            ecs_manager.run_task(
-                cluster="test-cluster",
-                task_definition="test-task",
-                count=1,
-                launch_type="FARGATE",
-                network_configuration={
-                    "awsvpcConfiguration": {
-                        "subnets": ["subnet-12345"],
-                        "securityGroups": ["sg-12345"],
-                        "assignPublicIp": "ENABLED",
-                    }
+        with (
+            patch.object(
+                ecs_manager, "_register_task_definition", return_value="arn:task-def"
+            ),
+            patch.object(
+                ecs_manager,
+                "_get_or_create_network_resources",
+                return_value={
+                    "subnet_ids": ["subnet-12345"],
+                    "security_group_id": "sg-12345",
                 },
-            )
+            ),
+        ):
+            with pytest.raises(JobSubmissionError):
+                ecs_manager.submit_job("job-1", "echo hello", tasks_per_node=1)
 
     def test_stop_task_error(self, ecs_manager):
-        """Test handling of ECS stop task errors."""
-        # Simulate stop task error
-        error_response = {
-            "Error": {"Code": "ClientException", "Message": "Task not found"}
-        }
+        """A refused stop_task propagates rather than reporting success."""
         ecs_manager.ecs_client.stop_task.side_effect = ClientError(
-            error_response, "StopTask"
+            {
+                "Error": {
+                    "Code": "InvalidParameterException",
+                    "Message": "Task not found",
+                }
+            },
+            "StopTask",
         )
 
-        with pytest.raises(ECSTaskError):
-            ecs_manager.stop_task("test-cluster", "task-12345")
+        with pytest.raises(ClientError):
+            ecs_manager.cancel_job("parsl-ecs-cluster-test", "task-1")
 
 
 class TestProviderConfigurationErrors:
