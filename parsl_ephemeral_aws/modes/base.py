@@ -101,6 +101,7 @@ class OperatingMode(abc.ABC):
         custom_ami: bool = False,
         debug: bool = False,
         region: Optional[str] = None,
+        require_network_resources: bool = True,
         **kwargs: Any,
     ) -> None:
         """Initialize the operating mode.
@@ -153,6 +154,10 @@ class OperatingMode(abc.ABC):
             Whether image_id refers to a custom AMI, by default False
         debug : bool, optional
             Whether to enable debug logging, by default False
+        require_network_resources : bool, optional
+            Whether vpc_id, subnet_id, and security_group_id are mandatory, by
+            default True. Subclasses whose compute backend supplies its own
+            networking (e.g. Lambda-only serverless mode) pass False.
         """
         self.provider_id = provider_id
         self.session = session
@@ -188,7 +193,11 @@ class OperatingMode(abc.ABC):
         self.resources: Dict[str, Dict[str, Any]] = {}
         self.initialized = False
 
-        if not self.vpc_id or not self.subnet_id or not self.security_group_id:
+        self.require_network_resources = require_network_resources
+
+        if require_network_resources and (
+            not self.vpc_id or not self.subnet_id or not self.security_group_id
+        ):
             raise ValueError(
                 "vpc_id, subnet_id, and security_group_id are required. "
                 "Pre-provision network resources and pass their IDs."

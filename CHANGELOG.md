@@ -34,11 +34,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   in #69 the explicit-subnet branch always ran, so the line always raised. It
   also overwrote the caller's explicit subnet with every subnet discovered in the
   VPC (closes #71).
+- `ServerlessMode` could never be constructed. `LambdaManager` and `ECSManager`
+  were written against `EphemeralAWSProvider` but are handed the mode as their
+  `provider`, and the mode defined none of the attributes they read — so
+  `_initialize_compute_managers()` raised
+  `AttributeError: 'ServerlessMode' object has no attribute 'workflow_id'`.
+  Since `EphemeralAWSProvider.__init__` calls `initialize()` unconditionally,
+  `EphemeralAWSProvider(mode="serverless")` always raised. The mode now defines
+  `workflow_id`, `subnet_ids`, `use_spot_instances`, `security_config`, and the
+  four credential attributes (closes #72).
+- `compute_type`, `memory_size`, and `timeout` were forwarded by the provider but
+  accepted by no `ServerlessMode` parameter, so they vanished into `**kwargs`:
+  `worker_type` was always `auto` regardless of `compute_type`, and Lambda memory
+  and timeout were always the defaults (closes #73).
+- `ServerlessMode.initialize()` never set `self.initialized`, so every
+  `submit_job()` re-ran `ensure_initialized()` and rebuilt both compute managers
+  (closes #73).
+- `LambdaManager._generate_lambda_code()` raised
+  `ValueError: Invalid format specifier` on every call. The generated handler was
+  built as an f-string whose literal dict braces were read as replacement fields,
+  so no Lambda job could ever be submitted. All six test call sites patch the
+  method with a stub, so the real body had never run. It is now a plain template
+  with a single JSON-encoded substitution for the command (closes #96).
+- `LambdaManager._create_credential_config_from_provider()` raised
+  `TypeError: CredentialConfiguration.__init__() got an unexpected keyword
+  argument 'aws_access_key_id'` on every construction — none of the three
+  `aws_*` kwargs it passed are fields on the dataclass. It now matches the
+  `EC2Manager`/`ECSManager`/`SpotFleetManager` implementations, and no longer
+  defaults `use_profile` to a profile literally named `aws` (closes #95).
 
 ### Added
 - `tests/unit/test_ecs_manager.py` — 6 tests covering explicit `subnet_id`,
   explicit `subnet_ids` precedence, subnet discovery, default-VPC fallback, and
   both empty-result error paths.
+- `tests/unit/test_serverless_mode_contract.py` — 30 tests covering the
+  compute-manager attribute contract, the conditional network guard, provider
+  parameter plumbing, and the absence of the network-creation helpers.
+- `tests/unit/test_lambda_manager.py` — 13 tests that execute the real
+  `_generate_lambda_code()` body and compile its output.
+
+### Changed
+- `vpc_id`, `subnet_id`, and `security_group_id` are no longer required for
+  Lambda-only serverless mode. `compute/lambda_func.py` references none of them
+  and `create_function` passes no `VpcConfig`, so functions run in the
+  Lambda-managed VPC. ECS/Fargate still requires them — `awsvpcConfiguration` is
+  mandatory — so the guard now keys off the resolved worker type in both
+  `EphemeralAWSProvider` and `OperatingMode` (new `require_network_resources`
+  flag) (closes #74).
+- `EphemeralAWSProvider` now passes `region` explicitly to the operating mode
+  rather than letting it fall back to `session.region_name`.
 
 ### Removed
 - `SpotFleetManager._create_vpc()`, `_create_subnet()`, `_create_security_group()`,
@@ -50,6 +94,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `_create_vpc()`, `_create_subnet()`, `_create_security_group()`, and
   `_find_available_vpc_cidr()` helpers deleted from `StandardMode` and
   `DetachedMode`.
+- `ServerlessMode._create_vpc()`, `_create_subnet()`, and
+  `_create_security_group()` (182 LOC). These built the VPC through
+  CloudFormation rather than direct EC2 calls, which is why #69's pass missed
+  them; `create_vpc` is gone from `ServerlessMode` as well (closes #73).
 
 ### Changed
 - `vpc_id`, `subnet_id`, and `security_group_id` are now **required** constructor

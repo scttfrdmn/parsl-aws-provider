@@ -247,7 +247,8 @@ class TestServerlessMode:
         assert mode.vpc_id == "vpc-12345"
         assert mode.subnet_id == "subnet-12345"
         assert mode.security_group_id == "sg-12345"
-        assert mode.create_vpc is False
+        # ECSManager reads subnet_ids in preference to subnet_id
+        assert mode.subnet_ids == ["subnet-12345"]
 
     def test_initialize_lambda_only(self, serverless_mode):
         """Test initialize method for Lambda-only mode."""

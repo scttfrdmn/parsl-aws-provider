@@ -351,8 +351,14 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
         self.one_shot = one_shot
         self.kwargs = kwargs
 
-        # Guard: network IDs are required (provider no longer creates VPC/subnet/SG)
-        if not vpc_id or not subnet_id or not security_group_id:
+        # Guard: network IDs are required (provider no longer creates VPC/subnet/SG).
+        # Lambda-only serverless is the one exception: functions run in the
+        # Lambda-managed VPC, so there is nothing for the caller to pre-provision.
+        lambda_only = (
+            self.mode_type == OperatingModeType.SERVERLESS
+            and self.compute_type == ComputeType.LAMBDA
+        )
+        if not lambda_only and (not vpc_id or not subnet_id or not security_group_id):
             raise ValueError(
                 "vpc_id, subnet_id, and security_group_id are required. "
                 "Pre-provision network resources outside the provider."
@@ -523,6 +529,7 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
             "use_public_ips": self.use_public_ips,
             "custom_ami": self.custom_ami,
             "debug": self.debug,
+            "region": self.region,
         }
 
         if self.mode_type == OperatingModeType.STANDARD:

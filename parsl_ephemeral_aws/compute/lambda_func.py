@@ -174,15 +174,43 @@ class LambdaManager:
                 )
 
     def _create_credential_config_from_provider(self) -> CredentialConfiguration:
-        """Create credential configuration from provider settings."""
-        return CredentialConfiguration(
-            aws_access_key_id=getattr(self.provider, "aws_access_key_id", None),
-            aws_secret_access_key=getattr(self.provider, "aws_secret_access_key", None),
-            aws_session_token=getattr(self.provider, "aws_session_token", None),
-            use_profile=getattr(self.provider, "aws_profile", "aws"),
+        """Create credential configuration from provider settings.
+
+        Returns
+        -------
+        CredentialConfiguration
+            Credential configuration based on provider settings
+        """
+        # Extract credential settings from provider
+        role_arn = getattr(self.provider, "role_arn", None)
+        aws_profile = getattr(self.provider, "aws_profile", None)
+        use_env_vars = (
+            hasattr(self.provider, "aws_access_key_id")
+            and self.provider.aws_access_key_id is not None
+        )
+
+        # Create credential configuration
+        config = CredentialConfiguration(
+            role_arn=role_arn,
             enable_sanitization=True,
             sanitize_logs=True,
+            use_environment_variables=use_env_vars,
+            use_profile=aws_profile,
+            auto_refresh_tokens=True,
         )
+
+        # Set security-based defaults
+        if self.security_config.environment.value == "production":
+            config.use_environment_variables = False
+            config.use_profile = None
+            config.require_mfa = False
+
+        logger.info(
+            f"Lambda Created credential config: role_arn={bool(role_arn)}, "
+            f"profile={aws_profile}, use_env={use_env_vars}"
+        )
+
+        return config
 
     def _create_lambda_execution_role(self) -> str:
         """Get or create an IAM role for Lambda execution (idempotent).
@@ -328,28 +356,30 @@ class LambdaManager:
         bytes
             Zip file content containing the Lambda function code
         """
-        # For a real implementation, this would generate a proper Lambda function
-        # that can execute the command and return the results.
-        # For now, we'll create a simple function that logs the command and returns success.
-
         import io
         import zipfile
 
-        # Create a Python module to handle the job
-        handler_code = f"""
+        # A plain template, not an f-string: the handler is full of dict literals
+        # whose braces an f-string would read as replacement fields. The command
+        # is the only substitution, and it goes in as a JSON literal so any
+        # quoting in it survives.
+        handler_template = """
 import json
 import subprocess
 import sys
 import os
 import traceback
 
+DEFAULT_COMMAND = __COMMAND__
+
+
 def main(event, context):
     print("Starting Parsl job execution")
 
     try:
         # Get command from event or use the baked-in command
-        command = event.get('command', {json.dumps(command)})
-        print(f"Executing command: {{command}}")
+        command = event.get('command', DEFAULT_COMMAND)
+        print(f"Executing command: {command}")
 
         # Execute the command
         result = subprocess.run(
@@ -370,8 +400,8 @@ def main(event, context):
 
         # Log results
         print(f"Command completed with return code: {result.returncode}")
-        print(f"STDOUT: {result.stdout[:1000]}{'...' if len(result.stdout) > 1000 else ''}")
-        print(f"STDERR: {result.stderr[:1000]}{'...' if len(result.stderr) > 1000 else ''}")
+        print(f"STDOUT: {result.stdout[:1000]}")
+        print(f"STDERR: {result.stderr[:1000]}")
 
         return response
 
@@ -387,6 +417,7 @@ def main(event, context):
             'traceback': traceback.format_exc()
         }
 """
+        handler_code = handler_template.replace("__COMMAND__", json.dumps(command))
 
         # Create a ZIP file in memory
         zip_buffer = io.BytesIO()
