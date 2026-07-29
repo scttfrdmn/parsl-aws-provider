@@ -535,6 +535,7 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
         if self.mode_type == OperatingModeType.STANDARD:
             return StandardMode(
                 iam_instance_profile_arn=self.iam_instance_profile_arn,
+                auto_create_instance_profile=self.auto_create_instance_profile,
                 warm_pool_size=self.warm_pool_size,
                 warm_pool_ttl=self.warm_pool_ttl,
                 bake_ami=self.bake_ami,

@@ -41,6 +41,7 @@ from parsl_ephemeral_aws.compute.spot_interruption import (
 )
 from parsl_ephemeral_aws.utils.aws import (
     get_default_ami,
+    get_or_create_ssm_instance_profile,
     wait_for_resource,
 )
 
@@ -86,6 +87,7 @@ class StandardMode(OperatingMode):
         warm_pool_size: int = 0,
         warm_pool_ttl: int = 600,
         iam_instance_profile_arn: Optional[str] = None,
+        auto_create_instance_profile: bool = False,
         bake_ami: bool = False,
         baked_ami_id: Optional[str] = None,
         one_shot: bool = False,
@@ -141,6 +143,24 @@ class StandardMode(OperatingMode):
             Number of nodes per block, by default 1
         spot_max_price_percentage : Optional[int], optional
             Maximum spot price as a percentage of on-demand price, by default None
+        warm_pool_size : int, optional
+            Number of idle instances to keep for reuse, by default 0 (disabled)
+        warm_pool_ttl : int, optional
+            Seconds a warm instance is kept before termination, by default 600
+        iam_instance_profile_arn : Optional[str], optional
+            Instance profile ARN granting SSM access, by default None
+        auto_create_instance_profile : bool, optional
+            Whether to create an instance profile with the
+            ``AmazonSSMManagedInstanceCore`` policy when
+            ``iam_instance_profile_arn`` is not supplied, by default False.
+            SSM ``SendCommand`` dispatch cannot work without one of the two.
+        bake_ami : bool, optional
+            Whether to pre-install ``worker_init`` into a custom AMI, by default False
+        baked_ami_id : Optional[str], optional
+            Pre-baked AMI to use instead of baking one, by default None
+        one_shot : bool, optional
+            Whether to dispatch a single command per instance and terminate,
+            by default False
         """
         # Call parent __init__ with standard params
         super().__init__(
@@ -176,6 +196,7 @@ class StandardMode(OperatingMode):
         self.warm_pool_size = warm_pool_size
         self.warm_pool_ttl = warm_pool_ttl
         self.iam_instance_profile_arn = iam_instance_profile_arn
+        self.auto_create_instance_profile = auto_create_instance_profile
         # List of instance IDs currently in the warm pool (ready for reuse, FIFO)
         self._warm_instances: List[str] = []
 
@@ -595,6 +616,10 @@ class StandardMode(OperatingMode):
         if self.initialized:
             return
 
+        # Resolve the SSM instance profile before either path below, so a
+        # resumed provider gets an ARN too — it is not persisted in state.
+        self._resolve_instance_profile()
+
         # Try to load state first
         if self.load_state():
             logger.debug("Loaded state, checking resources")
@@ -657,6 +682,37 @@ class StandardMode(OperatingMode):
             raise ResourceCreationError(
                 f"Failed to initialize standard mode infrastructure: {e}"
             ) from e
+
+    def _resolve_instance_profile(self) -> None:
+        """Resolve ``iam_instance_profile_arn``, creating a profile if asked.
+
+        Warm-pool and one-shot dispatch both go through SSM ``SendCommand``,
+        which only works if the instance carries a profile holding the
+        ``AmazonSSMManagedInstanceCore`` policy. With no ARN, ``_create_instance``
+        attaches no profile, the SSM agent never registers, and every dispatch
+        times out and silently falls back to UserData.
+
+        A failure here is not fatal: dispatch degrades to UserData rather than
+        the whole provider failing to start.
+        """
+        if self.iam_instance_profile_arn or not self.auto_create_instance_profile:
+            return
+
+        try:
+            self.iam_instance_profile_arn = get_or_create_ssm_instance_profile(
+                session=self.session,
+                name_suffix=self.provider_id,
+                auto_create=True,
+            )
+            logger.info(
+                f"Resolved IAM instance profile {self.iam_instance_profile_arn} "
+                "for SSM command dispatch"
+            )
+        except Exception as e:
+            logger.error(
+                f"Failed to create IAM instance profile: {e}. SSM command "
+                "dispatch will not be available."
+            )
 
     def _verify_resources(self) -> None:
         """Verify that the required resources exist.
@@ -932,8 +988,7 @@ class StandardMode(OperatingMode):
                 logger.debug(f"SSM describe_instance_information: {e}")
             time.sleep(10)
         raise OperatingModeError(
-            f"Instance {instance_id} did not become available in SSM "
-            f"within {timeout}s"
+            f"Instance {instance_id} did not become available in SSM within {timeout}s"
         )
 
     def _wait_for_worker_ready(self, instance_id: str, timeout: int = 600) -> None:
@@ -1091,8 +1146,9 @@ class StandardMode(OperatingMode):
         if self.key_name:
             run_args["KeyName"] = self.key_name
 
-        # Attach IAM instance profile when warm pool is enabled (SSM requires it)
-        if self.warm_pool_size > 0 and self.iam_instance_profile_arn:
+        # Attach the IAM instance profile whenever one is available. SSM
+        # SendCommand needs it, and an unused profile costs nothing.
+        if self.iam_instance_profile_arn:
             run_args["IamInstanceProfile"] = {"Arn": self.iam_instance_profile_arn}
 
         # Use spot instances if requested

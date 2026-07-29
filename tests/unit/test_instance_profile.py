@@ -1,0 +1,259 @@
+"""Unit tests for SSM instance profile resolution.
+
+Warm-pool and one-shot dispatch both go through SSM ``SendCommand``, which needs
+the instance to carry a profile holding ``AmazonSSMManagedInstanceCore``. The
+provider accepted ``auto_create_instance_profile`` but never forwarded it, so no
+profile was ever attached and every dispatch silently fell back to UserData.
+
+SPDX-License-Identifier: Apache-2.0
+SPDX-FileCopyrightText: 2025 Scott Friedman and Project Contributors
+"""
+
+from unittest.mock import MagicMock, patch
+
+import boto3
+import pytest
+from moto import mock_aws
+
+from parsl_ephemeral_aws.modes.standard import StandardMode
+from parsl_ephemeral_aws.utils.aws import get_or_create_ssm_instance_profile
+
+
+pytestmark = pytest.mark.unit
+
+NETWORK_IDS = {
+    "vpc_id": "vpc-12345",
+    "subnet_id": "subnet-12345",
+    "security_group_id": "sg-12345",
+}
+
+SSM_POLICY_ARN = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+
+
+@pytest.fixture
+def iam_session(monkeypatch):
+    """A moto-backed session that can attach AWS managed policies.
+
+    moto only serves the AWS managed policy catalogue when
+    ``MOTO_IAM_LOAD_MANAGED_POLICIES`` is set, and it reads the variable when the
+    IAM backend is built — so it has to be in place before ``mock_aws`` starts.
+    The synthetic credentials keep moto from picking up an ambient real profile.
+    """
+    monkeypatch.setenv("MOTO_IAM_LOAD_MANAGED_POLICIES", "true")
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "testing")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "testing")
+    monkeypatch.setenv("AWS_SECURITY_TOKEN", "testing")
+    monkeypatch.setenv("AWS_SESSION_TOKEN", "testing")
+    monkeypatch.setenv("AWS_DEFAULT_REGION", "us-east-1")
+    monkeypatch.delenv("AWS_PROFILE", raising=False)
+
+    with mock_aws():
+        yield boto3.Session(region_name="us-east-1")
+
+
+class TestGetOrCreateSSMInstanceProfile:
+    """Tests for ``utils.aws.get_or_create_ssm_instance_profile``."""
+
+    def test_explicit_arn_is_returned_verbatim(self):
+        """A supplied ARN wins; nothing is created."""
+        session = MagicMock()
+
+        result = get_or_create_ssm_instance_profile(
+            session=session,
+            name_suffix="wf",
+            iam_instance_profile_arn="arn:aws:iam::1:instance-profile/mine",
+            auto_create=True,
+        )
+
+        assert result == "arn:aws:iam::1:instance-profile/mine"
+        session.client.assert_not_called()
+
+    def test_returns_none_without_auto_create(self):
+        """With neither an ARN nor auto-creation, instances get no profile."""
+        session = MagicMock()
+
+        result = get_or_create_ssm_instance_profile(
+            session=session, name_suffix="wf", auto_create=False
+        )
+
+        assert result is None
+        session.client.assert_not_called()
+
+    def test_creates_role_and_profile_with_the_ssm_policy(self, iam_session):
+        """The created role must carry AmazonSSMManagedInstanceCore."""
+        session = iam_session
+
+        arn = get_or_create_ssm_instance_profile(
+            session=session, name_suffix="wf-1", auto_create=True
+        )
+
+        assert arn is not None
+        iam = session.client("iam")
+        profile = iam.get_instance_profile(
+            InstanceProfileName="parsl-ephemeral-ssm-profile-wf-1"
+        )["InstanceProfile"]
+
+        assert profile["Arn"] == arn
+        role_names = [role["RoleName"] for role in profile["Roles"]]
+        assert role_names == ["parsl-ephemeral-ssm-role-wf-1"]
+
+        attached = iam.list_attached_role_policies(
+            RoleName="parsl-ephemeral-ssm-role-wf-1"
+        )["AttachedPolicies"]
+        assert SSM_POLICY_ARN in [p["PolicyArn"] for p in attached]
+
+    def test_is_idempotent(self, iam_session):
+        """A second call reuses the profile rather than failing on the conflict."""
+        session = iam_session
+
+        first = get_or_create_ssm_instance_profile(
+            session=session, name_suffix="wf-2", auto_create=True
+        )
+        second = get_or_create_ssm_instance_profile(
+            session=session, name_suffix="wf-2", auto_create=True
+        )
+
+        assert first == second
+
+        # And the role is still attached exactly once.
+        iam = session.client("iam")
+        profile = iam.get_instance_profile(
+            InstanceProfileName="parsl-ephemeral-ssm-profile-wf-2"
+        )["InstanceProfile"]
+        assert len(profile["Roles"]) == 1
+
+    def test_attaches_the_role_to_a_pre_existing_empty_profile(self, iam_session):
+        """A profile left behind without its role must still be usable.
+
+        The original implementation returned early on ``get_instance_profile``
+        success, so a profile whose role attachment had failed stayed empty
+        forever and SSM never came online.
+        """
+        session = iam_session
+        iam = session.client("iam")
+        iam.create_instance_profile(
+            InstanceProfileName="parsl-ephemeral-ssm-profile-wf-3"
+        )
+
+        get_or_create_ssm_instance_profile(
+            session=session, name_suffix="wf-3", auto_create=True
+        )
+
+        profile = iam.get_instance_profile(
+            InstanceProfileName="parsl-ephemeral-ssm-profile-wf-3"
+        )["InstanceProfile"]
+        assert [r["RoleName"] for r in profile["Roles"]] == [
+            "parsl-ephemeral-ssm-role-wf-3"
+        ]
+
+
+class TestStandardModeProfileResolution:
+    """``StandardMode`` must resolve an ARN before instances are launched."""
+
+    @pytest.fixture
+    def mock_session(self):
+        session = MagicMock(spec=boto3.Session)
+        session.region_name = "us-east-1"
+        return session
+
+    @pytest.fixture
+    def mock_state_store(self):
+        store = MagicMock()
+        store.load_state.return_value = None
+        return store
+
+    def _mode(self, mock_session, mock_state_store, **overrides):
+        params = {
+            "provider_id": "test-provider",
+            "session": mock_session,
+            "state_store": mock_state_store,
+            "image_id": "ami-12345",
+            "region": "us-east-1",
+            **NETWORK_IDS,
+        }
+        params.update(overrides)
+        return StandardMode(**params)
+
+    def test_auto_create_flag_is_accepted(self, mock_session, mock_state_store):
+        """Regression: the mode had no such parameter, so it fell into kwargs."""
+        mode = self._mode(
+            mock_session,
+            mock_state_store,
+            warm_pool_size=2,
+            auto_create_instance_profile=True,
+        )
+        assert mode.auto_create_instance_profile is True
+
+    def test_initialize_resolves_the_arn(self, mock_session, mock_state_store):
+        """After initialize(), `_create_instance` must have an ARN to attach."""
+        mode = self._mode(
+            mock_session,
+            mock_state_store,
+            warm_pool_size=2,
+            auto_create_instance_profile=True,
+        )
+        assert mode.iam_instance_profile_arn is None
+
+        with patch(
+            "parsl_ephemeral_aws.modes.standard.get_or_create_ssm_instance_profile",
+            return_value="arn:aws:iam::1:instance-profile/created",
+        ) as resolve:
+            mode.initialize()
+
+        assert (
+            mode.iam_instance_profile_arn == "arn:aws:iam::1:instance-profile/created"
+        )
+        assert resolve.call_args.kwargs["name_suffix"] == "test-provider"
+        assert resolve.call_args.kwargs["auto_create"] is True
+
+    def test_explicit_arn_is_not_overwritten(self, mock_session, mock_state_store):
+        """An explicitly supplied profile must be left alone."""
+        mode = self._mode(
+            mock_session,
+            mock_state_store,
+            warm_pool_size=2,
+            iam_instance_profile_arn="arn:aws:iam::1:instance-profile/mine",
+            auto_create_instance_profile=True,
+        )
+
+        with patch(
+            "parsl_ephemeral_aws.modes.standard.get_or_create_ssm_instance_profile"
+        ) as resolve:
+            mode.initialize()
+
+        resolve.assert_not_called()
+        assert mode.iam_instance_profile_arn == "arn:aws:iam::1:instance-profile/mine"
+
+    def test_no_profile_is_created_when_not_requested(
+        self, mock_session, mock_state_store
+    ):
+        """Without the flag, no IAM resources are touched at all."""
+        mode = self._mode(mock_session, mock_state_store)
+
+        with patch(
+            "parsl_ephemeral_aws.modes.standard.get_or_create_ssm_instance_profile"
+        ) as resolve:
+            mode.initialize()
+
+        resolve.assert_not_called()
+        assert mode.iam_instance_profile_arn is None
+
+    def test_profile_creation_failure_is_not_fatal(
+        self, mock_session, mock_state_store
+    ):
+        """Dispatch degrades to UserData rather than the provider failing."""
+        mode = self._mode(
+            mock_session,
+            mock_state_store,
+            warm_pool_size=2,
+            auto_create_instance_profile=True,
+        )
+
+        with patch(
+            "parsl_ephemeral_aws.modes.standard.get_or_create_ssm_instance_profile",
+            side_effect=RuntimeError("IAM denied"),
+        ):
+            mode.initialize()
+
+        assert mode.initialized is True
+        assert mode.iam_instance_profile_arn is None

@@ -62,6 +62,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `aws_*` kwargs it passed are fields on the dataclass. It now matches the
   `EC2Manager`/`ECSManager`/`SpotFleetManager` implementations, and no longer
   defaults `use_profile` to a profile literally named `aws` (closes #95).
+- `auto_create_instance_profile` was accepted by `EphemeralAWSProvider` but never
+  forwarded to `StandardMode`, so the documented warm-pool configuration could
+  never work. Instances launched with no IAM instance profile, SSM never came
+  online, `_wait_for_ssm_online()` timed out, and every submission silently fell
+  back to UserData dispatch — losing both instance reuse and exit-code
+  reporting. `StandardMode` now accepts the flag and resolves an ARN in
+  `initialize()`, on both the fresh and resumed paths (the ARN is not persisted
+  in state). A failure to create the profile is logged, not fatal: dispatch
+  degrades to UserData rather than the provider failing to start (closes #75).
+- Instance-profile resolution no longer leaves a profile permanently empty. The
+  previous implementation returned early when `get_instance_profile` succeeded,
+  so a profile whose role attachment had failed midway kept being reused with no
+  role attached and SSM never came online. The role is now attached on all three
+  paths (pre-existing profile, freshly created, and lost creation race).
 
 ### Added
 - `tests/unit/test_ecs_manager.py` — 6 tests covering explicit `subnet_id`,
@@ -72,6 +86,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   parameter plumbing, and the absence of the network-creation helpers.
 - `tests/unit/test_lambda_manager.py` — 13 tests that execute the real
   `_generate_lambda_code()` body and compile its output.
+- `tests/unit/test_instance_profile.py` — 10 tests covering SSM instance-profile
+  resolution against moto and `StandardMode`'s resolution behaviour.
+- `get_or_create_ssm_instance_profile()` in `utils/aws.py` — promoted from
+  `EC2Manager._get_or_create_instance_profile()` so `StandardMode` and
+  `EC2Manager` share one implementation. Resolution order is explicit ARN, then
+  auto-creation, then `None`.
 
 ### Changed
 - `vpc_id`, `subnet_id`, and `security_group_id` are no longer required for
@@ -83,6 +103,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   flag) (closes #74).
 - `EphemeralAWSProvider` now passes `region` explicitly to the operating mode
   rather than letting it fall back to `session.region_name`.
+- `StandardMode._create_instance()` attaches the IAM instance profile whenever
+  one is available, not only when `warm_pool_size > 0`. One-shot dispatch needs
+  it too, and an unused profile costs nothing.
+- `EC2Manager._get_or_create_instance_profile()` now delegates to
+  `utils.aws.get_or_create_ssm_instance_profile()`.
 
 ### Removed
 - `SpotFleetManager._create_vpc()`, `_create_subnet()`, `_create_security_group()`,

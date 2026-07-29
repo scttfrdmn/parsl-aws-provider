@@ -408,8 +408,7 @@ def delete_resource(
                         logger.debug(f"Deleting NAT gateway {ngw['NatGatewayId']}")
                     except ClientError as e:
                         logger.warning(
-                            f"Could not delete NAT gateway "
-                            f"{ngw['NatGatewayId']}: {e}"
+                            f"Could not delete NAT gateway {ngw['NatGatewayId']}: {e}"
                         )
                 # Poll until all NAT gateways have finished deleting (max ~2 min).
                 # Only enter the loop if we actually submitted deletion requests.
@@ -445,8 +444,7 @@ def delete_resource(
                             logger.debug(f"Deleted ENI {eni['NetworkInterfaceId']}")
                         except ClientError as e:
                             logger.warning(
-                                f"Could not delete ENI "
-                                f"{eni['NetworkInterfaceId']}: {e}"
+                                f"Could not delete ENI {eni['NetworkInterfaceId']}: {e}"
                             )
 
                 # Get all subnets in the VPC
@@ -507,8 +505,7 @@ def delete_resource(
                         logger.debug(f"Deleted route table {rt['RouteTableId']}")
                     except ClientError as e:
                         logger.warning(
-                            f"Could not delete route table "
-                            f"{rt['RouteTableId']}: {e}"
+                            f"Could not delete route table {rt['RouteTableId']}: {e}"
                         )
 
             # Delete the VPC
@@ -726,4 +723,130 @@ def get_or_create_iam_role(
                 ) from inner_e
         raise ResourceCreationError(
             f"Failed to create IAM role {role_name}: {e}"
+        ) from e
+
+
+def get_or_create_ssm_instance_profile(
+    session: boto3.Session,
+    name_suffix: str,
+    iam_instance_profile_arn: Optional[str] = None,
+    auto_create: bool = False,
+) -> Optional[str]:
+    """Resolve an IAM instance profile ARN granting SSM access, or None.
+
+    SSM ``SendCommand`` — used by warm-pool and one-shot dispatch — needs the
+    instance to carry a profile with the ``AmazonSSMManagedInstanceCore`` policy.
+    Without it the SSM agent never registers and every command dispatch times out.
+
+    Resolution order:
+
+    1. ``iam_instance_profile_arn`` if supplied → used directly.
+    2. ``auto_create`` → get-or-create a profile holding
+       ``AmazonSSMManagedInstanceCore``.
+    3. Otherwise → ``None``; the caller launches instances without a profile.
+
+    Both the create and the attach steps are idempotent, so concurrent callers
+    sharing a ``name_suffix`` converge on the same profile.
+
+    Parameters
+    ----------
+    session : boto3.Session
+        AWS session used to build the IAM client.
+    name_suffix : str
+        Discriminator appended to the role and profile names — normally the
+        provider ID, so resources are traceable back to their provider.
+    iam_instance_profile_arn : Optional[str], optional
+        Pre-existing profile ARN to use verbatim, by default None.
+    auto_create : bool, optional
+        Whether to create a profile when none was supplied, by default False.
+
+    Returns
+    -------
+    Optional[str]
+        ARN of the resolved instance profile, or None when neither an explicit
+        ARN was given nor auto-creation requested.
+
+    Raises
+    ------
+    ResourceCreationError
+        If the profile cannot be created or retrieved.
+    """
+    if iam_instance_profile_arn:
+        return iam_instance_profile_arn
+
+    if not auto_create:
+        return None
+
+    iam = session.client("iam")
+    role_name = f"parsl-ephemeral-ssm-role-{name_suffix}"
+    profile_name = f"parsl-ephemeral-ssm-profile-{name_suffix}"
+
+    get_or_create_iam_role(
+        iam_client=iam,
+        role_name=role_name,
+        assume_role_policy={
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Effect": "Allow",
+                    "Principal": {"Service": "ec2.amazonaws.com"},
+                    "Action": "sts:AssumeRole",
+                }
+            ],
+        },
+        policy_arns=["arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"],
+        description=f"SSM instance role for Parsl ({name_suffix})",
+    )
+
+    # Ensure the instance profile exists and has the role attached
+    try:
+        response = iam.get_instance_profile(InstanceProfileName=profile_name)
+        existing_arn: str = response["InstanceProfile"]["Arn"]
+        _attach_role_to_instance_profile(iam, profile_name, role_name)
+        return existing_arn
+    except ClientError as e:
+        if e.response["Error"]["Code"] not in ("NoSuchEntity", "NoSuchEntityException"):
+            raise ResourceCreationError(
+                f"Failed to check instance profile {profile_name}: {e}"
+            ) from e
+
+    try:
+        response = iam.create_instance_profile(InstanceProfileName=profile_name)
+        arn: str = response["InstanceProfile"]["Arn"]
+        _attach_role_to_instance_profile(iam, profile_name, role_name)
+        logger.info(f"Created IAM instance profile: {profile_name}")
+        return arn
+    except ClientError as e:
+        if e.response["Error"]["Code"] == "EntityAlreadyExists":
+            # Race condition — another caller created it; fetch the ARN
+            response = iam.get_instance_profile(InstanceProfileName=profile_name)
+            raced_arn: str = response["InstanceProfile"]["Arn"]
+            _attach_role_to_instance_profile(iam, profile_name, role_name)
+            return raced_arn
+        raise ResourceCreationError(
+            f"Failed to create instance profile {profile_name}: {e}"
+        ) from e
+
+
+def _attach_role_to_instance_profile(
+    iam_client: Any, profile_name: str, role_name: str
+) -> None:
+    """Attach a role to an instance profile, tolerating an existing attachment.
+
+    A profile holds at most one role, so re-attaching the same role is a no-op
+    that AWS reports as ``LimitExceeded``. Any other role already present is
+    left alone: the caller supplied the profile name, so its contents are
+    theirs to manage.
+    """
+    try:
+        iam_client.add_role_to_instance_profile(
+            InstanceProfileName=profile_name, RoleName=role_name
+        )
+    except ClientError as e:
+        code = e.response["Error"]["Code"]
+        if code in ("LimitExceeded", "LimitExceededException"):
+            logger.debug(f"Instance profile {profile_name} already holds a role")
+            return
+        raise ResourceCreationError(
+            f"Failed to attach role {role_name} to profile {profile_name}: {e}"
         ) from e
