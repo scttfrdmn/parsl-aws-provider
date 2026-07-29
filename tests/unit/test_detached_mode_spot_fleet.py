@@ -214,6 +214,9 @@ class TestDetachedModeSpotFleet:
             instance_types=["t3.small", "t3.medium", "m5.small"],
             nodes_per_block=2,
             spot_max_price_percentage=80,
+            vpc_id="vpc-12345",
+            subnet_id="subnet-12345",
+            security_group_id="sg-12345",
         )
 
         return mode

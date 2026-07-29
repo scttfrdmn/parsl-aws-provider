@@ -197,6 +197,9 @@ class TestServerlessMode:
             ecs_task_cpu=1024,
             ecs_task_memory=2048,
             region="us-east-1",
+            vpc_id="vpc-12345",
+            subnet_id="subnet-12345",
+            security_group_id="sg-12345",
         )
 
         # Mock LambdaManager and ECSManager

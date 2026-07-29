@@ -92,6 +92,9 @@ class TestStandardMode:
             instance_type="t3.micro",
             image_id="ami-12345678",
             region="us-east-1",
+            vpc_id="vpc-12345",
+            subnet_id="subnet-12345",
+            security_group_id="sg-12345",
         )
 
         return mode

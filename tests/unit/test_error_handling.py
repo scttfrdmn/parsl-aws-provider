@@ -774,6 +774,9 @@ class TestCloudFormationErrors:
             ecs_task_cpu=256,
             ecs_task_memory=512,
             ecs_container_image="amazon/amazon-ecs-sample",
+            vpc_id="vpc-12345",
+            subnet_id="subnet-12345",
+            security_group_id="sg-12345",
         )
 
     def test_stack_creation_error(self, serverless_mode):
