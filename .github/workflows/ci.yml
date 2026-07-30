@@ -184,12 +184,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Set up bats
+        # `sudo` applied to the npm line only, so `mkdir -p /usr/local/lib/bats`
+        # ran unprivileged and the step died on "Permission denied" once the
+        # runner image stopped leaving /usr/local/lib group-writable.
+        #
+        # The three helper libraries are cloned under sudo for the same reason,
+        # but they stay optional: tests/bats/test_environment.bats loads each one
+        # only `if [[ -f "$BATS_SUPPORT" ]]`, and no test in this suite calls an
+        # assert_* helper, so the suite passes with or without them.
         run: |
           sudo npm install -g bats
-          mkdir -p /usr/local/lib/bats
-          git clone https://github.com/bats-core/bats-support.git /usr/local/lib/bats/bats-support
-          git clone https://github.com/bats-core/bats-assert.git /usr/local/lib/bats/bats-assert
-          git clone https://github.com/bats-core/bats-file.git /usr/local/lib/bats/bats-file
+          sudo mkdir -p /usr/local/lib/bats
+          sudo git clone --depth 1 https://github.com/bats-core/bats-support.git /usr/local/lib/bats/bats-support
+          sudo git clone --depth 1 https://github.com/bats-core/bats-assert.git /usr/local/lib/bats/bats-assert
+          sudo git clone --depth 1 https://github.com/bats-core/bats-file.git /usr/local/lib/bats/bats-file
       - name: Run bats tests
         run: bats tests/bats/
 

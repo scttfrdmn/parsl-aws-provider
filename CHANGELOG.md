@@ -27,6 +27,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   live VPC and blackhole egress for unrelated workloads (closes #94).
 
 ### Fixed
+- The `test-bats` CI job failed in setup, before running a test. `sudo` was
+  applied to the `npm install` line only, so `mkdir -p /usr/local/lib/bats` ran
+  unprivileged and died on `Permission denied` once the runner image stopped
+  leaving `/usr/local/lib` group-writable. The `mkdir` and the three helper-library
+  clones now run under `sudo` (refs #83).
 - The `integration-tests` CI job failed unconditionally. LocalStack OSS is
   end-of-life — the upstream repository was archived read-only in March 2026,
   `4.14.0` is the last community image, and `localstack/localstack:latest` now
