@@ -8,6 +8,8 @@ extend-ignore = [
     "F841",
 ]
 
-[per-file-ignores]
+# Was a top-level [per-file-ignores], which ruff deprecated in favour of the lint
+# section and warned about on every single invocation.
+[lint.per-file-ignores]
 # Allow F821 errors in compute modules that generate dynamic code templates
 "parsl_ephemeral_aws/compute/*.py" = ["F821", "F841"]

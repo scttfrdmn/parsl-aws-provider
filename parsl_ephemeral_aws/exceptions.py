@@ -5,6 +5,31 @@ SPDX-License-Identifier: Apache-2.0
 SPDX-FileCopyrightText: 2025 Scott Friedman and Project Contributors
 """
 
+from botocore.exceptions import NoCredentialsError as _BotoNoCredentialsError
+
+
+class CredentialResolutionError(_BotoNoCredentialsError):
+    """No usable AWS credentials could be resolved, with a reason.
+
+    botocore's ``NoCredentialsError`` derives from ``BotoCoreError``, whose
+    ``__init__`` accepts **keyword arguments only** and formats them into a
+    fixed class-level ``fmt`` — so ``NoCredentialsError("why")`` raises
+    ``TypeError: BotoCoreError.__init__() takes 1 positional argument but 2
+    were given`` and the reason never reaches the caller. Every raise site in
+    ``security/credential_manager.py`` did exactly that, turning each of the
+    seven distinct credential failures into the same opaque ``TypeError``.
+
+    Subclassing keeps ``except NoCredentialsError`` handlers working —
+    ``compute/{ec2,ecs,lambda_func,spot_fleet}.py`` and
+    ``error_handling.py:269`` all catch the botocore class and must continue to
+    — while allowing the message through.
+    """
+
+    fmt = "{message}"
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message=message)
+
 
 class EphemeralAWSError(Exception):
     """Base class for all EphemeralAWSProvider exceptions."""

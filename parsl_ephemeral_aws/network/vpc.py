@@ -13,7 +13,7 @@ from botocore.exceptions import ClientError
 from ..exceptions import ResourceCreationError, ResourceCleanupError
 from ..constants import (
     TAG_PREFIX,
-    TAG_NAME,
+    TAG_MANAGED,
     TAG_WORKFLOW_ID,
     DEFAULT_VPC_CIDR,
     DEFAULT_SUBNET_CIDR,
@@ -40,9 +40,9 @@ class VPCManager:
         session_kwargs = {}
         if self.provider.aws_access_key_id and self.provider.aws_secret_access_key:
             session_kwargs["aws_access_key_id"] = self.provider.aws_access_key_id
-            session_kwargs[
-                "aws_secret_access_key"
-            ] = self.provider.aws_secret_access_key
+            session_kwargs["aws_secret_access_key"] = (
+                self.provider.aws_secret_access_key
+            )
 
         if self.provider.aws_session_token:
             session_kwargs["aws_session_token"] = self.provider.aws_session_token
@@ -95,7 +95,7 @@ class VPCManager:
                                 "Key": "Name",
                                 "Value": f"{TAG_PREFIX}-vpc-{self.provider.workflow_id}",
                             },
-                            {"Key": TAG_NAME, "Value": "true"},
+                            {"Key": TAG_MANAGED, "Value": "true"},
                             {
                                 "Key": TAG_WORKFLOW_ID,
                                 "Value": self.provider.workflow_id,
@@ -162,7 +162,7 @@ class VPCManager:
                                 "Key": "Name",
                                 "Value": f"{TAG_PREFIX}-igw-{self.provider.workflow_id}",
                             },
-                            {"Key": TAG_NAME, "Value": "true"},
+                            {"Key": TAG_MANAGED, "Value": "true"},
                             {
                                 "Key": TAG_WORKFLOW_ID,
                                 "Value": self.provider.workflow_id,
@@ -233,7 +233,7 @@ class VPCManager:
                                 "Key": "Name",
                                 "Value": f"{TAG_PREFIX}-subnet-{self.provider.workflow_id}",
                             },
-                            {"Key": TAG_NAME, "Value": "true"},
+                            {"Key": TAG_MANAGED, "Value": "true"},
                             {
                                 "Key": TAG_WORKFLOW_ID,
                                 "Value": self.provider.workflow_id,
@@ -304,7 +304,7 @@ class VPCManager:
                                 "Key": "Name",
                                 "Value": f"{TAG_PREFIX}-rt-{self.provider.workflow_id}",
                             },
-                            {"Key": TAG_NAME, "Value": "true"},
+                            {"Key": TAG_MANAGED, "Value": "true"},
                             {
                                 "Key": TAG_WORKFLOW_ID,
                                 "Value": self.provider.workflow_id,

@@ -70,9 +70,9 @@ class TestDetachedModeInfrastructure:
         response = ec2.describe_vpcs(VpcIds=[vpc_id])
         vpcs = response.get("Vpcs", [])
         assert len(vpcs) == 1, f"Expected exactly one VPC for {vpc_id}, got {vpcs}"
-        assert (
-            vpcs[0]["State"] == "available"
-        ), f"VPC {vpc_id} is in state '{vpcs[0]['State']}', expected 'available'"
+        assert vpcs[0]["State"] == "available", (
+            f"VPC {vpc_id} is in state '{vpcs[0]['State']}', expected 'available'"
+        )
 
     def test_bastion_instance_running(self, detached_provider, aws_session, aws_region):
         """The bastion host EC2 instance exists and is in 'running' state.
@@ -83,9 +83,9 @@ class TestDetachedModeInfrastructure:
         (the instance ID is retrieved from the stack outputs / resources).
         """
         bastion_id = detached_provider.operating_mode.bastion_id
-        assert (
-            bastion_id is not None
-        ), "bastion_id should be set after initialize() in detached mode"
+        assert bastion_id is not None, (
+            "bastion_id should be set after initialize() in detached mode"
+        )
 
         ec2 = aws_session.client("ec2", region_name=aws_region)
 
@@ -100,9 +100,9 @@ class TestDetachedModeInfrastructure:
             ]
             assert instances, f"No EC2 instance found for bastion_id={bastion_id}"
             state = instances[0]["State"]["Name"]
-            assert (
-                state == "running"
-            ), f"Bastion instance {bastion_id} is in state '{state}', expected 'running'"
+            assert state == "running", (
+                f"Bastion instance {bastion_id} is in state '{state}', expected 'running'"
+            )
         else:
             # CloudFormation-based bastion: look for instances tagged with the stack
             response = ec2.describe_instances(
@@ -122,13 +122,13 @@ class TestDetachedModeInfrastructure:
                 for res in response.get("Reservations", [])
                 for inst in res.get("Instances", [])
             ]
-            assert (
-                instances
-            ), f"No running EC2 instance found for CF bastion stack '{bastion_id}'"
+            assert instances, (
+                f"No running EC2 instance found for CF bastion stack '{bastion_id}'"
+            )
             state = instances[0]["State"]["Name"]
-            assert (
-                state in ("pending", "running")
-            ), f"Bastion instance is in state '{state}'; expected 'pending' or 'running'"
+            assert state in ("pending", "running"), (
+                f"Bastion instance is in state '{state}'; expected 'pending' or 'running'"
+            )
 
     def test_bastion_tagged_correctly(self, detached_provider, aws_session, aws_region):
         """Bastion instance (direct) carries the 'ProviderId' tag."""
@@ -177,9 +177,9 @@ class TestDetachedModeComputeLifecycle:
         job_id = detached_provider.submit("echo hello-from-detached", tasks_per_node=1)
         try:
             assert job_id, "job_id should be a non-empty string"
-            assert (
-                job_id in detached_provider.job_map
-            ), f"job_id {job_id} not found in provider.job_map"
+            assert job_id in detached_provider.job_map, (
+                f"job_id {job_id} not found in provider.job_map"
+            )
         finally:
             try:
                 detached_provider.cancel([job_id])
@@ -231,9 +231,9 @@ class TestDetachedModeComputeLifecycle:
         result = detached_provider.status([job_id])
         if result:
             state = result[0].state
-            assert (
-                state != JobState.RUNNING
-            ), f"Job {job_id} is still RUNNING after cancel(); state={state}"
+            assert state != JobState.RUNNING, (
+                f"Job {job_id} is still RUNNING after cancel(); state={state}"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -319,6 +319,6 @@ class TestDetachedModeCleanup:
             assert vpcs == [], f"VPC {vpc_id} still exists after shutdown(): {vpcs}"
         except ClientError as exc:
             error_code = exc.response["Error"]["Code"]
-            assert (
-                error_code == "InvalidVpcID.NotFound"
-            ), f"Unexpected ClientError checking VPC after shutdown(): {exc}"
+            assert error_code == "InvalidVpcID.NotFound", (
+                f"Unexpected ClientError checking VPC after shutdown(): {exc}"
+            )

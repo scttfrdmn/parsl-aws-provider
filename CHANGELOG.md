@@ -27,6 +27,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   live VPC and blackhole egress for unrelated workloads (closes #94).
 
 ### Fixed
+- The `test-bats` CI job failed in setup, before running a test. `sudo` was
+  applied to the `npm install` line only, so `mkdir -p /usr/local/lib/bats` ran
+  unprivileged and died on `Permission denied` once the runner image stopped
+  leaving `/usr/local/lib` group-writable. The `mkdir` and the three helper-library
+  clones now run under `sudo` (refs #83).
+- The `integration-tests` CI job failed unconditionally. LocalStack OSS is
+  end-of-life — the upstream repository was archived read-only in March 2026,
+  `4.14.0` is the last community image, and `localstack/localstack:latest` now
+  resolves to the Pro build (byte-identical digest to
+  `localstack/localstack-pro`). The container exited 55 on
+  `License activation failed!` before any step ran, and `continue-on-error: true`
+  does not cover service-container startup. The service container is removed; the
+  moto-backed tests need no endpoint and still run, and the emulator-gated ones
+  skip themselves as they have since #69. Substrate replaces the endpoint in
+  #125 (refs #83, refs #125).
+- The `docs` CI job could never have built the documentation. `docs/conf.py` has
+  listed `myst_parser` in `extensions` all along without it being declared
+  anywhere, so `make -C docs html` died on
+  `ExtensionError: Could not import extension myst_parser`; it is now in the
+  `docs` extra. All but three of the doc sources are Markdown, so the extension
+  is load-bearing (refs #83).
+- `docs/makefile` renamed to `docs/Makefile`, and `SOURCEDIR` corrected from
+  `source` to `.`. The catch-all rule read `%: Makefile`, and on a
+  case-insensitive filesystem that is the makefile itself — so `make html`
+  matched the catch-all with `$@ = "makefile"` *before* the explicit `html` rule,
+  because a pattern rule that can remake the makefile is tried first. The result
+  was `sphinx -M makefile`, i.e.
+  `SphinxError: Builder name makefile not registered`. `SOURCEDIR = source`
+  pointed at `docs/source/`, an abandoned second doc tree, so every target built
+  the wrong sources (refs #83, #124).
 - `ECSManager._get_or_create_network_resources()` raised
   `UnboundLocalError: cannot access local variable 'subnet_response'` on every
   ECS/Fargate submission. A leftover line dereferenced `subnet_response`, which
@@ -201,6 +231,140 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   described network IDs — and, for the mode, a baked AMI — that shutdown had just
   released. `delete_state` was implemented in all three stores and declared on
   the ABC, but called from nowhere in the package (closes #99).
+- Spot Fleet was unreachable through `EphemeralAWSProvider`. `use_spot_fleet`,
+  `instance_types`, `spot_max_price_percentage`, and `nodes_per_block` were
+  accepted by no provider parameter, so they landed in `**kwargs`, were stored on
+  the never-read `self.kwargs`, and were never forwarded — `StandardMode` kept its
+  defaults and `spot_fleet_manager` stayed `None`. `use_spot_fleet=True` appears
+  in 13 documentation files and 2 examples; every one of them silently ran single
+  on-demand or single-spot instances instead. All three modes already accepted the
+  four parameters, so they are now forwarded to each (closes #105).
+- `ServerlessMode.get_job_status()` reported rolled-back CloudFormation stacks as
+  `RUNNING`. The mapping tested `endswith("FAILED")` then `startswith("DELETE")`,
+  and `ROLLBACK_COMPLETE`/`ROLLBACK_IN_PROGRESS`/`UPDATE_ROLLBACK_COMPLETE` match
+  neither, so they fell through to the `RUNNING` default. `ROLLBACK_COMPLETE` is
+  the *usual* CloudFormation failure state, since automatic rollback on
+  `CREATE_FAILED` is the default — so the ordinary serverless failure path was the
+  one that misreported. `RUNNING` is not terminal, so the job was polled forever:
+  Parsl never learned the task had failed, never retried it, and never released
+  the block, while the stack sat in a state that can only be deleted (closes
+  #106).
+- `EphemeralAWSProvider` accepted an unknown `region` without complaint, then
+  failed much later with an opaque `EndpointConnectionError` from whichever AWS
+  call ran first — in standard mode from inside `initialize()`, after the state
+  store had been created. The region is now checked against botocore's packaged
+  endpoint data across all five partitions, so GovCloud, China, and
+  newly-launched regions are accepted without any in-tree list to maintain
+  (closes #107).
+- `EphemeralAWSProvider` accepted contradictory and negative block counts:
+  `min_blocks=10, max_blocks=5` and `min_blocks=-3` both constructed. Parsl's
+  scaling strategy reads all three counts straight off the provider and validates
+  none of them, so an unreachable range pinned the executor — it could not scale
+  out to reach `min_blocks` (case 2a refuses at `active_blocks >= max_blocks`) and
+  would not scale in because case 1a's `active_blocks <= min_blocks` held at every
+  reachable count. The check existed before the v0.1.0 rewrite and was lost; the
+  only surviving record was a test in a file that had failed at collection since
+  `MODE_STANDARD` was removed from `constants.py` (closes #108).
+- Every tagged resource was created with a duplicate `Name` tag key, which EC2
+  rejects. The marker tag identifying a resource as provider-managed was emitted
+  as `TAG_NAME`, and `TAG_NAME` is the literal string `"Name"` — so each tag list
+  carrying a descriptive `Name` *and* the marker sent `Name` twice. Verified
+  against real AWS: `run_instances` fails with `InvalidParameterValue: Duplicate
+  tag key 'Name' specified.`, `create_security_group` the same, and
+  `request_spot_fleet` with `InvalidSpotFleetRequestConfig`. `moto` accepts
+  duplicate keys and silently keeps the last value, so the collision was
+  invisible under test while overwriting the descriptive name with `"true"`. The
+  marker is now a distinct `TAG_MANAGED = "ParslEphemeralManaged"`. `TAG_NAME`
+  remains `"Name"` for descriptive tags. Introduced in `f9f7def`, which flattened
+  `TAG_NAME` from `"parsl-ephemeral-resource"` to `"Name"` "as an alias for
+  backward compatibility" (closes #109).
+- `ECSManager._get_or_create_network_resources()` called
+  `authorize_security_group_egress` on a security group it had just created. EC2
+  attaches an allow-all-outbound rule to every new security group, so
+  re-authorizing it raises `InvalidPermission.Duplicate: the specified rule
+  "peer: 0.0.0.0/0, ALL, ALLOW" already exists`, which was re-raised as
+  `ResourceCreationError` and then wrapped as `JobSubmissionError` — making the
+  create-security-group branch impossible to complete. The call is removed;
+  Fargate tasks still have the outbound access they need. The ingress path in
+  `network/security.py` already treated `InvalidPermission.Duplicate` as benign
+  (closes #110).
+- A Lambda job that outlived its configured timeout could never reach a terminal
+  status. `LambdaManager.get_job_status()` is called with
+  `(function_name, request_id)` and locates the job record by scanning, but the
+  timeout branch's log message interpolated a `job_id` local that is never bound
+  there — raising `NameError`, which the method's blanket `except Exception`
+  converted into `"UNKNOWN"`. `status` was therefore never assigned, so the
+  stored record stayed `PENDING`: Parsl polled the job forever and never released
+  the block. Introduced in `90577ed` (closes #111).
+- `get_cf_template()` raised `ModuleNotFoundError` on every call, taking
+  `DetachedMode.initialize()` with it. It called `pkg_resources.resource_string`
+  but placed the `import pkg_resources` *outside* its own `try`, so once
+  setuptools 81 removed the module the `except ModuleNotFoundError` fallback
+  became unreachable. It now uses `importlib.resources`. The CloudFormation and
+  Terraform templates were also absent from the built wheel —
+  `[tool.setuptools.packages.find]` collects modules, not data files — which was
+  invisible in development because an editable install resolves to the source
+  tree. A missing template now raises `FileNotFoundError` instead of returning a
+  placeholder document with no `Outputs` section, which the bastion path then
+  indexed for `BastionHostId`, failing several steps from the real cause
+  (closes #112).
+- `ServerlessMode` loaded both of its CloudFormation templates by filesystem
+  path, computed from `__file__`, rather than through `get_cf_template()`. An
+  installed wheel raised `FileNotFoundError` on the first Lambda or ECS
+  submission (closes #113).
+- The Spot Fleet capacity check read `FulfilledCapacity` from the top level of
+  the `DescribeSpotFleetRequests` entry, where it does not exist — both
+  capacities live in the nested `SpotFleetRequestConfig`. The `.get(..., 0)`
+  default meant `0 >= target_capacity` was false for any capacity of 1 or more,
+  so a fully provisioned fleet reported `PENDING` forever, never reached a
+  terminal state, and Parsl never released the block (closes #114).
+- Every `ServerlessMode.submit_job()` raised `KeyError`. Both submit helpers
+  finish by calling `self.resources[resource_id].update(...)` to record the
+  stack name, but the tracking record was not created until after they returned
+  — so the update raised inside the helper's blanket `except Exception` and
+  surfaced as an opaque `Failed to submit ECS job: 'serverless-ecs-<job>'`. The
+  CloudFormation stack was created before that point and left untracked, so
+  nothing could clean it up. The record is now created before dispatch, and a
+  failed submit cleans up the partially created stack (closes #115).
+- Lambda deployment packages were passed to CloudFormation as a latin1-decoded
+  string in the `CodeZipContent` parameter. That is neither the base64 the
+  template documents nor legal XML — 117 of its codepoints are control
+  characters that XML 1.0 forbids in character data — so CloudFormation's own
+  `DescribeStacks` echo of the parameter came back unparseable and every Lambda
+  job reported `UNKNOWN` forever. `AWS::Lambda::Function`'s `ZipFile` also takes
+  inline source text capped at 4096 bytes, not archive bytes, so even correct
+  base64 would have deployed a broken function. Packages are now staged in S3
+  and referenced by `CodeS3Bucket`/`CodeS3Key`, which the template already
+  supported. A caller-supplied `checkpoint_bucket` is reused if present;
+  otherwise a provider-scoped bucket is created and removed on cleanup
+  (closes #116).
+- All four compute managers ignored `provider.session` and built their own from
+  the credential manager, so an explicitly configured session — temporary role
+  credentials, a chosen profile, a LocalStack `endpoint_url` — was silently
+  replaced by one assembled from ambient environment credentials, possibly
+  pointing at a different account. It also meant an injected test double was
+  ignored and the manager reached real AWS; a unit test created a live ECS
+  cluster this way. New `resolve_manager_session()` prefers the caller's
+  session, mirroring the fix already applied to the state stores. The dead
+  "legacy fallback" in `LambdaManager` — unreachable by its own `if`, but which
+  still dereferenced four provider attributes that `EphemeralAWSProvider` does
+  not define — is removed (closes #117).
+- `ServerlessMode.save_state()` omitted `worker_type`, the field that determines
+  whether the three network IDs are required at all, so a state document could
+  not be interpreted without it (closes #118).
+- Every credential-resolution failure raised `TypeError` rather than a
+  credentials error. `security/credential_manager.py` called
+  `NoCredentialsError(f"...")` at seven sites, but botocore's `BotoCoreError`
+  accepts keyword arguments only, so each raised
+  `TypeError: BotoCoreError.__init__() takes 1 positional argument but 2 were
+  given` and the reason never reached the caller. Handlers that catch
+  `NoCredentialsError` — in all four compute managers and `error_handling.py` —
+  did not catch it. A new `CredentialResolutionError` subclasses the botocore
+  class, so those handlers keep working and the message survives (closes #121).
+- `SecureStateManager.verify_state_integrity()` returned `True` for a path that
+  does not exist. It reported success when `load_secure_state()` raised nothing,
+  but that method deliberately swallows `FileNotFoundError` and returns `{}` so
+  a first run can proceed with no saved state (closes #122).
 
 ### Added
 - **One-shot mode** for `StandardMode`: set `one_shot=True` to declare that each
@@ -274,8 +438,71 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `EC2Manager._get_or_create_instance_profile()` so `StandardMode` and
   `EC2Manager` share one implementation. Resolution order is explicit ARN, then
   auto-creation, then `None`.
+- `test_cf_templates.py` falls back to the `tomli` backport, since `tomllib` is
+  3.11+ and `requires-python` is `>=3.10`. This is not a new dependency: pytest
+  itself requires `tomli` below 3.11.
+- `tests/unit/test_manager_session.py` — 5 tests pinning
+  `resolve_manager_session()`'s precedence directly: the provider's own session
+  is returned by identity, a provider with no session (or no `session` attribute
+  at all) falls back to the credential manager, and a falsy region resolves to
+  `DEFAULT_REGION` rather than letting boto3 pick one up from the environment.
+  Only one test had covered #117, incidentally, via a client the manager happened
+  to reach through the injected session.
+- `test_templates_are_deployed_through_the_package_loader` — both serverless
+  submit paths are asserted to obtain their CloudFormation template from
+  `get_cf_template()`. Comparing `TemplateBody` to the loader's output cannot
+  establish this alone: in a source checkout, reading the file by a path built
+  from `__file__` yields identical bytes, which is precisely why #112 stayed
+  invisible in development and failed only from an installed wheel. Both stack
+  parameter tests also now assert `TemplateBody`, so deploying the other
+  template is caught (refs #112, #113).
 
 ### Changed
+- **CI is one workflow.** `ci.yml` and `ci-cd.yml` were near-duplicate pipelines
+  that between them ran the same unit suite five times, over Python 3.8 and 3.9,
+  which `requires-python = ">=3.10"` excludes. `ci-cd.yml` is deleted; `ci.yml`
+  now carries lint, type-check, unit, integration, real-AWS, bats, build, and
+  docs jobs, all on `uv sync --locked` rather than `pip install -e`. `ci-cd.yml`
+  also held a second PyPI publish job triggered by `release: published`, so a tag
+  push followed by a published release ran two independent uploads; `release.yml`
+  is now the only publish path (closes #83).
+- `release.yml` verifies the pushed tag against `parsl_ephemeral_aws.__version__`
+  before building. `bump-my-version` has silently missed `__init__.py` before —
+  v0.6.0 shipped with `__version__ == "0.1.0"` — and a PyPI version can never be
+  reused. Publishing now uses trusted publishing via OIDC instead of a
+  `PYPI_API_TOKEN` secret, and the release is created with `gh release create`;
+  `actions/create-release` and `actions/upload-release-asset` are both archived.
+- The build job asserts the CloudFormation templates are present in the wheel, so
+  a packaging regression fails in CI rather than at runtime on a real AWS call
+  (refs #112).
+- A `workflow_dispatch` job runs the 51 real-AWS tests in `tests/aws`, which no
+  workflow referenced — #60 closed with them unreachable in CI. Credentials come
+  from OIDC, and a final always-run step reports orphaned resources (refs #83).
+- Test selection is by path, not `-m unit`. The Makefile selected `-m unit`, which
+  collected 88 of 295 tests and passed while CI ran the full set and failed. An
+  unmarked new file now still runs. `pytestmark = pytest.mark.unit` was added to
+  the 11 unmarked unit files and to `tests/security`, which had 92 tests and no
+  markers at all.
+- `--cov-fail-under` in `pyproject.toml` is 25, a smoke floor, because `addopts`
+  applies to narrow invocations too — `pytest tests/integration` alone measures
+  34%. The gate that matters is `--cov-fail-under=65` on the CI unit-tests job,
+  which runs `tests/unit` and `tests/security` together at 68%.
+- Formatting is ruff-format only. `black` and `isort` are removed from the `dev`
+  extra and their config from `pyproject.toml`: `[tool.black] line-length = 100`
+  disagreed with the 88-character default that every file is actually formatted
+  to, so running black reformatted ~80 unrelated lines. The `ruff-pre-commit` pin
+  moved from v0.2.2 to the version `uv.lock` resolves, because the two disagreed
+  on comprehension-conditional parenthesization and each would undo the other's
+  output.
+- The two standing `bandit` findings are annotated with `# nosec` and a reason
+  rather than left to fail the new lint gate: retry jitter is not a security
+  decision, and LocalStack's `test`/`test` credentials authenticate against
+  nothing real. `bandit -r parsl_ephemeral_aws` now exits 0.
+- Non-AWS-marked tests now run with synthetic credentials and `AWS_PROFILE`
+  unset. A `@mock_aws`-decorated *class* only wraps its `test_*` methods, so a
+  fixture on that class runs outside the mock — one reached the live account and
+  failed `VpcLimitExceeded` against production VPCs. An un-mocked call now fails
+  as an auth error against a fake account instead of mutating a real one.
 - `vpc_id`, `subnet_id`, and `security_group_id` are no longer required for
   Lambda-only serverless mode. `compute/lambda_func.py` references none of them
   and `create_function` passes no `VpcConfig`, so functions run in the
@@ -305,6 +532,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   logging "falling back to UserData execution". There was nothing to fall back
   to — the command is not in the UserData, so the instance would have idled
   until `max_idle_time` while reporting `RUNNING`.
+- `EphemeralAWSProvider.__init__` now raises `ProviderConfigurationError` for
+  unrecognised keyword arguments instead of absorbing them into `**kwargs`. The
+  collected `self.kwargs` attribute was write-only — read nowhere in the package —
+  so the permissiveness only ever hid typos and dropped options, which is exactly
+  how the Spot Fleet parameters went unnoticed (refs #105).
 - `EphemeralAWSProvider.status()` runs `_cleanup_resources()` when `one_shot` is
   set, not only when a warm pool is configured; a one-shot instance has no
   UserData shutdown to end it.
@@ -316,6 +548,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   from the environment; tests are skipped (not failed) when these are unset.
 
 ### Removed
+- The bats test `Required environment variables are set`. It asserted that
+  `AWS_REGION` and `AWS_ACCESS_KEY_ID`/`AWS_PROFILE` were set in the ambient
+  environment, guarded so that it ran only when `CI` was set — so it failed on
+  every CI run since it was written, failing the whole `test-bats` job while the
+  other 11 tests passed. It could not have done otherwise: the suite exercises
+  shell scripts against a mocked AWS CLI, needs no credentials, and the workflow
+  supplies none. The env-file contents the scripts do depend on are covered by
+  `test_setup_environment.bats`.
 - `SpotFleetManager._create_vpc()`, `_create_subnet()`, `_create_security_group()`,
   and `_cleanup_network_resources()`. `_setup_network_resources()` now only
   resolves the caller-supplied IDs and raises `ResourceCreationError` if any are

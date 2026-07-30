@@ -5,6 +5,7 @@
 
 .PHONY: clean test lint type-check test-unit test-integration test-bats docs build install install-dev help
 .PHONY: localstack-up localstack-down localstack-status test-aws coverage format pre-commit version-check
+.PHONY: version-verify lint-python lint-shell security coverage-aws release
 
 # Colors for output
 BLUE := \033[36m
@@ -14,8 +15,15 @@ RED := \033[31m
 RESET := \033[0m
 
 # Configuration
-PYTHON := python3
-COVERAGE_MIN := 10
+# Everything runs through `uv run`, per CLAUDE.md -- never bare pytest/ruff/mypy,
+# which resolve against whatever happens to be on PATH rather than .venv.
+UV := uv
+RUN := $(UV) run
+PYTHON := $(RUN) python
+# Matches the gate on the CI unit-tests job; tests/unit + tests/security together
+# measure 68%. pyproject's --cov-fail-under is a lower smoke floor because it
+# applies to narrow invocations too.
+COVERAGE_MIN := 65
 
 # Auto-detect container runtime (prefer podman, fallback to docker)
 PODMAN_AVAILABLE := $(shell which podman > /dev/null 2>&1 && echo "yes")
@@ -52,37 +60,43 @@ clean: ## Clean build artifacts and cache
 # Install for development
 install-dev: ## Install package with development dependencies
 	@echo "$(YELLOW)Installing development dependencies...$(RESET)"
-	pip install -e ".[dev,test]"
-	pre-commit install
-	pre-commit install --hook-type commit-msg
+	$(UV) sync --extra dev --extra test
+	$(RUN) pre-commit install
+	$(RUN) pre-commit install --hook-type commit-msg
 	@echo "$(GREEN)Development environment ready$(RESET)"
 
 # Install for production
 install: ## Install package in production mode
 	@echo "$(YELLOW)Installing package...$(RESET)"
-	pip install .
+	$(UV) sync --no-dev
 	@echo "$(GREEN)Package installed$(RESET)"
 
 # Run tests
 test: test-unit test-integration test-bats ## Run all tests
 
 # Run unit tests
-test-unit: ## Run unit tests only
+test-unit: ## Run unit and security tests
 	@echo "$(YELLOW)Running unit tests...$(RESET)"
-	pytest tests/unit/ -v -m "unit"
+	# Selected by path, not `-m unit`, to match CI. The old `-m unit` collected 88
+	# of 295 tests here, so this target passed while CI ran the full set and
+	# failed. tests/security is pure-mock and marked `unit`, so it belongs here.
+	$(RUN) pytest tests/unit/ tests/security/ -v --cov-fail-under=$(COVERAGE_MIN)
 
 # Run integration tests with LocalStack
 test-integration: localstack-up ## Run integration tests with LocalStack
 	@echo "$(YELLOW)Running integration tests with LocalStack...$(RESET)"
 	@$(MAKE) localstack-wait
-	pytest tests/integration/ -v -m "integration or localstack"
+	$(RUN) pytest tests/integration/ -v
 
-# Run integration tests against real AWS
-test-aws: ## Run integration tests against real AWS (costs money!)
-	@echo "$(YELLOW)Running integration tests against real AWS...$(RESET)"
+# Run E2E tests against real AWS
+test-aws: ## Run E2E tests against real AWS (costs money!)
+	@echo "$(YELLOW)Running E2E tests against real AWS...$(RESET)"
 	@echo "$(RED)WARNING: This will create real AWS resources and may incur costs!$(RESET)"
 	@read -p "Continue? [y/N] " response && [ "$$response" = "y" ] || (echo "Aborted" && exit 1)
-	AWS_PROFILE=aws pytest tests/integration/ -v -m "aws"
+	# tests/aws, not tests/integration: the real-AWS suite lives in tests/aws and
+	# nothing under tests/integration carries the `aws` marker, so this target
+	# collected zero tests and reported success.
+	AWS_PROFILE=aws $(RUN) pytest tests/aws/ -v -m "aws" --no-cov
 
 # Run BATS tests for shell scripts
 test-bats: ## Run BATS tests for shell scripts
@@ -121,8 +135,14 @@ lint: lint-python lint-shell ## Run all linting checks
 # Run Python linting
 lint-python: ## Run Python linting with ruff
 	@echo "$(YELLOW)Running Python linting...$(RESET)"
-	ruff check .
-	ruff format --check .
+	# Scoped to the package and tests, matching CI. `ruff check .` reports 107
+	# pre-existing errors, all in tools/ one-off debug scripts that #93 prunes in
+	# v0.8.0 -- so this target could never pass and was effectively unrunnable.
+	$(RUN) ruff check parsl_ephemeral_aws tests
+	# Same scope as `format` below and as the pre-commit hook, which formats
+	# whatever is staged: a narrower check here lets tests/ drift out of format
+	# and only fail on the next commit that happens to stage one of those files.
+	$(RUN) ruff format --check parsl_ephemeral_aws tests
 
 # Run shell script linting
 lint-shell: ## Run shell script linting
@@ -137,18 +157,18 @@ lint-shell: ## Run shell script linting
 # Format code
 format: ## Format code with ruff
 	@echo "$(YELLOW)Formatting code...$(RESET)"
-	ruff format .
-	ruff check --fix .
+	$(RUN) ruff format parsl_ephemeral_aws tests
+	$(RUN) ruff check --fix parsl_ephemeral_aws tests
 
 # Run type checking
 type-check: ## Run type checking with mypy
 	@echo "$(YELLOW)Running type checks...$(RESET)"
-	mypy parsl_ephemeral_aws
+	$(RUN) mypy parsl_ephemeral_aws
 
 # Run pre-commit hooks
 pre-commit: ## Run all pre-commit hooks
 	@echo "$(YELLOW)Running pre-commit hooks...$(RESET)"
-	pre-commit run --all-files
+	$(RUN) pre-commit run --all-files
 
 # Build documentation
 docs: ## Generate documentation
@@ -159,26 +179,28 @@ docs: ## Generate documentation
 # Build package
 build: clean ## Build package for distribution
 	@echo "$(YELLOW)Building package...$(RESET)"
-	python setup.py sdist bdist_wheel
+	# `uv build`, not setup.py sdist bdist_wheel: setup.py is a legacy shim and
+	# the invocation has been deprecated by setuptools for years.
+	$(UV) build
 	@echo "$(GREEN)Package built$(RESET)"
 
 # Create a release
 release: lint type-check test build ## Prepare package for release
-	@echo "$(GREEN)Package ready for release. Use the following commands to publish:$(RESET)"
-	@echo "  twine check dist/*"
-	@echo "  twine upload dist/*"
+	@echo "$(GREEN)Package ready for release. Push a v* tag to publish:$(RESET)"
+	@echo "  $(RUN) twine check dist/*"
+	@echo "  git tag vX.Y.Z && git push origin vX.Y.Z"
 
 # Run security checks
 security: ## Run security scan with bandit
 	@echo "$(YELLOW)Running security scan...$(RESET)"
-	bandit -r parsl_ephemeral_aws -c pyproject.toml
+	$(RUN) bandit -r parsl_ephemeral_aws -c pyproject.toml
 
 # Code coverage
 coverage: ## Generate test coverage report (LocalStack only)
 	@echo "$(YELLOW)Generating coverage report...$(RESET)"
-	coverage run -m pytest -m "not aws"
-	coverage report --fail-under=$(COVERAGE_MIN)
-	coverage html
+	$(RUN) coverage run -m pytest -m "not aws"
+	$(RUN) coverage report --fail-under=$(COVERAGE_MIN)
+	$(RUN) coverage html
 	@echo "$(GREEN)Coverage report generated in htmlcov/$(RESET)"
 
 # Coverage including AWS tests
@@ -186,9 +208,9 @@ coverage-aws: ## Generate coverage including AWS tests (costs money!)
 	@echo "$(YELLOW)Generating coverage with AWS tests...$(RESET)"
 	@echo "$(RED)WARNING: This will create real AWS resources!$(RESET)"
 	@read -p "Continue? [y/N] " response && [ "$$response" = "y" ] || (echo "Aborted" && exit 1)
-	AWS_PROFILE=aws coverage run -m pytest
-	coverage report --fail-under=$(COVERAGE_MIN)
-	coverage html
+	AWS_PROFILE=aws $(RUN) coverage run -m pytest
+	$(RUN) coverage report --fail-under=$(COVERAGE_MIN)
+	$(RUN) coverage html
 
 # Version management
 version-check: ## Check current version information
@@ -199,15 +221,28 @@ version-check: ## Check current version information
 
 version-bump-patch: ## Bump patch version (0.1.0 -> 0.1.1)
 	@echo "$(YELLOW)Bumping patch version...$(RESET)"
-	bump-my-version bump patch
+	$(RUN) bump-my-version bump patch
+	@$(MAKE) version-verify
 
 version-bump-minor: ## Bump minor version (0.1.0 -> 0.2.0)
 	@echo "$(YELLOW)Bumping minor version...$(RESET)"
-	bump-my-version bump minor
+	$(RUN) bump-my-version bump minor
+	@$(MAKE) version-verify
 
 version-bump-major: ## Bump major version (0.1.0 -> 1.0.0)
 	@echo "$(YELLOW)Bumping major version...$(RESET)"
-	bump-my-version bump major
+	$(RUN) bump-my-version bump major
+	@$(MAKE) version-verify
+
+version-verify: ## Check pyproject and __init__ versions agree
+	@toml="$$(grep '^version = ' pyproject.toml | head -1 | cut -d'"' -f2)"; \
+	pkg="$$($(RUN) python -c 'import parsl_ephemeral_aws as p; print(p.__version__)')"; \
+	if [ "$$toml" != "$$pkg" ]; then \
+		echo "$(RED)version mismatch: pyproject=$$toml __init__=$$pkg$(RESET)"; \
+		echo "$(RED)bump-my-version's search string has drifted; edit __init__.py by hand$(RESET)"; \
+		exit 1; \
+	fi; \
+	echo "$(GREEN)Versions agree: $$pkg$(RESET)"
 
 # Development workflows
 dev-setup: install-dev localstack-up ## Complete development environment setup

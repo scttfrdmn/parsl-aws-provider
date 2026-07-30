@@ -77,8 +77,9 @@ def create_localstack_session(
     if not is_localstack_running(endpoint):
         raise RuntimeError("LocalStack is not running")
 
-    # Create a session with dummy credentials
-    return boto3.Session(
+    # Create a session with dummy credentials. LocalStack accepts any values and
+    # documents these; they authenticate against nothing real.
+    return boto3.Session(  # nosec B106
         aws_access_key_id="test", aws_secret_access_key="test", region_name=region
     )
 
@@ -290,9 +291,9 @@ def setup_localstack_vpc() -> Dict[str, str]:
 
 def is_localstack_available() -> bool:
     """Check if LocalStack is available and running.
-    
+
     This function combines endpoint availability check with a basic health check.
-    
+
     Returns
     -------
     bool
@@ -306,14 +307,14 @@ def is_localstack_available() -> bool:
 
 def get_localstack_session(region: str = "us-east-1") -> boto3.Session:
     """Get a boto3 session configured for LocalStack.
-    
+
     This is an alias for create_localstack_session for backwards compatibility.
-    
+
     Parameters
     ----------
     region : str, optional
         The AWS region to use, by default 'us-east-1'
-        
+
     Returns
     -------
     boto3.Session

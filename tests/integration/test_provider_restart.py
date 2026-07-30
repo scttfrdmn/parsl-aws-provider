@@ -60,6 +60,11 @@ def _make_provider(tmp_dir, provider_id, state_file, max_blocks=10):
             image_id="ami-12345678",
             instance_type="t3.micro",
             mode="standard",
+            # Required since #69; the mode is a MagicMock so they are never used,
+            # but the provider validates their presence in __init__.
+            vpc_id="vpc-12345",
+            subnet_id="subnet-12345",
+            security_group_id="sg-12345",
             max_blocks=max_blocks,
             min_blocks=0,
             init_blocks=0,
@@ -111,9 +116,9 @@ class TestProviderRestart:
 
         # All 3 resource_ids must be in the recovered resources dict
         for rid in resource_ids:
-            assert (
-                rid in p2.resources
-            ), f"resource_id {rid} missing from recovered resources"
+            assert rid in p2.resources, (
+                f"resource_id {rid} missing from recovered resources"
+            )
 
     def test_restart_preserves_job_status(self, tmp_dir):
         """Recovered provider sees the same statuses as the original."""
@@ -132,12 +137,12 @@ class TestProviderRestart:
         p2, _, _ = _make_provider(tmp_dir, provider_id, state_file)
         p2._load_state()
 
-        assert (
-            p2.job_map.get(jid, {}).get("status") == "RUNNING"
-        ), "Recovered provider should see RUNNING status"
-        assert (
-            p2.resources.get(rid, {}).get("status") == "RUNNING"
-        ), "Recovered provider should see RUNNING resource status"
+        assert p2.job_map.get(jid, {}).get("status") == "RUNNING", (
+            "Recovered provider should see RUNNING status"
+        )
+        assert p2.resources.get(rid, {}).get("status") == "RUNNING", (
+            "Recovered provider should see RUNNING resource status"
+        )
 
     def test_empty_state_file_handled_gracefully(self, tmp_dir):
         """Provider restart with a missing state file returns False gracefully."""
@@ -147,6 +152,6 @@ class TestProviderRestart:
         p, _, _ = _make_provider(tmp_dir, provider_id, state_file)
         # No state saved — _load_state should return False without raising
         result = p._load_state()
-        assert (
-            result is False or result is None
-        ), "Loading nonexistent state should return falsy"
+        assert result is False or result is None, (
+            "Loading nonexistent state should return falsy"
+        )

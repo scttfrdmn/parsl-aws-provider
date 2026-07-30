@@ -20,6 +20,8 @@ from parsl_ephemeral_aws.constants import (
     STATUS_CANCELLED,
 )
 
+pytestmark = pytest.mark.unit
+
 
 class TestServerlessModeSpotFleet:
     """Tests for the SpotFleet functionality in ServerlessMode class."""
@@ -89,14 +91,20 @@ class TestServerlessModeSpotFleet:
             "SecurityGroups": [{"GroupId": "sg-12345"}]
         }
 
-        # Mock describe_spot_fleet_requests
+        # Mock describe_spot_fleet_requests. Both capacities live inside the
+        # nested SpotFleetRequestConfig — the entry itself carries only
+        # ActivityStatus/CreateTime/SpotFleetRequestConfig/SpotFleetRequestId/
+        # SpotFleetRequestState/Tags. These fixtures put FulfilledCapacity at the
+        # top level, which is precisely the misreading #114 fixed in the package.
         client.describe_spot_fleet_requests.return_value = {
             "SpotFleetRequestConfigs": [
                 {
                     "SpotFleetRequestId": "sfr-12345",
                     "SpotFleetRequestState": "active",
-                    "SpotFleetRequestConfig": {"TargetCapacity": 2},
-                    "FulfilledCapacity": 2,
+                    "SpotFleetRequestConfig": {
+                        "TargetCapacity": 2,
+                        "FulfilledCapacity": 2,
+                    },
                 }
             ]
         }
@@ -141,6 +149,9 @@ class TestServerlessModeSpotFleet:
             instance_types=["t3.small", "t3.medium", "m5.small"],
             nodes_per_block=2,
             spot_max_price_percentage=80,
+            vpc_id="vpc-12345",
+            subnet_id="subnet-12345",
+            security_group_id="sg-12345",
         )
 
         return mode
@@ -158,7 +169,8 @@ class TestServerlessModeSpotFleet:
 
     def test_default_instance_types(self, mock_session, mock_state_store):
         """Test that default instance types are provided if not specified."""
-        # Create mode with SpotFleet but no instance types specified
+        # Create mode with SpotFleet but no instance types specified. ECS needs
+        # the network IDs (#69) — its awsvpcConfiguration is mandatory.
         mode = ServerlessMode(
             provider_id="test-provider",
             session=mock_session,
@@ -166,6 +178,9 @@ class TestServerlessModeSpotFleet:
             worker_type=WORKER_TYPE_ECS,
             use_spot_fleet=True,
             nodes_per_block=2,
+            vpc_id="vpc-12345",
+            subnet_id="subnet-12345",
+            security_group_id="sg-12345",
         )
 
         # Verify default instance types are set
@@ -174,28 +189,23 @@ class TestServerlessModeSpotFleet:
         assert "t3.small" in mode.instance_types
         assert "m5.large" in mode.instance_types
 
-    @patch("os.path.join")
     def test_submit_job_with_spot_fleet(
-        self, mock_join, serverless_mode_with_spot_fleet, mock_cf_client
+        self, serverless_mode_with_spot_fleet, mock_cf_client
     ):
-        """Test job submission with SpotFleet options."""
+        """Test job submission with SpotFleet options.
+
+        The packaged ``ecs_worker.yml`` is loaded for real. This used to patch
+        ``os.path.join`` *globally* and stub ``builtins.open`` to return "template
+        content"; the mode now goes through ``get_cf_template()`` (#113), and
+        patching every path join in the interpreter was never safe.
+        """
         # Setup for job submission
         serverless_mode_with_spot_fleet.initialized = True
-        serverless_mode_with_spot_fleet.vpc_id = "vpc-12345"
-        serverless_mode_with_spot_fleet.subnet_id = "subnet-12345"
-        serverless_mode_with_spot_fleet.security_group_id = "sg-12345"
+        serverless_mode_with_spot_fleet.ecs_manager = MagicMock()
 
-        # Setup mock path
-        mock_join.return_value = "path/to/template.yml"
-
-        # Mock open file
-        m = MagicMock()
-        m.__enter__.return_value.read.return_value = "template content"
-        with patch("builtins.open", return_value=m):
-            # Submit job
-            resource_id = serverless_mode_with_spot_fleet.submit_job(
-                "job-1", "echo hello", 2
-            )
+        resource_id = serverless_mode_with_spot_fleet.submit_job(
+            "job-1", "echo hello", 2
+        )
 
         # Verify CloudFormation stack was created
         mock_cf_client.create_stack.assert_called_once()
@@ -247,8 +257,10 @@ class TestServerlessModeSpotFleet:
                 {
                     "SpotFleetRequestId": "sfr-12345",
                     "SpotFleetRequestState": "active",
-                    "SpotFleetRequestConfig": {"TargetCapacity": 2},
-                    "FulfilledCapacity": 1,  # Only half fulfilled
+                    "SpotFleetRequestConfig": {
+                        "TargetCapacity": 2,
+                        "FulfilledCapacity": 1,  # Only half fulfilled
+                    },
                 }
             ]
         }
@@ -397,10 +409,12 @@ class TestServerlessModeSpotFleet:
             cleanup_iam_roles=True,
         )
 
-        # Verify infrastructure was reset
-        assert serverless_mode_with_spot_fleet.vpc_id is None
-        assert serverless_mode_with_spot_fleet.subnet_id is None
-        assert serverless_mode_with_spot_fleet.security_group_id is None
+        # The caller's network survives cleanup and stays configured, so a
+        # subsequent initialize() can reuse it (#69).
+        assert serverless_mode_with_spot_fleet.vpc_id == "vpc-12345"
+        assert serverless_mode_with_spot_fleet.subnet_id == "subnet-12345"
+        assert serverless_mode_with_spot_fleet.security_group_id == "sg-12345"
+
         assert serverless_mode_with_spot_fleet.initialized is False
 
     def test_list_resources_with_spot_fleet(self, serverless_mode_with_spot_fleet):

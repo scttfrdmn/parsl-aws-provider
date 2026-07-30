@@ -1,60 +1,52 @@
-"""Unit tests with AWS mocking using Moto.
+"""Unit tests that drive the resource managers against moto-mocked AWS.
 
-These tests use the Moto library to mock AWS services, providing isolated and
-comprehensive testing of AWS interactions without requiring LocalStack or AWS.
+Unlike the rest of ``tests/unit``, these tests do not mock the boto3 client:
+moto intercepts the HTTP layer, so the managers issue real API calls against a
+simulated AWS. That makes this the only place in the unit suite where a request
+shape is validated rather than asserted against a MagicMock.
+
+Two things about the file's history are worth stating, because both hid bugs:
+
+1. The import guard caught an ``ImportError`` for moto 4's per-service
+   decorators (``mock_ec2``, ``mock_s3``, ...), which moto 5 removed in favour of
+   a single ``mock_aws``. moto was installed and working the whole time, so the
+   guard silently skipped all 12 tests on every run.
+2. Underneath the skips, the tests called constructors and methods that no
+   commit has ever produced -- ``VPCManager(session=, region=)``,
+   ``create_instances()``, ``LambdaManager.invoke_lambda_function()``, and so on.
+   Every manager takes ``__init__(self, provider)`` and reads its configuration
+   off that object. These tests now use the real surface.
 
 SPDX-License-Identifier: Apache-2.0
 SPDX-FileCopyrightText: 2025 Scott Friedman and Project Contributors
 """
 
+import json
 import os
 import uuid
-import json
-import pytest
-from unittest.mock import patch, MagicMock
+from types import SimpleNamespace
+from unittest.mock import patch
+
 import boto3
+import pytest
 
-try:
-    # Import moto decorators
-    from moto import (
-        mock_ec2,
-        mock_s3,
-        mock_ssm,
-        mock_iam,
-        mock_lambda,
-        mock_ecs,
-        mock_cloudformation,
-    )
-
-    MOTO_AVAILABLE = True
-except ImportError:
-    MOTO_AVAILABLE = False
-
-    # Create placeholder decorators if moto is not available
-    def mock_decorator(func):
-        return pytest.mark.skip(reason="Moto library not available")(func)
-
-    mock_ec2 = (
-        mock_s3
-    ) = (
-        mock_ssm
-    ) = mock_iam = mock_lambda = mock_ecs = mock_cloudformation = mock_decorator
-
-# Mark tests as requiring moto
-pytestmark = pytest.mark.skipif(
-    not MOTO_AVAILABLE,
-    reason="Moto library not available. Install with: pip install moto",
-)
+from moto import mock_aws
 
 from parsl_ephemeral_aws.compute.ec2 import EC2Manager
-from parsl_ephemeral_aws.compute.spot_fleet import SpotFleetManager
-from parsl_ephemeral_aws.compute.lambda_func import LambdaManager
 from parsl_ephemeral_aws.compute.ecs import ECSManager
-from parsl_ephemeral_aws.network.vpc import VPCManager
+from parsl_ephemeral_aws.compute.lambda_func import LambdaManager
+from parsl_ephemeral_aws.compute.spot_fleet import SpotFleetManager
+from parsl_ephemeral_aws.constants import (
+    STATUS_CANCELLED,
+    TAG_MANAGED,
+    TAG_WORKFLOW_ID,
+)
 from parsl_ephemeral_aws.network.security import SecurityGroupManager
+from parsl_ephemeral_aws.network.vpc import VPCManager
 from parsl_ephemeral_aws.state.parameter_store import ParameterStoreState
 from parsl_ephemeral_aws.state.s3 import S3State
-from parsl_ephemeral_aws.modes.serverless import ServerlessMode
+
+pytestmark = pytest.mark.unit
 
 
 @pytest.fixture
@@ -64,911 +56,672 @@ def region():
 
 
 @pytest.fixture
-def aws_credentials():
-    """Mocked AWS credentials for testing."""
-    os.environ["AWS_ACCESS_KEY_ID"] = "testing"
-    os.environ["AWS_SECRET_ACCESS_KEY"] = "testing"
-    os.environ["AWS_SECURITY_TOKEN"] = "testing"
-    os.environ["AWS_SESSION_TOKEN"] = "testing"
-    os.environ["AWS_DEFAULT_REGION"] = "us-east-1"
-    yield
-    # Clean up
-    del os.environ["AWS_ACCESS_KEY_ID"]
-    del os.environ["AWS_SECRET_ACCESS_KEY"]
-    del os.environ["AWS_SECURITY_TOKEN"]
-    del os.environ["AWS_SESSION_TOKEN"]
-    del os.environ["AWS_DEFAULT_REGION"]
+def aws_credentials(monkeypatch, region):
+    """Synthetic credentials so boto3 never reaches a real credential chain.
+
+    The AWS-managed-policy support these tests also need
+    (``MOTO_IAM_LOAD_MANAGED_POLICIES``) is set session-wide in
+    ``tests/conftest.py``; without it every ``attach_role_policy`` against an
+    ``arn:aws:iam::aws:policy/...`` ARN fails with ``NoSuchEntity``.
+    """
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "testing")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "testing")
+    monkeypatch.setenv("AWS_SECURITY_TOKEN", "testing")
+    monkeypatch.setenv("AWS_SESSION_TOKEN", "testing")
+    monkeypatch.setenv("AWS_DEFAULT_REGION", region)
 
 
 @pytest.fixture
 def moto_session(aws_credentials, region):
-    """Create a boto3 session for moto tests."""
+    """A boto3 session for asserting against AWS state directly."""
     return boto3.Session(region_name=region)
 
 
+def make_provider(**overrides):
+    """Build the provider object the managers read their configuration from.
+
+    A ``SimpleNamespace``, not a ``MagicMock``: the managers read several settings
+    with ``getattr(provider, name, <default>)`` -- ``vpc_cidr``,
+    ``security_environment``, ``admin_cidr_blocks``, ``strict_security_mode`` --
+    and a MagicMock answers every one of them, so the default never applies and
+    ``SecurityConfig`` raises ``ValueError: Invalid VPC CIDR: <MagicMock ...>``
+    during construction. Only the attributes listed here exist, matching what the
+    operating modes actually pass.
+    """
+    attrs = {
+        "workflow_id": f"wf-{uuid.uuid4().hex[:8]}",
+        "region": "us-east-1",
+        "aws_access_key_id": "testing",
+        "aws_secret_access_key": "testing",
+        "aws_session_token": None,
+        "aws_profile": None,
+        "tags": {"TestTag": "TestValue"},
+        "vpc_id": None,
+        "subnet_id": None,
+        "subnet_ids": None,
+        "security_group_id": None,
+        "image_id": "ami-12345678",
+        "instance_type": "t3.micro",
+        "instance_types": [],
+        "key_name": None,
+        "use_public_ips": True,
+        "nodes_per_block": 1,
+        "use_spot_instances": False,
+        "worker_init": "echo 'worker init'",
+        "spot_max_price_percentage": 100,
+        "lambda_timeout": 300,
+        "lambda_memory": 1024,
+        "ecs_task_cpu": 1024,
+        "ecs_task_memory": 2048,
+        "ecs_container_image": None,
+    }
+    attrs.update(overrides)
+    return SimpleNamespace(**attrs)
+
+
+def provision_network(session):
+    """Create the pre-provisioned VPC/subnet/SG the managers now require.
+
+    Since #69 the provider does not create network resources; the caller supplies
+    all three IDs. These tests mirror that by building them with plain boto3.
+    """
+    ec2 = session.client("ec2")
+    vpc_id = ec2.create_vpc(CidrBlock="10.0.0.0/16")["Vpc"]["VpcId"]
+    subnet_id = ec2.create_subnet(
+        VpcId=vpc_id, CidrBlock="10.0.1.0/24", AvailabilityZone="us-east-1a"
+    )["Subnet"]["SubnetId"]
+    sg_id = ec2.create_security_group(
+        GroupName=f"test-sg-{uuid.uuid4().hex[:8]}",
+        Description="Pre-provisioned test security group",
+        VpcId=vpc_id,
+    )["GroupId"]
+    return vpc_id, subnet_id, sg_id
+
+
+def tag_dict(tags):
+    """Normalize a boto3 tag list to a dict, rejecting duplicate keys.
+
+    A duplicate key is a bug, not a shape variation: EC2 rejects duplicate tag
+    keys outright on ``RunInstances``/``CreateSecurityGroup``/``RequestSpotFleet``
+    (#109), and moto tolerates them, so an assertion has to look for them.
+    """
+    keys = [tag["Key"] for tag in tags]
+    assert len(keys) == len(set(keys)), f"duplicate tag key: {keys}"
+    return {tag["Key"]: tag["Value"] for tag in tags}
+
+
 class TestVPCWithMoto:
-    """Test VPCManager with moto mocked AWS."""
+    """``VPCManager`` builds and tears down a full network."""
 
-    @mock_ec2
-    def test_vpc_creation_and_deletion(self, moto_session):
-        """Test creating and deleting a VPC."""
-        vpc_manager = VPCManager(session=moto_session, region="us-east-1")
+    @mock_aws
+    def test_network_lifecycle(self, moto_session):
+        """Create VPC, subnet, gateway, and route table, then clean up.
 
-        # Create a VPC
-        vpc_id = vpc_manager.create_vpc(
-            cidr_block="10.0.0.0/16", tags={"Name": "test-vpc", "TestKey": "TestValue"}
+        ``create_vpc`` takes only ``cidr_block`` (tags come from the provider),
+        ``create_subnet`` takes ``(cidr_block, availability_zone, is_public)`` and
+        uses the VPC the manager is already tracking, and deletion is
+        ``cleanup_subnet``/``delete_vpc()`` -- the latter taking no argument.
+        """
+        manager = VPCManager(make_provider())
+        ec2 = moto_session.client("ec2")
+
+        vpc_id = manager.create_vpc(cidr_block="10.0.0.0/16")
+        vpc = ec2.describe_vpcs(VpcIds=[vpc_id])["Vpcs"][0]
+        assert vpc["CidrBlock"] == "10.0.0.0/16"
+
+        tags = tag_dict(vpc["Tags"])
+        assert tags[TAG_MANAGED] == "true"
+        assert tags[TAG_WORKFLOW_ID] == manager.provider.workflow_id
+        assert tags["Name"].endswith(manager.provider.workflow_id)
+        # Provider tags are applied on top via CreateTags.
+        assert tags["TestTag"] == "TestValue"
+
+        subnet_id = manager.create_subnet(
+            cidr_block="10.0.1.0/24", availability_zone="us-east-1a", is_public=True
         )
+        subnet = ec2.describe_subnets(SubnetIds=[subnet_id])["Subnets"][0]
+        assert subnet["VpcId"] == vpc_id
+        assert subnet["MapPublicIpOnLaunch"] is True
+        assert tag_dict(subnet["Tags"])["IsPublic"] == "true"
 
-        # Verify VPC was created
-        ec2_client = moto_session.client("ec2")
-        response = ec2_client.describe_vpcs(VpcIds=[vpc_id])
+        igw_id = manager.create_internet_gateway()
+        igw = ec2.describe_internet_gateways(InternetGatewayIds=[igw_id])[
+            "InternetGateways"
+        ][0]
+        assert [a["VpcId"] for a in igw["Attachments"]] == [vpc_id]
 
-        assert len(response["Vpcs"]) == 1
-        assert response["Vpcs"][0]["VpcId"] == vpc_id
-        assert response["Vpcs"][0]["CidrBlock"] == "10.0.0.0/16"
+        route_table_id = manager.create_route_table(subnet_id, is_public=True)
+        routes = ec2.describe_route_tables(RouteTableIds=[route_table_id])[
+            "RouteTables"
+        ][0]["Routes"]
+        assert any(r.get("GatewayId") == igw_id for r in routes)
 
-        # Create a subnet
-        subnet_id = vpc_manager.create_subnet(
-            vpc_id=vpc_id,
-            cidr_block="10.0.0.0/24",
-            availability_zone=f"{moto_session.region_name}a",
-            tags={"Name": "test-subnet"},
-        )
+        manager.cleanup_network_resources()
 
-        # Verify subnet was created
-        response = ec2_client.describe_subnets(SubnetIds=[subnet_id])
-        assert len(response["Subnets"]) == 1
-        assert response["Subnets"][0]["SubnetId"] == subnet_id
-        assert response["Subnets"][0]["VpcId"] == vpc_id
+        assert manager.vpc_id is None
+        with pytest.raises(ec2.exceptions.ClientError, match="InvalidVpcID.NotFound"):
+            ec2.describe_vpcs(VpcIds=[vpc_id])
+        with pytest.raises(
+            ec2.exceptions.ClientError, match="InvalidSubnetID.NotFound"
+        ):
+            ec2.describe_subnets(SubnetIds=[subnet_id])
 
-        # Delete the subnet
-        vpc_manager.delete_subnet(subnet_id)
+    @mock_aws
+    def test_cleanup_subnet_tolerates_missing_subnet(self, moto_session):
+        """Cleanup is idempotent: an already-deleted subnet is not an error."""
+        manager = VPCManager(make_provider())
+        manager.create_vpc()
+        subnet_id = manager.create_subnet(cidr_block="10.0.1.0/24")
 
-        # Try to describe the subnet (should fail)
-        try:
-            ec2_client.describe_subnets(SubnetIds=[subnet_id])
-            assert False, "Subnet should be deleted"
-        except ec2_client.exceptions.ClientError as e:
-            # Expected error because subnet is deleted
-            assert "InvalidSubnetID.NotFound" in str(e)
+        manager.cleanup_subnet(subnet_id)
+        manager.cleanup_subnet(subnet_id)  # must not raise
 
-        # Delete the VPC
-        vpc_manager.delete_vpc(vpc_id)
-
-        # Try to describe the VPC (should fail)
-        try:
-            ec2_client.describe_vpcs(VpcIds=[vpc_id])
-            assert False, "VPC should be deleted"
-        except ec2_client.exceptions.ClientError as e:
-            # Expected error because VPC is deleted
-            assert "InvalidVpcID.NotFound" in str(e)
+        assert subnet_id not in manager.subnet_ids
 
 
 class TestSecurityGroupWithMoto:
-    """Test SecurityGroupManager with moto mocked AWS."""
+    """``SecurityGroupManager`` manages groups and rules."""
 
-    @mock_ec2
-    def test_security_group_creation_and_deletion(self, moto_session):
-        """Test creating and deleting a security group."""
-        # First create a VPC
-        vpc_manager = VPCManager(session=moto_session, region="us-east-1")
-        vpc_id = vpc_manager.create_vpc(
-            cidr_block="10.0.0.0/16", tags={"Name": "test-vpc"}
+    @mock_aws
+    def test_security_group_lifecycle(self, moto_session):
+        """Create a group, add and revoke a rule, then delete it.
+
+        ``create_security_group`` is ``(vpc_id, name=None, description=None)``
+        positionally on ``vpc_id``, and ingress takes ``cidr_blocks`` (a list),
+        not ``cidr_ip``.
+        """
+        provider = make_provider()
+        vpc_manager = VPCManager(provider)
+        vpc_id = vpc_manager.create_vpc()
+
+        manager = SecurityGroupManager(provider)
+        ec2 = moto_session.client("ec2")
+
+        sg_id = manager.create_security_group(
+            vpc_id, name="test-sg", description="Test security group"
+        )
+        group = ec2.describe_security_groups(GroupIds=[sg_id])["SecurityGroups"][0]
+        assert group["GroupName"] == "test-sg"
+        assert group["VpcId"] == vpc_id
+        assert tag_dict(group["Tags"])[TAG_MANAGED] == "true"
+
+        manager.add_ingress_rule(
+            sg_id, "tcp", 22, 22, cidr_blocks=["10.0.0.0/8"], description="ssh"
+        )
+        permissions = ec2.describe_security_groups(GroupIds=[sg_id])["SecurityGroups"][
+            0
+        ]["IpPermissions"]
+        assert len(permissions) == 1
+        assert permissions[0]["FromPort"] == 22
+        assert permissions[0]["IpRanges"][0]["CidrIp"] == "10.0.0.0/8"
+
+        manager.revoke_ingress_rule(sg_id, "tcp", 22, 22, cidr_blocks=["10.0.0.0/8"])
+        assert (
+            ec2.describe_security_groups(GroupIds=[sg_id])["SecurityGroups"][0][
+                "IpPermissions"
+            ]
+            == []
         )
 
-        # Create a security group manager
-        sg_manager = SecurityGroupManager(session=moto_session, region="us-east-1")
+        manager.delete_security_group(sg_id)
+        with pytest.raises(ec2.exceptions.ClientError, match="InvalidGroup.NotFound"):
+            ec2.describe_security_groups(GroupIds=[sg_id])
 
-        # Create a security group
-        sg_id = sg_manager.create_security_group(
-            name="test-sg",
-            description="Test security group",
-            vpc_id=vpc_id,
-            tags={"Name": "test-sg"},
-        )
+    @mock_aws
+    def test_duplicate_ingress_rule_is_tolerated(self, moto_session):
+        """Re-adding a rule must not raise: the duplicate is benign."""
+        provider = make_provider()
+        vpc_id = VPCManager(provider).create_vpc()
+        manager = SecurityGroupManager(provider)
+        sg_id = manager.create_security_group(vpc_id)
 
-        # Verify security group was created
-        ec2_client = moto_session.client("ec2")
-        response = ec2_client.describe_security_groups(GroupIds=[sg_id])
+        manager.add_ingress_rule(sg_id, "tcp", 443, 443, cidr_blocks=["10.0.0.0/8"])
+        manager.add_ingress_rule(sg_id, "tcp", 443, 443, cidr_blocks=["10.0.0.0/8"])
 
-        assert len(response["SecurityGroups"]) == 1
-        assert response["SecurityGroups"][0]["GroupId"] == sg_id
-        assert response["SecurityGroups"][0]["GroupName"] == "test-sg"
-        assert response["SecurityGroups"][0]["VpcId"] == vpc_id
+    @mock_aws
+    def test_find_workflow_security_groups(self, moto_session):
+        """Groups are discoverable by their workflow tag, for cleanup."""
+        provider = make_provider()
+        vpc_id = VPCManager(provider).create_vpc()
+        manager = SecurityGroupManager(provider)
+        sg_id = manager.create_security_group(vpc_id)
 
-        # Add ingress rules
-        sg_manager.add_ingress_rule(
-            security_group_id=sg_id,
-            ip_protocol="tcp",
-            from_port=22,
-            to_port=22,
-            cidr_ip="0.0.0.0/0",
-        )
-
-        # Verify ingress rule was added
-        response = ec2_client.describe_security_groups(GroupIds=[sg_id])
-        assert len(response["SecurityGroups"][0]["IpPermissions"]) == 1
-
-        # Delete the security group
-        sg_manager.delete_security_group(sg_id)
-
-        # Try to describe the security group (should fail)
-        try:
-            ec2_client.describe_security_groups(GroupIds=[sg_id])
-            assert False, "Security group should be deleted"
-        except ec2_client.exceptions.ClientError as e:
-            # Expected error because security group is deleted
-            assert "InvalidGroup.NotFound" in str(e)
-
-        # Clean up VPC
-        vpc_manager.delete_vpc(vpc_id)
+        assert manager.find_workflow_security_groups() == [sg_id]
 
 
 class TestEC2WithMoto:
-    """Test EC2Manager with moto mocked AWS."""
+    """``EC2Manager`` provisions blocks of instances."""
 
-    @mock_ec2
-    def test_ec2_instance_lifecycle(self, moto_session):
-        """Test EC2 instance creation, status, and termination."""
-        # First create a VPC and subnet
-        vpc_manager = VPCManager(session=moto_session, region="us-east-1")
-        vpc_id = vpc_manager.create_vpc(
-            cidr_block="10.0.0.0/16", tags={"Name": "test-vpc"}
-        )
+    @mock_aws
+    def test_block_lifecycle(self, moto_session):
+        """``create_blocks(count)`` is the whole entry point.
 
-        subnet_id = vpc_manager.create_subnet(
-            vpc_id=vpc_id,
-            cidr_block="10.0.0.0/24",
-            availability_zone=f"{moto_session.region_name}a",
-            tags={"Name": "test-subnet"},
-        )
+        There is no ``create_instance``/``create_instances``: the manager reads
+        the AMI, instance type, and ``nodes_per_block`` off the provider and
+        resolves its own network.
+        """
+        manager = EC2Manager(make_provider(nodes_per_block=2))
+        ec2 = moto_session.client("ec2")
 
-        # Create a security group
-        sg_manager = SecurityGroupManager(session=moto_session, region="us-east-1")
-        sg_id = sg_manager.create_security_group(
-            name="test-sg",
-            description="Test security group",
-            vpc_id=vpc_id,
-            tags={"Name": "test-sg"},
-        )
+        blocks = manager.create_blocks(1)
+        assert len(blocks) == 1
 
-        # Create an EC2 manager
-        ec2_manager = EC2Manager(
-            session=moto_session,
-            region="us-east-1",
-            vpc_id=vpc_id,
-            subnet_id=subnet_id,
-            security_group_id=sg_id,
-        )
+        block_id, block = next(iter(blocks.items()))
+        assert len(block["instance_ids"]) == 2
 
-        # Create test AMI
-        ec2_client = moto_session.client("ec2")
-        ami_response = ec2_client.run_instances(
-            ImageId="ami-12345678",  # This doesn't matter in moto
-            MinCount=1,
-            MaxCount=1,
-            InstanceType="t2.micro",
-        )
-        instance_id = ami_response["Instances"][0]["InstanceId"]
+        instance_id = block["instance_ids"][0]
+        assert manager.get_instance_status(instance_id) == "running"
 
-        # Create AMI from the instance
-        image_response = ec2_client.create_image(
-            InstanceId=instance_id, Name="test-ami"
-        )
-        ami_id = image_response["ImageId"]
+        instance = ec2.describe_instances(InstanceIds=[instance_id])["Reservations"][0][
+            "Instances"
+        ][0]
+        tags = tag_dict(instance["Tags"])
+        assert tags[TAG_MANAGED] == "true"
+        assert tags[TAG_WORKFLOW_ID] == manager.provider.workflow_id
+        # The descriptive Name must survive; while the marker was also keyed
+        # "Name" the marker's "true" overwrote it (#109).
+        assert tags["Name"].startswith("parsl-ephemeral-node-")
 
-        # Create an EC2 instance
-        instance = ec2_manager.create_instance(
-            image_id=ami_id,
-            instance_type="t2.micro",
-            min_count=1,
-            max_count=1,
-            tags={"Name": "test-instance"},
-        )
-
-        # Verify instance was created
-        assert "instance_id" in instance
-        instance_id = instance["instance_id"]
-
-        # Get instance status
-        status = ec2_manager.get_instance_status(instance_id)
-
-        # Moto doesn't perfectly simulate all AWS behavior, but we should get a status
-        assert status in [
-            "pending",
-            "running",
+        manager.terminate_block(block_id)
+        assert manager.get_instance_status(instance_id) in (
             "shutting-down",
             "terminated",
-            "stopping",
-            "stopped",
-        ]
-
-        # Terminate the instance
-        ec2_manager.terminate_instance(instance_id)
-
-        # Clean up
-        sg_manager.delete_security_group(sg_id)
-        vpc_manager.delete_subnet(subnet_id)
-        vpc_manager.delete_vpc(vpc_id)
-
-    @mock_ec2
-    def test_ec2_instance_block(self, moto_session):
-        """Test creating multiple EC2 instances as a block."""
-        # First create a VPC and subnet
-        vpc_manager = VPCManager(session=moto_session, region="us-east-1")
-        vpc_id = vpc_manager.create_vpc(
-            cidr_block="10.0.0.0/16", tags={"Name": "test-vpc"}
         )
 
-        subnet_id = vpc_manager.create_subnet(
-            vpc_id=vpc_id,
-            cidr_block="10.0.0.0/24",
-            availability_zone=f"{moto_session.region_name}a",
-            tags={"Name": "test-subnet"},
-        )
+    @mock_aws
+    def test_spot_instances_are_requested_when_configured(self, moto_session):
+        """``use_spot_instances`` routes through the spot request path."""
+        manager = EC2Manager(make_provider(use_spot_instances=True))
+        ec2 = moto_session.client("ec2")
 
-        # Create a security group
-        sg_manager = SecurityGroupManager(session=moto_session, region="us-east-1")
-        sg_id = sg_manager.create_security_group(
-            name="test-sg",
-            description="Test security group",
-            vpc_id=vpc_id,
-            tags={"Name": "test-sg"},
-        )
+        manager.create_blocks(1)
 
-        # Create an EC2 manager
-        ec2_manager = EC2Manager(
-            session=moto_session,
-            region="us-east-1",
-            vpc_id=vpc_id,
-            subnet_id=subnet_id,
-            security_group_id=sg_id,
-        )
-
-        # Create test AMI
-        ec2_client = moto_session.client("ec2")
-        ami_response = ec2_client.run_instances(
-            ImageId="ami-12345678",  # This doesn't matter in moto
-            MinCount=1,
-            MaxCount=1,
-            InstanceType="t2.micro",
-        )
-        instance_id = ami_response["Instances"][0]["InstanceId"]
-
-        # Create AMI from the instance
-        image_response = ec2_client.create_image(
-            InstanceId=instance_id, Name="test-ami"
-        )
-        ami_id = image_response["ImageId"]
-
-        # Create a block of EC2 instances (2 instances)
-        instances = ec2_manager.create_instances(
-            image_id=ami_id,
-            instance_type="t2.micro",
-            count=2,
-            tags={"Name": "test-instance-block"},
-        )
-
-        # Verify instances were created
-        assert len(instances) == 2
-        for instance in instances:
-            assert "instance_id" in instance
-
-        # Clean up
-        for instance in instances:
-            ec2_manager.terminate_instance(instance["instance_id"])
-
-        sg_manager.delete_security_group(sg_id)
-        vpc_manager.delete_subnet(subnet_id)
-        vpc_manager.delete_vpc(vpc_id)
-
-
-class TestParameterStoreWithMoto:
-    """Test ParameterStoreState with moto mocked AWS."""
-
-    @mock_ssm
-    def test_parameter_store_lifecycle(self, moto_session):
-        """Test saving, loading, and deleting state in Parameter Store."""
-        # Create a mock provider
-        mock_provider = type(
-            "MockProvider",
-            (),
-            {
-                "workflow_id": f"test-workflow-{uuid.uuid4().hex[:8]}",
-                "region": "us-east-1",
-                "aws_access_key_id": None,
-                "aws_secret_access_key": None,
-                "aws_session_token": None,
-                "aws_profile": None,
-            },
-        )
-
-        # Create a parameter store state
-        prefix = f"/parsl/test/{uuid.uuid4().hex[:8]}"
-        param_store = ParameterStoreState(provider=mock_provider, prefix=prefix)
-
-        # Save a test state
-        test_state_key = "test-state"
-        test_state = {
-            "provider_info": {"id": "test-provider", "region": "us-east-1"},
-            "resources": {"resource-1": {"id": "r-1", "status": "running"}},
-        }
-
-        param_store.save_state(test_state_key, test_state)
-
-        # Load the state
-        loaded_state = param_store.load_state(test_state_key)
-
-        # Verify state was saved and loaded correctly
-        assert loaded_state is not None
-        assert loaded_state["provider_info"]["id"] == test_state["provider_info"]["id"]
-        assert (
-            loaded_state["resources"]["resource-1"]["id"]
-            == test_state["resources"]["resource-1"]["id"]
-        )
-
-        # List states
-        states = param_store.list_states("")
-        assert len(states) >= 1
-        assert any(k.endswith(test_state_key) for k in states.keys())
-
-        # Delete the state
-        param_store.delete_state(test_state_key)
-
-        # Verify state was deleted
-        loaded_state = param_store.load_state(test_state_key)
-        assert loaded_state is None
-
-
-class TestS3StateWithMoto:
-    """Test S3State with moto mocked AWS."""
-
-    @mock_s3
-    def test_s3_state_lifecycle(self, moto_session):
-        """Test saving, loading, and deleting state in S3."""
-        # Create a mock provider
-        mock_provider = type(
-            "MockProvider",
-            (),
-            {
-                "workflow_id": f"test-workflow-{uuid.uuid4().hex[:8]}",
-                "region": "us-east-1",
-                "aws_access_key_id": None,
-                "aws_secret_access_key": None,
-                "aws_session_token": None,
-                "aws_profile": None,
-            },
-        )
-
-        # Create a bucket
-        bucket_name = f"test-bucket-{uuid.uuid4().hex[:8]}"
-        s3_client = moto_session.client("s3")
-        s3_client.create_bucket(Bucket=bucket_name)
-
-        # Create an S3 state
-        key_prefix = f"parsl/test/{uuid.uuid4().hex[:8]}"
-        s3_state = S3State(
-            provider=mock_provider, bucket_name=bucket_name, key_prefix=key_prefix
-        )
-
-        # Save a test state
-        test_state_key = "test-state"
-        test_state = {
-            "provider_info": {"id": "test-provider", "region": "us-east-1"},
-            "resources": {"resource-1": {"id": "r-1", "status": "running"}},
-        }
-
-        s3_state.save_state(test_state_key, test_state)
-
-        # Load the state
-        loaded_state = s3_state.load_state(test_state_key)
-
-        # Verify state was saved and loaded correctly
-        assert loaded_state is not None
-        assert loaded_state["provider_info"]["id"] == test_state["provider_info"]["id"]
-        assert (
-            loaded_state["resources"]["resource-1"]["id"]
-            == test_state["resources"]["resource-1"]["id"]
-        )
-
-        # List states
-        states = s3_state.list_states("")
-        assert len(states) >= 1
-        assert any(k.endswith(test_state_key) for k in states.keys())
-
-        # Delete the state
-        s3_state.delete_state(test_state_key)
-
-        # Verify state was deleted
-        loaded_state = s3_state.load_state(test_state_key)
-        assert loaded_state is None
-
-
-class TestLambdaWithMoto:
-    """Test LambdaManager with moto mocked AWS."""
-
-    @mock_lambda
-    @mock_iam
-    def test_lambda_function_lifecycle(self, moto_session):
-        """Test Lambda function creation, invocation, and deletion."""
-        # Create IAM role for Lambda
-        iam_client = moto_session.client("iam")
-        role_name = f"lambda-test-role-{uuid.uuid4().hex[:8]}"
-
-        assume_role_policy = {
-            "Version": "2012-10-17",
-            "Statement": [
-                {
-                    "Effect": "Allow",
-                    "Principal": {"Service": "lambda.amazonaws.com"},
-                    "Action": "sts:AssumeRole",
-                }
-            ],
-        }
-
-        role_response = iam_client.create_role(
-            RoleName=role_name, AssumeRolePolicyDocument=json.dumps(assume_role_policy)
-        )
-
-        role_arn = role_response["Role"]["Arn"]
-
-        # Create a Lambda manager
-        lambda_manager = LambdaManager(session=moto_session, region="us-east-1")
-
-        # Prepare Lambda function
-        function_name = f"test-function-{uuid.uuid4().hex[:8]}"
-        handler = "index.handler"
-        runtime = "python3.8"
-        memory_size = 128
-        timeout = 30
-        code_content = """
-def handler(event, context):
-    return {
-        'statusCode': 200,
-        'body': 'Hello from Lambda!'
-    }
-"""
-
-        # Mock lambda code generation
-        with patch.object(
-            lambda_manager, "_generate_lambda_code", return_value=b"dummy_code"
-        ):
-            # Create Lambda function
-            function = lambda_manager.create_lambda_function(
-                function_name=function_name,
-                handler=handler,
-                runtime=runtime,
-                role=role_arn,
-                memory_size=memory_size,
-                timeout=timeout,
-                code_content=code_content,
-            )
-
-        # Verify function was created
-        assert function["FunctionName"] == function_name
-
-        # Invoke Lambda function
-        with patch.object(lambda_manager.lambda_client, "invoke") as mock_invoke:
-            mock_invoke.return_value = {
-                "StatusCode": 200,
-                "Payload": MagicMock(
-                    read=lambda: json.dumps(
-                        {"statusCode": 200, "body": "Hello from Lambda!"}
-                    ).encode()
-                ),
-            }
-
-            response = lambda_manager.invoke_lambda_function(
-                function_name=function_name, payload={"key": "value"}
-            )
-
-        # Verify invocation response
-        assert response["statusCode"] == 200
-        assert "Hello from Lambda!" in response["body"]
-
-        # Delete Lambda function
-        lambda_manager.delete_lambda_function(function_name)
-
-        # Verify function was deleted
-        try:
-            lambda_client = moto_session.client("lambda")
-            lambda_client.get_function(FunctionName=function_name)
-            assert False, "Lambda function should be deleted"
-        except lambda_client.exceptions.ResourceNotFoundException:
-            # Expected error because function is deleted
-            pass
-
-        # Clean up IAM role
-        iam_client.delete_role(RoleName=role_name)
-
-
-class TestECSWithMoto:
-    """Test ECSManager with moto mocked AWS."""
-
-    @mock_ecs
-    def test_ecs_cluster_lifecycle(self, moto_session):
-        """Test ECS cluster creation and deletion."""
-        # Create an ECS manager
-        ecs_manager = ECSManager(
-            session=moto_session,
-            region="us-east-1",
-            vpc_id="vpc-12345",  # Dummy values for network resources
-            subnet_id="subnet-12345",
-            security_group_id="sg-12345",
-        )
-
-        # Create an ECS cluster
-        cluster_name = f"test-cluster-{uuid.uuid4().hex[:8]}"
-        cluster_arn = ecs_manager.create_cluster(cluster_name)
-
-        # Verify cluster was created
-        ecs_client = moto_session.client("ecs")
-        response = ecs_client.describe_clusters(clusters=[cluster_name])
-
-        assert len(response["clusters"]) == 1
-        assert response["clusters"][0]["clusterName"] == cluster_name
-        assert response["clusters"][0]["status"] == "ACTIVE"
-
-        # Delete the cluster
-        ecs_manager.delete_cluster(cluster_name)
-
-        # Verify cluster was deleted
-        response = ecs_client.describe_clusters(clusters=[cluster_name])
-        assert (
-            len(response["clusters"]) == 0
-            or response["clusters"][0]["status"] == "INACTIVE"
-        )
-
-    @mock_ecs
-    def test_ecs_task_definition(self, moto_session):
-        """Test ECS task definition registration and deregistration."""
-        # Create an ECS manager
-        ecs_manager = ECSManager(
-            session=moto_session,
-            region="us-east-1",
-            vpc_id="vpc-12345",  # Dummy values for network resources
-            subnet_id="subnet-12345",
-            security_group_id="sg-12345",
-        )
-
-        # Create a task definition
-        family = f"test-task-{uuid.uuid4().hex[:8]}"
-        container_definitions = [
-            {
-                "name": "test-container",
-                "image": "amazon/amazon-ecs-sample",
-                "cpu": 256,
-                "memory": 512,
-                "essential": True,
-            }
-        ]
-
-        task_definition_arn = ecs_manager.register_task_definition(
-            family=family,
-            container_definitions=container_definitions,
-            cpu="256",
-            memory="512",
-        )
-
-        # Verify task definition was registered
-        ecs_client = moto_session.client("ecs")
-        response = ecs_client.describe_task_definition(taskDefinition=family)
-
-        assert response["taskDefinition"]["family"] == family
-        assert len(response["taskDefinition"]["containerDefinitions"]) == 1
-        assert (
-            response["taskDefinition"]["containerDefinitions"][0]["name"]
-            == "test-container"
-        )
-
-        # Deregister task definition
-        ecs_manager.deregister_task_definition(task_definition_arn)
-
-        # Moto doesn't properly support deregistering task definitions, so we can't verify deletion
+        requests = ec2.describe_spot_instance_requests()["SpotInstanceRequests"]
+        assert len(requests) == 1
 
 
 class TestSpotFleetWithMoto:
-    """Test SpotFleetManager with moto mocked AWS."""
+    """``SpotFleetManager`` requests fleets against pre-provisioned network."""
 
-    @mock_ec2
-    @mock_iam
-    def test_spot_fleet_request_lifecycle(self, moto_session):
-        """Test spot fleet request creation and cancellation."""
-        # First create a VPC and subnet
-        vpc_manager = VPCManager(session=moto_session, region="us-east-1")
-        vpc_id = vpc_manager.create_vpc(
-            cidr_block="10.0.0.0/16", tags={"Name": "test-vpc"}
+    @mock_aws
+    def test_fleet_block_lifecycle(self, moto_session):
+        """``create_blocks`` requests the fleet; ``terminate_block`` cancels it.
+
+        The public surface is ``create_blocks``/``get_block_status``/
+        ``terminate_block``, not ``request_spot_fleet``/
+        ``get_spot_fleet_request_status``/``cancel_spot_fleet_request``.
+        ``time.sleep`` is patched out because ``_get_iam_fleet_role`` sleeps 10s
+        for IAM propagation.
+        """
+        vpc_id, subnet_id, sg_id = provision_network(moto_session)
+        manager = SpotFleetManager(
+            make_provider(vpc_id=vpc_id, subnet_id=subnet_id, security_group_id=sg_id)
         )
+        ec2 = moto_session.client("ec2")
 
-        subnet_id = vpc_manager.create_subnet(
-            vpc_id=vpc_id,
-            cidr_block="10.0.0.0/24",
-            availability_zone=f"{moto_session.region_name}a",
-            tags={"Name": "test-subnet"},
-        )
+        with patch("parsl_ephemeral_aws.compute.spot_fleet.time.sleep"):
+            blocks = manager.create_blocks(1)
 
-        # Create a security group
-        sg_manager = SecurityGroupManager(session=moto_session, region="us-east-1")
-        sg_id = sg_manager.create_security_group(
-            name="test-sg",
-            description="Test security group",
-            vpc_id=vpc_id,
-            tags={"Name": "test-sg"},
-        )
+        block_id, block = next(iter(blocks.items()))
+        fleet_request_id = block["fleet_request_id"]
 
-        # Create IAM role for Spot Fleet
-        iam_client = moto_session.client("iam")
-        role_name = f"spot-fleet-role-{uuid.uuid4().hex[:8]}"
+        config = ec2.describe_spot_fleet_requests(
+            SpotFleetRequestIds=[fleet_request_id]
+        )["SpotFleetRequestConfigs"][0]
+        assert config["SpotFleetRequestState"] == "active"
+        assert manager.get_block_status(block_id) in ("PENDING", "RUNNING")
 
-        assume_role_policy = {
-            "Version": "2012-10-17",
-            "Statement": [
-                {
-                    "Effect": "Allow",
-                    "Principal": {"Service": "spotfleet.amazonaws.com"},
-                    "Action": "sts:AssumeRole",
-                }
-            ],
+        # The fleet role was created and the managed policy attached -- the whole
+        # reason MOTO_IAM_LOAD_MANAGED_POLICIES has to be set.
+        iam = moto_session.client("iam")
+        role_name = manager.iam_fleet_role_arn.split("/")[-1]
+        attached = iam.list_attached_role_policies(RoleName=role_name)[
+            "AttachedPolicies"
+        ]
+        assert any("SpotFleet" in p["PolicyName"] for p in attached)
+
+        manager.terminate_block(block_id)
+        assert manager.blocks[block_id]["status"] == STATUS_CANCELLED
+
+    @mock_aws
+    def test_missing_network_is_rejected(self, moto_session):
+        """Without pre-provisioned IDs the manager refuses to create blocks."""
+        from parsl_ephemeral_aws.exceptions import ResourceCreationError
+
+        manager = SpotFleetManager(make_provider())
+
+        with pytest.raises(ResourceCreationError, match="pre-provisioned"):
+            manager.create_blocks(1)
+
+
+class TestLambdaWithMoto:
+    """``LambdaManager`` creates and deletes functions and their roles."""
+
+    @mock_aws
+    def test_function_and_role_lifecycle(self, moto_session):
+        """``_create_lambda_function`` then ``cleanup_all_resources``.
+
+        There is no ``create_lambda_function``/``delete_lambda_function``; the
+        public surface is ``submit_job``/``get_job_status``/
+        ``cleanup_all_resources``. ``submit_job`` cannot run under moto -- moto
+        *executes* the packaged handler, so an async invoke returns a
+        ``FunctionError`` -- so the creation half is driven directly.
+        """
+        manager = LambdaManager(make_provider())
+        lambda_client = moto_session.client("lambda")
+        iam = moto_session.client("iam")
+
+        function_name = manager._create_lambda_function("job-1", "echo hello")
+
+        function = lambda_client.get_function(FunctionName=function_name)
+        assert function["Configuration"]["MemorySize"] == 1024
+        assert function["Configuration"]["Timeout"] == 300
+        assert function["Tags"][TAG_MANAGED] == "true"
+        assert function["Tags"][TAG_WORKFLOW_ID] == manager.provider.workflow_id
+
+        # The execution role carries the AWS-managed basic execution policy.
+        (role_name,) = manager.role_names
+        attached = iam.list_attached_role_policies(RoleName=role_name)[
+            "AttachedPolicies"
+        ]
+        assert [p["PolicyName"] for p in attached] == ["AWSLambdaBasicExecutionRole"]
+
+        manager.cleanup_all_resources()
+
+        assert manager.function_names == set()
+        assert manager.role_names == set()
+        with pytest.raises(lambda_client.exceptions.ResourceNotFoundException):
+            lambda_client.get_function(FunctionName=function_name)
+
+    @mock_aws
+    def test_execution_role_creation_is_idempotent(self, moto_session):
+        """Two calls reuse one role rather than failing on EntityAlreadyExists."""
+        manager = LambdaManager(make_provider())
+
+        first = manager._create_lambda_execution_role()
+        second = manager._create_lambda_execution_role()
+
+        assert first == second
+        assert len(manager.role_names) == 1
+
+    @mock_aws
+    def test_timed_out_job_reaches_a_terminal_status(self, moto_session):
+        """A job past its timeout must not be stuck reporting UNKNOWN (#111).
+
+        The timeout branch interpolated a ``job_id`` that is not in scope, so it
+        raised ``NameError``, which the blanket ``except`` converted to
+        ``"UNKNOWN"`` -- a non-terminal status, so the job was polled forever and
+        its stored status never advanced.
+        """
+        import time
+
+        manager = LambdaManager(make_provider(lambda_timeout=1))
+        manager.jobs["job-1"] = {
+            "id": "job-1",
+            "function_name": "fn",
+            "request_id": "rid",
+            "status": "PENDING",
+            "submitted_at": time.time() - 3600,
         }
 
-        role_response = iam_client.create_role(
-            RoleName=role_name, AssumeRolePolicyDocument=json.dumps(assume_role_policy)
-        )
+        assert manager.get_job_status("fn", "rid") == "COMPLETED"
+        assert manager.jobs["job-1"]["status"] == "COMPLETED"
 
-        role_arn = role_response["Role"]["Arn"]
 
-        # Attach necessary policies
-        policy_arn = (
-            "arn:aws:iam::aws:policy/service-role/AmazonEC2SpotFleetTaggingRole"
-        )
-        try:
-            iam_client.attach_role_policy(RoleName=role_name, PolicyArn=policy_arn)
-        except iam_client.exceptions.NoSuchEntityException:
-            # Moto might not have this policy, so we'll create it
-            policy_document = {
-                "Version": "2012-10-17",
-                "Statement": [
-                    {
-                        "Effect": "Allow",
-                        "Action": [
-                            "ec2:CreateTags",
-                            "ec2:DescribeTags",
-                            "ec2:DescribeInstances",
-                            "ec2:TerminateInstances",
-                            "ec2:RequestSpotInstances",
-                            "ec2:CancelSpotInstanceRequests",
-                            "ec2:DescribeSpotInstanceRequests",
-                        ],
-                        "Resource": "*",
-                    }
-                ],
-            }
+class TestECSWithMoto:
+    """``ECSManager`` sets up the cluster, task definition, and network."""
 
-            iam_client.put_role_policy(
-                RoleName=role_name,
-                PolicyName="SpotFleetTaggingPolicy",
-                PolicyDocument=json.dumps(policy_document),
+    @mock_aws
+    def test_cluster_is_created_during_init(self, moto_session):
+        """``__init__`` calls ``_get_or_create_cluster``; there is no
+        ``create_cluster``/``delete_cluster``."""
+        vpc_id, subnet_id, _ = provision_network(moto_session)
+        manager = ECSManager(make_provider(vpc_id=vpc_id, subnet_id=subnet_id))
+        ecs = moto_session.client("ecs")
+
+        cluster = ecs.describe_clusters(clusters=[manager.cluster_name])["clusters"][0]
+        assert cluster["status"] == "ACTIVE"
+        assert manager.cluster_name in manager.clusters
+
+        # A second manager on the same workflow adopts the existing cluster.
+        again = ECSManager(
+            make_provider(
+                workflow_id=manager.provider.workflow_id,
+                vpc_id=vpc_id,
+                subnet_id=subnet_id,
             )
-
-        # Create test AMI
-        ec2_client = moto_session.client("ec2")
-        ami_response = ec2_client.run_instances(
-            ImageId="ami-12345678",  # This doesn't matter in moto
-            MinCount=1,
-            MaxCount=1,
-            InstanceType="t2.micro",
         )
-        instance_id = ami_response["Instances"][0]["InstanceId"]
+        assert again.cluster_name == manager.cluster_name
 
-        # Create AMI from the instance
-        image_response = ec2_client.create_image(
-            InstanceId=instance_id, Name="test-ami"
-        )
-        ami_id = image_response["ImageId"]
+    @mock_aws
+    def test_task_definition_registration(self, moto_session):
+        """``_register_task_definition(job_id, command)`` builds the Fargate
+        task; there is no ``register_task_definition(family=, ...)``."""
+        vpc_id, subnet_id, _ = provision_network(moto_session)
+        manager = ECSManager(make_provider(vpc_id=vpc_id, subnet_id=subnet_id))
+        ecs = moto_session.client("ecs")
+        logs = moto_session.client("logs")
 
-        # Create a SpotFleetManager
-        spot_fleet_manager = SpotFleetManager(
-            session=moto_session,
-            region="us-east-1",
-            vpc_id=vpc_id,
-            subnet_id=subnet_id,
-            security_group_id=sg_id,
-            iam_fleet_role=role_arn,
-        )
+        task_definition_arn = manager._register_task_definition("job-1", "echo hello")
 
-        # Define launch specification
-        launch_specification = {
-            "ImageId": ami_id,
-            "InstanceType": "t2.micro",
-            "SubnetId": subnet_id,
-            "SecurityGroupIds": [sg_id],
-            "TagSpecifications": [
-                {
-                    "ResourceType": "instance",
-                    "Tags": [{"Key": "Name", "Value": "test-spot-instance"}],
-                }
-            ],
-        }
+        task_definition = ecs.describe_task_definition(
+            taskDefinition=task_definition_arn
+        )["taskDefinition"]
+        assert task_definition["networkMode"] == "awsvpc"
+        assert task_definition["requiresCompatibilities"] == ["FARGATE"]
 
-        # Mock the spot fleet request creation since Moto's implementation is limited
-        with patch.object(
-            spot_fleet_manager.ec2_client, "request_spot_fleet"
-        ) as mock_request:
-            request_id = f"sfr-{uuid.uuid4().hex[:8]}"
-            mock_request.return_value = {"SpotFleetRequestId": request_id}
+        (container,) = task_definition["containerDefinitions"]
+        assert container["command"] == ["/bin/sh", "-c", "echo hello"]
+        assert container["cpu"] == 1024
+        assert container["memory"] == 2048
 
-            # Create spot fleet request
-            spot_fleet_request_id = spot_fleet_manager.request_spot_fleet(
-                target_capacity=2,
-                valid_until=None,  # Use default future time
-                allocation_strategy="lowestPrice",
-                instance_interruption_behavior="terminate",
-                launch_specifications=[launch_specification],
-            )
+        # The log group is created ahead of the task: Fargate tasks fail
+        # immediately if the awslogs driver cannot write.
+        log_group_name = container["logConfiguration"]["options"]["awslogs-group"]
+        assert log_group_name in manager.log_groups
+        assert [
+            g["logGroupName"]
+            for g in logs.describe_log_groups(logGroupNamePrefix=log_group_name)[
+                "logGroups"
+            ]
+        ] == [log_group_name]
 
-        assert spot_fleet_request_id is not None
+    @mock_aws
+    def test_network_resolution_honours_supplied_ids(self, moto_session):
+        """The caller's VPC and subnet are used verbatim; the SG is created."""
+        vpc_id, subnet_id, _ = provision_network(moto_session)
+        manager = ECSManager(make_provider(vpc_id=vpc_id, subnet_id=subnet_id))
+        ec2 = moto_session.client("ec2")
 
-        # Mock describe spot fleet requests
-        with patch.object(
-            spot_fleet_manager.ec2_client, "describe_spot_fleet_requests"
-        ) as mock_describe:
-            mock_describe.return_value = {
-                "SpotFleetRequestConfigs": [
-                    {
-                        "SpotFleetRequestId": spot_fleet_request_id,
-                        "SpotFleetRequestState": "active",
-                        "ActivityStatus": "fulfilled",
-                    }
-                ]
-            }
+        network = manager._get_or_create_network_resources()
 
-            # Check status
-            status = spot_fleet_manager.get_spot_fleet_request_status(
-                spot_fleet_request_id
-            )
-            assert status == "active"
+        assert network["vpc_id"] == vpc_id
+        assert network["subnet_ids"] == [subnet_id]
 
-        # Mock cancel spot fleet request
-        with patch.object(
-            spot_fleet_manager.ec2_client, "cancel_spot_fleet_requests"
-        ) as mock_cancel:
-            mock_cancel.return_value = {
-                "SuccessfulFleetRequests": [
-                    {
-                        "SpotFleetRequestId": spot_fleet_request_id,
-                        "CurrentSpotFleetRequestState": "cancelled_terminating",
-                        "PreviousSpotFleetRequestState": "active",
-                    }
-                ],
-                "UnsuccessfulFleetRequests": [],
-            }
-
-            # Cancel spot fleet request
-            cancelled = spot_fleet_manager.cancel_spot_fleet_request(
-                spot_fleet_request_id, terminate_instances=True
-            )
-            assert cancelled is True
-
-        # Clean up
-        iam_client.delete_role_policy(
-            RoleName=role_name, PolicyName="SpotFleetTaggingPolicy"
-        )
-        iam_client.delete_role(RoleName=role_name)
-        sg_manager.delete_security_group(sg_id)
-        vpc_manager.delete_subnet(subnet_id)
-        vpc_manager.delete_vpc(vpc_id)
-
-
-class TestServerlessModeWithMoto:
-    """Test ServerlessMode with moto mocked AWS."""
-
-    @pytest.mark.xfail(reason="ServerlessMode requires more complex mocking")
-    @mock_lambda
-    @mock_ecs
-    @mock_ec2
-    @mock_iam
-    def test_serverless_mode_initialization(self, moto_session):
-        """Test ServerlessMode initialization."""
-        # Mock the provider
-        mock_provider = type(
-            "MockProvider",
-            (),
+        group = ec2.describe_security_groups(GroupIds=[network["security_group_id"]])[
+            "SecurityGroups"
+        ][0]
+        assert group["VpcId"] == vpc_id
+        # EC2 attaches allow-all-outbound itself; re-authorizing it raises
+        # InvalidPermission.Duplicate and used to abort this branch (#110).
+        assert group["IpPermissionsEgress"] == [
             {
-                "workflow_id": f"test-workflow-{uuid.uuid4().hex[:8]}",
-                "region": "us-east-1",
-                "aws_access_key_id": None,
-                "aws_secret_access_key": None,
-                "aws_session_token": None,
-                "aws_profile": None,
-                "label": "test-provider",
-                "engine": MagicMock(),
-                "session": moto_session,
-            },
+                "IpProtocol": "-1",
+                "IpRanges": [{"CidrIp": "0.0.0.0/0"}],
+                "Ipv6Ranges": [],
+                "PrefixListIds": [],
+                "UserIdGroupPairs": [],
+            }
+        ]
+
+    @mock_aws
+    def test_cleanup_removes_cluster_and_role(self, moto_session):
+        """Cleanup drops the cluster, task definitions, and execution role."""
+        vpc_id, subnet_id, _ = provision_network(moto_session)
+        manager = ECSManager(make_provider(vpc_id=vpc_id, subnet_id=subnet_id))
+        ecs = moto_session.client("ecs")
+        cluster_name = manager.cluster_name
+
+        manager._register_task_definition("job-1", "echo hello")
+        manager.cleanup_all_resources()
+
+        clusters = ecs.describe_clusters(clusters=[cluster_name])["clusters"]
+        assert not clusters or clusters[0]["status"] == "INACTIVE"
+        assert manager.role_names == set()
+
+
+class TestParameterStoreWithMoto:
+    """``ParameterStoreState`` round-trips keyed state documents."""
+
+    @mock_aws
+    def test_parameter_store_lifecycle(self, moto_session):
+        """Save, load, list, and delete a keyed state document."""
+        provider = make_provider()
+        prefix = f"/parsl/test/{uuid.uuid4().hex[:8]}"
+        store = ParameterStoreState(provider=provider, prefix=prefix)
+
+        state = {
+            "provider_info": {"id": "test-provider", "region": "us-east-1"},
+            "resources": {"resource-1": {"id": "r-1", "status": "running"}},
+        }
+
+        store.save_state("test-state", state)
+
+        assert store.load_state("test-state") == state
+
+        states = store.list_states("")
+        assert any(key.endswith("test-state") for key in states)
+
+        store.delete_state("test-state")
+        assert store.load_state("test-state") is None
+
+    @mock_aws
+    def test_keys_are_namespaced(self, moto_session):
+        """Two keys are separate documents, not one clobbering the other.
+
+        The provider writes ``"provider"`` and the operating mode writes
+        ``"mode"``; before the state layer was keyed both went to the same slot
+        and each full overwrite destroyed the other's fields.
+        """
+        store = ParameterStoreState(
+            provider=make_provider(), prefix=f"/parsl/test/{uuid.uuid4().hex[:8]}"
         )
 
-        # Mock Lambda and ECS managers with patches
-        with patch(
-            "parsl_ephemeral_aws.compute.lambda_func.LambdaManager"
-        ) as mock_lambda_manager, patch(
-            "parsl_ephemeral_aws.compute.ecs.ECSManager"
-        ) as mock_ecs_manager, patch(
-            "parsl_ephemeral_aws.network.vpc.VPCManager"
-        ) as mock_vpc_manager, patch(
-            "parsl_ephemeral_aws.network.security.SecurityGroupManager"
-        ) as mock_sg_manager:
-            # Create mock manager instances
-            mock_lambda_manager.return_value.create_lambda_function.return_value = {
-                "FunctionName": "test-function"
-            }
-            mock_ecs_manager.return_value.create_cluster.return_value = (
-                "test-cluster-arn"
-            )
-            mock_vpc_manager.return_value.create_vpc.return_value = "vpc-12345"
-            mock_vpc_manager.return_value.create_subnet.return_value = "subnet-12345"
-            mock_sg_manager.return_value.create_security_group.return_value = "sg-12345"
+        store.save_state("provider", {"job_map": {"job-1": "block-1"}})
+        store.save_state("mode", {"baked_ami_id": "ami-baked"})
 
-            # Initialize ServerlessMode
-            config = {
-                "region": "us-east-1",
-                "serverless": {
-                    "lambda": {"memory_size": 128, "timeout": 30},
-                    "ecs": {"cpu": "256", "memory": "512"},
-                },
-            }
+        assert store.load_state("provider") == {"job_map": {"job-1": "block-1"}}
+        assert store.load_state("mode") == {"baked_ami_id": "ami-baked"}
 
-            mode = ServerlessMode(
-                provider=mock_provider, label="test-serverless", config=config
-            )
 
-            # Verify managers were created
-            assert mode.lambda_manager is not None
-            assert mode.ecs_manager is not None
+class TestS3StateWithMoto:
+    """``S3State`` round-trips keyed state documents."""
+
+    @mock_aws
+    def test_s3_state_lifecycle(self, moto_session):
+        """Save, load, list, and delete a keyed state document."""
+        bucket_name = f"test-bucket-{uuid.uuid4().hex[:8]}"
+        moto_session.client("s3").create_bucket(Bucket=bucket_name)
+
+        store = S3State(
+            provider=make_provider(),
+            bucket_name=bucket_name,
+            key_prefix=f"parsl/test/{uuid.uuid4().hex[:8]}",
+        )
+
+        state = {
+            "provider_info": {"id": "test-provider", "region": "us-east-1"},
+            "resources": {"resource-1": {"id": "r-1", "status": "running"}},
+        }
+
+        store.save_state("test-state", state)
+
+        assert store.load_state("test-state") == state
+
+        states = store.list_states("")
+        assert any(key.endswith("test-state") for key in states)
+
+        store.delete_state("test-state")
+        assert store.load_state("test-state") is None
+
+    @mock_aws
+    def test_bucket_is_created_when_requested(self, moto_session):
+        """``create_bucket_if_not_exists`` provisions a missing bucket."""
+        bucket_name = f"test-bucket-{uuid.uuid4().hex[:8]}"
+
+        store = S3State(
+            provider=make_provider(),
+            bucket_name=bucket_name,
+            create_bucket_if_not_exists=True,
+        )
+        store.save_state("test-state", {"ok": True})
+
+        s3 = moto_session.client("s3")
+        assert bucket_name in [b["Name"] for b in s3.list_buckets()["Buckets"]]
 
 
 class TestCloudFormationWithMoto:
-    """Test CloudFormation operations with moto mocked AWS."""
+    """CloudFormation is the substrate for detached and serverless modes."""
 
-    @mock_cloudformation
-    def test_cloudformation_stack_lifecycle(self, moto_session):
-        """Test CloudFormation stack creation and deletion."""
-        # Create CloudFormation client
-        cf_client = moto_session.client("cloudformation")
+    @mock_aws
+    def test_stack_lifecycle(self, moto_session):
+        """A stack can be created, described, and deleted.
 
-        # Define a simple CloudFormation template
+        Note this needs ``openapi-spec-validator``: moto's CloudFormation parser
+        imports its API Gateway backend, which imports that package
+        unconditionally. Without it every CloudFormation call raises
+        ``ModuleNotFoundError`` -- which is why it is a declared test dependency
+        rather than something moto pulls in.
+        """
+        cf = moto_session.client("cloudformation")
+        s3 = moto_session.client("s3")
+        stack_name = f"test-stack-{uuid.uuid4().hex[:8]}"
+        bucket_name = f"cf-bucket-{uuid.uuid4().hex[:8]}"
         template = {
             "AWSTemplateFormatVersion": "2010-09-09",
             "Resources": {
                 "TestBucket": {
                     "Type": "AWS::S3::Bucket",
-                    "Properties": {"BucketName": f"test-bucket-{uuid.uuid4().hex[:8]}"},
+                    "Properties": {"BucketName": bucket_name},
                 }
             },
             "Outputs": {"BucketName": {"Value": {"Ref": "TestBucket"}}},
         }
 
-        # Create stack
-        stack_name = f"test-stack-{uuid.uuid4().hex[:8]}"
-        response = cf_client.create_stack(
+        stack_id = cf.create_stack(
             StackName=stack_name,
             TemplateBody=json.dumps(template),
             Capabilities=["CAPABILITY_IAM"],
+        )["StackId"]
+
+        stack = cf.describe_stacks(StackName=stack_name)["Stacks"][0]
+        assert stack["StackName"] == stack_name
+        assert stack["StackStatus"] == "CREATE_COMPLETE"
+        assert stack["Outputs"] == [
+            {"OutputKey": "BucketName", "OutputValue": bucket_name}
+        ]
+        # The templated resource really exists, not just the stack record.
+        assert bucket_name in [b["Name"] for b in s3.list_buckets()["Buckets"]]
+
+        cf.delete_stack(StackName=stack_name)
+
+        # A deleted stack is addressable only by ID -- by name it is gone, on
+        # real AWS and under moto alike.
+        assert (
+            cf.describe_stacks(StackName=stack_id)["Stacks"][0]["StackStatus"]
+            == "DELETE_COMPLETE"
         )
+        with pytest.raises(cf.exceptions.ClientError, match="does not exist"):
+            cf.describe_stacks(StackName=stack_name)
 
-        # Verify stack was created
-        assert "StackId" in response
 
-        # Describe stack
-        response = cf_client.describe_stacks(StackName=stack_name)
+def test_moto_is_installed_and_serves_managed_policies():
+    """A canary for the guard this file used to carry.
 
-        assert len(response["Stacks"]) == 1
-        assert response["Stacks"][0]["StackName"] == stack_name
-
-        # Due to limitations in moto, we won't be able to fully test outputs
-        # But we can test basic functionality
-
-        # Delete stack
-        cf_client.delete_stack(StackName=stack_name)
-
-        # Verify stack was deleted
-        # Note: Moto's CloudFormation implementation doesn't fully support stack deletion
-        # so we can't verify deletion here
+    The old ``try: from moto import mock_ec2 / except ImportError`` skipped all
+    12 tests here on every run, reporting "Moto library not available" while moto
+    was installed and working. If moto ever really goes missing, the import at
+    the top of this module fails loudly instead.
+    """
+    assert mock_aws is not None
+    assert os.environ.get("MOTO_IAM_LOAD_MANAGED_POLICIES") == "true"

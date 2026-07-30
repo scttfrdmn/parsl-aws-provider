@@ -20,6 +20,8 @@ from parsl_ephemeral_aws.error_handling import (
     retry_with_backoff,
 )
 
+pytestmark = pytest.mark.unit
+
 
 class TestRetryConfig:
     """Tests for retry configuration."""

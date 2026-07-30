@@ -11,7 +11,7 @@ import boto3
 from botocore.exceptions import ClientError
 
 from ..exceptions import ResourceCreationError, ResourceCleanupError
-from ..constants import TAG_NAME, TAG_WORKFLOW_ID, DEFAULT_SG_NAME, DEFAULT_VPC_CIDR
+from ..constants import TAG_MANAGED, TAG_WORKFLOW_ID, DEFAULT_SG_NAME, DEFAULT_VPC_CIDR
 from ..config import SecurityConfig
 
 
@@ -35,9 +35,9 @@ class SecurityGroupManager:
         session_kwargs = {}
         if self.provider.aws_access_key_id and self.provider.aws_secret_access_key:
             session_kwargs["aws_access_key_id"] = self.provider.aws_access_key_id
-            session_kwargs[
-                "aws_secret_access_key"
-            ] = self.provider.aws_secret_access_key
+            session_kwargs["aws_secret_access_key"] = (
+                self.provider.aws_secret_access_key
+            )
 
         if self.provider.aws_session_token:
             session_kwargs["aws_session_token"] = self.provider.aws_session_token
@@ -128,7 +128,7 @@ class SecurityGroupManager:
                         "ResourceType": "security-group",
                         "Tags": [
                             {"Key": "Name", "Value": name},
-                            {"Key": TAG_NAME, "Value": "true"},
+                            {"Key": TAG_MANAGED, "Value": "true"},
                             {
                                 "Key": TAG_WORKFLOW_ID,
                                 "Value": self.provider.workflow_id,

@@ -13,9 +13,10 @@ import pytest
 import json
 
 try:
-    # Check if moto is available — importing the decorators is the probe; a
-    # bare `import moto` alongside them was redundant.
-    from moto import mock_ec2, mock_iam, mock_ssm, mock_cloudformation
+    # Check if moto is available — importing the decorator is the probe; a
+    # bare `import moto` alongside it was redundant. moto 5 replaced the
+    # per-service decorators with a single mock_aws.
+    from moto import mock_aws
 
     MOTO_AVAILABLE = True
 except ImportError:
@@ -59,10 +60,7 @@ class MockStateStore:
         self.states.pop(state_key, None)
 
 
-@mock_ec2
-@mock_iam
-@mock_ssm
-@mock_cloudformation
+@mock_aws
 class TestDetachedModeSpotFleetIntegration(unittest.TestCase):
     """Integration tests for DetachedMode SpotFleet functionality using moto."""
 
@@ -154,15 +152,12 @@ class TestDetachedModeSpotFleetIntegration(unittest.TestCase):
         command = "echo 'Hello, world!'"
         tasks_per_node = 1
 
-        # Submit the job
-        with patch(
-            "parsl_ephemeral_aws.modes.detached.get_cf_template", return_value="{}"
-        ):
-            # First initialize the mode
-            self.detached_mode.initialize()
-
-            # Then submit the job
-            resource_id = self.detached_mode.submit_job(job_id, command, tasks_per_node)
+        # The real bastion.yml is used here rather than a stub: patching
+        # get_cf_template out is what let #112 (it raised ModuleNotFoundError on
+        # every call, and the templates never shipped in the wheel) go unnoticed
+        # at all four of its call sites.
+        self.detached_mode.initialize()
+        resource_id = self.detached_mode.submit_job(job_id, command, tasks_per_node)
 
         # Verify resource is tracked
         self.assertIn(resource_id, self.detached_mode.resources)

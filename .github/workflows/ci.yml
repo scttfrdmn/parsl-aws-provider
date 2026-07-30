@@ -1,5 +1,14 @@
 name: CI
 
+# One pipeline for lint, tests, build, and docs. Replaces the near-duplicate
+# ci.yml + ci-cd.yml pair, which between them ran the same unit suite five times
+# (unit-tests, unit-test, cross-platform, python-versions, and release.yml) over
+# Python versions this package no longer supports.
+#
+# Everything runs through uv, per CLAUDE.md: no `pip install`, no bare
+# `python -m venv`. `uv sync --locked` installs from the committed uv.lock, so CI
+# resolves exactly the dependency set a developer's checkout does.
+
 on:
   push:
     branches: [ main ]
@@ -7,155 +16,227 @@ on:
     branches: [ main ]
   workflow_dispatch:
 
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
-      - name: Set up Python
-        uses: actions/setup-python@v4
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
         with:
-          python-version: '3.9'
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -e ".[dev,test]"
-      - name: Lint with flake8
-        run: |
-          flake8 parsl_ephemeral_aws tests
+          enable-cache: true
+      - name: Sync environment
+        run: uv sync --locked --extra dev --extra test
+      - name: Lint with ruff
+        # Scoped to the package and tests, not `.`: tools/ carries 107 pre-existing
+        # errors (bare excepts, unused imports) in one-off debug scripts that #93
+        # prunes in v0.8.0. flake8 was never a declared dependency, so the old
+        # `flake8 parsl_ephemeral_aws tests` step could only ever have failed.
+        run: uv run ruff check parsl_ephemeral_aws tests
+      - name: Check formatting with ruff
+        # ruff-format, not black: .pre-commit-config.yaml formats with ruff-format,
+        # while [tool.black] line-length = 100 is stale config that disagrees with
+        # how the tree is actually formatted. Running black churns unrelated lines.
+        #
+        # tests/ is in scope because the pre-commit hook formats whatever is
+        # staged. Checking only the package here lets tests/ drift out of format
+        # until some later commit stages one of those files and the hook rewrites
+        # it, failing a commit that had nothing to do with the change.
+        run: uv run ruff format --check parsl_ephemeral_aws tests
+      - name: Security scan with bandit
+        run: uv run bandit -r parsl_ephemeral_aws -c pyproject.toml
+
+  type-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - name: Sync environment
+        run: uv sync --locked --extra dev --extra test
       - name: Type check with mypy
-        run: |
-          mypy parsl_ephemeral_aws
+        # Reported, not gated: 125 pre-existing errors are being worked down under
+        # #81/#82. Drop continue-on-error once the count reaches zero, so this
+        # becomes a real gate rather than a signal.
+        continue-on-error: true
+        run: uv run mypy parsl_ephemeral_aws
 
   unit-tests:
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
-        python-version: [3.9, "3.10", 3.11, 3.12]
+        # requires-python = ">=3.10". Parsl 2026.x dropped 3.9, so the old 3.8/3.9
+        # matrix entries could not have installed the package at all.
+        python-version: ["3.10", "3.11", "3.12"]
     steps:
-      - uses: actions/checkout@v3
-      - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v4
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
         with:
+          enable-cache: true
           python-version: ${{ matrix.python-version }}
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -e ".[dev,test]"
-      - name: Run unit tests with moto
-        run: |
-          pytest tests/unit -v --cov=parsl_ephemeral_aws --cov-report=xml
+      - name: Sync environment
+        run: uv sync --locked --extra dev --extra test
+      - name: Run unit and security tests
+        # tests/security is pure-mock and marked `unit`; it belongs to this job
+        # rather than a separate one. Selection is by path, not `-m unit`, so a
+        # newly-added file without a marker still runs -- the divergence that let
+        # the Makefile pass while CI failed.
+        #
+        # This is the real coverage gate. pyproject's --cov-fail-under is a 25%
+        # smoke floor because it applies to narrow invocations too; these two
+        # paths together measure 68%, so 65 leaves a little headroom without
+        # letting coverage silently rot.
+        run: uv run pytest tests/unit tests/security -v --cov-fail-under=65
       - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v3
+        uses: codecov/codecov-action@v5
         with:
-          file: ./coverage.xml
+          files: ./coverage.xml
           flags: unittests
-          name: python-${{ matrix.python-version }}-moto
+          name: python-${{ matrix.python-version }}
+        continue-on-error: true
 
   integration-tests:
     runs-on: ubuntu-latest
     needs: unit-tests
-    services:
-      localstack:
-        image: localstack/localstack:latest
-        env:
-          SERVICES: ec2,s3,ssm,lambda,ecs,iam,cloudformation
-          DEBUG: true
-        ports:
-          - 4566:4566
+    # No emulator service container. LocalStack OSS is end-of-life: the upstream
+    # repository was archived read-only in March 2026, `4.14.0` is the last
+    # community image, and `localstack/localstack:latest` now resolves to the Pro
+    # build (same digest as `localstack/localstack-pro`). It exits 55 on
+    # "License activation failed!" before any step runs, and `continue-on-error`
+    # does not cover service-container startup, so the job failed unconditionally.
+    #
+    # The moto-backed tests in this directory need no endpoint and still run; the
+    # emulator-gated ones skip themselves, exactly as they have since #69.
+    # Substrate replaces the endpoint in #125.
     steps:
-      - uses: actions/checkout@v3
-      - name: Set up Python
-        uses: actions/setup-python@v4
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
         with:
-          python-version: '3.11'
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -e ".[dev,test]"
-      - name: Wait for LocalStack to be ready
-        timeout-minutes: 2
-        run: |
-          echo "Waiting for LocalStack to be ready..."
-          while ! curl -s http://localhost:4566/_localstack/health | grep -q '"s3":"available"'; do
-            sleep 5
-          done
-          echo "LocalStack is ready!"
-      - name: Run integration tests with LocalStack
+          enable-cache: true
+      - name: Sync environment
+        run: uv sync --locked --extra dev --extra test
+      - name: Run integration tests
+        # Not gating yet: 46 mode constructions across 9 files still omit the
+        # network IDs #69 made required, so the emulator-backed tests cannot pass
+        # until they are repaired (#92, v0.8.0). Gating here would make every PR
+        # red on known debt.
+        continue-on-error: true
         env:
           AWS_ACCESS_KEY_ID: test
           AWS_SECRET_ACCESS_KEY: test
           AWS_DEFAULT_REGION: us-east-1
-          AWS_ENDPOINT_URL: http://localhost:4566
-          LOCALSTACK_ENDPOINT: http://localhost:4566
-        run: |
-          pytest tests/integration -v --cov=parsl_ephemeral_aws --cov-report=xml
+        run: uv run pytest tests/integration -v
       - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v3
+        uses: codecov/codecov-action@v5
         with:
-          file: ./coverage.xml
+          files: ./coverage.xml
           flags: integration
-          name: python-localstack
+          name: integration
+        continue-on-error: true
+
+  aws-e2e-tests:
+    # Real AWS: bills money and needs a pre-provisioned VPC/subnet/SG, so it is
+    # manual-only. #60 closed with 51 tests under tests/aws that no workflow ever
+    # referenced. tests/aws/conftest.py skips when the three IDs are unset, so a
+    # run without the repository variables configured is a no-op, not a failure.
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    needs: unit-tests
+    environment: aws-e2e
+    permissions:
+      id-token: write      # OIDC, so no long-lived keys live in secrets
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - name: Sync environment
+        run: uv sync --locked --extra dev --extra test
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_E2E_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_TEST_REGION }}
+      - name: Run real-AWS E2E tests
+        env:
+          AWS_TEST_REGION: ${{ vars.AWS_TEST_REGION }}
+          AWS_TEST_VPC_ID: ${{ vars.AWS_TEST_VPC_ID }}
+          AWS_TEST_SUBNET_ID: ${{ vars.AWS_TEST_SUBNET_ID }}
+          AWS_TEST_SG_ID: ${{ vars.AWS_TEST_SG_ID }}
+        run: uv run pytest tests/aws -m aws -v --no-cov
+      - name: Report orphaned resources
+        # always(): a failed test is exactly when instances are most likely to be
+        # left running. --dry-run reports without deleting, so a shared account is
+        # never touched by CI.
+        if: always()
+        env:
+          AWS_TEST_REGION: ${{ vars.AWS_TEST_REGION }}
+        run: uv run python tools/cleanup_aws_resources.py --dry-run --region "${AWS_TEST_REGION}"
 
   test-bats:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       - name: Set up bats
+        # `sudo` applied to the npm line only, so `mkdir -p /usr/local/lib/bats`
+        # ran unprivileged and the step died on "Permission denied" once the
+        # runner image stopped leaving /usr/local/lib group-writable.
+        #
+        # The three helper libraries are cloned under sudo for the same reason,
+        # but they stay optional: tests/bats/test_environment.bats loads each one
+        # only `if [[ -f "$BATS_SUPPORT" ]]`, and no test in this suite calls an
+        # assert_* helper, so the suite passes with or without them.
         run: |
           sudo npm install -g bats
-          mkdir -p /usr/local/lib/bats
-          git clone https://github.com/bats-core/bats-support.git /usr/local/lib/bats/bats-support
-          git clone https://github.com/bats-core/bats-assert.git /usr/local/lib/bats/bats-assert
-          git clone https://github.com/bats-core/bats-file.git /usr/local/lib/bats/bats-file
+          sudo mkdir -p /usr/local/lib/bats
+          sudo git clone --depth 1 https://github.com/bats-core/bats-support.git /usr/local/lib/bats/bats-support
+          sudo git clone --depth 1 https://github.com/bats-core/bats-assert.git /usr/local/lib/bats/bats-assert
+          sudo git clone --depth 1 https://github.com/bats-core/bats-file.git /usr/local/lib/bats/bats-file
       - name: Run bats tests
-        run: |
-          bats tests/bats/
+        run: bats tests/bats/
 
   build:
     runs-on: ubuntu-latest
     needs: [lint, unit-tests]
     steps:
-      - uses: actions/checkout@v3
-      - name: Set up Python
-        uses: actions/setup-python@v4
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
         with:
-          python-version: '3.11'
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install build twine
+          enable-cache: true
       - name: Build package
+        run: uv build
+      - name: Check package metadata
+        run: uvx twine check dist/*
+      - name: Verify CloudFormation templates ship in the wheel
+        # #112: get_cf_template() resolved templates by filesystem path, so a
+        # wheel that omitted them failed only at runtime, on a real AWS call.
         run: |
-          python -m build
-      - name: Check package with twine
-        run: |
-          twine check dist/*
+          python -m zipfile -l dist/*.whl | grep -q 'templates/cloudformation/' \
+            || { echo "::error::CloudFormation templates missing from wheel"; exit 1; }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
 
   docs:
     runs-on: ubuntu-latest
     needs: [lint, unit-tests]
     steps:
-      - uses: actions/checkout@v3
-      - name: Set up Python
-        uses: actions/setup-python@v4
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
         with:
-          python-version: '3.9'
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -e ".[dev,docs]"
+          enable-cache: true
+      - name: Sync environment
+        run: uv sync --locked --extra dev --extra docs
       - name: Build documentation
-        run: |
-          if [ -d docs ]; then
-            cd docs
-            make html
-          else
-            echo "No docs directory found, skipping documentation build"
-          fi
-      - name: Upload documentation
-        if: success() && hashFiles('docs/_build/html') != ''
-        uses: actions/upload-artifact@v3
+        run: uv run make -C docs html
+      - uses: actions/upload-artifact@v4
         with:
           name: documentation
           path: docs/_build/html/

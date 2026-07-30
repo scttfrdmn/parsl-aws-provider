@@ -18,8 +18,12 @@ repos:
     -   id: mixed-line-ending
         args: ['--fix=lf']
 
+# Pinned to the same ruff that uv.lock resolves (0.15.4) and CI runs. At v0.2.2
+# the hook and `uv run ruff` disagreed on comprehension-conditional
+# parenthesization, so a pre-commit pass and a CI format check could each demand
+# the other's output be undone.
 -   repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.2.2
+    rev: v0.15.4
     hooks:
     -   id: ruff
         args: [--fix, --exit-non-zero-on-fix]

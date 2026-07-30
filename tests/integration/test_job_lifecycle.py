@@ -16,6 +16,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from unittest.mock import MagicMock, patch
 
 import pytest
+from parsl.jobs.states import JobState
 
 from parsl_ephemeral_aws.exceptions import ProviderError
 from parsl_ephemeral_aws.provider import EphemeralAWSProvider
@@ -74,6 +75,11 @@ def _make_provider_with_file_state(tmp_dir, provider_id=None, max_blocks=10):
             image_id="ami-12345678",
             instance_type="t3.micro",
             mode="standard",
+            # Required since #69; the mode is a MagicMock so they are never used,
+            # but the provider validates their presence in __init__.
+            vpc_id="vpc-12345",
+            subnet_id="subnet-12345",
+            security_group_id="sg-12345",
             max_blocks=max_blocks,
             min_blocks=0,
             init_blocks=0,
@@ -118,9 +124,11 @@ class TestJobLifecycle:
         provider.resources[resource_id]["status"] = "COMPLETED"
         mode.get_job_status.return_value = {resource_id: "COMPLETED"}
 
-        # Poll status
+        # Poll status. ``status()`` returns Parsl ``JobStatus`` objects, not the
+        # dicts it returned before v0.5.0 -- HTEX reads ``.state`` off them, so a
+        # dict raised AttributeError there. This assertion outlived that change.
         statuses = provider.status([job_id])
-        assert statuses[0]["status"] == "COMPLETED"
+        assert statuses[0].state == JobState.COMPLETED
 
         # Trigger cleanup
         provider._cleanup_resources()
@@ -168,6 +176,9 @@ class TestJobLifecycle:
                 image_id="ami-12345678",
                 instance_type="t3.micro",
                 mode="standard",
+                vpc_id="vpc-12345",
+                subnet_id="subnet-12345",
+                security_group_id="sg-12345",
                 max_blocks=5,
             )
 

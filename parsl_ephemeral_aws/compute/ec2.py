@@ -14,12 +14,13 @@ from botocore.exceptions import ClientError, NoCredentialsError
 from ..exceptions import ResourceCreationError, ResourceCleanupError
 from ..constants import (
     TAG_PREFIX,
-    TAG_NAME,
+    TAG_MANAGED,
     TAG_WORKFLOW_ID,
     TAG_BLOCK_ID,
     DEFAULT_VPC_CIDR,
 )
 from ..config import SecurityConfig
+from ..utils.aws import resolve_manager_session
 from ..security import (
     CredentialManager,
     CredentialConfiguration,
@@ -112,10 +113,16 @@ class EC2Manager:
 
             raise ResourceCreationError(f"Credential initialization failed: {e}")
 
-        # Initialize AWS session using credential manager
+        # Resolve the AWS session. The caller's own session takes precedence;
+        # the credential manager is only a fallback for a provider that has
+        # none. Going straight to the credential manager discarded an
+        # explicitly configured session -- role credentials, a chosen profile,
+        # a LocalStack endpoint -- in favour of ambient environment
+        # credentials, so operations could land in a different account than the
+        # caller selected (#117).
         try:
-            self.aws_session = self.credential_manager.create_boto3_session(
-                region=self.provider.region
+            self.aws_session = resolve_manager_session(
+                self.provider, self.credential_manager
             )
         except NoCredentialsError as e:
             logger.error(f"No valid AWS credentials found: {e}")
@@ -247,7 +254,7 @@ class EC2Manager:
                                 "Key": "Name",
                                 "Value": f"{TAG_PREFIX}-vpc-{self.provider.workflow_id}",
                             },
-                            {"Key": TAG_NAME, "Value": "true"},
+                            {"Key": TAG_MANAGED, "Value": "true"},
                             {
                                 "Key": TAG_WORKFLOW_ID,
                                 "Value": self.provider.workflow_id,
@@ -364,7 +371,7 @@ class EC2Manager:
                                 "Key": "Name",
                                 "Value": f"{TAG_PREFIX}-subnet-{self.provider.workflow_id}",
                             },
-                            {"Key": TAG_NAME, "Value": "true"},
+                            {"Key": TAG_MANAGED, "Value": "true"},
                             {
                                 "Key": TAG_WORKFLOW_ID,
                                 "Value": self.provider.workflow_id,
@@ -386,7 +393,7 @@ class EC2Manager:
                                 "Key": "Name",
                                 "Value": f"{TAG_PREFIX}-igw-{self.provider.workflow_id}",
                             },
-                            {"Key": TAG_NAME, "Value": "true"},
+                            {"Key": TAG_MANAGED, "Value": "true"},
                             {
                                 "Key": TAG_WORKFLOW_ID,
                                 "Value": self.provider.workflow_id,
@@ -413,7 +420,7 @@ class EC2Manager:
                                 "Key": "Name",
                                 "Value": f"{TAG_PREFIX}-rt-{self.provider.workflow_id}",
                             },
-                            {"Key": TAG_NAME, "Value": "true"},
+                            {"Key": TAG_MANAGED, "Value": "true"},
                             {
                                 "Key": TAG_WORKFLOW_ID,
                                 "Value": self.provider.workflow_id,
@@ -450,7 +457,7 @@ class EC2Manager:
                                 "Key": "Name",
                                 "Value": f"{TAG_PREFIX}-sg-{self.provider.workflow_id}",
                             },
-                            {"Key": TAG_NAME, "Value": "true"},
+                            {"Key": TAG_MANAGED, "Value": "true"},
                             {
                                 "Key": TAG_WORKFLOW_ID,
                                 "Value": self.provider.workflow_id,
@@ -743,7 +750,7 @@ class EC2Manager:
                     "ResourceType": "instance",
                     "Tags": [
                         {"Key": "Name", "Value": f"{TAG_PREFIX}-node-{node_id}"},
-                        {"Key": TAG_NAME, "Value": "true"},
+                        {"Key": TAG_MANAGED, "Value": "true"},
                         {"Key": TAG_WORKFLOW_ID, "Value": self.provider.workflow_id},
                         {"Key": TAG_BLOCK_ID, "Value": block_id},
                     ],
@@ -840,7 +847,7 @@ class EC2Manager:
                     "ResourceType": "spot-instances-request",
                     "Tags": [
                         {"Key": "Name", "Value": f"{TAG_PREFIX}-spot-{node_id}"},
-                        {"Key": TAG_NAME, "Value": "true"},
+                        {"Key": TAG_MANAGED, "Value": "true"},
                         {"Key": TAG_WORKFLOW_ID, "Value": self.provider.workflow_id},
                         {"Key": TAG_BLOCK_ID, "Value": block_id},
                     ],
@@ -887,7 +894,7 @@ class EC2Manager:
             Resources=[instance_id],
             Tags=[
                 {"Key": "Name", "Value": f"{TAG_PREFIX}-node-{node_id}"},
-                {"Key": TAG_NAME, "Value": "true"},
+                {"Key": TAG_MANAGED, "Value": "true"},
                 {"Key": TAG_WORKFLOW_ID, "Value": self.provider.workflow_id},
                 {"Key": TAG_BLOCK_ID, "Value": block_id},
             ],
@@ -1093,7 +1100,7 @@ class EC2Manager:
                                 "Key": "Name",
                                 "Value": f"{TAG_PREFIX}-bastion-{self.provider.workflow_id}",
                             },
-                            {"Key": TAG_NAME, "Value": "true"},
+                            {"Key": TAG_MANAGED, "Value": "true"},
                             {
                                 "Key": TAG_WORKFLOW_ID,
                                 "Value": self.provider.workflow_id,

@@ -90,9 +90,9 @@ class TestSpotFleetInstanceTypes:
             provider = _make_provider(instance_type, instance_types=None)
             types = self._get_instance_types_for_provider(provider)
             # Must only contain the original type — nothing synthesised
-            assert types == [
-                instance_type
-            ], f"Expected only [{instance_type}], got {types}"
+            assert types == [instance_type], (
+                f"Expected only [{instance_type}], got {types}"
+            )
 
     def test_no_invalid_types_for_high_generation(self):
         """Generation numbers ≥ 9 do not produce integer overflow types."""

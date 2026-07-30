@@ -18,8 +18,10 @@ from parsl_ephemeral_aws.compute.spot_interruption import (
     checkpointable,
 )
 from parsl_ephemeral_aws.exceptions import (
-    SpotInterruptionError,
+    SpotInstanceError,
 )
+
+pytestmark = pytest.mark.unit
 
 
 class TestSpotInterruptionMonitor:
@@ -36,15 +38,25 @@ class TestSpotInterruptionMonitor:
         """Create a mock EC2 client."""
         client = MagicMock()
 
-        # Mock describe_instances response
+        # Mock describe_instances response. Detection keys off two real,
+        # observable fields: an ``InstanceLifecycle`` of "spot" and a state of
+        # "shutting-down"/"stopping". The previous fixture used
+        # "marked-for-termination" — not an EC2 instance state at all — and
+        # omitted InstanceLifecycle, so neither half of the condition could match
+        # and no interruption was ever detected.
         client.describe_instances.return_value = {
             "Reservations": [
                 {
                     "Instances": [
-                        {"InstanceId": "i-test1", "State": {"Name": "running"}},
+                        {
+                            "InstanceId": "i-test1",
+                            "InstanceLifecycle": "spot",
+                            "State": {"Name": "running"},
+                        },
                         {
                             "InstanceId": "i-test2",
-                            "State": {"Name": "marked-for-termination"},
+                            "InstanceLifecycle": "spot",
+                            "State": {"Name": "shutting-down"},
                         },
                     ]
                 }
@@ -287,11 +299,14 @@ class TestSpotInterruptionHandler:
             == f"s3://{handler.checkpoint_bucket}/{handler.checkpoint_prefix}/{task_id}.json"
         )
 
-        # Verify S3 put_object was called correctly
+        # Verify S3 put_object was called correctly. Checkpoints are encrypted at
+        # rest — the kwarg has been in spot_interruption.py since v0.2.0 and this
+        # expectation never caught up.
         mock_s3_client.put_object.assert_called_with(
             Bucket="test-bucket",
             Key=f"{handler.checkpoint_prefix}/{task_id}.json",
             Body=json.dumps(data),
+            ServerSideEncryption="AES256",
             Metadata={
                 "Priority": "1",
                 "Timestamp": mock_s3_client.put_object.call_args[1]["Metadata"][
@@ -301,10 +316,16 @@ class TestSpotInterruptionHandler:
         )
 
     def test_save_checkpoint_no_bucket(self, mock_session):
-        """Test saving a checkpoint with no bucket configured."""
+        """Test saving a checkpoint with no bucket configured.
+
+        ``save_checkpoint`` raises ``SpotInstanceError``, the *parent* of
+        ``SpotInterruptionError`` — which is what its docstring documents and what
+        ``load_checkpoint`` raises for the same reason. The assertion here named
+        the subclass, so it could never match.
+        """
         handler = SpotInterruptionHandler(session=mock_session)
 
-        with pytest.raises(SpotInterruptionError):
+        with pytest.raises(SpotInstanceError):
             handler.save_checkpoint("task-123", {})
 
     def test_load_checkpoint(self, handler, mock_s3_client):

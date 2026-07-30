@@ -8,6 +8,15 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools.packages.find]
 include = ["parsl_ephemeral_aws*"]
 
+# packages.find collects modules, not data files, so without this the
+# CloudFormation and Terraform templates are omitted from the wheel and
+# get_cf_template() cannot find bastion.yml in an installed package (#112).
+[tool.setuptools.package-data]
+parsl_ephemeral_aws = [
+    "templates/cloudformation/*.yml",
+    "templates/terraform/*/*.tf",
+]
+
 [project]
 name = "parsl-ephemeral-aws"
 version = "0.6.0"
@@ -43,16 +52,19 @@ dev = [
     "pytest-cov>=2.12.0",
     "pytest-mock>=3.0.0",
     "coverage>=6.0",
-    "ruff>=0.1.0",
+    # Floor matches the ruff-pre-commit pin so the hook and `uv run ruff` cannot
+    # disagree on formatting; at 0.2.x they differed on comprehension-conditional
+    # parenthesization and each would undo the other's output.
+    "ruff>=0.15.4",
     "mypy>=0.812",
-    "black>=21.5b2",
-    "isort>=5.9.0",
     "bandit>=1.7.0",
     "pre-commit>=2.15.0",
     "bump-my-version>=1.0.0",
 ]
 test = [
-    "moto>=3.1.0",
+    # moto 5 replaced the per-service decorators (mock_ec2, mock_s3, ...) with a
+    # single mock_aws; the tests use mock_aws, so 5.0 is a hard floor.
+    "moto[cloudformation]>=5.0.0",
     "localstack>=2.0.0",
     "requests>=2.25.0",
 ]
@@ -64,6 +76,11 @@ docs = [
     "sphinx>=4.0.0",
     "sphinx-rtd-theme>=1.0.0",
     "sphinx-autodoc-typehints>=1.12.0",
+    # docs/conf.py has listed myst_parser in `extensions` all along without it
+    # being declared here, so `make -C docs html` died on
+    # `ExtensionError: Could not import extension myst_parser`. All but three of
+    # the doc sources are Markdown, so this is load-bearing, not optional.
+    "myst-parser>=2.0.0",
 ]
 
 [project.urls]
@@ -82,14 +99,12 @@ conflicts = [
     ],
 ]
 
-[tool.black]
-line-length = 100
-target-version = ['py310']
-include = '\.pyi?$'
-
-[tool.isort]
-profile = "black"
-line_length = 100
+# [tool.black] and [tool.isort] removed: the repo formats with ruff-format (see
+# .pre-commit-config.yaml), whose default line length is 88, so `line-length =
+# 100` here silently disagreed with how every file is actually formatted --
+# running black reformatted ~80 unrelated lines. ruff's isort rules cover import
+# sorting. Both tools also stayed in the `dev` extra long after nothing invoked
+# them; they are dropped from there too.
 
 [tool.mypy]
 python_version = "3.10"
@@ -115,7 +130,12 @@ addopts = [
     "--cov-report=term-missing",
     "--cov-report=html",
     "--cov-report=xml",
-    "--cov-fail-under=10",
+    # A smoke floor only. This applies to *every* invocation, including narrow
+    # ones -- `pytest tests/integration` alone measures 34% -- so it cannot carry
+    # the project's real coverage target without breaking subset runs. The gate
+    # that matters is `--cov-fail-under=65` on the CI unit-tests job, which runs
+    # tests/unit + tests/security together (68% measured).
+    "--cov-fail-under=25",
     "-ra",
     "--tb=short"
 ]
@@ -125,7 +145,9 @@ markers = [
     "aws: Tests requiring real AWS credentials",
     "globus: Tests requiring Globus Compute credentials and a running endpoint",
     "slow: Slow-running tests",
-    "localstack: Tests using LocalStack"
+    "localstack: Tests using LocalStack",
+    # Applied automatically by pytest_collection_modifyitems, never by hand.
+    "setenv_aws(name, value): internal — synthetic AWS credentials for non-aws tests",
 ]
 
 [tool.coverage.run]

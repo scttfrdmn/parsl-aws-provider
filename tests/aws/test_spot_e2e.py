@@ -89,9 +89,9 @@ class TestSpotInfrastructure:
         response = ec2.describe_vpcs(VpcIds=[vpc_id])
         vpcs = response.get("Vpcs", [])
         assert len(vpcs) == 1, f"Expected exactly one VPC for {vpc_id}, got {vpcs}"
-        assert (
-            vpcs[0]["State"] == "available"
-        ), f"VPC {vpc_id} is in state '{vpcs[0]['State']}', expected 'available'"
+        assert vpcs[0]["State"] == "available", (
+            f"VPC {vpc_id} is in state '{vpcs[0]['State']}', expected 'available'"
+        )
 
     def test_subnet_created_in_vpc(self, spot_provider, aws_session, aws_region):
         """Provider creates a subnet inside the provider VPC."""
@@ -103,9 +103,9 @@ class TestSpotInfrastructure:
         response = ec2.describe_subnets(SubnetIds=[subnet_id])
         subnets = response.get("Subnets", [])
         assert len(subnets) == 1, f"Expected exactly one subnet for {subnet_id}"
-        assert (
-            subnets[0]["VpcId"] == vpc_id
-        ), f"Subnet {subnet_id} belongs to VPC {subnets[0]['VpcId']}, expected {vpc_id}"
+        assert subnets[0]["VpcId"] == vpc_id, (
+            f"Subnet {subnet_id} belongs to VPC {subnets[0]['VpcId']}, expected {vpc_id}"
+        )
 
     def test_security_group_created_in_vpc(
         self, spot_provider, aws_session, aws_region
@@ -146,9 +146,9 @@ class TestSpotInfrastructure:
         provider_net = ipaddress.IPv4Network(provider_cidr, strict=False)
         for cidr in other_cidrs:
             other_net = ipaddress.IPv4Network(cidr, strict=False)
-            assert not provider_net.overlaps(
-                other_net
-            ), f"Provider VPC CIDR {provider_cidr} overlaps existing VPC CIDR {cidr}"
+            assert not provider_net.overlaps(other_net), (
+                f"Provider VPC CIDR {provider_cidr} overlaps existing VPC CIDR {cidr}"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -171,9 +171,9 @@ class TestSpotComputeLifecycle:
         job_id = spot_provider.submit("echo hello-from-spot", tasks_per_node=1)
         try:
             assert job_id, "job_id should be a non-empty string"
-            assert (
-                job_id in spot_provider.job_map
-            ), f"job_id {job_id} not found in provider.job_map"
+            assert job_id in spot_provider.job_map, (
+                f"job_id {job_id} not found in provider.job_map"
+            )
         finally:
             try:
                 spot_provider.cancel([job_id])
@@ -197,9 +197,9 @@ class TestSpotComputeLifecycle:
             ]
             assert instances, f"No instance found for {resource_id}"
             lifecycle = instances[0].get("InstanceLifecycle")
-            assert (
-                lifecycle == "spot"
-            ), f"Expected InstanceLifecycle='spot', got '{lifecycle}' for {resource_id}"
+            assert lifecycle == "spot", (
+                f"Expected InstanceLifecycle='spot', got '{lifecycle}' for {resource_id}"
+            )
         finally:
             try:
                 spot_provider.cancel([job_id])
@@ -217,9 +217,9 @@ class TestSpotComputeLifecycle:
             result = spot_provider.status([job_id])
             assert result, "status() returned an empty list"
             state = result[0].state
-            assert (
-                state == JobState.RUNNING
-            ), f"Expected RUNNING immediately after submit, got {state}"
+            assert state == JobState.RUNNING, (
+                f"Expected RUNNING immediately after submit, got {state}"
+            )
         finally:
             try:
                 spot_provider.cancel([job_id])
@@ -260,9 +260,9 @@ class TestSpotComputeLifecycle:
         resource_id = spot_provider.job_map[job_id]["resource_id"]
 
         result = spot_provider.status([job_id])
-        assert (
-            result[0].state == JobState.RUNNING
-        ), "Expected RUNNING before cancellation"
+        assert result[0].state == JobState.RUNNING, (
+            "Expected RUNNING before cancellation"
+        )
 
         spot_provider.cancel([job_id])
 
@@ -403,9 +403,9 @@ class TestSpotInterruptionMonitor:
 
         # Confirm it is RUNNING first
         result = spot_provider.status([job_id])
-        assert (
-            result and result[0].state == JobState.RUNNING
-        ), "Expected RUNNING status before force-termination"
+        assert result and result[0].state == JobState.RUNNING, (
+            "Expected RUNNING status before force-termination"
+        )
 
         # Force-terminate the EC2 instance directly
         ec2 = aws_session.client("ec2", region_name=aws_region)

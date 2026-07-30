@@ -18,6 +18,8 @@ from parsl_ephemeral_aws.security.credential_manager import (
     CredentialManager,
 )
 
+pytestmark = pytest.mark.unit
+
 
 class TestCredentialConfiguration:
     """Tests for credential configuration."""
@@ -278,19 +280,34 @@ class TestCredentialManager:
 
     @patch("parsl_ephemeral_aws.security.credential_manager.logging.getLogger")
     def test_log_sanitization_setup(self, mock_get_logger):
-        """Test log sanitization setup."""
-        # Mock root logger and handler
+        """Test log sanitization setup.
+
+        The handler must be a *real* one. ``SanitizingLogHandler.__init__``
+        copies ``handler.level`` and ``handler.formatter``, and both are set in
+        ``logging.Handler.__init__`` rather than declared on the class — so a
+        ``Mock(spec=logging.Handler)`` has neither and raises ``AttributeError:
+        Mock object has no attribute 'level'`` before any assertion runs.
+        """
+        # Mock root logger, but wrap a genuine handler.
         mock_root_logger = Mock()
-        mock_handler = Mock(spec=logging.Handler)
-        mock_root_logger.handlers = [mock_handler]
+        real_handler = logging.NullHandler()
+        real_handler.setLevel(logging.WARNING)
+        mock_root_logger.handlers = [real_handler]
         mock_get_logger.return_value = mock_root_logger
 
         config = CredentialConfiguration(enable_sanitization=True, sanitize_logs=True)
         CredentialManager(config)
 
         # Verify handlers were wrapped
-        mock_root_logger.removeHandler.assert_called_once_with(mock_handler)
+        mock_root_logger.removeHandler.assert_called_once_with(real_handler)
         mock_root_logger.addHandler.assert_called_once()
+
+        # The wrapper stands in for the original and inherits its level, so
+        # nothing that used to be logged starts being dropped.
+        wrapper = mock_root_logger.addHandler.call_args[0][0]
+        assert isinstance(wrapper, SanitizingLogHandler)
+        assert wrapper.handler is real_handler
+        assert wrapper.level == logging.WARNING
 
     @patch.dict(
         "os.environ",

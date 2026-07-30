@@ -9,7 +9,6 @@ import json
 import time
 from typing import Dict, Any, Set
 
-import boto3
 from botocore.exceptions import ClientError, NoCredentialsError
 
 from ..exceptions import ResourceCreationError, ResourceCleanupError, JobSubmissionError
@@ -22,10 +21,10 @@ from ..security import (
     SecurityEvent,
 )
 from ..error_handling import RobustErrorHandler, RetryConfig
-from ..utils.aws import get_or_create_iam_role
+from ..utils.aws import get_or_create_iam_role, resolve_manager_session
 from ..constants import (
     TAG_PREFIX,
-    TAG_NAME,
+    TAG_MANAGED,
     TAG_WORKFLOW_ID,
     TAG_JOB_ID,
     DEFAULT_LAMBDA_RUNTIME,
@@ -114,34 +113,30 @@ class LambdaManager:
 
             raise ResourceCreationError(f"Credential initialization failed: {e}")
 
-        # Initialize AWS session using credential manager
+        # Resolve the AWS session. The caller's own session takes precedence;
+        # the credential manager is only a fallback for a provider that has
+        # none. Going straight to the credential manager discarded an
+        # explicitly configured session -- role credentials, a chosen profile,
+        # a LocalStack endpoint -- in favour of ambient environment
+        # credentials, so operations could land in a different account than the
+        # caller selected (#117).
         try:
-            self.aws_session = self.credential_manager.create_boto3_session(
-                region=self.provider.region
+            self.aws_session = resolve_manager_session(
+                self.provider, self.credential_manager
             )
         except NoCredentialsError as e:
             logger.error(f"No valid AWS credentials found: {e}")
             raise ResourceCreationError(f"AWS credential error: {e}")
 
-        # Initialize AWS session (legacy fallback)
-        session_kwargs = {}
-        if self.provider.aws_access_key_id and self.provider.aws_secret_access_key:
-            session_kwargs["aws_access_key_id"] = self.provider.aws_access_key_id
-            session_kwargs[
-                "aws_secret_access_key"
-            ] = self.provider.aws_secret_access_key
-
-        if self.provider.aws_session_token:
-            session_kwargs["aws_session_token"] = self.provider.aws_session_token
-
-        if self.provider.aws_profile:
-            session_kwargs["profile_name"] = self.provider.aws_profile
-
-        # Fallback session creation if credential manager fails
-        if not self.aws_session:
-            self.aws_session = boto3.Session(
-                region_name=self.provider.region, **session_kwargs
-            )
+        # The legacy fallback that used to sit here was dead code that still ran:
+        # it built session_kwargs from four unguarded provider attributes before
+        # testing `if not self.aws_session`, which can never be true because
+        # session resolution either returns a session or raises. So the only
+        # thing it accomplished was raising AttributeError for any provider
+        # lacking aws_access_key_id/aws_secret_access_key/aws_session_token/
+        # aws_profile -- which EphemeralAWSProvider does not define. Credential
+        # resolution now belongs entirely to resolve_manager_session() and the
+        # credential manager (#117).
 
         # Initialize clients
         self.lambda_client = self.aws_session.client("lambda")
@@ -241,7 +236,7 @@ class LambdaManager:
                 "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
             ],
             tags=[
-                {"Key": TAG_NAME, "Value": "true"},
+                {"Key": TAG_MANAGED, "Value": "true"},
                 {"Key": TAG_WORKFLOW_ID, "Value": self.provider.workflow_id},
             ],
             description=f"Execution role for Parsl Lambda functions ({self.provider.workflow_id})",
@@ -299,7 +294,7 @@ class LambdaManager:
                 ),  # Lambda max is 900s (15 min)
                 MemorySize=self.provider.lambda_memory,
                 Tags={
-                    TAG_NAME: "true",
+                    TAG_MANAGED: "true",
                     TAG_WORKFLOW_ID: self.provider.workflow_id,
                     TAG_JOB_ID: job_id,
                 },
@@ -543,8 +538,15 @@ def main(event, context):
             else:
                 # After timeout, mark as COMPLETED.
                 # Real status requires CloudWatch Logs integration (v0.3.0).
+                #
+                # The job ID comes from the job record, not a `job_id` local:
+                # this method is called with (function_name, request_id) and
+                # locates the job by scanning. Interpolating a bare `job_id` here
+                # raised NameError, which the blanket `except` below turned into
+                # "UNKNOWN" -- so a job that outlived its timeout could never
+                # reach a terminal status and was polled forever (#111).
                 logger.warning(
-                    f"Lambda job {job_id} exceeded configured timeout. "
+                    f"Lambda job {job.get('id')} exceeded configured timeout. "
                     "Marking as COMPLETED. Integrate CloudWatch Logs in v0.3.0 "
                     "for accurate terminal status."
                 )

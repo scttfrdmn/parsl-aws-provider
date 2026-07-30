@@ -1,324 +1,420 @@
 """Integration tests for ServerlessMode with SpotFleet functionality.
 
+These run the mode against moto, which intercepts the HTTP layer, so the real
+CloudFormation templates are deployed and the real ``describe_*`` response shapes
+are exercised. Nothing on the mode is stubbed.
+
+The template's spot fleet branch is one deliberate omission: moto's
+``AWS::EC2::SpotFleet`` handler reads
+``SpotFleetRequestConfigData["LaunchSpecifications"]`` unconditionally
+(``moto/ec2/models/spot_requests.py``), while ``ecs_worker.yml`` -- like current
+AWS guidance -- declares ``LaunchTemplateConfigs``. Deploying that branch dies
+inside moto with ``KeyError: 'LaunchSpecifications'``, a simulator gap rather
+than a package defect, so ``_get_spot_fleet_status()`` is exercised against a
+directly created fleet request instead.
+
 SPDX-License-Identifier: Apache-2.0
 SPDX-FileCopyrightText: 2025 Scott Friedman and Project Contributors
 """
 
-import pytest
-import boto3
-import os
+import io
+import json
 import uuid
-from unittest.mock import patch, MagicMock
+import zipfile
+from unittest.mock import patch
 
-from moto import mock_ec2, mock_iam, mock_cloudformation
+import boto3
+import pytest
+
+try:
+    # moto 5 replaced the per-service decorators (mock_ec2, mock_iam, ...) with a
+    # single mock_aws.
+    from moto import mock_aws
+
+    MOTO_AVAILABLE = True
+except ImportError:
+    MOTO_AVAILABLE = False
 
 from parsl_ephemeral_aws.modes.serverless import ServerlessMode
 from parsl_ephemeral_aws.constants import (
-    RESOURCE_TYPE_SPOT_FLEET,
+    RESOURCE_TYPE_ECS_TASK,
+    RESOURCE_TYPE_LAMBDA_FUNCTION,
     WORKER_TYPE_ECS,
+    WORKER_TYPE_LAMBDA,
+    STATUS_CANCELLED,
     STATUS_PENDING,
     STATUS_RUNNING,
-    STATUS_CANCELLED,
 )
 
+pytestmark = [
+    pytest.mark.integration,
+    pytest.mark.skipif(not MOTO_AVAILABLE, reason="moto not installed"),
+]
 
-@mock_ec2
-@mock_iam
-@mock_cloudformation
+
+class MockStateStore:
+    """Keyed state store, matching the real stores' two-argument interface."""
+
+    def __init__(self):
+        self.states = {}
+
+    def save_state(self, state_key, state_data):
+        self.states[state_key] = state_data
+        return True
+
+    def load_state(self, state_key):
+        return self.states.get(state_key)
+
+    def delete_state(self, state_key):
+        self.states.pop(state_key, None)
+
+
+@pytest.fixture(autouse=True)
+def moto():
+    """Activate moto around each test *and* around its fixtures.
+
+    ``@mock_aws`` as a class decorator wraps only the ``test_*`` methods, so a
+    fixture that provisions a VPC runs outside the mock and hits real AWS. An
+    autouse fixture is entered before the fixtures that depend on it, so the
+    whole graph is covered.
+    """
+    with mock_aws():
+        yield
+
+
 class TestServerlessModeSpotFleetIntegration:
-    """Integration tests for ServerlessMode with SpotFleet."""
+    """Integration tests for ServerlessMode against moto."""
 
     @pytest.fixture
     def aws_session(self):
-        """Create a real boto3 session that will use moto's mocks."""
+        """A real boto3 session; moto intercepts its calls."""
         return boto3.Session(region_name="us-east-1")
 
     @pytest.fixture
-    def mock_state_store(self):
-        """Create a mock state store."""
-        state_store = MagicMock()
-        state_store.load_state.return_value = None
-        state = {}
-        state_store.save_state = lambda s: state.update(s)
-        return state_store
+    def network(self, aws_session):
+        """Pre-provision the VPC, subnet, and security group.
+
+        Since #69 no mode creates network resources -- all three IDs are
+        caller-supplied and required for the ECS worker type.
+        """
+        ec2 = aws_session.client("ec2")
+        vpc_id = ec2.create_vpc(CidrBlock="10.0.0.0/16")["Vpc"]["VpcId"]
+        subnet_id = ec2.create_subnet(VpcId=vpc_id, CidrBlock="10.0.0.0/24")["Subnet"][
+            "SubnetId"
+        ]
+        security_group_id = ec2.create_security_group(
+            GroupName=f"parsl-test-{uuid.uuid4().hex[:8]}",
+            Description="Test security group",
+            VpcId=vpc_id,
+        )["GroupId"]
+        return {
+            "vpc_id": vpc_id,
+            "subnet_id": subnet_id,
+            "security_group_id": security_group_id,
+        }
+
+    def _mode(self, aws_session, **overrides):
+        """Build a ServerlessMode with a unique provider ID."""
+        kwargs = {
+            "provider_id": f"test-{uuid.uuid4()}",
+            "session": aws_session,
+            "state_store": MockStateStore(),
+            "worker_type": WORKER_TYPE_ECS,
+            "instance_types": ["t3.small", "t3.medium"],
+            "nodes_per_block": 2,
+            "spot_max_price_percentage": 80,
+        }
+        kwargs.update(overrides)
+        return ServerlessMode(**kwargs)
 
     @pytest.fixture
-    def provider_id(self):
-        """Generate a unique provider ID for testing."""
-        return f"test-{uuid.uuid4()}"
+    def serverless_mode(self, aws_session, network):
+        """An ECS-mode instance wired to the pre-provisioned network."""
+        return self._mode(aws_session, **network)
 
-    @pytest.fixture
-    def serverless_mode(self, aws_session, mock_state_store, provider_id):
-        """Create a ServerlessMode instance for testing."""
-        # Create a custom template for easier mocking with moto
-        template_dir = os.path.join(
-            os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
-            "parsl_ephemeral_aws",
-            "templates",
-            "cloudformation",
-        )
-        os.makedirs(template_dir, exist_ok=True)
-
-        # Create a simple CloudFormation template for testing
-        with open(os.path.join(template_dir, "ecs_worker.yml"), "w") as f:
-            f.write(
-                """
-AWSTemplateFormatVersion: '2010-09-09'
-Parameters:
-  WorkflowId:
-    Type: String
-  JobId:
-    Type: String
-  UseSpotFleet:
-    Type: String
-    Default: 'false'
-  InstanceTypes:
-    Type: String
-    Default: '[]'
-  NodesPerBlock:
-    Type: Number
-    Default: 1
-  SpotMaxPricePercentage:
-    Type: String
-    Default: ''
-  VpcId:
-    Type: String
-  SubnetIds:
-    Type: CommaDelimitedList
-  SecurityGroupIds:
-    Type: CommaDelimitedList
-  Command:
-    Type: String
-  UseSpot:
-    Type: String
-    Default: 'false'
-Resources:
-  # Simplified template for testing
-  DummyInstance:
-    Type: AWS::EC2::Instance
-    Properties:
-      ImageId: ami-12345678
-      InstanceType: t2.micro
-      Tags:
-        - Key: Name
-          Value: !Sub "parsl-test-${WorkflowId}"
-  SpotFleetRole:
-    Type: AWS::IAM::Role
-    Properties:
-      AssumeRolePolicyDocument:
-        Version: '2012-10-17'
-        Statement:
-          - Effect: Allow
-            Principal:
-              Service: spotfleet.amazonaws.com
-            Action: sts:AssumeRole
-      ManagedPolicyArns:
-        - arn:aws:iam::aws:policy/service-role/AmazonEC2SpotFleetTaggingRole
-Outputs:
-  SpotFleetRequestId:
-    Description: ID of the Spot Fleet request
-    Value: sfr-12345678
-            """
-            )
-
-        # Create the VPC template
-        with open(os.path.join(template_dir, "vpc.yml"), "w") as f:
-            f.write(
-                """
-AWSTemplateFormatVersion: '2010-09-09'
-Parameters:
-  VpcCidr:
-    Type: String
-  PublicSubnetCidr:
-    Type: String
-  WorkflowId:
-    Type: String
-Resources:
-  DummyVPC:
-    Type: AWS::EC2::VPC
-    Properties:
-      CidrBlock: !Ref VpcCidr
-      Tags:
-        - Key: Name
-          Value: !Sub "parsl-vpc-${WorkflowId}"
-  DummySubnet:
-    Type: AWS::EC2::Subnet
-    Properties:
-      VpcId: !Ref DummyVPC
-      CidrBlock: !Ref PublicSubnetCidr
-      Tags:
-        - Key: Name
-          Value: !Sub "parsl-subnet-${WorkflowId}"
-Outputs:
-  VpcId:
-    Description: VPC ID
-    Value: !Ref DummyVPC
-  PublicSubnetId:
-    Description: Public Subnet ID
-    Value: !Ref DummySubnet
-            """
-            )
-
-        # Create ServerlessMode with SpotFleet
-        mode = ServerlessMode(
-            provider_id=provider_id,
-            session=aws_session,
-            state_store=mock_state_store,
-            worker_type=WORKER_TYPE_ECS,
-            use_spot_fleet=True,
-            instance_types=["t3.small", "t3.medium"],
-            nodes_per_block=2,
-            spot_max_price_percentage=80,
-            create_vpc=True,
-        )
-
-        # Setup mocks
-        mode.cf_client = aws_session.client("cloudformation")
-        mode.lambda_manager = MagicMock()
-        mode.lambda_manager._generate_lambda_code.return_value = b"lambda_code_zip"
-
-        # Patch _get_spot_fleet_status to return consistent results in tests
-        mode._get_spot_fleet_status = MagicMock(return_value=STATUS_RUNNING)
-
-        return mode
-
-    def test_integration_initialize_with_spot_fleet(self, serverless_mode):
-        """Test initializing infrastructure with SpotFleet support."""
-        # Initialize the mode
+    def test_initialize_adopts_the_supplied_network(self, serverless_mode, network):
+        """Initialization adopts the caller's network and keeps fleet settings."""
         serverless_mode.initialize()
 
-        # Verify initialization
         assert serverless_mode.initialized is True
-        assert serverless_mode.vpc_id is not None
-        assert serverless_mode.subnet_id is not None
-        assert serverless_mode.security_group_id is not None
+        assert serverless_mode.vpc_id == network["vpc_id"]
+        assert serverless_mode.subnet_id == network["subnet_id"]
+        assert serverless_mode.security_group_id == network["security_group_id"]
 
-        # Verify SpotFleet-specific attributes were preserved
-        assert serverless_mode.use_spot_fleet is True
         assert len(serverless_mode.instance_types) == 2
         assert serverless_mode.nodes_per_block == 2
         assert serverless_mode.spot_max_price_percentage == 80
 
-    def test_integration_submit_job_with_spot_fleet(self, serverless_mode):
-        """Test job submission with SpotFleet."""
-        # Initialize first
+    def test_submit_ecs_job_deploys_the_packaged_template(self, serverless_mode):
+        """An ECS submit deploys the real ecs_worker.yml and tracks the stack.
+
+        Two defects meet here. The tracking record used to be created *after*
+        dispatch, while both submit helpers end by updating it -- so every submit
+        raised `KeyError` from inside a blanket `except`, leaving a live stack
+        with no tracking record to clean it up (#115). And the template was read
+        off a `__file__`-relative path rather than through `get_cf_template()`,
+        so it could not be found in an installed package (#113).
+        """
         serverless_mode.initialize()
 
-        # Submit a job
-        job_id = "test-job-1"
-        command = "echo hello from spot fleet"
-        resource_id = serverless_mode.submit_job(job_id, command, 2)
+        resource_id = serverless_mode.submit_job("test-job-1", "echo hello", 2)
 
-        # Verify resource tracking
-        assert resource_id in serverless_mode.resources
-        assert serverless_mode.resources[resource_id]["job_id"] == job_id
-        assert serverless_mode.resources[resource_id]["command"] == command
-        assert serverless_mode.resources[resource_id]["status"] == STATUS_PENDING
-        assert serverless_mode.resources[resource_id]["use_spot_fleet"] is True
+        resource = serverless_mode.resources[resource_id]
+        assert resource["job_id"] == "test-job-1"
+        assert resource["command"] == "echo hello"
+        assert resource["status"] == STATUS_PENDING
+        assert resource["resource_type"] == RESOURCE_TYPE_ECS_TASK
 
-        # Get job status (which should update with fleet_request_id)
-        status = serverless_mode.get_job_status([resource_id])
+        # The stack really exists, and carries the outputs get_job_status reads.
+        stack = serverless_mode.cf_client.describe_stacks(
+            StackName=resource["stack_name"]
+        )["Stacks"][0]
+        assert stack["StackStatus"] == "CREATE_COMPLETE"
+        outputs = {out["OutputKey"] for out in stack["Outputs"]}
+        assert {"ClusterName", "ServiceName"} <= outputs
 
-        # With our mocked _get_spot_fleet_status, should be RUNNING
-        assert status[resource_id] == STATUS_RUNNING
+    def test_submit_lambda_job_stages_a_real_zip_in_s3(self, aws_session):
+        """A Lambda submit stages an intact archive and deploys the function.
 
-        # Should have updated tracking with fleet details
-        assert "fleet_request_id" in serverless_mode.resources[resource_id]
-        assert (
-            serverless_mode.resources[resource_id]["fleet_request_id"] == "sfr-12345678"
+        The deployment package used to be latin1-decoded into the
+        `CodeZipContent` CloudFormation parameter. That is neither the base64 the
+        template documents nor legal XML, so CloudFormation's own DescribeStacks
+        echo came back unparseable and the job reported UNKNOWN forever (#116).
+        """
+        mode = self._mode(aws_session, worker_type=WORKER_TYPE_LAMBDA)
+        mode.initialize()
+
+        resource_id = mode.submit_job("test-job-lambda", "echo hi", 1)
+        resource = mode.resources[resource_id]
+
+        assert resource["resource_type"] == RESOURCE_TYPE_LAMBDA_FUNCTION
+
+        # The staged object is a valid zip holding the generated handler.
+        body = (
+            aws_session.client("s3")
+            .get_object(Bucket=resource["code_bucket"], Key=resource["code_key"])[
+                "Body"
+            ]
+            .read()
         )
-        assert (
-            serverless_mode.resources[resource_id]["resource_type"]
-            == RESOURCE_TYPE_SPOT_FLEET
-        )
+        assert zipfile.ZipFile(io.BytesIO(body)).namelist() == ["handler.py"]
 
-    def test_integration_cancel_spot_fleet_job(self, serverless_mode):
-        """Test canceling a SpotFleet job."""
-        # Initialize and submit a job
+        # The status query parses -- it could not while the parameter carried
+        # XML-illegal control characters.
+        assert mode.get_job_status([resource_id])[resource_id] == STATUS_PENDING
+
+        # And the function was really deployed from that archive.
+        function = aws_session.client("lambda").get_function(
+            FunctionName="parsl-lambda-test-job-lambda"
+        )
+        assert function["Configuration"]["CodeSize"] == len(body)
+
+    def test_cleanup_removes_the_staged_lambda_code(self, aws_session):
+        """Cleaning up a Lambda job deletes its staged package and bucket."""
+        mode = self._mode(aws_session, worker_type=WORKER_TYPE_LAMBDA)
+        mode.initialize()
+        resource_id = mode.submit_job("test-job-lambda-2", "echo hi", 1)
+        bucket = mode.resources[resource_id]["code_bucket"]
+        key = mode.resources[resource_id]["code_key"]
+
+        mode.cleanup_resources([resource_id])
+
+        s3 = aws_session.client("s3")
+        with pytest.raises(s3.exceptions.ClientError):
+            s3.head_object(Bucket=bucket, Key=key)
+
+        # The bucket was created by the mode, so the mode removes it.
+        mode.cleanup_infrastructure()
+        assert bucket not in [b["Name"] for b in s3.list_buckets()["Buckets"]]
+
+    def test_a_caller_supplied_bucket_is_reused_and_kept(self, aws_session):
+        """A configured checkpoint_bucket is staged into, never deleted."""
+        s3 = aws_session.client("s3")
+        s3.create_bucket(Bucket="parsl-test-caller-bucket")
+
+        mode = self._mode(
+            aws_session,
+            worker_type=WORKER_TYPE_LAMBDA,
+            checkpoint_bucket="parsl-test-caller-bucket",
+        )
+        mode.initialize()
+        resource_id = mode.submit_job("test-job-lambda-3", "echo hi", 1)
+
+        assert mode.resources[resource_id]["code_bucket"] == "parsl-test-caller-bucket"
+
+        mode.cleanup_resources([resource_id])
+        mode.cleanup_infrastructure()
+
+        # The caller's bucket survives: only a bucket the mode created is deleted.
+        assert "parsl-test-caller-bucket" in [
+            b["Name"] for b in s3.list_buckets()["Buckets"]
+        ]
+
+    def test_a_failed_submit_leaves_nothing_behind(self, serverless_mode):
+        """A submit that fails mid-flight does not leak a stack or a record."""
         serverless_mode.initialize()
-        job_id = "test-job-2"
-        resource_id = serverless_mode.submit_job(job_id, "echo hello", 2)
 
-        # Get status to set fleet_request_id
-        serverless_mode.get_job_status([resource_id])
+        with patch.object(
+            serverless_mode.cf_client,
+            "create_stack",
+            side_effect=RuntimeError("boom"),
+        ):
+            with pytest.raises(Exception, match="Failed to submit job"):
+                serverless_mode.submit_job("test-job-fail", "echo hello", 1)
 
-        # Cancel the job
+        # Tracking is created before dispatch now, so the failure path has to
+        # remove it again -- otherwise a phantom job would be polled forever.
+        assert serverless_mode.resources == {}
+
+    def test_get_spot_fleet_status_reads_the_nested_capacity(
+        self, serverless_mode, network
+    ):
+        """An active, fully fulfilled fleet reports RUNNING.
+
+        `FulfilledCapacity` lives only inside `SpotFleetRequestConfig`, beside
+        `TargetCapacity`. Reading it from the entry's top level always yielded
+        the 0 default, so `0 >= target` was false and a fully provisioned fleet
+        reported PENDING forever -- never terminal, so Parsl polled it and never
+        freed the block (#114).
+        """
+        serverless_mode.initialize()
+        ec2 = serverless_mode.session.client("ec2")
+        fleet_request_id = ec2.request_spot_fleet(
+            SpotFleetRequestConfig={
+                "IamFleetRole": "arn:aws:iam::123456789012:role/parsl-test-fleet",
+                "AllocationStrategy": "priceCapacityOptimized",
+                "TargetCapacity": 2,
+                "LaunchSpecifications": [
+                    {
+                        "ImageId": "ami-12345678",
+                        "InstanceType": "t3.small",
+                        "SubnetId": network["subnet_id"],
+                        "SecurityGroups": [{"GroupId": network["security_group_id"]}],
+                    }
+                ],
+            }
+        )["SpotFleetRequestId"]
+
+        assert (
+            serverless_mode._get_spot_fleet_status(fleet_request_id) == STATUS_RUNNING
+        )
+
+    def test_cancel_job_deletes_the_stack(self, serverless_mode):
+        """Cancelling a job marks it CANCELLED and deletes its stack."""
+        serverless_mode.initialize()
+        resource_id = serverless_mode.submit_job("test-job-2", "echo hello", 2)
+        stack_name = serverless_mode.resources[resource_id]["stack_name"]
+
         cancel_results = serverless_mode.cancel_jobs([resource_id])
 
-        # Verify cancellation
         assert cancel_results[resource_id] == STATUS_CANCELLED
         assert serverless_mode.resources[resource_id]["status"] == STATUS_CANCELLED
 
-    def test_integration_list_resources_with_spot_fleet(self, serverless_mode):
-        """Test listing resources including SpotFleet."""
-        # Initialize and submit jobs
+        # A deleted stack resolves by StackId only, so a lookup by name raises.
+        cf = serverless_mode.cf_client
+        with pytest.raises(cf.exceptions.ClientError, match="does not exist"):
+            cf.describe_stacks(StackName=stack_name)
+
+    def test_list_resources_groups_by_worker_type(self, serverless_mode):
+        """Submitted jobs are listed under their worker type."""
         serverless_mode.initialize()
-        job_id = "test-job-3"
-        resource_id = serverless_mode.submit_job(job_id, "echo hello", 2)
+        resource_id = serverless_mode.submit_job("test-job-3", "echo hello", 2)
 
-        # Get status to set fleet_request_id
-        serverless_mode.get_job_status([resource_id])
-
-        # List resources
         resources = serverless_mode.list_resources()
 
-        # Verify resource listing
-        assert "spot_fleet_requests" in resources
-        assert len(resources["spot_fleet_requests"]) == 1
-        assert resources["spot_fleet_requests"][0]["job_id"] == job_id
-        assert resources["spot_fleet_requests"][0]["fleet_request_id"] == "sfr-12345678"
+        assert len(resources["ecs_tasks"]) == 1
+        assert resources["ecs_tasks"][0]["id"] == resource_id
+        assert resources["ecs_tasks"][0]["job_id"] == "test-job-3"
 
-    def test_integration_cleanup_with_spot_fleet(self, serverless_mode):
-        """Test cleaning up resources with SpotFleet."""
-        # Initialize and submit a job
+    def test_cleanup_resources_drops_tracking(self, serverless_mode):
+        """Cleaning up a resource deletes its stack and drops the tracking."""
         serverless_mode.initialize()
-        job_id = "test-job-4"
-        resource_id = serverless_mode.submit_job(job_id, "echo hello", 2)
+        resource_id = serverless_mode.submit_job("test-job-4", "echo hello", 2)
+        stack_name = serverless_mode.resources[resource_id]["stack_name"]
 
-        # Get status to set fleet_request_id
-        serverless_mode.get_job_status([resource_id])
-
-        # Clean up the resource
         serverless_mode.cleanup_resources([resource_id])
 
-        # Verify resource was removed
         assert resource_id not in serverless_mode.resources
+        assert serverless_mode.list_resources()["ecs_tasks"] == []
 
-        # List resources to verify
-        resources = serverless_mode.list_resources()
-        assert len(resources["spot_fleet_requests"]) == 0
+        cf = serverless_mode.cf_client
+        with pytest.raises(cf.exceptions.ClientError, match="does not exist"):
+            cf.describe_stacks(StackName=stack_name)
 
     @patch(
         "parsl_ephemeral_aws.compute.spot_fleet_cleanup.cleanup_all_spot_fleet_resources"
     )
-    def test_integration_cleanup_infrastructure(
-        self, mock_cleanup_spot_fleet, serverless_mode
+    def test_cleanup_infrastructure_spares_the_callers_network(
+        self, mock_cleanup_spot_fleet, aws_session, network
     ):
-        """Test cleaning up all infrastructure with SpotFleet."""
-        # Initialize and submit a job
-        serverless_mode.initialize()
-        job_id = "test-job-5"
-        resource_id = serverless_mode.submit_job(job_id, "echo hello", 2)
+        """Infrastructure cleanup releases fleet resources, not the network."""
+        mode = self._mode(aws_session, use_spot_fleet=True, **network)
+        mode.initialize()
+        mode.resources["placeholder"] = {
+            "id": "placeholder",
+            "job_id": "test-job-5",
+            "worker_type": WORKER_TYPE_ECS,
+            "status": STATUS_PENDING,
+        }
 
-        # Get status to set fleet_request_id
-        serverless_mode.get_job_status([resource_id])
-
-        # Mock the SpotFleet cleanup utility
         mock_cleanup_spot_fleet.return_value = {
             "cancelled_requests": ["sfr-12345678"],
             "cleaned_roles": ["parsl-aws-spot-fleet-role-test"],
             "errors": [],
         }
 
-        # Clean up all infrastructure
-        serverless_mode.cleanup_infrastructure()
+        mode.cleanup_infrastructure()
 
-        # Verify SpotFleet cleanup was called
         mock_cleanup_spot_fleet.assert_called_once()
+        assert not mode.resources
+        assert mode.initialized is False
 
-        # Verify state was reset
-        assert serverless_mode.vpc_id is None
-        assert serverless_mode.subnet_id is None
-        assert serverless_mode.security_group_id is None
-        assert not serverless_mode.resources  # Resources should be empty
-        assert serverless_mode.initialized is False
+        # The VPC, subnet, and security group belong to the caller and must
+        # survive: nulling them is what #74 removed, and deleting the security
+        # group is what #70 removed.
+        assert mode.vpc_id == network["vpc_id"]
+        assert mode.subnet_id == network["subnet_id"]
+        assert mode.security_group_id == network["security_group_id"]
+        assert aws_session.client("ec2").describe_security_groups(
+            GroupIds=[network["security_group_id"]]
+        )["SecurityGroups"]
+
+    def test_ecs_template_parameters_match_the_template(self, serverless_mode, network):
+        """Every parameter the mode sends is one ecs_worker.yml declares.
+
+        A stale or misspelled ParameterKey is rejected by CloudFormation at
+        create time, so this deploys the real template with the full parameter
+        set the spot fleet path would send.
+        """
+        from parsl_ephemeral_aws.utils.aws import get_cf_template
+
+        cf = serverless_mode.cf_client
+        params = {
+            "ClusterName": "parsl-test-cluster",
+            "TaskFamily": "parsl-test-task",
+            "Command": "echo hello",
+            "VpcId": network["vpc_id"],
+            "SubnetIds": network["subnet_id"],
+            "SecurityGroupIds": network["security_group_id"],
+            "AssignPublicIp": "ENABLED",
+            "WorkflowId": "wf-1",
+            "JobId": "job-1",
+            "TaskCount": "1",
+            "UseSpot": "false",
+            "UseSpotFleet": "false",
+            "InstanceTypes": json.dumps(["t3.small"]),
+            "NodesPerBlock": "2",
+            "SpotMaxPricePercentage": "80",
+        }
+        cf.create_stack(
+            StackName="parsl-ecs-parameter-check",
+            TemplateBody=get_cf_template("ecs_worker.yml"),
+            Parameters=[
+                {"ParameterKey": key, "ParameterValue": value}
+                for key, value in params.items()
+            ],
+            Capabilities=["CAPABILITY_IAM"],
+        )
+
+        stack = cf.describe_stacks(StackName="parsl-ecs-parameter-check")["Stacks"][0]
+        assert stack["StackStatus"] == "CREATE_COMPLETE"

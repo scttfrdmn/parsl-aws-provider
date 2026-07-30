@@ -5,25 +5,25 @@ SPDX-FileCopyrightText: 2025 Scott Friedman and Project Contributors
 """
 
 import pytest
-from unittest.mock import MagicMock, patch, call
+from unittest.mock import MagicMock
 import boto3
+from botocore.exceptions import ClientError
 
 from parsl_ephemeral_aws.modes.standard import StandardMode
 from parsl_ephemeral_aws.state.base import STATE_KEY_MODE
 from parsl_ephemeral_aws.exceptions import (
     OperatingModeError,
-    ResourceCreationError,
+    ResourceNotFoundError,
 )
 from parsl_ephemeral_aws.constants import (
     RESOURCE_TYPE_EC2,
-    RESOURCE_TYPE_VPC,
-    RESOURCE_TYPE_SUBNET,
-    RESOURCE_TYPE_SECURITY_GROUP,
     STATUS_PENDING,
     STATUS_RUNNING,
-    STATUS_COMPLETED,
+    STATUS_CANCELED,
     STATUS_FAILED,
 )
+
+pytestmark = pytest.mark.unit
 
 
 class TestStandardMode:
@@ -92,6 +92,9 @@ class TestStandardMode:
             instance_type="t3.micro",
             image_id="ami-12345678",
             region="us-east-1",
+            vpc_id="vpc-12345",
+            subnet_id="subnet-12345",
+            security_group_id="sg-12345",
         )
 
         return mode
@@ -122,57 +125,69 @@ class TestStandardMode:
         assert mode.vpc_id == "vpc-12345"
         assert mode.subnet_id == "subnet-12345"
         assert mode.security_group_id == "sg-12345"
-        assert mode.create_vpc is False
 
-    @patch("parsl_ephemeral_aws.modes.standard.get_default_ami")
-    def test_initialize(self, mock_get_default_ami, standard_mode, mock_ec2_client):
-        """Test initialize method creates required infrastructure."""
-        # Setup mocks
-        mock_get_default_ami.return_value = "ami-default"
+        # #69 made all three IDs caller-supplied and removed the create-on-demand
+        # switch entirely. The old `mode.create_vpc is False` assertion outlived
+        # the attribute it read.
+        assert not hasattr(mode, "create_vpc")
 
-        # Mock VPC creation
-        mock_ec2_client.create_vpc.return_value = {"Vpc": {"VpcId": "vpc-12345"}}
+    def test_initialize(self, standard_mode, mock_ec2_client):
+        """Initialize verifies the caller's network; it never creates one.
 
-        # Mock subnet creation
-        mock_ec2_client.create_subnet.return_value = {
-            "Subnet": {"SubnetId": "subnet-12345"}
-        }
-
-        # Mock security group creation
-        mock_ec2_client.create_security_group.return_value = {"GroupId": "sg-12345"}
-
-        # Call initialize
+        This test used to mock ``create_vpc``/``create_subnet``/
+        ``create_security_group`` and assert each was called once. #69 removed
+        those calls, so the assertions describe behaviour the mode no longer has.
+        What matters now is that the supplied IDs are checked for existence and
+        adopted unchanged.
+        """
         standard_mode.initialize()
 
-        # Verify infrastructure was created
+        # The supplied network is verified, not created.
+        mock_ec2_client.describe_vpcs.assert_called_once_with(VpcIds=["vpc-12345"])
+        mock_ec2_client.describe_subnets.assert_called_once_with(
+            SubnetIds=["subnet-12345"]
+        )
+        mock_ec2_client.describe_security_groups.assert_called_once_with(
+            GroupIds=["sg-12345"]
+        )
+        mock_ec2_client.create_vpc.assert_not_called()
+        mock_ec2_client.create_subnet.assert_not_called()
+        mock_ec2_client.create_security_group.assert_not_called()
+
+        # The IDs are adopted as-is.
         assert standard_mode.vpc_id == "vpc-12345"
         assert standard_mode.subnet_id == "subnet-12345"
         assert standard_mode.security_group_id == "sg-12345"
         assert standard_mode.initialized is True
 
-        # Verify EC2 client calls
-        mock_ec2_client.create_vpc.assert_called_once()
-        mock_ec2_client.create_subnet.assert_called_once()
-        mock_ec2_client.create_security_group.assert_called_once()
-
         # Verify state was saved
         standard_mode.state_store.save_state.assert_called()
 
-    @patch("parsl_ephemeral_aws.modes.standard.delete_resource")
-    def test_initialize_failure_cleanup(
-        self, mock_delete_resource, standard_mode, mock_ec2_client
+    def test_initialize_reports_a_missing_network_resource(
+        self, standard_mode, mock_ec2_client
     ):
-        """Test that resources are cleaned up if initialization fails."""
-        # Make subnet creation fail
-        mock_ec2_client.create_vpc.return_value = {"Vpc": {"VpcId": "vpc-12345"}}
-        mock_ec2_client.create_subnet.side_effect = Exception("Subnet creation failed")
+        """A missing VPC is named, not silently replaced.
 
-        # Call initialize and expect exception
-        with pytest.raises(ResourceCreationError):
+        Replaces ``test_initialize_failure_cleanup``, which made ``create_subnet``
+        fail and asserted ``delete_resource`` was called to roll back. Neither
+        function is reachable from this mode any more. The failure mode that
+        exists today is a caller-supplied ID that does not resolve, and #77
+        requires it be reported rather than nulled out.
+        """
+        mock_ec2_client.describe_vpcs.side_effect = ClientError(
+            {"Error": {"Code": "InvalidVpcID.NotFound", "Message": "not found"}},
+            "DescribeVpcs",
+        )
+
+        with pytest.raises(ResourceNotFoundError) as exc_info:
             standard_mode.initialize()
 
-        # Verify cleanup was called
-        mock_delete_resource.assert_called()
+        assert "vpc-12345" in str(exc_info.value)
+
+        # The ID must survive the failure: nulling it turned a named error into an
+        # opaque InvalidParameterValue from inside run_instances later on (#77).
+        assert standard_mode.vpc_id == "vpc-12345"
+        assert standard_mode.initialized is False
 
     def test_submit_job(self, standard_mode, mock_ec2_client):
         """Test job submission."""
@@ -206,15 +221,21 @@ class TestStandardMode:
             standard_mode.submit_job("job-1", "echo hello", 1)
 
     def test_get_job_status(self, standard_mode, mock_ec2_client):
-        """Test getting job status."""
+        """Test getting job status.
+
+        ``resources`` is keyed *by instance ID* — ``submit_job`` returns the
+        instance ID and stores under it, and ``get_job_status``/``cancel_jobs``
+        pass those keys straight to EC2. The earlier fixtures here used an
+        arbitrary ``resource-job-1`` key with the real ID in a separate
+        ``instance_id`` field, a shape no code has ever produced, so
+        ``terminate_instances`` was asserted against IDs the mode never sends.
+        """
         # Setup mock resources
-        job_id = "job-1"
-        resource_id = f"resource-{job_id}"
+        resource_id = "i-12345678"
         standard_mode.resources = {
             resource_id: {
                 "type": RESOURCE_TYPE_EC2,
-                "job_id": job_id,
-                "instance_id": "i-12345678",
+                "job_id": "job-1",
                 "status": STATUS_PENDING,
             }
         }
@@ -223,7 +244,9 @@ class TestStandardMode:
         status = standard_mode.get_job_status([resource_id])
 
         # Verify status call and result
-        mock_ec2_client.describe_instances.assert_called_once()
+        mock_ec2_client.describe_instances.assert_called_once_with(
+            InstanceIds=[resource_id]
+        )
         assert status[resource_id] == STATUS_RUNNING  # Status from mocked response
 
         # Verify resource was updated
@@ -231,20 +254,18 @@ class TestStandardMode:
 
     def test_cancel_jobs(self, standard_mode, mock_ec2_client):
         """Test canceling jobs."""
-        # Setup mock resources
-        resource_id1 = "resource-1"
-        resource_id2 = "resource-2"
+        # Setup mock resources, keyed by instance ID as the mode stores them.
+        resource_id1 = "i-12345678"
+        resource_id2 = "i-87654321"
         standard_mode.resources = {
             resource_id1: {
                 "type": RESOURCE_TYPE_EC2,
                 "job_id": "job-1",
-                "instance_id": "i-12345678",
                 "status": STATUS_RUNNING,
             },
             resource_id2: {
                 "type": RESOURCE_TYPE_EC2,
                 "job_id": "job-2",
-                "instance_id": "i-87654321",
                 "status": STATUS_RUNNING,
             },
         }
@@ -254,18 +275,25 @@ class TestStandardMode:
 
         # Verify EC2 calls
         mock_ec2_client.terminate_instances.assert_called_once_with(
-            InstanceIds=["i-12345678", "i-87654321"]
+            InstanceIds=[resource_id1, resource_id2]
         )
 
-        # Verify status results
-        assert (
-            status[resource_id1] == STATUS_COMPLETED
-        )  # Assume completed on termination
-        assert status[resource_id2] == STATUS_COMPLETED
+        # A deliberate cancellation is CANCELED, distinct from a job that ran to
+        # completion. The previous expectation of COMPLETED ("assume completed on
+        # termination") is the status the mode reports only when EC2 says the
+        # instance is already gone.
+        assert status[resource_id1] == STATUS_CANCELED
+        assert status[resource_id2] == STATUS_CANCELED
+        assert standard_mode.resources[resource_id1]["status"] == STATUS_CANCELED
 
-    @patch("parsl_ephemeral_aws.modes.standard.delete_resource")
-    def test_cleanup_infrastructure(self, mock_delete_resource, standard_mode):
-        """Test infrastructure cleanup."""
+    def test_cleanup_infrastructure(self, standard_mode, mock_ec2_client):
+        """Cleanup terminates this mode's instances and spares the caller's network.
+
+        The previous version patched ``modes.standard.delete_resource`` — a
+        function this module no longer imports, so the patch itself raised
+        ``AttributeError`` — and asserted the SG, subnet, and VPC were each
+        deleted. #69 made all three the caller's property.
+        """
         # Setup infrastructure resources
         standard_mode.vpc_id = "vpc-12345"
         standard_mode.subnet_id = "subnet-12345"
@@ -273,12 +301,11 @@ class TestStandardMode:
         standard_mode.initialized = True
 
         # Add a resource to be cleaned up
-        resource_id = "resource-1"
+        resource_id = "i-12345678"
         standard_mode.resources = {
             resource_id: {
                 "type": RESOURCE_TYPE_EC2,
                 "job_id": "job-1",
-                "instance_id": "i-12345678",
                 "status": STATUS_RUNNING,
             }
         }
@@ -286,37 +313,38 @@ class TestStandardMode:
         # Call cleanup
         standard_mode.cleanup_infrastructure()
 
-        # Verify resource deletion
-        expected_calls = [
-            call("sg-12345", standard_mode.session, RESOURCE_TYPE_SECURITY_GROUP),
-            call("subnet-12345", standard_mode.session, RESOURCE_TYPE_SUBNET),
-            call("vpc-12345", standard_mode.session, RESOURCE_TYPE_VPC, force=True),
-        ]
-        mock_delete_resource.assert_has_calls(expected_calls, any_order=True)
+        # The mode's own instances go, and it waits for them to reach terminated
+        # so their ENIs stop referencing the security group.
+        mock_ec2_client.terminate_instances.assert_called_once_with(
+            InstanceIds=[resource_id]
+        )
+        mock_ec2_client.get_waiter.assert_called_once_with("instance_terminated")
+        assert not standard_mode.resources
 
-        # Verify state was reset
-        assert standard_mode.vpc_id is None
-        assert standard_mode.subnet_id is None
-        assert standard_mode.security_group_id is None
+        # The caller's network is left intact and still configured.
+        mock_ec2_client.delete_security_group.assert_not_called()
+        mock_ec2_client.delete_subnet.assert_not_called()
+        mock_ec2_client.delete_vpc.assert_not_called()
+        assert standard_mode.vpc_id == "vpc-12345"
+        assert standard_mode.subnet_id == "subnet-12345"
+        assert standard_mode.security_group_id == "sg-12345"
+
         assert standard_mode.initialized is False
-        assert not standard_mode.resources  # Resources should be empty
 
     def test_cleanup_resources(self, standard_mode, mock_ec2_client):
         """Test resource cleanup."""
-        # Setup resources
-        resource_id1 = "resource-1"
-        resource_id2 = "resource-2"
+        # Setup resources, keyed by instance ID as the mode stores them.
+        resource_id1 = "i-12345678"
+        resource_id2 = "i-87654321"
         standard_mode.resources = {
             resource_id1: {
                 "type": RESOURCE_TYPE_EC2,
                 "job_id": "job-1",
-                "instance_id": "i-12345678",
                 "status": STATUS_RUNNING,
             },
             resource_id2: {
                 "type": RESOURCE_TYPE_EC2,
                 "job_id": "job-2",
-                "instance_id": "i-87654321",
                 "status": STATUS_RUNNING,
             },
         }
@@ -326,7 +354,7 @@ class TestStandardMode:
 
         # Verify EC2 termination call
         mock_ec2_client.terminate_instances.assert_called_once_with(
-            InstanceIds=["i-12345678"]
+            InstanceIds=[resource_id1]
         )
 
         # Verify resource was removed from tracking

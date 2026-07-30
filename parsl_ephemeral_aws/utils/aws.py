@@ -7,11 +7,19 @@ SPDX-FileCopyrightText: 2025 Scott Friedman and Project Contributors
 
 import json
 import logging
+import os
 import time
 from typing import Any, Dict, List, Optional, Union
 
 import boto3
-from botocore.exceptions import ClientError
+from botocore.exceptions import (
+    ClientError,
+    CredentialRetrievalError,
+    NoCredentialsError,
+    PartialCredentialsError,
+    ProfileNotFound,
+    TokenRetrievalError,
+)
 
 from parsl_ephemeral_aws.constants import DEFAULT_AMI_MAPPING, DEFAULT_REGION
 from parsl_ephemeral_aws.exceptions import (
@@ -25,6 +33,76 @@ from parsl_ephemeral_aws.exceptions import (
 
 
 logger = logging.getLogger(__name__)
+
+# STS error codes that mean "your credentials are bad", as opposed to "AWS could
+# not be reached". Both map to AWSConnectionError subclasses, but only the former
+# is worth telling the user to go fix their credentials over — the latter is
+# worth retrying.
+_AUTH_ERROR_CODES = frozenset(
+    {
+        "AccessDenied",
+        "AccessDeniedException",
+        "AuthFailure",
+        "ExpiredToken",
+        "ExpiredTokenException",
+        "InvalidAccessKeyId",
+        "InvalidClientTokenId",
+        "MissingAuthenticationToken",
+        "SignatureDoesNotMatch",
+        "UnauthorizedOperation",
+        "UnrecognizedClientException",
+    }
+)
+
+# botocore exceptions raised when credentials are absent, incomplete, or
+# unresolvable. These are never transient, so they must not be reported as a
+# connection failure that a caller might retry.
+_CREDENTIAL_EXCEPTIONS = (
+    CredentialRetrievalError,
+    NoCredentialsError,
+    PartialCredentialsError,
+    ProfileNotFound,
+    TokenRetrievalError,
+)
+
+
+def resolve_manager_session(provider: Any, credential_manager: Any) -> boto3.Session:
+    """Return the session a compute manager should use.
+
+    The caller's own session wins. Only when the provider has none does this fall
+    back to building one from the credential manager.
+
+    All four compute managers previously went straight to
+    ``credential_manager.create_boto3_session()``, discarding
+    ``provider.session`` entirely — so a caller who passed an explicitly
+    configured session (temporary role credentials, a chosen profile, a
+    LocalStack ``endpoint_url``) had it silently replaced by one built from
+    ambient environment credentials, possibly pointing at a different account
+    (#117). It also meant an injected test double was ignored and the manager
+    reached real AWS; a unit test created a live ECS cluster this way.
+
+    This mirrors the fix already applied to the state stores, which had the same
+    defect.
+
+    Parameters
+    ----------
+    provider : Any
+        The provider (or operating mode) the manager was constructed with.
+    credential_manager : Any
+        Fallback used when the provider carries no session.
+
+    Returns
+    -------
+    boto3.Session
+        The caller's session if it has one, else a newly built session.
+    """
+    session = getattr(provider, "session", None)
+    if session is not None:
+        return session
+
+    return credential_manager.create_boto3_session(
+        region=getattr(provider, "region", None) or DEFAULT_REGION
+    )
 
 
 def create_session(
@@ -80,8 +158,19 @@ def create_session(
         logger.debug(f"Created AWS session for region {session.region_name}")
         return session
 
+    except _CREDENTIAL_EXCEPTIONS as e:
+        # Absent or unresolvable credentials. Not transient, so don't let this
+        # reach the generic handler and be reported as a connection failure the
+        # caller might retry.
+        logger.error(f"AWS authentication failed: {e}")
+        raise AWSAuthenticationError(f"AWS authentication failed: {e}") from e
     except ClientError as e:
-        if "InvalidClientTokenId" in str(e) or "AccessDenied" in str(e):
+        # Classify on the error *code*, not on str(e) -- a message that merely
+        # mentions AccessDenied is not an auth failure, and matching the string
+        # missed AuthFailure, SignatureDoesNotMatch, ExpiredToken, and
+        # UnrecognizedClientException, all of which plainly are.
+        error_code = e.response.get("Error", {}).get("Code", "")
+        if error_code in _AUTH_ERROR_CODES:
             logger.error(f"AWS authentication failed: {e}")
             raise AWSAuthenticationError(f"AWS authentication failed: {e}") from e
         else:
@@ -595,6 +684,16 @@ def get_cf_template(template_name: str) -> str:
     """
     Load a CloudFormation template from the templates directory.
 
+    Uses ``importlib.resources`` so the template is found both in an installed
+    wheel and in an editable/source checkout. The previous implementation called
+    ``pkg_resources.resource_string`` with the import placed *outside* its own
+    ``try`` — so once setuptools 81 removed ``pkg_resources`` the
+    ``except ModuleNotFoundError`` fallback became unreachable and every call
+    raised, taking down `DetachedMode.initialize()` with it. It also fell back to
+    a placeholder template declaring no ``Outputs``, which the bastion path then
+    indexed for ``BastionHostId`` — a confusing failure several steps removed
+    from the missing file (#112).
+
     Parameters
     ----------
     template_name : str
@@ -608,20 +707,17 @@ def get_cf_template(template_name: str) -> str:
     Raises
     ------
     FileNotFoundError
-        If template file is not found
+        If the template is not found in the package or on the filesystem
     """
-    import os
-    import pkg_resources
+    from importlib.resources import files
 
     try:
-        # Try to load from package resources
-        template_path = f"templates/cloudformation/{template_name}"
-        template_content = pkg_resources.resource_string(
-            "parsl_ephemeral_aws", template_path
-        ).decode("utf-8")
-        return template_content
-    except (FileNotFoundError, ModuleNotFoundError):
-        # Fallback to file system
+        resource = files("parsl_ephemeral_aws").joinpath(
+            "templates", "cloudformation", template_name
+        )
+        return resource.read_text(encoding="utf-8")
+    except (FileNotFoundError, ModuleNotFoundError, OSError):
+        # Fall back to the filesystem, for layouts importlib cannot address.
         current_dir = os.path.dirname(os.path.abspath(__file__))
         template_path = os.path.join(
             current_dir, "..", "templates", "cloudformation", template_name
@@ -630,16 +726,13 @@ def get_cf_template(template_name: str) -> str:
         if os.path.exists(template_path):
             with open(template_path, "r") as f:
                 return f.read()
-        else:
-            # Return a basic template as fallback
-            logger.warning(f"Template {template_name} not found, using basic template")
-            return """
-AWSTemplateFormatVersion: '2010-09-09'
-Description: 'Basic template placeholder'
-Resources:
-  PlaceholderResource:
-    Type: AWS::CloudFormation::WaitConditionHandle
-"""
+
+        raise FileNotFoundError(
+            f"CloudFormation template {template_name!r} not found in "
+            "parsl_ephemeral_aws/templates/cloudformation. If this is an "
+            "installed package, the templates were not included in the "
+            "distribution."
+        )
 
 
 def get_or_create_iam_role(

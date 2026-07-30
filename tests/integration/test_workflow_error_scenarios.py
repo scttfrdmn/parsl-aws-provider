@@ -26,11 +26,24 @@ from parsl_ephemeral_aws.exceptions import (
     LambdaFunctionError,
     EC2InstanceError,
 )
-from parsl_ephemeral_aws.utils.localstack import get_localstack_session
+from parsl_ephemeral_aws.utils.localstack import (
+    get_localstack_session,
+    is_localstack_available,
+)
 
 
-# Mark tests as requiring LocalStack
-pytestmark = [pytest.mark.integration, pytest.mark.localstack]
+# A marker only *selects* tests; it never skips them. Every sibling LocalStack
+# file pairs its markers with this skipif, and this one did not -- so a plain
+# `pytest tests/integration` erred out on all 7 tests with "LocalStack is not
+# running" from the class fixture, rather than skipping.
+pytestmark = [
+    pytest.mark.integration,
+    pytest.mark.localstack,
+    pytest.mark.skipif(
+        not is_localstack_available(),
+        reason="LocalStack is not available. Make sure it's running on port 4566.",
+    ),
+]
 
 
 @pytest.mark.integration

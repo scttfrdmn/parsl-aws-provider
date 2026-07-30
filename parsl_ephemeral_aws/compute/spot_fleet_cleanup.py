@@ -87,7 +87,7 @@ def cleanup_spot_fleet_role(
             ]:
                 if attempt < max_attempts - 1:
                     logger.warning(
-                        f"Could not delete role {role_name} on attempt {attempt+1}, "
+                        f"Could not delete role {role_name} on attempt {attempt + 1}, "
                         f"retrying in {delay_seconds} seconds..."
                     )
                     time.sleep(delay_seconds)
