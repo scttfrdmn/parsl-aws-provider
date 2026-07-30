@@ -76,6 +76,11 @@ docs = [
     "sphinx>=4.0.0",
     "sphinx-rtd-theme>=1.0.0",
     "sphinx-autodoc-typehints>=1.12.0",
+    # docs/conf.py has listed myst_parser in `extensions` all along without it
+    # being declared here, so `make -C docs html` died on
+    # `ExtensionError: Could not import extension myst_parser`. All but three of
+    # the doc sources are Markdown, so this is load-bearing, not optional.
+    "myst-parser>=2.0.0",
 ]
 
 [project.urls]

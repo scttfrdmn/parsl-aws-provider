@@ -27,6 +27,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   live VPC and blackhole egress for unrelated workloads (closes #94).
 
 ### Fixed
+- The `docs` CI job could never have built the documentation. `docs/conf.py` has
+  listed `myst_parser` in `extensions` all along without it being declared
+  anywhere, so `make -C docs html` died on
+  `ExtensionError: Could not import extension myst_parser`; it is now in the
+  `docs` extra. All but three of the doc sources are Markdown, so the extension
+  is load-bearing (refs #83).
+- `docs/makefile` renamed to `docs/Makefile`, and `SOURCEDIR` corrected from
+  `source` to `.`. The catch-all rule read `%: Makefile`, and on a
+  case-insensitive filesystem that is the makefile itself — so `make html`
+  matched the catch-all with `$@ = "makefile"` *before* the explicit `html` rule,
+  because a pattern rule that can remake the makefile is tried first. The result
+  was `sphinx -M makefile`, i.e.
+  `SphinxError: Builder name makefile not registered`. `SOURCEDIR = source`
+  pointed at `docs/source/`, an abandoned second doc tree, so every target built
+  the wrong sources (refs #83, #124).
 - `ECSManager._get_or_create_network_resources()` raised
   `UnboundLocalError: cannot access local variable 'subnet_response'` on every
   ECS/Fargate submission. A leftover line dereferenced `subnet_response`, which
