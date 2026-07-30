@@ -201,6 +201,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   described network IDs — and, for the mode, a baked AMI — that shutdown had just
   released. `delete_state` was implemented in all three stores and declared on
   the ABC, but called from nowhere in the package (closes #99).
+- Spot Fleet was unreachable through `EphemeralAWSProvider`. `use_spot_fleet`,
+  `instance_types`, `spot_max_price_percentage`, and `nodes_per_block` were
+  accepted by no provider parameter, so they landed in `**kwargs`, were stored on
+  the never-read `self.kwargs`, and were never forwarded — `StandardMode` kept its
+  defaults and `spot_fleet_manager` stayed `None`. `use_spot_fleet=True` appears
+  in 13 documentation files and 2 examples; every one of them silently ran single
+  on-demand or single-spot instances instead. All three modes already accepted the
+  four parameters, so they are now forwarded to each (closes #105).
+- `ServerlessMode.get_job_status()` reported rolled-back CloudFormation stacks as
+  `RUNNING`. The mapping tested `endswith("FAILED")` then `startswith("DELETE")`,
+  and `ROLLBACK_COMPLETE`/`ROLLBACK_IN_PROGRESS`/`UPDATE_ROLLBACK_COMPLETE` match
+  neither, so they fell through to the `RUNNING` default. `ROLLBACK_COMPLETE` is
+  the *usual* CloudFormation failure state, since automatic rollback on
+  `CREATE_FAILED` is the default — so the ordinary serverless failure path was the
+  one that misreported. `RUNNING` is not terminal, so the job was polled forever:
+  Parsl never learned the task had failed, never retried it, and never released
+  the block, while the stack sat in a state that can only be deleted (closes
+  #106).
+- `EphemeralAWSProvider` accepted an unknown `region` without complaint, then
+  failed much later with an opaque `EndpointConnectionError` from whichever AWS
+  call ran first — in standard mode from inside `initialize()`, after the state
+  store had been created. The region is now checked against botocore's packaged
+  endpoint data across all five partitions, so GovCloud, China, and
+  newly-launched regions are accepted without any in-tree list to maintain
+  (closes #107).
 
 ### Added
 - **One-shot mode** for `StandardMode`: set `one_shot=True` to declare that each
@@ -305,6 +330,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   logging "falling back to UserData execution". There was nothing to fall back
   to — the command is not in the UserData, so the instance would have idled
   until `max_idle_time` while reporting `RUNNING`.
+- `EphemeralAWSProvider.__init__` now raises `ProviderConfigurationError` for
+  unrecognised keyword arguments instead of absorbing them into `**kwargs`. The
+  collected `self.kwargs` attribute was write-only — read nowhere in the package —
+  so the permissiveness only ever hid typos and dropped options, which is exactly
+  how the Spot Fleet parameters went unnoticed (refs #105).
 - `EphemeralAWSProvider.status()` runs `_cleanup_resources()` when `one_shot` is
   set, not only when a warm pool is configured; a one-shot instance has no
   UserData shutdown to end it.

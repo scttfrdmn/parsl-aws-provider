@@ -21,7 +21,13 @@ from parsl_ephemeral_aws.modes.serverless import ServerlessMode
 from parsl_ephemeral_aws.compute.spot_fleet import SpotFleetManager
 from parsl_ephemeral_aws.compute.lambda_func import LambdaManager
 from parsl_ephemeral_aws.compute.ecs import ECSManager
-from parsl_ephemeral_aws.constants import STATUS_CANCELLED
+from parsl_ephemeral_aws.constants import (
+    STATUS_CANCELLED,
+    STATUS_FAILED,
+    STATUS_PENDING,
+    STATUS_SUCCEEDED,
+    STATUS_UNKNOWN,
+)
 from parsl_ephemeral_aws.exceptions import (
     AWSAuthenticationError,
     AWSConnectionError,
@@ -32,7 +38,6 @@ from parsl_ephemeral_aws.exceptions import (
     SpotFleetError,
     SpotFleetRequestError,
     SpotFleetThrottlingError,
-    CloudFormationError,
 )
 
 
@@ -912,91 +917,176 @@ class TestECSManagerErrors:
 
 
 class TestProviderConfigurationErrors:
-    """Tests for provider configuration errors."""
+    """Tests for provider configuration errors.
 
-    def test_invalid_mode(self):
-        """Test handling of invalid operating mode."""
-        with pytest.raises(ProviderConfigurationError):
-            provider = EphemeralAWSProvider(
-                region="us-east-1",
-                instance_type="t3.micro",
-                image_id="ami-12345678",
-                mode="invalid_mode",
-            )
+    What the provider validates, and what it deliberately does not, is a
+    contract in itself. Two things it *should* reject were found missing here
+    and fixed: an unknown region (#107) and an unrecognised keyword (#105).
+    Two more it is right to leave alone -- see
+    ``test_unvalidated_by_design`` for why.
+    """
 
-    def test_missing_required_parameter(self):
-        """Test handling of missing required parameters."""
-        # Missing image_id in standard mode
-        with pytest.raises(ProviderConfigurationError):
-            provider = EphemeralAWSProvider(
-                region="us-east-1",
-                instance_type="t3.micro",
-                mode="standard",
-                # Missing image_id
-            )
+    @pytest.fixture
+    def provider_config(self):
+        """Minimum config that constructs, for tests to perturb one field of."""
+        return {
+            "region": "us-east-1",
+            "instance_type": "t3.micro",
+            "image_id": "ami-12345678",
+            "mode": "standard",
+            "vpc_id": "vpc-12345",
+            "subnet_id": "subnet-12345",
+            "security_group_id": "sg-12345",
+        }
 
-    def test_incompatible_parameters(self):
-        """Test handling of incompatible parameter combinations."""
-        # Spot Fleet without instance types
-        with pytest.raises(ProviderConfigurationError):
-            provider = EphemeralAWSProvider(
-                region="us-east-1",
-                instance_type="t3.micro",
-                image_id="ami-12345678",
-                mode="standard",
-                use_spot_fleet=True,
-                # Missing instance_types
-            )
+    @staticmethod
+    def _mock_session():
+        session = MagicMock()
+        session.client.return_value = MagicMock()
+        session.region_name = "us-east-1"
+        return session
 
-    def test_invalid_parameter_values(self):
-        """Test handling of invalid parameter values."""
-        # Invalid region
-        with pytest.raises(ProviderConfigurationError):
-            provider = EphemeralAWSProvider(
-                region="invalid-region",
-                instance_type="t3.micro",
-                image_id="ami-12345678",
-                mode="standard",
-            )
+    def _construct(self, config):
+        """Construct a provider with boto3 fully mocked out."""
+        with patch("boto3.Session", return_value=self._mock_session()):
+            return EphemeralAWSProvider(**config)
 
-        # Invalid instance type format
-        with pytest.raises(ProviderConfigurationError):
-            provider = EphemeralAWSProvider(
-                region="us-east-1",
-                instance_type="invalid_instance_type",
-                image_id="ami-12345678",
-                mode="standard",
-            )
+    def test_invalid_mode(self, provider_config):
+        """An unknown operating mode is rejected by name."""
+        with pytest.raises(ProviderConfigurationError, match="invalid_mode"):
+            self._construct({**provider_config, "mode": "invalid_mode"})
 
-    def test_spot_without_interruption_warning(self):
-        """Test warning when using spot instances without interruption handling."""
-        with patch("logging.Logger.warning") as mock_warning:
-            provider = EphemeralAWSProvider(
-                region="us-east-1",
-                instance_type="t3.micro",
-                image_id="ami-12345678",
-                mode="standard",
-                use_spot=True,
-                spot_interruption_handling=False,
-            )
+    def test_invalid_compute_type(self, provider_config):
+        """An unknown compute type is rejected by name."""
+        with pytest.raises(ProviderConfigurationError, match="quantum"):
+            self._construct({**provider_config, "compute_type": "quantum"})
 
-            # Verify warning was logged
-            mock_warning.assert_called_with(
-                "Spot instances are enabled but spot interruption handling is disabled. Tasks may be lost if instances are interrupted."
-            )
+    def test_invalid_state_store_type(self, provider_config):
+        """An unknown state store type is rejected by name."""
+        with pytest.raises(ProviderConfigurationError, match="carrier-pigeon"):
+            self._construct({**provider_config, "state_store_type": "carrier-pigeon"})
+
+    def test_s3_store_without_bucket(self, provider_config):
+        """The s3 store needs a bucket; without one there is nowhere to write."""
+        with pytest.raises(ProviderConfigurationError, match="s3_bucket"):
+            self._construct({**provider_config, "state_store_type": "s3"})
+
+    def test_invalid_region(self, provider_config):
+        """An unknown region is rejected at construction, not at first API call.
+
+        Left unchecked it surfaced much later as an opaque
+        ``EndpointConnectionError`` from whichever AWS call ran first -- in
+        standard mode from inside ``initialize()``, after the state store had
+        already been built (#107).
+        """
+        with pytest.raises(ProviderConfigurationError, match="invalid-region"):
+            self._construct({**provider_config, "region": "invalid-region"})
+
+    @pytest.mark.parametrize(
+        "region",
+        [
+            "us-east-1",
+            # Added to AWS well after this package was written: the check has to
+            # read botocore's shipped table, not a list maintained in-tree.
+            "ap-southeast-5",
+            # Non-commercial partitions are usable and must not be rejected.
+            "us-gov-west-1",
+            "cn-north-1",
+        ],
+    )
+    def test_valid_regions_accepted(self, provider_config, region):
+        """Every partition botocore knows about is accepted."""
+        provider = self._construct({**provider_config, "region": region})
+
+        assert provider.region == region
+
+    def test_unknown_option_is_rejected(self, provider_config):
+        """A misspelled option raises instead of vanishing into **kwargs.
+
+        ``self.kwargs = kwargs`` was write-only, so an unrecognised option was
+        accepted in silence and then ignored -- which is exactly how
+        ``use_spot_fleet`` went unnoticed (#105).
+        """
+        with pytest.raises(ProviderConfigurationError, match="use_sp0t_fleet"):
+            self._construct({**provider_config, "use_sp0t_fleet": True})
+
+    def test_spot_fleet_options_reach_the_mode(self, provider_config):
+        """use_spot_fleet and friends must actually configure the mode.
+
+        This is the regression test for #105: all four of these were accepted by
+        the provider signature-less ``**kwargs``, stored on the unread
+        ``self.kwargs``, and never forwarded, so ``StandardMode`` kept its
+        defaults and ``spot_fleet_manager`` stayed ``None``. Spot Fleet was
+        documented in a dozen places and unreachable in all of them.
+        """
+        provider = self._construct(
+            {
+                **provider_config,
+                "use_spot": True,
+                "use_spot_fleet": True,
+                "instance_types": ["t3.micro", "t3.small"],
+                "spot_max_price_percentage": 80,
+                "nodes_per_block": 2,
+            }
+        )
+        mode = provider.operating_mode
+
+        assert mode.use_spot_fleet is True
+        assert mode.instance_types == ["t3.micro", "t3.small"]
+        assert mode.spot_max_price_percentage == 80
+        assert mode.nodes_per_block == 2
+        # The manager is gated on use_spot and use_spot_fleet both being set;
+        # its presence is what proves the forwarding took effect.
+        assert mode.spot_fleet_manager is not None
+
+    @pytest.mark.parametrize(
+        "override",
+        [
+            # Thousands of names, new families constantly; a local pattern check
+            # would reject valid types or wave through typos. RunInstances is the
+            # authority.
+            {"instance_type": "invalid_instance_type"},
+            # Omitting it is a supported feature, not an error: the provider
+            # resolves a per-region Amazon Linux 2023 default.
+            {"image_id": None},
+        ],
+    )
+    def test_unvalidated_by_design(self, provider_config, override):
+        """Two fields are deliberately not validated locally.
+
+        Pinned so a future "add more validation" pass has to argue with the
+        reasoning rather than quietly reverse it.
+        """
+        provider = self._construct({**provider_config, **override})
+
+        assert provider is not None
 
 
 class TestCloudFormationErrors:
-    """Tests for CloudFormation error handling in Serverless mode."""
+    """Tests for CloudFormation error handling in Serverless mode.
+
+    ``ServerlessMode`` drives CloudFormation through inline ``self.cf_client``
+    calls in ``_submit_ecs_job``/``_submit_lambda_job`` (create), ``cancel_jobs``
+    and ``cleanup_resources`` (delete), and ``get_job_status`` (describe). These
+    tests exercise those.
+
+    The suite previously called ``_create_cloudformation_stack``,
+    ``_delete_cloudformation_stack``, and ``_wait_for_stack`` and expected
+    ``CloudFormationError``. No commit has ever defined any of the three, and
+    ``CloudFormationError`` (``exceptions.py:185``) is raised nowhere in the
+    package -- so all four tests could only ever have raised ``AttributeError``.
+    The failures they describe are real, though, and are asserted below against
+    the code that actually runs.
+    """
 
     @pytest.fixture
     def serverless_mode(self):
-        """Create a ServerlessMode with mock session."""
+        """Create an ECS-mode ServerlessMode with its cf_client mocked."""
         session = MagicMock()
-        cf_client = MagicMock()
-        session.client.return_value = cf_client
+        session.client.return_value = MagicMock()
+        session.region_name = "us-east-1"
 
-        return ServerlessMode(
+        mode = ServerlessMode(
             provider_id=str(uuid.uuid4()),
             session=session,
             state_store=MagicMock(),
@@ -1009,46 +1099,74 @@ class TestCloudFormationErrors:
             subnet_id="subnet-12345",
             security_group_id="sg-12345",
         )
+        mode.cf_client = MagicMock()
+        return mode
+
+    @staticmethod
+    def _track(mode, resource_id="res-1", **extra):
+        """Register a resource the way a successful submit would have."""
+        mode.resources[resource_id] = {
+            "job_id": "job-1",
+            "stack_name": "test-stack",
+            "worker_type": "ecs",
+            "status": "PENDING",
+            **extra,
+        }
+        return resource_id
 
     def test_stack_creation_error(self, serverless_mode):
-        """Test handling of CloudFormation stack creation errors."""
-        # Simulate stack creation error
-        error_response = {
-            "Error": {
-                "Code": "LimitExceededException",
-                "Message": "Stack limit exceeded",
-            }
-        }
+        """A rejected create_stack surfaces as JobSubmissionError.
+
+        ``_submit_ecs_job`` wraps everything it catches, so JobSubmissionError --
+        not CloudFormationError -- is what a caller can actually catch.
+        """
+        resource_id = self._track(serverless_mode)
         serverless_mode.cf_client.create_stack.side_effect = ClientError(
-            error_response, "CreateStack"
+            {
+                "Error": {
+                    "Code": "LimitExceededException",
+                    "Message": "Stack limit exceeded",
+                }
+            },
+            "CreateStack",
         )
 
-        with pytest.raises(CloudFormationError):
-            serverless_mode._create_cloudformation_stack(
-                stack_name="test-stack", template_body="{}", parameters=[], tags={}
+        with pytest.raises(JobSubmissionError):
+            serverless_mode._submit_ecs_job(
+                job_id="job-1",
+                command="echo hello",
+                tasks_per_node=1,
+                job_name=None,
+                resource_id=resource_id,
             )
 
-    def test_stack_deletion_error(self, serverless_mode):
-        """Test handling of CloudFormation stack deletion errors."""
-        # Simulate stack deletion error
-        error_response = {
-            "Error": {"Code": "ValidationError", "Message": "Stack does not exist"}
-        }
+    def test_stack_deletion_of_absent_stack_is_not_an_error(self, serverless_mode):
+        """Deleting a stack AWS has already forgotten still clears tracking.
+
+        Cleanup has to be idempotent -- it runs on paths that may have already
+        run it -- so a "does not exist" ValidationError must not strand the
+        resource record.
+        """
+        resource_id = self._track(serverless_mode)
         serverless_mode.cf_client.delete_stack.side_effect = ClientError(
-            error_response, "DeleteStack"
+            {"Error": {"Code": "ValidationError", "Message": "Stack does not exist"}},
+            "DeleteStack",
         )
 
-        # This should log the error but not raise an exception since we're trying to delete something that doesn't exist
-        serverless_mode._delete_cloudformation_stack("test-stack")
+        serverless_mode.cleanup_resources([resource_id])
 
-        # Verify delete_stack was called with the right stack name
         serverless_mode.cf_client.delete_stack.assert_called_with(
             StackName="test-stack"
         )
+        assert resource_id not in serverless_mode.resources
 
-    def test_stack_waiting_error(self, serverless_mode):
-        """Test handling of errors while waiting for CloudFormation stack."""
-        # Mock describe_stacks to return a failed stack
+    def test_failed_stack_is_reported_failed(self, serverless_mode):
+        """A CREATE_FAILED stack reports FAILED rather than raising.
+
+        ``get_job_status`` is polled on every Parsl iteration; raising there
+        would abort the run instead of letting Parsl see the task failed.
+        """
+        resource_id = self._track(serverless_mode)
         serverless_mode.cf_client.describe_stacks.return_value = {
             "Stacks": [
                 {
@@ -1059,20 +1177,102 @@ class TestCloudFormationErrors:
             ]
         }
 
-        with pytest.raises(CloudFormationError):
-            serverless_mode._wait_for_stack("test-stack", "CREATE_COMPLETE", 10)
+        assert serverless_mode.get_job_status([resource_id])[resource_id] == (
+            STATUS_FAILED
+        )
 
-    def test_stack_timeout_error(self, serverless_mode):
-        """Test handling of timeout while waiting for CloudFormation stack."""
-        # Mock describe_stacks to always return an in-progress stack
+    @pytest.mark.parametrize(
+        "stack_status",
+        [
+            "ROLLBACK_COMPLETE",
+            "ROLLBACK_IN_PROGRESS",
+            "UPDATE_ROLLBACK_COMPLETE",
+            "UPDATE_ROLLBACK_IN_PROGRESS",
+        ],
+    )
+    def test_rolled_back_stack_is_reported_failed(self, serverless_mode, stack_status):
+        """Any rollback is a failure, including the ones that end in COMPLETE.
+
+        The mapping tested affixes -- ``endswith("FAILED")`` then
+        ``startswith("DELETE")`` -- and ``ROLLBACK_COMPLETE`` matches neither, so
+        it fell through to RUNNING (#106). That is the *usual* CloudFormation
+        failure state, since automatic rollback on CREATE_FAILED is the default.
+        RUNNING is not terminal, so the job was polled forever: Parsl never
+        learned the task had failed and never retried it, while the stack sat in
+        a state that can only be deleted.
+        """
+        resource_id = self._track(serverless_mode)
+        serverless_mode.cf_client.describe_stacks.return_value = {
+            "Stacks": [{"StackName": "test-stack", "StackStatus": stack_status}]
+        }
+
+        assert serverless_mode.get_job_status([resource_id])[resource_id] == (
+            STATUS_FAILED
+        )
+
+    def test_in_progress_stack_is_reported_pending(self, serverless_mode):
+        """A stack still being created is PENDING, not FAILED.
+
+        Guards the #106 fix against over-reaching: only rollbacks became
+        failures.
+        """
+        resource_id = self._track(serverless_mode)
         serverless_mode.cf_client.describe_stacks.return_value = {
             "Stacks": [{"StackName": "test-stack", "StackStatus": "CREATE_IN_PROGRESS"}]
         }
 
-        # Set a short timeout to trigger the timeout error
-        with pytest.raises(CloudFormationError):
-            # Pass a very short timeout (1 second)
-            serverless_mode._wait_for_stack("test-stack", "CREATE_COMPLETE", 1)
+        assert serverless_mode.get_job_status([resource_id])[resource_id] == (
+            STATUS_PENDING
+        )
+
+    def test_deleting_stack_is_reported_cancelled(self, serverless_mode):
+        """A stack being deleted reads as cancelled, not failed."""
+        resource_id = self._track(serverless_mode)
+        serverless_mode.cf_client.describe_stacks.return_value = {
+            "Stacks": [{"StackName": "test-stack", "StackStatus": "DELETE_IN_PROGRESS"}]
+        }
+
+        assert serverless_mode.get_job_status([resource_id])[resource_id] == (
+            STATUS_CANCELLED
+        )
+
+    def test_vanished_stack_is_reported_succeeded(self, serverless_mode):
+        """A stack AWS no longer knows about has finished, so report success.
+
+        ``cleanup_resources`` deletes the stack once a job is done, so a missing
+        stack is the normal end state -- reporting UNKNOWN or FAILED would make
+        every completed serverless job look broken.
+        """
+        resource_id = self._track(serverless_mode)
+        serverless_mode.cf_client.describe_stacks.side_effect = ClientError(
+            {
+                "Error": {
+                    "Code": "ValidationError",
+                    "Message": "Stack with id test-stack does not exist",
+                }
+            },
+            "DescribeStacks",
+        )
+
+        assert serverless_mode.get_job_status([resource_id])[resource_id] == (
+            STATUS_SUCCEEDED
+        )
+
+    def test_throttled_describe_degrades_to_unknown(self, serverless_mode):
+        """A transient describe failure yields UNKNOWN rather than raising.
+
+        UNKNOWN keeps the job pollable; a raise would abort the whole run over a
+        throttle.
+        """
+        resource_id = self._track(serverless_mode)
+        serverless_mode.cf_client.describe_stacks.side_effect = ClientError(
+            {"Error": {"Code": "Throttling", "Message": "Rate exceeded"}},
+            "DescribeStacks",
+        )
+
+        assert serverless_mode.get_job_status([resource_id])[resource_id] == (
+            STATUS_UNKNOWN
+        )
 
 
 @pytest.mark.unit

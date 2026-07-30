@@ -915,6 +915,17 @@ class ServerlessMode(OperatingMode):
                     else:
                         status = STATUS_RUNNING
 
+                # Any rollback means the stack failed. Checked before the
+                # affix tests below because ROLLBACK_COMPLETE and
+                # UPDATE_ROLLBACK_COMPLETE match neither of them and so used to
+                # fall through to RUNNING (#106) -- and ROLLBACK_COMPLETE is the
+                # *usual* CloudFormation failure state, since automatic rollback
+                # on CREATE_FAILED is the default. Reporting RUNNING there left
+                # the job outside _TERMINAL_STATES and polled forever, so Parsl
+                # never learned the task had failed and never retried it, while
+                # the stack sat in a state that can only be deleted.
+                elif "ROLLBACK" in stack_status:
+                    status = STATUS_FAILED
                 elif stack_status.endswith("FAILED"):
                     status = STATUS_FAILED
                 elif stack_status.startswith("DELETE"):

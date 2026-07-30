@@ -15,6 +15,7 @@ import uuid
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
+import botocore.session
 from parsl.jobs.states import JobState, JobStatus
 from parsl.providers.base import ExecutionProvider
 from parsl.utils import RepresentationMixin
@@ -255,6 +256,9 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
         spot_max_price: Optional[str] = None,
         spot_allocation_strategy: str = "capacity-optimized",
         spot_interruption_handling: bool = False,
+        use_spot_fleet: bool = False,
+        instance_types: Optional[List[str]] = None,
+        spot_max_price_percentage: Optional[int] = None,
         checkpoint_bucket: Optional[str] = None,
         checkpoint_prefix: str = "parsl/checkpoints",
         checkpoint_interval: int = 60,
@@ -289,6 +293,18 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
         if debug:
             logger.setLevel(logging.DEBUG)
 
+        # Reject options this provider does not recognise. **kwargs used to
+        # absorb them in silence: use_spot_fleet and instance_types were
+        # documented across a dozen files and two examples yet landed here and
+        # were never read, so the entire Spot Fleet path was unreachable and
+        # nothing said so (#105). A typo deserves the same treatment.
+        if kwargs:
+            raise ProviderConfigurationError(
+                f"Unknown configuration option(s): {', '.join(sorted(kwargs))}. "
+                "Check the spelling against EphemeralAWSProvider.__init__; an "
+                "option accepted here but never read would be silently ignored."
+            )
+
         # Validate configuration
         self._validate_config(
             image_id=image_id,
@@ -296,6 +312,7 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
             compute_type=compute_type,
             state_store_type=state_store_type,
             s3_bucket=s3_bucket,
+            region=region,
         )
 
         # Set basic attributes - resolve image_id if not provided
@@ -341,6 +358,9 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
         self.spot_max_price = spot_max_price
         self.spot_allocation_strategy = spot_allocation_strategy
         self.spot_interruption_handling = spot_interruption_handling
+        self.use_spot_fleet = use_spot_fleet
+        self.instance_types = instance_types or []
+        self.spot_max_price_percentage = spot_max_price_percentage
         self.checkpoint_bucket = checkpoint_bucket
         self.checkpoint_prefix = checkpoint_prefix
         self.checkpoint_interval = checkpoint_interval
@@ -365,7 +385,6 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
         self.bake_ami = bake_ami
         self.baked_ami_id = baked_ami_id
         self.one_shot = one_shot
-        self.kwargs = kwargs
 
         # Guard: network IDs are required (provider no longer creates VPC/subnet/SG).
         # Lambda-only serverless is the one exception: functions run in the
@@ -468,6 +487,7 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
         compute_type: str,
         state_store_type: str,
         s3_bucket: Optional[str],
+        region: str,
     ) -> None:
         """Validate the configuration parameters.
 
@@ -483,11 +503,21 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
             Type of state store to use.
         s3_bucket : Optional[str]
             S3 bucket name when using 's3' state store.
+        region : str
+            AWS region name.
 
         Raises
         ------
         ProviderConfigurationError
             If the configuration is invalid.
+
+        Notes
+        -----
+        ``instance_type`` is deliberately not validated. There are thousands of
+        names and AWS adds more continually, so any local check would either
+        reject valid new families or wave through typos; ``RunInstances``
+        rejects a bad one authoritatively. ``image_id`` is likewise not
+        required — omitting it selects a per-region default.
         """
         # Validate operating mode
         try:
@@ -497,6 +527,13 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
                 f"Invalid operating mode: {mode}. Must be one of: "
                 f"{', '.join([m.value for m in OperatingModeType])}"
             )
+
+        # Validate the region against botocore's shipped endpoint data. This is
+        # offline and self-maintaining. Without it an unknown region surfaces
+        # much later as an opaque EndpointConnectionError from whichever AWS
+        # call happens to run first — in standard mode that is inside
+        # initialize(), after the state store has already been created.
+        self._validate_region(region)
 
         # Note: image_id validation removed - it will be auto-detected if not provided
 
@@ -522,6 +559,54 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
             raise ProviderConfigurationError(
                 f"Invalid compute type: {compute_type}. Must be one of: "
                 f"{', '.join([c.value for c in ComputeType])}"
+            )
+
+    # Every partition botocore ships endpoint data for. The commercial
+    # partition alone would reject GovCloud and China regions, which are
+    # perfectly usable here.
+    _AWS_PARTITIONS = ("aws", "aws-cn", "aws-us-gov", "aws-iso", "aws-iso-b")
+
+    @classmethod
+    def _known_regions(cls) -> set:
+        """Return every EC2 region botocore knows, across all partitions.
+
+        Reads the packaged endpoint data through ``botocore.session`` rather
+        than ``boto3.Session``: this is an offline table lookup, not an AWS
+        call, and going through boto3 would make the result depend on whether a
+        caller happens to have patched ``boto3.Session`` — which every test in
+        this suite does.
+        """
+        known: set = set()
+        session = botocore.session.get_session()
+        for partition in cls._AWS_PARTITIONS:
+            try:
+                known.update(
+                    session.get_available_regions("ec2", partition_name=partition)
+                )
+            except Exception as e:  # pragma: no cover - packaged data
+                logger.debug(f"No endpoint data for partition {partition}: {e}")
+        return known
+
+    @classmethod
+    def _validate_region(cls, region: str) -> None:
+        """Reject a region name botocore does not know about.
+
+        Raises
+        ------
+        ProviderConfigurationError
+            If ``region`` is not a known EC2 region.
+        """
+        known = cls._known_regions()
+        if not known:  # pragma: no cover - packaged data
+            # Never let unreadable endpoint data block construction; a bad
+            # region still fails at the first AWS call.
+            logger.debug("Could not load the botocore region list, skipping check")
+            return
+
+        if region not in known:
+            raise ProviderConfigurationError(
+                f"Invalid region: {region}. Must be one of: "
+                f"{', '.join(sorted(known))}"
             )
 
     def _parameter_store_prefix(self) -> str:
@@ -603,6 +688,12 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
             "spot_max_price": self.spot_max_price,
             "spot_allocation_strategy": self.spot_allocation_strategy,
             "spot_interruption_handling": self.spot_interruption_handling,
+            # All three modes accept these; without the forwarding the whole
+            # Spot Fleet path was unreachable through the provider (#105).
+            "use_spot_fleet": self.use_spot_fleet,
+            "instance_types": self.instance_types,
+            "spot_max_price_percentage": self.spot_max_price_percentage,
+            "nodes_per_block": self.nodes_per_block,
             "checkpoint_bucket": self.checkpoint_bucket,
             "checkpoint_prefix": self.checkpoint_prefix,
             "checkpoint_interval": self.checkpoint_interval,
