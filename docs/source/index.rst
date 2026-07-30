@@ -32,7 +32,7 @@ Features
 * **State Persistence**: Multiple mechanisms for workflow state persistence and recovery
 * **Cost Optimization**: Support for spot instances, auto-shutdown policies, and resource tagging
 * **HPC Features**: MPI support for high-performance computing workloads
-* **Testing Framework**: Comprehensive testing with LocalStack integration
+* **Testing Framework**: Unit tests with moto, integration tests against the substrate AWS emulator, and real-AWS E2E tests
 * **Infrastructure-as-Code**: CloudFormation templates and Terraform modules
 
 User Guide
@@ -93,7 +93,7 @@ Developer Guide
    dev/architecture
    dev/contributing
    dev/testing
-   dev/localstack
+   dev/substrate_testing
    dev/ci_cd
    dev/release_process
    dev/roadmap

@@ -48,14 +48,19 @@ Install development dependencies:
 
    pip install "parsl-ephemeral-aws[dev]"
 
-LocalStack Testing
-~~~~~~~~~~~~~~~~~
+Local AWS Emulation
+~~~~~~~~~~~~~~~~~~~
 
-Install LocalStack dependencies for local AWS service emulation:
+The test suite runs against `substrate <https://github.com/scttfrdmn/substrate>`_,
+a local AWS emulator. It is a container image rather than a Python package, so
+there is no extra to install:
 
 .. code-block:: bash
 
-   pip install "parsl-ephemeral-aws[localstack]"
+   make substrate-up
+
+See ``docs/substrate_testing.md``. Substrate replaced LocalStack in #125; the
+former ``[localstack]`` extra no longer exists.
 
 Documentation
 ~~~~~~~~~~~~

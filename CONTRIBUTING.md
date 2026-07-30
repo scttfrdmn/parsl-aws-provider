@@ -56,7 +56,7 @@ Thank you for your interest in contributing to this project! Here's how you can 
    # Unit + security tests, with the same coverage gate CI applies
    make test-unit
 
-   # Integration tests (starts LocalStack; they skip without it)
+   # Integration tests (starts the substrate emulator; they skip without it)
    make test-integration
 
    # A single file or test

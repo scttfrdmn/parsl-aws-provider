@@ -14,6 +14,8 @@ bandit>=1.7.0
 types-boto3>=1.0.0
 
 # Optional dependencies
-localstack>=2.0.0
+# `localstack` dropped in #125: LocalStack OSS is end-of-life and the emulator is
+# now substrate, a Go binary pulled as a container image rather than a Python
+# package. See docs/substrate_testing.md.
 tf-ecosystem>=0.0.1
 tf-python>=0.0.1

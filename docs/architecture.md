@@ -146,9 +146,11 @@ The provider follows AWS security best practices:
 - Resource isolation between workflows
 - No persistent credentials in EC2 instances
 
-## Testing with LocalStack
+## Testing with a local AWS emulator
 
-For testing AWS interactions without real AWS resources, the provider supports LocalStack integration, which provides a local emulation of AWS services.
+For testing AWS interactions without real AWS resources, the suite runs against
+[substrate](https://github.com/scttfrdmn/substrate), a local AWS emulator. See
+[substrate_testing.md](substrate_testing.md); it replaced LocalStack in #125.
 
 SPDX-License-Identifier: Apache-2.0
 SPDX-FileCopyrightText: 2025 Scott Friedman and Project Contributors

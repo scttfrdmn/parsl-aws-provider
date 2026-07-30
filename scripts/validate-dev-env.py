@@ -11,7 +11,12 @@ SPDX-FileCopyrightText: 2025 Scott Friedman and Project Contributors
 
 import sys
 import importlib
-import subprocess
+
+# This script shells out to developer tools to report their versions. Every
+# argument list below is a literal -- no user input reaches subprocess -- and
+# resolving each tool via PATH is the point, since the whole check is "is this on
+# the developer's PATH?". Hence the B404/B603/B607 waivers at the call sites.
+import subprocess  # nosec B404
 from pathlib import Path
 from typing import List, Tuple
 
@@ -92,7 +97,7 @@ def check_version_management() -> List[Tuple[str, bool, str]]:
 
     # Check bump-my-version availability
     try:
-        result = subprocess.run(
+        result = subprocess.run(  # nosec B603 B607
             ["bump-my-version", "--version"], capture_output=True, text=True, timeout=10
         )
         if result.returncode == 0:
@@ -134,7 +139,7 @@ def check_development_tools() -> List[Tuple[str, bool, str]]:
     results = []
     for tool, description in tools_to_check:
         try:
-            result = subprocess.run(
+            result = subprocess.run(  # nosec B603
                 [tool, "--version"], capture_output=True, text=True, timeout=5
             )
             if result.returncode == 0:
@@ -150,9 +155,9 @@ def check_development_tools() -> List[Tuple[str, bool, str]]:
 
 def print_results(category: str, results: List[Tuple[str, bool, str]]):
     """Print results for a category."""
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print(f"  {category.upper()}")
-    print(f"{'='*60}")
+    print(f"{'=' * 60}")
 
     passed = 0
     total = len(results)
@@ -192,9 +197,9 @@ def main():
         all_total += total
 
     # Final summary
-    print(f"\n{'='*80}")
+    print(f"\n{'=' * 80}")
     print("  OVERALL SUMMARY")
-    print(f"{'='*80}")
+    print(f"{'=' * 80}")
 
     percentage = (all_passed / all_total) * 100 if all_total > 0 else 0
 
@@ -226,8 +231,10 @@ def main():
         print("\n❌ Development environment needs significant work.")
         exit_code = 1
 
-    print("\nNote: Docker/LocalStack validation requires Docker Desktop to be running.")
-    print("Start Docker Desktop and run 'make localstack-up' to test AWS integration.")
+    print(
+        "\nNote: emulator validation requires a container runtime (podman or docker)."
+    )
+    print("Start it and run 'make substrate-up' to test AWS integration.")
 
     sys.exit(exit_code)
 

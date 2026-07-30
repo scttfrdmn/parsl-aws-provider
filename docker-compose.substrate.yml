@@ -1,0 +1,49 @@
+# Substrate — the AWS emulator this suite tests against (#125).
+#
+# Replaces docker-compose.localstack.yml. LocalStack OSS is end-of-life: the
+# upstream repository was archived read-only in March 2026, `4.14.0` is the last
+# community image, and `localstack/localstack:latest` now resolves to the Pro
+# build (byte-identical digest to `localstack/localstack-pro`), which exits 55 on
+# "License activation failed!" without a LOCALSTACK_AUTH_TOKEN.
+#
+# Substrate is a single Go binary with no license gate, and it answers
+# `/_localstack/health` with a LocalStack-shaped payload, so it is a drop-in.
+#
+# The old file needed SERVICES=ec2,ecs,lambda,s3,... plus PROVIDER_OVERRIDE_*
+# and a bind-mounted /var/run/docker.sock (LocalStack shelled out to Docker to
+# run Lambdas). Substrate needs none of that: every service its build supports is
+# on by default, and nothing here mounts the container socket.
+
+services:
+  substrate:
+    # Pinned, not `latest`: an emulator that silently changes under CI turns an
+    # unrelated PR red. Bump deliberately.
+    image: ghcr.io/scttfrdmn/substrate:0.76.0
+    container_name: parsl-substrate
+    ports:
+      - "4566:4566"
+
+    # No volume. State is in-memory and `POST /v1/state/reset` wipes it, which is
+    # what tests use for isolation -- LocalStack's DATA_DIR/PERSISTENCE pair
+    # existed because it had no reset endpoint, and persisting emulator state
+    # across runs makes tests order-dependent.
+
+    healthcheck:
+      # /health, not /_localstack/health: it is substrate's own liveness endpoint
+      # and returns a small fixed payload. wget, because the image is Alpine-based
+      # and ships no curl.
+      test: ["CMD", "wget", "-qO-", "http://localhost:4566/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
+    networks:
+      - parsl-test
+
+networks:
+  parsl-test:
+    driver: bridge
+
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2025 Scott Friedman and Project Contributors

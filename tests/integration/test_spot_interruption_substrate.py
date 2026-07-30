@@ -1,6 +1,6 @@
-"""Integration tests for spot interruption handling with LocalStack.
+"""Integration tests for spot interruption handling with substrate.
 
-This module focuses on testing spot interruption handling with LocalStack's
+This module focuses on testing spot interruption handling with substrate's
 mocked AWS services, simulating actual AWS API calls and responses.
 
 SPDX-License-Identifier: Apache-2.0
@@ -19,31 +19,31 @@ from parsl_ephemeral_aws.compute.spot_interruption import (
     ParslSpotInterruptionHandler,
     checkpointable,
 )
-from parsl_ephemeral_aws.utils.localstack import (
-    is_localstack_available,
-    get_localstack_session,
+from tests.substrate_support import (
+    get_substrate_session,
+    is_substrate_available,
 )
 
 
 @pytest.fixture(scope="session")
-def localstack_available():
-    """Check if LocalStack is available for testing."""
-    if not is_localstack_available():
-        pytest.skip("LocalStack is not available. Make sure it's running on port 4566.")
+def substrate_available():
+    """Check if substrate is available for testing."""
+    if not is_substrate_available():
+        pytest.skip("substrate not available - start with 'make substrate-up'")
     return True
 
 
 @pytest.fixture(scope="session")
-def localstack_session(localstack_available):
-    """Create a session connected to LocalStack."""
-    return get_localstack_session()
+def substrate_session(substrate_available):
+    """Create a session connected to substrate."""
+    return get_substrate_session()
 
 
 @pytest.fixture
-def checkpoint_bucket(localstack_session):
+def checkpoint_bucket(substrate_session):
     """Create a temporary S3 bucket for checkpoints."""
     bucket_name = f"test-checkpoint-bucket-{uuid.uuid4().hex[:8]}"
-    s3_client = localstack_session.client("s3")
+    s3_client = substrate_session.client("s3")
 
     try:
         s3_client.create_bucket(Bucket=bucket_name)
@@ -69,9 +69,9 @@ def checkpoint_bucket(localstack_session):
 
 
 @pytest.fixture
-def cloudwatch_event_client(localstack_session):
+def cloudwatch_event_client(substrate_session):
     """Create a CloudWatch Events client."""
-    return localstack_session.client("events")
+    return substrate_session.client("events")
 
 
 @pytest.fixture
@@ -99,11 +99,11 @@ def setup_cloudwatch_events(cloudwatch_event_client):
 
 
 @pytest.mark.integration
-class TestSpotInterruptionLocalstack:
-    """Integration tests for spot interruption using LocalStack."""
+class TestSpotInterruptionSubstrate:
+    """Integration tests for spot interruption using substrate."""
 
-    @pytest.mark.localstack
-    def test_s3_checkpoint_persistence(self, localstack_session, checkpoint_bucket):
+    @pytest.mark.substrate
+    def test_s3_checkpoint_persistence(self, substrate_session, checkpoint_bucket):
         """Test that checkpoints can be saved and loaded from S3."""
         task_id = f"test-task-{uuid.uuid4().hex[:8]}"
         checkpoint_data = {
@@ -116,7 +116,7 @@ class TestSpotInterruptionLocalstack:
 
         # Create handler
         handler = SpotInterruptionHandler(
-            session=localstack_session,
+            session=substrate_session,
             checkpoint_bucket=checkpoint_bucket,
             checkpoint_prefix="test/checkpoints",
         )
@@ -126,7 +126,7 @@ class TestSpotInterruptionLocalstack:
         assert uri == f"s3://{checkpoint_bucket}/test/checkpoints/{task_id}.json"
 
         # Verify object exists in S3
-        s3_client = localstack_session.client("s3")
+        s3_client = substrate_session.client("s3")
         response = s3_client.list_objects_v2(
             Bucket=checkpoint_bucket, Prefix=f"test/checkpoints/{task_id}"
         )
@@ -147,12 +147,12 @@ class TestSpotInterruptionLocalstack:
         handler_loaded_data = handler.load_checkpoint(task_id)
         assert handler_loaded_data == checkpoint_data
 
-    @pytest.mark.localstack
+    @pytest.mark.substrate
     def test_checkpointable_decorator_with_s3(
-        self, localstack_session, checkpoint_bucket
+        self, substrate_session, checkpoint_bucket
     ):
         """Test that the checkpointable decorator works with real S3."""
-        s3_client = localstack_session.client("s3")
+        s3_client = substrate_session.client("s3")
 
         # Define a checkpointable function
         @checkpointable(
@@ -222,8 +222,8 @@ class TestSpotInterruptionLocalstack:
         with patch(
             "parsl_ephemeral_aws.compute.spot_interruption.boto3.Session"
         ) as mock_session:
-            # Return the real localstack session
-            mock_session.return_value = localstack_session
+            # Return the real substrate session
+            mock_session.return_value = substrate_session
 
             # Run with the latest task_id which has our interrupted checkpoint
             result = test_function(task_id=interrupted_task_id)
@@ -231,17 +231,17 @@ class TestSpotInterruptionLocalstack:
             # Should complete from iteration 2 onwards: 3+4=7, plus existing 3 = 10
             assert result == 10
 
-    @pytest.mark.localstack
+    @pytest.mark.substrate
     def test_spot_interruption_event_detection(
-        self, localstack_session, checkpoint_bucket, setup_cloudwatch_events
+        self, substrate_session, checkpoint_bucket, setup_cloudwatch_events
     ):
         """Test that spot interruption events can be detected and processed."""
         # Create a spot interruption monitor
-        monitor = SpotInterruptionMonitor(session=localstack_session)
+        monitor = SpotInterruptionMonitor(session=substrate_session)
 
         # Create a handler for tests
         handler = SpotInterruptionHandler(
-            session=localstack_session,
+            session=substrate_session,
             checkpoint_bucket=checkpoint_bucket,
             checkpoint_prefix="test/interruptions",
         )
@@ -260,7 +260,7 @@ class TestSpotInterruptionLocalstack:
         monitor.start_monitoring()
 
         # Simulate an interruption notice event
-        cloudwatch_event_client = localstack_session.client("events")
+        cloudwatch_event_client = substrate_session.client("events")
 
         event_detail = {
             "instance-id": instance_id,
@@ -268,8 +268,8 @@ class TestSpotInterruptionLocalstack:
             "time": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         }
 
-        # Put the event - in LocalStack this should be detected by our monitor
-        # Note: LocalStack may not fully simulate the event delivery to our monitor
+        # Put the event - the emulator should deliver it to our monitor
+        # Note: the emulator may not fully simulate event delivery to our monitor
         # This is a limitation of the testing environment
         try:
             cloudwatch_event_client.put_events(
@@ -286,7 +286,7 @@ class TestSpotInterruptionLocalstack:
             )
 
             # In a real environment, we would wait for the event to be processed
-            # In LocalStack, we'll mock this by directly calling the handler
+            # Against the emulator, mock this by directly calling the handler
             monitor._handle_instance_interruption(instance_id, event_detail)
 
             # Verify the handler was called
@@ -298,15 +298,15 @@ class TestSpotInterruptionLocalstack:
             # Stop monitoring
             monitor.stop_monitoring()
 
-    @pytest.mark.localstack
-    def test_spot_fleet_interruption(self, localstack_session, checkpoint_bucket):
+    @pytest.mark.substrate
+    def test_spot_fleet_interruption(self, substrate_session, checkpoint_bucket):
         """Test handling of spot fleet interruptions."""
         # Create a spot interruption monitor
-        monitor = SpotInterruptionMonitor(session=localstack_session)
+        monitor = SpotInterruptionMonitor(session=substrate_session)
 
         # Create a handler for tests
         handler = SpotInterruptionHandler(
-            session=localstack_session,
+            session=substrate_session,
             checkpoint_bucket=checkpoint_bucket,
             checkpoint_prefix="test/fleet-interruptions",
         )
@@ -336,7 +336,7 @@ class TestSpotInterruptionLocalstack:
         }
 
         try:
-            # In LocalStack, we'll mock this by directly calling the handler
+            # Against the emulator, mock this by directly calling the handler
             monitor._handle_fleet_interruption(fleet_id, instance_ids, event_detail)
 
             # Verify the handler was called
@@ -349,12 +349,12 @@ class TestSpotInterruptionLocalstack:
             # Stop monitoring
             monitor.stop_monitoring()
 
-    @pytest.mark.localstack
-    def test_parsl_handler_recovery_queue(self, localstack_session, checkpoint_bucket):
+    @pytest.mark.substrate
+    def test_parsl_handler_recovery_queue(self, substrate_session, checkpoint_bucket):
         """Test the recovery queue in ParslSpotInterruptionHandler."""
         # Create handler
         handler = ParslSpotInterruptionHandler(
-            session=localstack_session,
+            session=substrate_session,
             checkpoint_bucket=checkpoint_bucket,
             checkpoint_prefix="test/recovery",
         )
@@ -396,8 +396,8 @@ class TestSpotInterruptionLocalstack:
             assert recovered_tasks[i]["task_id"] == task_ids[task_idx]
             assert recovered_tasks[i]["priority"] == priorities[task_idx]
 
-    @pytest.mark.localstack
-    def test_checkpoint_interval_timing(self, localstack_session, checkpoint_bucket):
+    @pytest.mark.substrate
+    def test_checkpoint_interval_timing(self, substrate_session, checkpoint_bucket):
         """Test that checkpoints are created at the specified interval."""
         # Set a short checkpoint interval for testing
         checkpoint_interval = 0.5  # seconds

@@ -12,11 +12,16 @@ import requests
 from unittest.mock import MagicMock
 from typing import Generator
 
+from tests.substrate_support import (
+    create_substrate_session,
+    get_substrate_endpoint,
+    is_substrate_running,
+)
+
 # Configure logging for tests
 logging.basicConfig(level=logging.INFO)
 
 # Test configuration
-LOCALSTACK_URL = os.environ.get("LOCALSTACK_URL", "http://localhost:4566")
 AWS_TEST_REGION = os.environ.get("AWS_TEST_REGION", "us-west-2")
 AWS_TEST_PROFILE = os.environ.get("AWS_TEST_PROFILE", "aws")
 
@@ -334,83 +339,73 @@ def mock_boto3_session(
 
 
 @pytest.fixture
-def localstack_endpoint():
-    """Get the LocalStack endpoint URL."""
-    # Default LocalStack endpoint
-    endpoint = "http://localhost:4566"
-
-    # Override with environment variable if specified
-    if "LOCALSTACK_ENDPOINT" in os.environ:
-        endpoint = os.environ["LOCALSTACK_ENDPOINT"]
-
-    return endpoint
+def substrate_endpoint() -> str:
+    """Return the substrate emulator endpoint URL."""
+    return get_substrate_endpoint()
 
 
 @pytest.fixture
-def is_localstack_running(localstack_endpoint):
-    """Check if LocalStack is running."""
-    try:
-        # Try to connect to the health endpoint
-        import requests
-
-        response = requests.get(f"{localstack_endpoint}/health", timeout=1)
-        return response.status_code == 200
-    except Exception:
-        return False
+def substrate_running(substrate_endpoint) -> bool:
+    """Return whether a substrate server answers at the endpoint."""
+    return is_substrate_running(substrate_endpoint)
 
 
 @pytest.fixture
-def boto3_localstack_session(
-    aws_credentials, localstack_endpoint, is_localstack_running
-):
-    """Create a boto3 session that connects to LocalStack."""
-    if not is_localstack_running:
-        pytest.skip("LocalStack is not running")
+def boto3_substrate_session(
+    aws_credentials, substrate_endpoint, substrate_running
+) -> boto3.Session:
+    """Boto3 session for substrate, skipping the test if it is not running."""
+    if not substrate_running:
+        pytest.skip(f"substrate is not running at {substrate_endpoint}")
 
-    # Return session configured for LocalStack
-    return boto3.Session(
-        aws_access_key_id="test", aws_secret_access_key="test", region_name="us-east-1"
-    )
+    return create_substrate_session(endpoint=substrate_endpoint)
 
 
 @pytest.fixture(scope="session")
-def localstack_available() -> bool:
-    """Check if LocalStack is available and ready."""
+def substrate_available() -> bool:
+    """Return whether substrate is up with the services this suite needs.
+
+    Session-scoped, so the probe runs once per run rather than per test.
+
+    ``/_localstack/health`` rather than ``/health``: the latter reports only
+    liveness, while this returns the per-service map. Substrate serves it
+    deliberately, so tools that poll LocalStack's health route work unchanged.
+    """
+    endpoint = get_substrate_endpoint()
     try:
-        response = requests.get(f"{LOCALSTACK_URL}/health", timeout=5)
+        response = requests.get(f"{endpoint}/_localstack/health", timeout=5)
         if response.status_code == 200:
-            health = response.json()
-            # Check that core services are available
-            required_services = ["ec2", "lambda", "s3", "ssm"]
+            services = response.json().get("services", {})
             return all(
-                health.get("services", {}).get(service) == "available"
-                for service in required_services
+                services.get(name) == "available"
+                for name in ("ec2", "lambda", "s3", "ssm")
             )
-    except Exception as e:
-        logging.warning(f"LocalStack health check failed: {e}")
+    except Exception as exc:
+        logging.warning("substrate health check failed: %s", exc)
     return False
 
 
 @pytest.fixture
-def localstack_session(localstack_available) -> Generator[boto3.Session, None, None]:
-    """Boto3 session configured for LocalStack."""
-    if not localstack_available:
-        pytest.skip("LocalStack not available - start with 'make localstack-up'")
+def substrate_session(substrate_available) -> Generator[boto3.Session, None, None]:
+    """Boto3 session whose clients are pre-bound to the substrate endpoint.
 
-    session = boto3.Session(
-        aws_access_key_id="test",
-        aws_secret_access_key="test",
-        region_name=AWS_TEST_REGION,
-    )
+    ``session.client`` is wrapped rather than each call site passing
+    ``endpoint_url``, so code under test that builds its own clients from this
+    session still reaches the emulator.
+    """
+    if not substrate_available:
+        pytest.skip("substrate not available - start with 'make substrate-up'")
 
-    # Configure endpoint URLs for LocalStack
+    endpoint = get_substrate_endpoint()
+    session = create_substrate_session(region=AWS_TEST_REGION, endpoint=endpoint)
+
     original_client = session.client
 
-    def localstack_client(service_name, **kwargs):
-        kwargs.setdefault("endpoint_url", LOCALSTACK_URL)
+    def substrate_client(service_name, **kwargs):
+        kwargs.setdefault("endpoint_url", endpoint)
         return original_client(service_name, **kwargs)
 
-    session.client = localstack_client
+    session.client = substrate_client
     yield session
 
 
@@ -432,22 +427,15 @@ def aws_session() -> Generator[boto3.Session, None, None]:
 
 
 @pytest.fixture
-def test_session(request, localstack_session, aws_session) -> boto3.Session:
-    """
-    Smart session fixture that chooses LocalStack or AWS based on test markers.
+def test_session(request, substrate_session, aws_session) -> boto3.Session:
+    """Choose the substrate emulator or real AWS based on test markers.
 
-    Use @pytest.mark.aws to force real AWS testing.
-    Use @pytest.mark.localstack to force LocalStack testing.
-    Default is LocalStack if available, otherwise skip.
+    ``@pytest.mark.aws`` selects real AWS; anything else gets substrate, so a
+    test that forgets its marker cannot reach a live account by accident.
     """
-    # Check test markers
     if request.node.get_closest_marker("aws"):
         return aws_session
-    elif request.node.get_closest_marker("localstack"):
-        return localstack_session
-    else:
-        # Default to LocalStack for safety
-        return localstack_session
+    return substrate_session
 
 
 @pytest.fixture

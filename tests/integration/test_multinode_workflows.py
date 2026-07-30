@@ -19,16 +19,16 @@ from parsl_ephemeral_aws.provider import EphemeralAWSProvider
 from parsl_ephemeral_aws.modes.standard import StandardMode
 from parsl_ephemeral_aws.modes.detached import DetachedMode
 from parsl_ephemeral_aws.state.file import FileStateStore
-from parsl_ephemeral_aws.utils.localstack import (
-    is_localstack_available,
-    get_localstack_session,
+from tests.substrate_support import (
+    get_substrate_session,
+    is_substrate_available,
 )
 
 
-# Skip all tests if LocalStack is not available
+# Skip all tests if the substrate emulator is not available
 pytestmark = pytest.mark.skipif(
-    not is_localstack_available(),
-    reason="LocalStack is not available. Make sure it's running on port 4566.",
+    not is_substrate_available(),
+    reason="substrate not available - start with 'make substrate-up'",
 )
 
 
@@ -37,9 +37,9 @@ class TestMultiNodeWorkflows:
     """Integration tests for multi-node execution workflow scenarios."""
 
     @pytest.fixture(scope="class")
-    def localstack_session(self):
-        """Create a session connected to LocalStack."""
-        return get_localstack_session()
+    def substrate_session(self):
+        """Create a session connected to substrate."""
+        return get_substrate_session()
 
     @pytest.fixture
     def temp_dir(self):
@@ -58,18 +58,18 @@ class TestMultiNodeWorkflows:
         provider_id = f"test-provider-{uuid.uuid4().hex[:8]}"
         return FileStateStore(file_path=state_file_path, provider_id=provider_id)
 
-    @pytest.mark.localstack
-    def test_standard_mode_multinode(self, localstack_session, file_state_store):
+    @pytest.mark.substrate
+    def test_standard_mode_multinode(self, substrate_session, file_state_store):
         """Test multi-node execution in StandardMode with MPI."""
         # Create a StandardMode instance for multi-node execution
         provider_id = f"test-provider-{uuid.uuid4().hex[:8]}"
 
-        # Set up mocks for AWS services using LocalStack
-        with patch("boto3.Session", return_value=localstack_session):
+        # Set up mocks for AWS services using substrate
+        with patch("boto3.Session", return_value=substrate_session):
             # Create standard mode with multi-node configuration
             mode = StandardMode(
                 provider_id=provider_id,
-                session=localstack_session,
+                session=substrate_session,
                 state_store=file_state_store,
                 region="us-east-1",
                 instance_type="c5.large",  # Compute-optimized for MPI
@@ -205,19 +205,19 @@ class TestMultiNodeWorkflows:
                         with patch.object(mode, "_delete_vpc"):
                             mode.cleanup_infrastructure()
 
-    @pytest.mark.localstack
-    def test_detached_mode_multinode(self, localstack_session, file_state_store):
+    @pytest.mark.substrate
+    def test_detached_mode_multinode(self, substrate_session, file_state_store):
         """Test multi-node execution in DetachedMode with MPI."""
         # Create a DetachedMode instance for multi-node execution
         provider_id = f"test-provider-{uuid.uuid4().hex[:8]}"
         workflow_id = f"test-workflow-{uuid.uuid4().hex[:8]}"
 
-        # Set up mocks for AWS services using LocalStack
-        with patch("boto3.Session", return_value=localstack_session):
+        # Set up mocks for AWS services using substrate
+        with patch("boto3.Session", return_value=substrate_session):
             # Create detached mode with multi-node configuration
             mode = DetachedMode(
                 provider_id=provider_id,
-                session=localstack_session,
+                session=substrate_session,
                 state_store=file_state_store,
                 region="us-east-1",
                 instance_type="c5.large",  # Compute-optimized for MPI
@@ -338,9 +338,9 @@ class TestMultiNodeWorkflows:
                                 )
                                 mode.cleanup_infrastructure()
 
-    @pytest.mark.localstack
+    @pytest.mark.substrate
     def test_standard_mode_with_different_launchers(
-        self, localstack_session, file_state_store
+        self, substrate_session, file_state_store
     ):
         """Test different launchers in StandardMode."""
         # Create a StandardMode instance
@@ -354,12 +354,12 @@ class TestMultiNodeWorkflows:
         ]
 
         for launcher, launcher_type in launchers:
-            # Set up mocks for AWS services using LocalStack
-            with patch("boto3.Session", return_value=localstack_session):
+            # Set up mocks for AWS services using substrate
+            with patch("boto3.Session", return_value=substrate_session):
                 # Create standard mode with specific launcher
                 mode = StandardMode(
                     provider_id=f"{provider_id}-{launcher_type}",
-                    session=localstack_session,
+                    session=substrate_session,
                     state_store=file_state_store,
                     region="us-east-1",
                     instance_type="c5.large",
@@ -458,8 +458,8 @@ class TestMultiNodeWorkflows:
                             with patch.object(mode, "_delete_vpc"):
                                 mode.cleanup_infrastructure()
 
-    @pytest.mark.localstack
-    def test_provider_multinode_integration(self, localstack_session, file_state_store):
+    @pytest.mark.substrate
+    def test_provider_multinode_integration(self, substrate_session, file_state_store):
         """Test multi-node integration through provider interface."""
         # Create a provider for multi-node execution
         provider_id = f"test-provider-{uuid.uuid4().hex[:8]}"
@@ -476,7 +476,7 @@ class TestMultiNodeWorkflows:
             max_blocks=2,
             launcher=MpiExecLauncher(),
             # Inject our session and state store for testing
-            _test_session=localstack_session,
+            _test_session=substrate_session,
             _test_state_store=file_state_store,
         )
 
@@ -485,7 +485,7 @@ class TestMultiNodeWorkflows:
             # Mock the operating mode
             mode = StandardMode(
                 provider_id=provider_id,
-                session=localstack_session,
+                session=substrate_session,
                 state_store=file_state_store,
                 region="us-east-1",
                 instance_type="c5.xlarge",

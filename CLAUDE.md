@@ -51,19 +51,22 @@ All work tracking for this project uses GitHub. **Do not create standalone plann
 
 ## AWS Credentials
 
-All real-AWS operations use `AWS_PROFILE=aws`. Tests marked `@pytest.mark.aws` and
-LocalStack health checks require this profile to be configured in `~/.aws/credentials`.
+All real-AWS operations use `AWS_PROFILE=aws`. Tests marked `@pytest.mark.aws`
+require this profile to be configured in `~/.aws/credentials`.
 
 ```bash
 export AWS_PROFILE=aws
 ```
 
-When running integration tests against real AWS:
+When running the real-AWS E2E suite:
 ```bash
-AWS_PROFILE=aws pytest tests/integration/ -m aws
+AWS_PROFILE=aws uv run pytest tests/aws/ -m aws --no-cov
 ```
 
-LocalStack tests do not require a real AWS profile — they use synthetic credentials.
+Emulator-backed tests do not require a real AWS profile — they use synthetic
+credentials. The emulator is [substrate](https://github.com/scttfrdmn/substrate),
+started with `make substrate-up`; it replaced LocalStack in #125, since LocalStack
+OSS is end-of-life. See `docs/substrate_testing.md`.
 
 ---
 

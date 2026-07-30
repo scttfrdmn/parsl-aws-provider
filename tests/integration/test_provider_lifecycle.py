@@ -18,17 +18,17 @@ from parsl_ephemeral_aws.modes.standard import StandardMode
 from parsl_ephemeral_aws.modes.detached import DetachedMode
 from parsl_ephemeral_aws.modes.serverless import ServerlessMode
 from parsl_ephemeral_aws.state.file import FileStateStore
-from parsl_ephemeral_aws.utils.localstack import (
-    is_localstack_available,
-    get_localstack_session,
+from tests.substrate_support import (
+    get_substrate_session,
+    is_substrate_available,
 )
 from parsl_ephemeral_aws.exceptions import ProviderConfigurationError
 
 
-# Skip all tests if LocalStack is not available
+# Skip all tests if the substrate emulator is not available
 pytestmark = pytest.mark.skipif(
-    not is_localstack_available(),
-    reason="LocalStack is not available. Make sure it's running on port 4566.",
+    not is_substrate_available(),
+    reason="substrate not available - start with 'make substrate-up'",
 )
 
 
@@ -37,9 +37,9 @@ class TestProviderLifecycle:
     """Integration tests for provider lifecycle."""
 
     @pytest.fixture(scope="class")
-    def localstack_session(self):
-        """Create a session connected to LocalStack."""
-        return get_localstack_session()
+    def substrate_session(self):
+        """Create a session connected to substrate."""
+        return get_substrate_session()
 
     @pytest.fixture
     def temp_dir(self):
@@ -58,8 +58,8 @@ class TestProviderLifecycle:
         provider_id = f"test-provider-{uuid.uuid4().hex[:8]}"
         return FileStateStore(file_path=state_file_path, provider_id=provider_id)
 
-    @pytest.mark.localstack
-    def test_standard_mode_full_lifecycle(self, localstack_session, file_state_store):
+    @pytest.mark.substrate
+    def test_standard_mode_full_lifecycle(self, substrate_session, file_state_store):
         """Test complete lifecycle of provider in standard mode."""
         # Configuration for standard mode
         config = {
@@ -72,7 +72,7 @@ class TestProviderLifecycle:
             "min_blocks": 0,
             "init_blocks": 1,
             # Inject test session
-            "_test_session": localstack_session,
+            "_test_session": substrate_session,
             "_test_state_store": file_state_store,
         }
 
@@ -141,8 +141,8 @@ class TestProviderLifecycle:
             ):
                 provider.shutdown()
 
-    @pytest.mark.localstack
-    def test_detached_mode_full_lifecycle(self, localstack_session, file_state_store):
+    @pytest.mark.substrate
+    def test_detached_mode_full_lifecycle(self, substrate_session, file_state_store):
         """Test complete lifecycle of provider in detached mode."""
         # Configuration for detached mode
         workflow_id = f"test-workflow-{uuid.uuid4().hex[:8]}"
@@ -158,7 +158,7 @@ class TestProviderLifecycle:
             "min_blocks": 0,
             "init_blocks": 1,
             # Inject test session
-            "_test_session": localstack_session,
+            "_test_session": substrate_session,
             "_test_state_store": file_state_store,
         }
 
@@ -232,8 +232,8 @@ class TestProviderLifecycle:
             ):
                 provider.shutdown()
 
-    @pytest.mark.localstack
-    def test_serverless_mode_full_lifecycle(self, localstack_session, file_state_store):
+    @pytest.mark.substrate
+    def test_serverless_mode_full_lifecycle(self, substrate_session, file_state_store):
         """Test complete lifecycle of provider in serverless mode."""
         # Configuration for serverless mode
         config = {
@@ -247,7 +247,7 @@ class TestProviderLifecycle:
             "min_blocks": 0,
             "init_blocks": 0,  # No initial blocks for serverless
             # Inject test session
-            "_test_session": localstack_session,
+            "_test_session": substrate_session,
             "_test_state_store": file_state_store,
         }
 
@@ -310,7 +310,7 @@ class TestProviderLifecycle:
             ):
                 provider.shutdown()
 
-    @pytest.mark.localstack
+    @pytest.mark.substrate
     def test_provider_validation(self):
         """Test validation of provider configuration."""
         # Test 1: Invalid mode
@@ -357,8 +357,8 @@ class TestProviderLifecycle:
                 # Missing instance_types for spot fleet
             )
 
-    @pytest.mark.localstack
-    def test_configuration_defaults(self, localstack_session, file_state_store):
+    @pytest.mark.substrate
+    def test_configuration_defaults(self, substrate_session, file_state_store):
         """Test provider default configuration values."""
         # Create provider with minimal configuration
         provider = EphemeralAWSProvider(
@@ -366,7 +366,7 @@ class TestProviderLifecycle:
             instance_type="t2.micro",
             image_id="ami-12345678",
             # Inject test session
-            _test_session=localstack_session,
+            _test_session=substrate_session,
             _test_state_store=file_state_store,
         )
 
@@ -397,10 +397,8 @@ class TestProviderLifecycle:
             ):
                 provider.shutdown()
 
-    @pytest.mark.localstack
-    def test_state_persistence_configuration(
-        self, localstack_session, file_state_store
-    ):
+    @pytest.mark.substrate
+    def test_state_persistence_configuration(self, substrate_session, file_state_store):
         """Test state persistence configuration options."""
         # Create provider with file state store
         provider_id = f"test-provider-{uuid.uuid4().hex[:8]}"
@@ -417,7 +415,7 @@ class TestProviderLifecycle:
             state_store="file",
             state_file_path=file_state_store.file_path,
             # Inject test session
-            _test_session=localstack_session,
+            _test_session=substrate_session,
             _test_state_store=file_state_store,
         )
 
@@ -445,8 +443,8 @@ class TestProviderLifecycle:
             ):
                 provider.shutdown()
 
-    @pytest.mark.localstack
-    def test_job_status_mapping(self, localstack_session, file_state_store):
+    @pytest.mark.substrate
+    def test_job_status_mapping(self, substrate_session, file_state_store):
         """Test job status mapping in the provider."""
         # Create provider
         provider_id = f"test-provider-{uuid.uuid4().hex[:8]}"
@@ -457,7 +455,7 @@ class TestProviderLifecycle:
             instance_type="t2.micro",
             image_id="ami-12345678",
             # Inject test session
-            _test_session=localstack_session,
+            _test_session=substrate_session,
             _test_state_store=file_state_store,
         )
 
@@ -508,8 +506,8 @@ class TestProviderLifecycle:
             ):
                 provider.shutdown()
 
-    @pytest.mark.localstack
-    def test_provider_tags(self, localstack_session, file_state_store):
+    @pytest.mark.substrate
+    def test_provider_tags(self, substrate_session, file_state_store):
         """Test provider tags configuration."""
         # Create provider with custom tags
         provider_id = f"test-provider-{uuid.uuid4().hex[:8]}"
@@ -526,7 +524,7 @@ class TestProviderLifecycle:
             image_id="ami-12345678",
             additional_tags=custom_tags,
             # Inject test session
-            _test_session=localstack_session,
+            _test_session=substrate_session,
             _test_state_store=file_state_store,
         )
 

@@ -133,9 +133,16 @@ aws.json
 *.json.state
 .parsl-state/
 
-# LocalStack
+# AWS emulator artifacts. Substrate (#125) keeps state in memory and writes
+# nothing to the working tree, so it needs no entry of its own; these are
+# LocalStack's DATA_DIR/PERSISTENCE directories, kept so a developer with an old
+# checkout does not commit one.
 localstack/
 .localstack/
+
+# AWS Session Manager plugin bundle, downloaded for SSM tunnelling
+sessionmanager-bundle/
+sessionmanager-bundle.zip
 
 # Temp files
 .tmp/

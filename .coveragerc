@@ -20,7 +20,7 @@ exclude_lines =
     except ImportError
     # Exclude mocking-specific code from coverage
     if not MOTO_AVAILABLE:
-    if not LOCALSTACK_AVAILABLE:
+    if not SUBSTRATE_AVAILABLE:
     def mock_decorator
 
 [html]

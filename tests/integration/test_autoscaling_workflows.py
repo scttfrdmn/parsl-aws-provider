@@ -18,16 +18,16 @@ from parsl_ephemeral_aws.modes.standard import StandardMode
 from parsl_ephemeral_aws.modes.detached import DetachedMode
 from parsl_ephemeral_aws.modes.serverless import ServerlessMode
 from parsl_ephemeral_aws.state.file import FileStateStore
-from parsl_ephemeral_aws.utils.localstack import (
-    is_localstack_available,
-    get_localstack_session,
+from tests.substrate_support import (
+    get_substrate_session,
+    is_substrate_available,
 )
 
 
-# Skip all tests if LocalStack is not available
+# Skip all tests if the substrate emulator is not available
 pytestmark = pytest.mark.skipif(
-    not is_localstack_available(),
-    reason="LocalStack is not available. Make sure it's running on port 4566.",
+    not is_substrate_available(),
+    reason="substrate not available - start with 'make substrate-up'",
 )
 
 
@@ -36,9 +36,9 @@ class TestAutoscalingWorkflows:
     """Integration tests for autoscaling workflow scenarios."""
 
     @pytest.fixture(scope="class")
-    def localstack_session(self):
-        """Create a session connected to LocalStack."""
-        return get_localstack_session()
+    def substrate_session(self):
+        """Create a session connected to substrate."""
+        return get_substrate_session()
 
     @pytest.fixture
     def temp_dir(self):
@@ -57,18 +57,18 @@ class TestAutoscalingWorkflows:
         provider_id = f"test-provider-{uuid.uuid4().hex[:8]}"
         return FileStateStore(file_path=state_file_path, provider_id=provider_id)
 
-    @pytest.mark.localstack
-    def test_standard_mode_scaling(self, localstack_session, file_state_store):
+    @pytest.mark.substrate
+    def test_standard_mode_scaling(self, substrate_session, file_state_store):
         """Test autoscaling in StandardMode."""
         # Create a StandardMode instance with scaling configuration
         provider_id = f"test-provider-{uuid.uuid4().hex[:8]}"
 
-        # Set up mocks for AWS services using LocalStack
-        with patch("boto3.Session", return_value=localstack_session):
+        # Set up mocks for AWS services using substrate
+        with patch("boto3.Session", return_value=substrate_session):
             # Create standard mode with scaling configuration
             mode = StandardMode(
                 provider_id=provider_id,
-                session=localstack_session,
+                session=substrate_session,
                 state_store=file_state_store,
                 region="us-east-1",
                 instance_type="t2.micro",
@@ -174,19 +174,19 @@ class TestAutoscalingWorkflows:
                         with patch.object(mode, "_delete_vpc"):
                             mode.cleanup_infrastructure()
 
-    @pytest.mark.localstack
-    def test_detached_mode_scaling(self, localstack_session, file_state_store):
+    @pytest.mark.substrate
+    def test_detached_mode_scaling(self, substrate_session, file_state_store):
         """Test autoscaling in DetachedMode."""
         # Create a DetachedMode instance with scaling configuration
         provider_id = f"test-provider-{uuid.uuid4().hex[:8]}"
         workflow_id = f"test-workflow-{uuid.uuid4().hex[:8]}"
 
-        # Set up mocks for AWS services using LocalStack
-        with patch("boto3.Session", return_value=localstack_session):
+        # Set up mocks for AWS services using substrate
+        with patch("boto3.Session", return_value=substrate_session):
             # Create detached mode with scaling configuration
             mode = DetachedMode(
                 provider_id=provider_id,
-                session=localstack_session,
+                session=substrate_session,
                 state_store=file_state_store,
                 region="us-east-1",
                 instance_type="t2.micro",
@@ -315,18 +315,18 @@ class TestAutoscalingWorkflows:
                                 )
                                 mode.cleanup_infrastructure()
 
-    @pytest.mark.localstack
-    def test_serverless_lambda_scaling(self, localstack_session, file_state_store):
+    @pytest.mark.substrate
+    def test_serverless_lambda_scaling(self, substrate_session, file_state_store):
         """Test autoscaling with Lambda functions in ServerlessMode."""
         # Create a ServerlessMode instance with Lambda and scaling configuration
         provider_id = f"test-provider-{uuid.uuid4().hex[:8]}"
 
-        # Set up mocks for AWS services using LocalStack
-        with patch("boto3.Session", return_value=localstack_session):
+        # Set up mocks for AWS services using substrate
+        with patch("boto3.Session", return_value=substrate_session):
             # Create serverless mode with scaling configuration
             mode = ServerlessMode(
                 provider_id=provider_id,
-                session=localstack_session,
+                session=substrate_session,
                 state_store=file_state_store,
                 region="us-east-1",
                 worker_type="lambda",
@@ -403,18 +403,18 @@ class TestAutoscalingWorkflows:
             mode.lambda_manager.delete_lambda_function.return_value = None
             mode.cleanup_infrastructure()
 
-    @pytest.mark.localstack
-    def test_auto_worker_type_selection(self, localstack_session, file_state_store):
+    @pytest.mark.substrate
+    def test_auto_worker_type_selection(self, substrate_session, file_state_store):
         """Test automatic worker type selection in ServerlessMode."""
         # Create a ServerlessMode instance with auto worker type selection
         provider_id = f"test-provider-{uuid.uuid4().hex[:8]}"
 
-        # Set up mocks for AWS services using LocalStack
-        with patch("boto3.Session", return_value=localstack_session):
+        # Set up mocks for AWS services using substrate
+        with patch("boto3.Session", return_value=substrate_session):
             # Create serverless mode with auto worker type
             mode = ServerlessMode(
                 provider_id=provider_id,
-                session=localstack_session,
+                session=substrate_session,
                 state_store=file_state_store,
                 region="us-east-1",
                 worker_type="auto",  # Auto selection based on job characteristics
@@ -500,8 +500,8 @@ class TestAutoscalingWorkflows:
             mode.ecs_manager.delete_cluster.return_value = None
             mode.cleanup_infrastructure()
 
-    @pytest.mark.localstack
-    def test_hybrid_scaling_strategy(self, localstack_session, file_state_store):
+    @pytest.mark.substrate
+    def test_hybrid_scaling_strategy(self, substrate_session, file_state_store):
         """Test hybrid scaling strategy using mixed resource types."""
         # Create a provider that uses a hybrid approach
         provider_id = f"test-provider-{uuid.uuid4().hex[:8]}"
@@ -521,7 +521,7 @@ class TestAutoscalingWorkflows:
             min_blocks=0,
             init_blocks=0,
             # Inject our session and state store for testing
-            _test_session=localstack_session,
+            _test_session=substrate_session,
             _test_state_store=file_state_store,
         )
 
@@ -530,7 +530,7 @@ class TestAutoscalingWorkflows:
             # Mock the operating mode
             mode = ServerlessMode(
                 provider_id=provider_id,
-                session=localstack_session,
+                session=substrate_session,
                 state_store=file_state_store,
                 region="us-east-1",
                 worker_type="auto",

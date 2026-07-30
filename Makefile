@@ -4,7 +4,7 @@
 # Makefile for Parsl Ephemeral AWS Provider
 
 .PHONY: clean test lint type-check test-unit test-integration test-bats docs build install install-dev help
-.PHONY: localstack-up localstack-down localstack-status test-aws coverage format pre-commit version-check
+.PHONY: substrate-up substrate-down substrate-wait substrate-status substrate-reset test-aws coverage format pre-commit version-check
 .PHONY: version-verify lint-python lint-shell security coverage-aws release
 
 # Colors for output
@@ -39,7 +39,8 @@ else
     $(error Neither podman nor docker found. Please install one of them.)
 endif
 
-LOCALSTACK_COMPOSE := $(COMPOSE_CMD) -f docker-compose.localstack.yml
+SUBSTRATE_COMPOSE := $(COMPOSE_CMD) -f docker-compose.substrate.yml
+SUBSTRATE_URL ?= http://localhost:4566
 
 # Default target
 all: lint type-check test build
@@ -82,10 +83,9 @@ test-unit: ## Run unit and security tests
 	# failed. tests/security is pure-mock and marked `unit`, so it belongs here.
 	$(RUN) pytest tests/unit/ tests/security/ -v --cov-fail-under=$(COVERAGE_MIN)
 
-# Run integration tests with LocalStack
-test-integration: localstack-up ## Run integration tests with LocalStack
-	@echo "$(YELLOW)Running integration tests with LocalStack...$(RESET)"
-	@$(MAKE) localstack-wait
+# Run integration tests against the substrate emulator
+test-integration: substrate-up ## Run integration tests against substrate
+	@echo "$(YELLOW)Running integration tests against substrate...$(RESET)"
 	$(RUN) pytest tests/integration/ -v
 
 # Run E2E tests against real AWS
@@ -108,26 +108,30 @@ test-bats: ## Run BATS tests for shell scripts
 		echo "Install with: brew install bats-core (macOS) or apt-get install bats (Ubuntu)"; \
 	fi
 
-# LocalStack management
-localstack-up: ## Start LocalStack for testing
-	@echo "$(YELLOW)Starting LocalStack...$(RESET)"
-	$(LOCALSTACK_COMPOSE) up -d
-	@$(MAKE) localstack-wait
+# Substrate emulator management (replaces the localstack-* targets, #125)
+substrate-up: ## Start the substrate AWS emulator
+	@echo "$(YELLOW)Starting substrate...$(RESET)"
+	$(SUBSTRATE_COMPOSE) up -d
+	@$(MAKE) substrate-wait
 
-localstack-wait: ## Wait for LocalStack to be ready
-	@echo "$(YELLOW)Waiting for LocalStack to be ready...$(RESET)"
-	./scripts/localstack-wait.sh
+substrate-wait: ## Wait for substrate to be ready
+	@echo "$(YELLOW)Waiting for substrate to be ready...$(RESET)"
+	SUBSTRATE_URL=$(SUBSTRATE_URL) ./scripts/substrate-wait.sh
 
-localstack-down: ## Stop LocalStack
-	@echo "$(YELLOW)Stopping LocalStack...$(RESET)"
-	$(LOCALSTACK_COMPOSE) down
+substrate-down: ## Stop substrate
+	@echo "$(YELLOW)Stopping substrate...$(RESET)"
+	$(SUBSTRATE_COMPOSE) down
 
-localstack-status: ## Check LocalStack status
-	@echo "$(YELLOW)LocalStack status:$(RESET)"
-	@$(LOCALSTACK_COMPOSE) ps
+substrate-status: ## Check substrate status
+	@echo "$(YELLOW)Substrate status:$(RESET)"
+	@$(SUBSTRATE_COMPOSE) ps
 	@echo ""
 	@echo "$(YELLOW)Health check:$(RESET)"
-	@curl -s http://localhost:4566/health | python3 -m json.tool || echo "LocalStack not responding"
+	@curl -fsS -m 5 $(SUBSTRATE_URL)/health | python3 -m json.tool || echo "substrate not responding"
+
+substrate-reset: ## Wipe all substrate state (no LocalStack equivalent)
+	@echo "$(YELLOW)Resetting substrate state...$(RESET)"
+	@curl -fsS -m 5 -X POST $(SUBSTRATE_URL)/v1/state/reset && echo "" || echo "reset unavailable"
 
 # Run linting
 lint: lint-python lint-shell ## Run all linting checks
@@ -196,7 +200,7 @@ security: ## Run security scan with bandit
 	$(RUN) bandit -r parsl_ephemeral_aws -c pyproject.toml
 
 # Code coverage
-coverage: ## Generate test coverage report (LocalStack only)
+coverage: ## Generate test coverage report (excludes real-AWS tests)
 	@echo "$(YELLOW)Generating coverage report...$(RESET)"
 	$(RUN) coverage run -m pytest -m "not aws"
 	$(RUN) coverage report --fail-under=$(COVERAGE_MIN)
@@ -245,7 +249,7 @@ version-verify: ## Check pyproject and __init__ versions agree
 	echo "$(GREEN)Versions agree: $$pkg$(RESET)"
 
 # Development workflows
-dev-setup: install-dev localstack-up ## Complete development environment setup
+dev-setup: install-dev substrate-up ## Complete development environment setup
 	@echo "$(GREEN)Development environment setup complete!$(RESET)"
 
 dev-test: lint test-unit test-integration coverage ## Full development test suite

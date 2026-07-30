@@ -19,11 +19,12 @@ from parsl_ephemeral_aws.exceptions import (
 )
 from tests.support import make_manager, mock_provider
 
-# Every test here mocks CredentialManager and the boto3 session, so no LocalStack
-# is needed -- hence `integration` and not `localstack`. Without any marker at all
-# the file was skipped by both the Makefile (`-m "integration or localstack"`) and
-# the AWS selection, so it never ran anywhere; adding the marker surfaced six
-# failures, all from a `Mock()` provider too thin for the managers' __init__.
+# Every test here mocks CredentialManager and the boto3 session, so no emulator is
+# needed -- hence `integration` and not `substrate`. Without any marker at all the
+# file was skipped by both the Makefile (which then selected
+# `-m "integration or localstack"`) and the AWS selection, so it never ran
+# anywhere; adding the marker surfaced six failures, all from a `Mock()` provider
+# too thin for the managers' __init__.
 pytestmark = pytest.mark.integration
 
 

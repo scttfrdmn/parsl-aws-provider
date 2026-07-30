@@ -2,6 +2,11 @@
 # Script to run tests with coverage reporting
 # Supports running unit tests, integration tests, or all tests
 #
+# NOTE: this duplicates `make test-unit` / `make test-integration`, is referenced
+# by nothing, and installs pytest with pip rather than uv (contra CLAUDE.md).
+# Tracked for removal in v0.8.0. The emulator references below were updated in
+# #125 only so it does not point at a dead LocalStack endpoint.
+#
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: 2025 Scott Friedman and Project Contributors
 
@@ -13,8 +18,8 @@ PROJECT_ROOT="$( cd "$SCRIPT_DIR/.." && pwd )"
 # Default settings
 COVERAGE=true
 TEST_TYPE="all"
-SKIP_LOCALSTACK_CHECK=false
-LOCALSTACK_ENDPOINT="http://localhost:4566"
+SKIP_SUBSTRATE_CHECK=false
+SUBSTRATE_ENDPOINT="${SUBSTRATE_ENDPOINT:-http://localhost:4566}"
 
 # Help message
 function show_help {
@@ -25,8 +30,8 @@ function show_help {
   echo "  -h, --help               Show this help message"
   echo "  -t, --type TYPE          Type of tests to run: unit, integration, all (default: all)"
   echo "  --no-coverage            Run tests without coverage reporting"
-  echo "  --skip-localstack-check  Skip checking if LocalStack is running for integration tests"
-  echo "  --localstack-endpoint    Specify custom LocalStack endpoint (default: http://localhost:4566)"
+  echo "  --skip-substrate-check   Skip checking if substrate is running for integration tests"
+  echo "  --substrate-endpoint     Specify custom substrate endpoint (default: http://localhost:4566)"
   echo
   echo "Examples:"
   echo "  $0 --type unit           Run unit tests with coverage reporting"
@@ -49,12 +54,12 @@ while [[ $# -gt 0 ]]; do
       COVERAGE=false
       shift
       ;;
-    --skip-localstack-check)
-      SKIP_LOCALSTACK_CHECK=true
+    --skip-substrate-check)
+      SKIP_SUBSTRATE_CHECK=true
       shift
       ;;
-    --localstack-endpoint)
-      LOCALSTACK_ENDPOINT="$2"
+    --substrate-endpoint)
+      SUBSTRATE_ENDPOINT="$2"
       shift 2
       ;;
     *)
@@ -91,22 +96,22 @@ fi
 echo "Checking for test dependencies..."
 "$PIP_CMD" install -q pytest pytest-cov
 
-# Check if running integration tests and LocalStack is needed
-if [[ "$TEST_TYPE" == "integration" || "$TEST_TYPE" == "all" ]] && [[ "$SKIP_LOCALSTACK_CHECK" == "false" ]]; then
-  echo "Checking LocalStack availability at $LOCALSTACK_ENDPOINT..."
-  if ! curl -s "$LOCALSTACK_ENDPOINT/health" | grep -q "\"status\":"; then
-    echo "LocalStack does not appear to be running at $LOCALSTACK_ENDPOINT."
+# Check if running integration tests and the emulator is needed
+if [[ "$TEST_TYPE" == "integration" || "$TEST_TYPE" == "all" ]] && [[ "$SKIP_SUBSTRATE_CHECK" == "false" ]]; then
+  echo "Checking substrate availability at $SUBSTRATE_ENDPOINT..."
+  if ! curl -fsS -m 5 "$SUBSTRATE_ENDPOINT/health" >/dev/null 2>&1; then
+    echo "substrate does not appear to be running at $SUBSTRATE_ENDPOINT."
     echo "Integration tests may fail or be skipped."
-    echo "To start LocalStack:"
-    echo "  docker run -d --name localstack -p 4566:4566 -p 4571:4571 localstack/localstack"
-    echo "To skip this check, use --skip-localstack-check"
+    echo "To start substrate:"
+    echo "  make substrate-up"
+    echo "To skip this check, use --skip-substrate-check"
 
-    read -p "Do you want to continue anyway? (y/N) " response
+    read -r -p "Do you want to continue anyway? (y/N) " response
     if [[ ! "$response" =~ ^[Yy]$ ]]; then
       exit 1
     fi
   else
-    echo "LocalStack is running."
+    echo "substrate is running."
   fi
 fi
 

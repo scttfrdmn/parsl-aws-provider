@@ -2,95 +2,116 @@
 
 This directory contains the test suite for the Parsl Ephemeral AWS Provider.
 
+Everything runs through `uv`, per `CLAUDE.md` — never bare `pytest`, which resolves
+against whatever happens to be on `PATH` rather than `.venv`.
+
 ## Test Structure
 
-The tests are organized into the following categories:
-
-- `unit/`: Unit tests for individual components
-  - `test_standard_mode.py`: Tests for StandardMode
-  - `test_detached_mode.py`: Tests for DetachedMode
-  - `test_serverless_mode.py`: Tests for ServerlessMode
-  - Other unit tests for various components
-
-- `integration/`: Integration tests that test the interactions between components
-  - `test_localstack_modes.py`: Tests using LocalStack for AWS service emulation
+- `unit/` — individual components in isolation, with moto and `unittest.mock`. No
+  network, no emulator.
+- `security/` — pure-mock tests of the credential, audit, and policy layers. Marked
+  `unit`, and run alongside `unit/` in CI as one coverage-gated job.
+- `integration/` — interactions between components. A subset is pure-moto; the rest
+  needs the substrate emulator and skips without it.
+- `aws/` — real-AWS E2E tests, marked `@pytest.mark.aws`. These create billable
+  resources.
+- `test_substrate_emulation.py` — conformance tests for the emulator itself. Drives
+  raw boto3 and imports no package code, so a failure here means the emulator
+  regressed rather than the provider.
+- `substrate_support.py` — emulator session/client helpers and VPC setup/teardown.
+- `support.py`, `conftest.py` — shared fixtures.
 
 ## Running Tests
 
-### Unit Tests
-
-To run all unit tests:
+### Unit and security tests
 
 ```bash
-pytest tests/unit
+make test-unit          # both directories, with the 65% coverage gate CI applies
+
+uv run pytest tests/unit/test_standard_mode.py -v --no-cov   # one file
 ```
 
-To run tests for a specific mode:
+### Integration tests
+
+These run against [substrate](https://github.com/scttfrdmn/substrate), a local AWS
+emulator. It replaced LocalStack in #125 — LocalStack OSS is end-of-life. Substrate
+is a container image, so there is no Python package to install:
 
 ```bash
-pytest tests/unit/test_standard_mode.py
-pytest tests/unit/test_detached_mode.py
-pytest tests/unit/test_serverless_mode.py
+make test-integration   # starts substrate via docker-compose.substrate.yml, then runs
 ```
 
-### Integration Tests
-
-Integration tests require LocalStack to be running. To run LocalStack:
+Or manage the emulator yourself:
 
 ```bash
-pip install localstack
-localstack start
+make substrate-up
+uv run pytest tests/integration -v
+make substrate-reset    # wipe emulator state between runs
+make substrate-down
 ```
 
-Then, in a separate terminal, run the integration tests:
+Without a running emulator the emulator-gated tests skip and the moto-backed ones
+still run. See [`docs/substrate_testing.md`](../docs/substrate_testing.md) for the
+known fidelity gaps and how to point the suite at a different port.
+
+### Real-AWS E2E tests
 
 ```bash
-pytest tests/integration
+export AWS_PROFILE=aws AWS_TEST_REGION=us-east-1
+export AWS_TEST_VPC_ID=vpc-… AWS_TEST_SUBNET_ID=subnet-… AWS_TEST_SG_ID=sg-…
+make test-aws           # prompts before creating billable resources
 ```
 
-### Code Coverage
+`tests/aws/conftest.py` skips when those three IDs are unset, so a run without them
+is a no-op rather than a failure.
 
-To run tests with code coverage:
+### Code coverage
 
 ```bash
-pytest --cov=parsl_ephemeral_aws tests
+make coverage           # everything except the real-AWS tests, HTML report in htmlcov/
 ```
 
-To generate a coverage report:
+## Markers
 
-```bash
-pytest --cov=parsl_ephemeral_aws --cov-report=html tests
-```
+A marker only *selects* tests — it never skips them. An emulator-backed file must
+pair its markers with a `skipif(not is_substrate_available())` guard; without one, a
+plain `pytest tests/integration` errors instead of skipping.
 
-This will create an HTML report in the `htmlcov` directory that you can view in a browser.
+| Marker | Meaning |
+|---|---|
+| `unit` | Isolated, mocked, no external services |
+| `integration` | Cross-component; may or may not need an endpoint |
+| `substrate` | Requires a running substrate emulator |
+| `aws` | Requires real AWS credentials; costs money |
+| `slow` | Long-running |
 
 ## Writing Tests
 
-When adding new features or fixing bugs, please follow these guidelines for writing tests:
-
-1. **Unit Tests**: Write unit tests for each new function or class
-   - Focus on testing individual components in isolation
-   - Use mocks for external dependencies like AWS services
-   - Test both successful paths and error handling
-
-2. **Integration Tests**: Write integration tests for interactions between components
-   - Use LocalStack for AWS service emulation
-   - Test realistic workflows that span multiple components
-   - Clean up any resources created during tests
+1. **Unit tests** — one function or class at a time, mocking external dependencies.
+   Cover error handling, not just the happy path.
+2. **Integration tests** — realistic workflows across components, against the
+   emulator. Clean up what you create.
+3. **Unique resource names** — emulator state persists for the server process's
+   lifetime, so a fixed name collides with `ResourceConflictException` on a second
+   run. Suffix with `uuid.uuid4().hex[:8]`.
+4. **Never reach real AWS by accident** — `conftest.py` injects synthetic
+   credentials into every test lacking `@pytest.mark.aws` and drops `AWS_PROFILE`,
+   so an unmocked call fails as an auth error against a fake account rather than
+   mutating a real one.
 
 ## CI Pipeline
 
-The CI pipeline runs the following checks:
-
-1. **Unit Tests**: Run all unit tests on multiple Python versions
-2. **Integration Tests**: Run integration tests using LocalStack
-3. **Linting**: Check code style with flake8
-4. **Type Checking**: Verify type annotations with mypy
-5. **Code Coverage**: Generate coverage report and upload to Codecov
-6. **Package Building**: Verify the package can be built correctly
+`.github/workflows/ci.yml` runs: ruff lint and format checks, bandit, mypy
+(reported, not gated), unit + security tests across Python 3.10–3.12 with a 65%
+coverage gate, integration tests against a pinned substrate service container, the
+emulator conformance suite (gated), bats shell tests, a package build, and a docs
+build. Real-AWS E2E is manual dispatch only.
 
 ## Additional Resources
 
 - [pytest Documentation](https://docs.pytest.org/)
-- [LocalStack Documentation](https://docs.localstack.cloud/)
-- [moto Documentation](https://docs.getmoto.org/) (for AWS service mocking)
+- [substrate](https://github.com/scttfrdmn/substrate)
+- [moto Documentation](https://docs.getmoto.org/)
+
+SPDX-License-Identifier: Apache-2.0
+SPDX-FileCopyrightText: 2025 Scott Friedman and Project Contributors

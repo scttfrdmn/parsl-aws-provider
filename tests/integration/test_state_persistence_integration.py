@@ -1,7 +1,7 @@
 """Integration tests for state persistence mechanisms.
 
 These tests verify that each state persistence implementation works correctly
-with real storage backend (file system, LocalStack for AWS services).
+with real storage backends (file system, substrate for AWS services).
 
 SPDX-License-Identifier: Apache-2.0
 SPDX-FileCopyrightText: 2025 Scott Friedman and Project Contributors
@@ -18,16 +18,16 @@ from parsl_ephemeral_aws.state.base import STATE_KEY_PROVIDER
 from parsl_ephemeral_aws.state.file import FileStateStore
 from parsl_ephemeral_aws.state.parameter_store import ParameterStoreState
 from parsl_ephemeral_aws.state.s3 import S3State
-from parsl_ephemeral_aws.utils.localstack import (
-    is_localstack_available,
-    get_localstack_session,
+from tests.substrate_support import (
+    get_substrate_session,
+    is_substrate_available,
 )
 
 
-# Skip all tests if LocalStack is not available
+# Skip all tests if the substrate emulator is not available
 pytestmark = pytest.mark.skipif(
-    not is_localstack_available(),
-    reason="LocalStack is not available. Make sure it's running on port 4566.",
+    not is_substrate_available(),
+    reason="substrate not available - start with 'make substrate-up'",
 )
 
 
@@ -161,12 +161,12 @@ class TestFileStateStoreIntegration:
 
 @pytest.mark.integration
 class TestParameterStoreStateIntegration:
-    """Integration tests for ParameterStoreState using LocalStack."""
+    """Integration tests for ParameterStoreState using substrate."""
 
     @pytest.fixture(scope="class")
-    def localstack_session(self):
-        """Create a session connected to LocalStack."""
-        return get_localstack_session()
+    def substrate_session(self):
+        """Create a session connected to substrate."""
+        return get_substrate_session()
 
     @pytest.fixture
     def mock_provider(self):
@@ -184,12 +184,12 @@ class TestParameterStoreStateIntegration:
         return MockProvider()
 
     @pytest.fixture
-    def parameter_store_state(self, mock_provider, localstack_session):
-        """Create a ParameterStoreState instance with LocalStack."""
+    def parameter_store_state(self, mock_provider, substrate_session):
+        """Create a ParameterStoreState instance with substrate."""
         state_prefix = f"/parsl/test/{uuid.uuid4().hex[:8]}"
 
-        # Override session creation to use our LocalStack session
-        with patch.object(boto3, "Session", return_value=localstack_session):
+        # Override session creation to use our substrate session
+        with patch.object(boto3, "Session", return_value=substrate_session):
             state_store = ParameterStoreState(
                 provider=mock_provider, prefix=state_prefix
             )
@@ -198,7 +198,7 @@ class TestParameterStoreStateIntegration:
             # Cleanup
             try:
                 # Find all parameters under our prefix
-                paginator = localstack_session.client("ssm").get_paginator(
+                paginator = substrate_session.client("ssm").get_paginator(
                     "get_parameters_by_path"
                 )
                 page_iterator = paginator.paginate(
@@ -211,7 +211,7 @@ class TestParameterStoreStateIntegration:
                         parameters_to_delete.append(param["Name"])
 
                 # Delete in batches
-                ssm_client = localstack_session.client("ssm")
+                ssm_client = substrate_session.client("ssm")
                 for i in range(0, len(parameters_to_delete), 10):
                     batch = parameters_to_delete[i : i + 10]
                     if batch:
@@ -246,7 +246,7 @@ class TestParameterStoreStateIntegration:
             },
         }
 
-    @pytest.mark.localstack
+    @pytest.mark.substrate
     def test_parameter_store_lifecycle(self, parameter_store_state, complex_state):
         """Test the full lifecycle of a Parameter Store state."""
         state_key = f"test-state-{uuid.uuid4().hex[:8]}"
@@ -285,7 +285,7 @@ class TestParameterStoreStateIntegration:
         final_state = parameter_store_state.load_state(state_key)
         assert final_state is None
 
-    @pytest.mark.localstack
+    @pytest.mark.substrate
     def test_list_parameters(self, parameter_store_state):
         """Test listing parameters with a prefix."""
         # Create multiple parameters with a common prefix
@@ -323,18 +323,18 @@ class TestParameterStoreStateIntegration:
 
 @pytest.mark.integration
 class TestS3StateIntegration:
-    """Integration tests for S3State using LocalStack."""
+    """Integration tests for S3State using substrate."""
 
     @pytest.fixture(scope="class")
-    def localstack_session(self):
-        """Create a session connected to LocalStack."""
-        return get_localstack_session()
+    def substrate_session(self):
+        """Create a session connected to substrate."""
+        return get_substrate_session()
 
     @pytest.fixture
-    def s3_bucket_name(self, localstack_session):
+    def s3_bucket_name(self, substrate_session):
         """Create a unique S3 bucket name and ensure it exists."""
         bucket_name = f"test-bucket-{uuid.uuid4().hex[:16]}"
-        s3_client = localstack_session.client("s3")
+        s3_client = substrate_session.client("s3")
 
         try:
             s3_client.create_bucket(Bucket=bucket_name)
@@ -374,12 +374,12 @@ class TestS3StateIntegration:
         return MockProvider()
 
     @pytest.fixture
-    def s3_state(self, mock_provider, s3_bucket_name, localstack_session):
-        """Create an S3State instance with LocalStack."""
+    def s3_state(self, mock_provider, s3_bucket_name, substrate_session):
+        """Create an S3State instance with substrate."""
         key_prefix = f"parsl/test/{uuid.uuid4().hex[:8]}"
 
-        # Override session creation to use our LocalStack session
-        with patch.object(boto3, "Session", return_value=localstack_session):
+        # Override session creation to use our substrate session
+        with patch.object(boto3, "Session", return_value=substrate_session):
             return S3State(
                 provider=mock_provider,
                 bucket_name=s3_bucket_name,
@@ -416,7 +416,7 @@ class TestS3StateIntegration:
             },
         }
 
-    @pytest.mark.localstack
+    @pytest.mark.substrate
     def test_s3_state_lifecycle(self, s3_state, complex_state):
         """Test the full lifecycle of S3 state."""
         state_key = f"test-state-{uuid.uuid4().hex[:8]}"
@@ -456,7 +456,7 @@ class TestS3StateIntegration:
         final_state = s3_state.load_state(state_key)
         assert final_state is None
 
-    @pytest.mark.localstack
+    @pytest.mark.substrate
     def test_list_s3_objects(self, s3_state):
         """Test listing S3 objects with a prefix."""
         # Create multiple states with a common prefix
@@ -483,8 +483,8 @@ class TestS3StateIntegration:
         for key in [f"{prefix}/state1", f"{prefix}/state2", f"{prefix}/state3"]:
             s3_state.delete_state(key)
 
-    @pytest.mark.localstack
-    def test_cleanup_workflow_states(self, s3_state, mock_provider, localstack_session):
+    @pytest.mark.substrate
+    def test_cleanup_workflow_states(self, s3_state, mock_provider, substrate_session):
         """Test cleaning up all workflow states."""
         # Create several objects for this workflow
         workflow_prefix = mock_provider.workflow_id
@@ -513,11 +513,11 @@ class TestS3StateIntegration:
         # Cleanup the other state
         s3_state.delete_state(other_key)
 
-    @pytest.mark.localstack
-    def test_create_bucket_if_not_exists(self, mock_provider, localstack_session):
+    @pytest.mark.substrate
+    def test_create_bucket_if_not_exists(self, mock_provider, substrate_session):
         """Test creating a bucket if it doesn't exist."""
         bucket_name = f"auto-create-bucket-{uuid.uuid4().hex[:16]}"
-        s3_client = localstack_session.client("s3")
+        s3_client = substrate_session.client("s3")
 
         # Verify bucket doesn't exist
         try:
@@ -529,7 +529,7 @@ class TestS3StateIntegration:
         assert not bucket_exists
 
         # Create S3State with create_bucket_if_not_exists=True
-        with patch.object(boto3, "Session", return_value=localstack_session):
+        with patch.object(boto3, "Session", return_value=substrate_session):
             s3_state = S3State(
                 provider=mock_provider,
                 bucket_name=bucket_name,

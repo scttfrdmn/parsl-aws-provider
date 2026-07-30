@@ -65,7 +65,10 @@ test = [
     # moto 5 replaced the per-service decorators (mock_ec2, mock_s3, ...) with a
     # single mock_aws; the tests use mock_aws, so 5.0 is a hard floor.
     "moto[cloudformation]>=5.0.0",
-    "localstack>=2.0.0",
+    # `localstack` dropped (#125). It was only ever the CLI wrapper -- nothing
+    # imported it, the emulator ran as a container, and LocalStack OSS is now
+    # end-of-life. Substrate needs no Python package: it is a single Go binary,
+    # pulled as ghcr.io/scttfrdmn/substrate by docker-compose.substrate.yml.
     "requests>=2.25.0",
 ]
 globus = [
@@ -88,16 +91,11 @@ docs = [
 "Bug Tracker" = "https://github.com/scttfrdmn/parsl-aws-provider/issues"
 "Documentation" = "https://parsl-ephemeral-aws.readthedocs.io"
 
-# globus-compute-sdk requires dill==0.3.9 which conflicts with localstack<4.10
-# (which requires dill==0.3.2 or 0.3.6).  Declare them as conflicting extras
-# so uv does not try to resolve them together during lock-file generation.
-[tool.uv]
-conflicts = [
-    [
-        {extra = "globus"},
-        {extra = "test"},
-    ],
-]
+# [tool.uv] conflicts removed with the localstack dependency (#125). The pin
+# existed because globus-compute-sdk requires dill==0.3.9 while localstack<4.10
+# requires dill 0.3.2/0.3.6, so uv could not resolve `globus` and `test`
+# together. Nothing else in either extra conflicts, so both now install side by
+# side and the unit suite no longer has to run outside the globus extra.
 
 # [tool.black] and [tool.isort] removed: the repo formats with ruff-format (see
 # .pre-commit-config.yaml), whose default line length is 88, so `line-length =
@@ -141,11 +139,14 @@ addopts = [
 ]
 markers = [
     "unit: Unit tests (no external dependencies)",
-    "integration: Integration tests (requires LocalStack)",
+    "integration: Integration tests (may require the substrate AWS emulator)",
     "aws: Tests requiring real AWS credentials",
     "globus: Tests requiring Globus Compute credentials and a running endpoint",
     "slow: Slow-running tests",
-    "localstack: Tests using LocalStack",
+    # Renamed from `localstack` in #125. Kept as a distinct marker from
+    # `integration` because a subset of that directory is pure-moto and needs
+    # no endpoint at all.
+    "substrate: Tests requiring a running substrate AWS emulator",
     # Applied automatically by pytest_collection_modifyitems, never by hand.
     "setenv_aws(name, value): internal — synthetic AWS credentials for non-aws tests",
 ]

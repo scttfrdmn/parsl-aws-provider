@@ -26,22 +26,22 @@ from parsl_ephemeral_aws.exceptions import (
     LambdaFunctionError,
     EC2InstanceError,
 )
-from parsl_ephemeral_aws.utils.localstack import (
-    get_localstack_session,
-    is_localstack_available,
+from tests.substrate_support import (
+    get_substrate_session,
+    is_substrate_available,
 )
 
 
-# A marker only *selects* tests; it never skips them. Every sibling LocalStack
-# file pairs its markers with this skipif, and this one did not -- so a plain
-# `pytest tests/integration` erred out on all 7 tests with "LocalStack is not
+# A marker only *selects* tests; it never skips them. Every sibling
+# emulator-backed file pairs its markers with this skipif, and this one did not --
+# so a plain `pytest tests/integration` erred out on all 7 tests with "not
 # running" from the class fixture, rather than skipping.
 pytestmark = [
     pytest.mark.integration,
-    pytest.mark.localstack,
+    pytest.mark.substrate,
     pytest.mark.skipif(
-        not is_localstack_available(),
-        reason="LocalStack is not available. Make sure it's running on port 4566.",
+        not is_substrate_available(),
+        reason="substrate not available - start with 'make substrate-up'",
     ),
 ]
 
@@ -51,9 +51,9 @@ class TestWorkflowErrorScenarios:
     """Integration tests for workflow error scenarios."""
 
     @pytest.fixture(scope="class")
-    def localstack_session(self):
-        """Create a session connected to LocalStack."""
-        return get_localstack_session()
+    def substrate_session(self):
+        """Create a session connected to substrate."""
+        return get_substrate_session()
 
     @pytest.fixture
     def temp_dir(self):
@@ -72,20 +72,18 @@ class TestWorkflowErrorScenarios:
         provider_id = f"test-provider-{uuid.uuid4().hex[:8]}"
         return FileStateStore(file_path=state_file_path, provider_id=provider_id)
 
-    @pytest.mark.localstack
-    def test_infrastructure_failure_recovery(
-        self, localstack_session, file_state_store
-    ):
+    @pytest.mark.substrate
+    def test_infrastructure_failure_recovery(self, substrate_session, file_state_store):
         """Test recovery after infrastructure creation failure."""
         # Create a StandardMode instance
         provider_id = f"test-provider-{uuid.uuid4().hex[:8]}"
 
-        # Set up mocks for AWS services using LocalStack
-        with patch("boto3.Session", return_value=localstack_session):
+        # Set up mocks for AWS services using substrate
+        with patch("boto3.Session", return_value=substrate_session):
             # Create a standard mode
             mode = StandardMode(
                 provider_id=provider_id,
-                session=localstack_session,
+                session=substrate_session,
                 state_store=file_state_store,
                 region="us-east-1",
                 instance_type="t2.micro",
@@ -126,20 +124,20 @@ class TestWorkflowErrorScenarios:
                     with patch.object(mode, "_delete_vpc"):
                         mode.cleanup_infrastructure()
 
-    @pytest.mark.localstack
+    @pytest.mark.substrate
     def test_instance_creation_failure_recovery(
-        self, localstack_session, file_state_store
+        self, substrate_session, file_state_store
     ):
         """Test recovery after instance creation failures."""
         # Create a StandardMode instance
         provider_id = f"test-provider-{uuid.uuid4().hex[:8]}"
 
-        # Set up mocks for AWS services using LocalStack
-        with patch("boto3.Session", return_value=localstack_session):
+        # Set up mocks for AWS services using substrate
+        with patch("boto3.Session", return_value=substrate_session):
             # Create a standard mode
             mode = StandardMode(
                 provider_id=provider_id,
-                session=localstack_session,
+                session=substrate_session,
                 state_store=file_state_store,
                 region="us-east-1",
                 instance_type="t2.micro",
@@ -193,19 +191,19 @@ class TestWorkflowErrorScenarios:
                         with patch.object(mode, "_delete_vpc"):
                             mode.cleanup_infrastructure()
 
-    @pytest.mark.localstack
-    def test_bastion_failure_recovery(self, localstack_session, file_state_store):
+    @pytest.mark.substrate
+    def test_bastion_failure_recovery(self, substrate_session, file_state_store):
         """Test recovery after bastion host creation failure."""
         # Create a DetachedMode instance
         provider_id = f"test-provider-{uuid.uuid4().hex[:8]}"
         workflow_id = f"test-workflow-{uuid.uuid4().hex[:8]}"
 
-        # Set up mocks for AWS services using LocalStack
-        with patch("boto3.Session", return_value=localstack_session):
+        # Set up mocks for AWS services using substrate
+        with patch("boto3.Session", return_value=substrate_session):
             # Create a detached mode
             mode = DetachedMode(
                 provider_id=provider_id,
-                session=localstack_session,
+                session=substrate_session,
                 state_store=file_state_store,
                 region="us-east-1",
                 instance_type="t2.micro",
@@ -272,18 +270,18 @@ class TestWorkflowErrorScenarios:
                             )
                             mode.cleanup_infrastructure()
 
-    @pytest.mark.localstack
-    def test_lambda_failure_recovery(self, localstack_session, file_state_store):
+    @pytest.mark.substrate
+    def test_lambda_failure_recovery(self, substrate_session, file_state_store):
         """Test recovery after Lambda function creation failure."""
         # Create a ServerlessMode instance
         provider_id = f"test-provider-{uuid.uuid4().hex[:8]}"
 
-        # Set up mocks for AWS services using LocalStack
-        with patch("boto3.Session", return_value=localstack_session):
+        # Set up mocks for AWS services using substrate
+        with patch("boto3.Session", return_value=substrate_session):
             # Create a serverless mode
             mode = ServerlessMode(
                 provider_id=provider_id,
-                session=localstack_session,
+                session=substrate_session,
                 state_store=file_state_store,
                 region="us-east-1",
                 worker_type="lambda",  # Use Lambda for simplicity
@@ -339,18 +337,18 @@ class TestWorkflowErrorScenarios:
             mode.lambda_manager.delete_lambda_function.return_value = None
             mode.cleanup_infrastructure()
 
-    @pytest.mark.localstack
-    def test_retry_after_throttling(self, localstack_session, file_state_store):
+    @pytest.mark.substrate
+    def test_retry_after_throttling(self, substrate_session, file_state_store):
         """Test retry logic after AWS API throttling."""
         # Create a StandardMode instance
         provider_id = f"test-provider-{uuid.uuid4().hex[:8]}"
 
-        # Set up mocks for AWS services using LocalStack
-        with patch("boto3.Session", return_value=localstack_session):
+        # Set up mocks for AWS services using substrate
+        with patch("boto3.Session", return_value=substrate_session):
             # Create a standard mode
             mode = StandardMode(
                 provider_id=provider_id,
-                session=localstack_session,
+                session=substrate_session,
                 state_store=file_state_store,
                 region="us-east-1",
                 instance_type="t2.micro",
@@ -411,18 +409,18 @@ class TestWorkflowErrorScenarios:
                         with patch.object(mode, "_delete_vpc"):
                             mode.cleanup_infrastructure()
 
-    @pytest.mark.localstack
-    def test_partial_infrastructure_cleanup(self, localstack_session, file_state_store):
+    @pytest.mark.substrate
+    def test_partial_infrastructure_cleanup(self, substrate_session, file_state_store):
         """Test partial infrastructure cleanup after some resources fail to delete."""
         # Create a StandardMode instance
         provider_id = f"test-provider-{uuid.uuid4().hex[:8]}"
 
-        # Set up mocks for AWS services using LocalStack
-        with patch("boto3.Session", return_value=localstack_session):
+        # Set up mocks for AWS services using substrate
+        with patch("boto3.Session", return_value=substrate_session):
             # Create a standard mode
             mode = StandardMode(
                 provider_id=provider_id,
-                session=localstack_session,
+                session=substrate_session,
                 state_store=file_state_store,
                 region="us-east-1",
                 instance_type="t2.micro",
@@ -473,18 +471,18 @@ class TestWorkflowErrorScenarios:
             assert mode.subnet_id is None
             assert mode.security_group_id is None
 
-    @pytest.mark.localstack
-    def test_spot_instance_interruption(self, localstack_session, file_state_store):
+    @pytest.mark.substrate
+    def test_spot_instance_interruption(self, substrate_session, file_state_store):
         """Test handling of spot instance interruption."""
         # Create a StandardMode instance with spot instances
         provider_id = f"test-provider-{uuid.uuid4().hex[:8]}"
 
-        # Set up mocks for AWS services using LocalStack
-        with patch("boto3.Session", return_value=localstack_session):
+        # Set up mocks for AWS services using substrate
+        with patch("boto3.Session", return_value=substrate_session):
             # Create a standard mode with spot instances
             mode = StandardMode(
                 provider_id=provider_id,
-                session=localstack_session,
+                session=substrate_session,
                 state_store=file_state_store,
                 region="us-east-1",
                 instance_type="t2.micro",
