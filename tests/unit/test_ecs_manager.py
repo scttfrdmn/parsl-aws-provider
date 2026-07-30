@@ -11,6 +11,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from parsl_ephemeral_aws.compute.ecs import ECSManager
+from parsl_ephemeral_aws.constants import TAG_MANAGED
 from parsl_ephemeral_aws.exceptions import ResourceCreationError
 
 
@@ -120,3 +121,30 @@ class TestECSNetworkResolution:
 
         with pytest.raises(ResourceCreationError, match="No default VPC found"):
             manager._get_or_create_network_resources()
+
+    def test_created_security_group_is_not_reauthorized_for_egress(self):
+        """A freshly created security group must not have egress authorized (#110).
+
+        EC2 attaches allow-all-outbound to every new security group, so
+        authorizing it again raises ``InvalidPermission.Duplicate`` — which was
+        re-raised as ``ResourceCreationError`` and wrapped as
+        ``JobSubmissionError``, making this branch impossible to complete.
+        """
+        manager = _manager(vpc_id="vpc-explicit", subnet_id="subnet-explicit")
+        manager.ec2_client.describe_security_groups.return_value = {
+            "SecurityGroups": []
+        }
+        manager.ec2_client.create_security_group.return_value = {"GroupId": "sg-new"}
+
+        result = manager._get_or_create_network_resources()
+
+        assert result["security_group_id"] == "sg-new"
+        manager.ec2_client.authorize_security_group_egress.assert_not_called()
+
+        # The provider-managed marker is its own key, never EC2's reserved
+        # "Name" (#109).
+        tags = manager.ec2_client.create_security_group.call_args.kwargs[
+            "TagSpecifications"
+        ][0]["Tags"]
+        assert {"Key": TAG_MANAGED, "Value": "true"} in tags
+        assert not any(tag["Key"] == "Name" for tag in tags)

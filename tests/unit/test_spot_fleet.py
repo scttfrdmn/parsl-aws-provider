@@ -285,6 +285,61 @@ class TestSpotFleetManager(unittest.TestCase):
         self.assertEqual(context.exception.operation, "request_spot_fleet")
         self.assertEqual(context.exception.retry_after, 30)
 
+    @patch("parsl_ephemeral_aws.compute.spot_fleet.CredentialManager")
+    def test_no_duplicate_tag_keys_in_fleet_request(self, mock_credential_manager_cls):
+        """No TagSpecification may repeat a tag key (#109).
+
+        EC2 rejects the whole request with ``InvalidSpotFleetRequestConfig:
+        Duplicate tag key 'Name' specified.``. The marker tag used to be emitted
+        as ``TAG_NAME``, which *is* the string ``"Name"``, so both the instance
+        and the fleet-request tag lists carried ``Name`` twice. moto accepts
+        duplicates and keeps the last value, so nothing caught it.
+        """
+        mock_ec2_client = MagicMock()
+        mock_session = MagicMock()
+        mock_session.client.return_value = mock_ec2_client
+        mock_session.resource.return_value = MagicMock()
+        mock_credential_manager_cls.return_value.create_boto3_session.return_value = (
+            mock_session
+        )
+        mock_ec2_client.request_spot_fleet.return_value = {
+            "SpotFleetRequestId": "sfr-123"
+        }
+
+        manager = SpotFleetManager(self.mock_provider)
+        manager._create_spot_fleet_request(
+            "block-123",
+            {
+                "vpc_id": "vpc-12345678",
+                "subnet_id": "subnet-12345678",
+                "security_group_id": "sg-12345678",
+            },
+            1,
+            "arn:aws:iam::123456789012:role/fleet-role",
+        )
+
+        config = mock_ec2_client.request_spot_fleet.call_args.kwargs[
+            "SpotFleetRequestConfig"
+        ]
+        tag_specs = config["TagSpecifications"] + [
+            spec
+            for launch_spec in config["LaunchSpecifications"]
+            for spec in launch_spec["TagSpecifications"]
+        ]
+        self.assertTrue(tag_specs)
+        for spec in tag_specs:
+            keys = [tag["Key"] for tag in spec["Tags"]]
+            self.assertCountEqual(
+                keys,
+                set(keys),
+                f"duplicate tag key in {spec['ResourceType']} spec: {keys}",
+            )
+            # And the descriptive Name must survive, not be overwritten by the
+            # marker's "true" -- which is what a duplicate key did on the
+            # services that tolerate them.
+            name = next(tag["Value"] for tag in spec["Tags"] if tag["Key"] == "Name")
+            self.assertTrue(name.startswith(TAG_PREFIX))
+
 
 if __name__ == "__main__":
     unittest.main()
