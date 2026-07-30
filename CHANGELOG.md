@@ -408,6 +408,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `EC2Manager._get_or_create_instance_profile()` so `StandardMode` and
   `EC2Manager` share one implementation. Resolution order is explicit ARN, then
   auto-creation, then `None`.
+- `tests/unit/test_manager_session.py` — 5 tests pinning
+  `resolve_manager_session()`'s precedence directly: the provider's own session
+  is returned by identity, a provider with no session (or no `session` attribute
+  at all) falls back to the credential manager, and a falsy region resolves to
+  `DEFAULT_REGION` rather than letting boto3 pick one up from the environment.
+  Only one test had covered #117, incidentally, via a client the manager happened
+  to reach through the injected session.
+- `test_templates_are_deployed_through_the_package_loader` — both serverless
+  submit paths are asserted to obtain their CloudFormation template from
+  `get_cf_template()`. Comparing `TemplateBody` to the loader's output cannot
+  establish this alone: in a source checkout, reading the file by a path built
+  from `__file__` yields identical bytes, which is precisely why #112 stayed
+  invisible in development and failed only from an installed wheel. Both stack
+  parameter tests also now assert `TemplateBody`, so deploying the other
+  template is caught (refs #112, #113).
 
 ### Changed
 - **CI is one workflow.** `ci.yml` and `ci-cd.yml` were near-duplicate pipelines

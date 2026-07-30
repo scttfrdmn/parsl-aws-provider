@@ -11,6 +11,7 @@ import time
 
 from parsl_ephemeral_aws.modes.serverless import ServerlessMode
 from parsl_ephemeral_aws.state.base import STATE_KEY_MODE
+from parsl_ephemeral_aws.utils.aws import get_cf_template
 from parsl_ephemeral_aws.exceptions import (
     JobSubmissionError,
     OperatingModeError,
@@ -356,6 +357,12 @@ class TestServerlessMode:
         args, kwargs = mock_cf_client.create_stack.call_args
         assert kwargs["StackName"].startswith("parsl-lambda-")
 
+        # The right one of the two templates was deployed. That the loader is
+        # what produced it is asserted separately, in
+        # ``test_templates_are_deployed_through_the_package_loader`` -- here both
+        # a packaged read and a ``__file__``-relative one yield the same bytes.
+        assert kwargs["TemplateBody"] == get_cf_template("lambda_worker.yml")
+
         # The function code is staged in S3, and the stack points at it rather
         # than carrying it inline.
         mock_s3_client.put_object.assert_called_once()
@@ -388,6 +395,10 @@ class TestServerlessMode:
         gets deployed — and patching every path join in the interpreter was
         never safe.
         """
+        # Guard the premise: if the two templates were interchangeable, the
+        # TemplateBody assertion below would pass for either one.
+        assert get_cf_template("ecs_worker.yml") != get_cf_template("lambda_worker.yml")
+
         # Configure for ECS
         serverless_mode.worker_type = WORKER_TYPE_ECS
         serverless_mode.initialized = True
@@ -402,6 +413,11 @@ class TestServerlessMode:
         args, kwargs = mock_cf_client.create_stack.call_args
         assert kwargs["StackName"].startswith("parsl-ecs-")
 
+        # The right one of the two templates was deployed; see
+        # ``test_templates_are_deployed_through_the_package_loader`` for the
+        # assertion that the loader is what produced it.
+        assert kwargs["TemplateBody"] == get_cf_template("ecs_worker.yml")
+
         # Verify stack parameters
         params = {p["ParameterKey"]: p["ParameterValue"] for p in kwargs["Parameters"]}
         assert params["VpcId"] == "vpc-12345"
@@ -414,6 +430,42 @@ class TestServerlessMode:
         assert serverless_mode.resources[resource_id]["job_id"] == "job-1"
         assert serverless_mode.resources[resource_id]["worker_type"] == WORKER_TYPE_ECS
         assert serverless_mode.resources[resource_id]["status"] == STATUS_PENDING
+
+    @pytest.mark.parametrize(
+        ("worker_type", "template_name"),
+        [
+            (WORKER_TYPE_LAMBDA, "lambda_worker.yml"),
+            (WORKER_TYPE_ECS, "ecs_worker.yml"),
+        ],
+    )
+    def test_templates_are_deployed_through_the_package_loader(
+        self, serverless_mode, mock_cf_client, worker_type, template_name
+    ):
+        """Both submit paths obtain their template from ``get_cf_template()``.
+
+        Comparing ``TemplateBody`` to the loader's output cannot establish this on
+        its own: in a source checkout, reading the file by a path built from
+        ``__file__`` -- which is what both paths did before #113 -- produces
+        identical bytes. That equivalence is exactly why #112 stayed invisible in
+        development and only failed from an installed wheel, where the
+        ``__file__``-relative path resolves to a file that is not there. So this
+        asserts on the *call*, which is the part that differs.
+        """
+        serverless_mode.worker_type = worker_type
+        serverless_mode.initialized = True
+
+        with patch(
+            "parsl_ephemeral_aws.modes.serverless.get_cf_template",
+            wraps=get_cf_template,
+        ) as mock_loader:
+            serverless_mode.submit_job("job-1", "echo hello", 1)
+
+        mock_loader.assert_called_once_with(template_name)
+        # ``wraps`` means the real loader still ran, so the body is genuine
+        # rather than a sentinel that would pass regardless of what was read.
+        assert mock_cf_client.create_stack.call_args[1][
+            "TemplateBody"
+        ] == get_cf_template(template_name)
 
     def test_submit_job_initializes_lazily(self, serverless_mode):
         """An un-initialized mode initializes itself rather than refusing.
