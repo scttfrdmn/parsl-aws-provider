@@ -1,385 +1,172 @@
-# CI/CD Pipeline Configuration
+# CI/CD Pipeline
 
-This document describes the continuous integration and continuous deployment (CI/CD) pipeline for the Parsl Ephemeral AWS Provider.
+This document describes the continuous integration and release pipeline for the
+Parsl Ephemeral AWS Provider.
 
-## Overview
+The authoritative definitions are the workflow files themselves —
+[`.github/workflows/ci.yml`](../.github/workflows/ci.yml) and
+[`.github/workflows/release.yml`](../.github/workflows/release.yml). This page
+explains *why* each job exists and how to run the same checks locally; it
+deliberately does not inline the YAML, because the copy that used to live here
+drifted out of sync with the workflow it documented.
 
-The CI/CD pipeline automates testing, validation, and deployment processes, ensuring code quality and reliability. The pipeline is configured to run on both pull requests and merges to the main branch.
+## Two workflows
 
-## Pipeline Components
+| Workflow | Trigger | Purpose |
+|---|---|---|
+| `ci.yml` | push to `main`, pull requests, manual dispatch | lint, type-check, tests, build, docs |
+| `release.yml` | push of a `v*` tag | version check, tests, build, GitHub release, PyPI |
 
-### 1. Code Validation
+`ci.yml` replaced a near-duplicate `ci.yml` + `ci-cd.yml` pair that between them
+ran the same unit suite five times, over Python versions the package no longer
+supports. Everything now runs through `uv` — `uv sync --locked` installs from the
+committed `uv.lock`, so CI resolves the same dependency set a developer's
+checkout does.
 
-The first stage validates code quality and style:
+## `ci.yml` jobs
 
-* **Linting**: Ensures code adheres to PEP 8 style guidelines
-* **Type Checking**: Verifies type annotations with mypy
-* **Security Scanning**: Identifies potential security issues
-* **Formatting Check**: Verifies code formatting with black
+### `lint`
 
-### 2. Unit Testing
+`ruff check` and `ruff format --check`, plus a `bandit` security scan.
 
-The second stage runs unit tests:
+Two details worth knowing:
 
-* **Test Execution**: Runs pytest test suite
-* **Coverage Analysis**: Generates code coverage reports
-* **Mocked AWS Tests**: Tests AWS interactions using moto
+* **Scope is `parsl_ephemeral_aws tests`, not `.`** — `tools/` carries pre-existing
+  errors (bare excepts, unused imports) in one-off debug scripts that
+  [#93](https://github.com/scttfrdmn/parsl-aws-provider/issues/93) prunes in
+  v0.8.0. A `.`-scoped check could never pass.
+* **ruff-format, not black.** `black` and `isort` are no longer dependencies. The
+  repo formats with `ruff-format` at its default 88-character line length; the old
+  `[tool.black] line-length = 100` disagreed with how every file was actually
+  formatted, so running black reformatted ~80 unrelated lines. The
+  `ruff-pre-commit` hook is pinned to the same ruff version `uv.lock` resolves, so
+  a local pre-commit pass and the CI check cannot demand opposite output.
 
-### 3. Integration Testing with LocalStack
+### `type-check`
 
-The third stage tests with LocalStack:
+`mypy parsl_ephemeral_aws`, reported but **not gated** (`continue-on-error: true`)
+while the pre-existing error count is worked down under
+[#81](https://github.com/scttfrdmn/parsl-aws-provider/issues/81) and
+[#82](https://github.com/scttfrdmn/parsl-aws-provider/issues/82). Remove the
+`continue-on-error` once it reaches zero.
 
-* **LocalStack Environment**: Spins up LocalStack container
-* **Service Verification**: Validates services are operating correctly
-* **Integration Tests**: Runs tests against LocalStack services
+### `unit-tests`
 
-### 4. Cross-Platform Testing
+Runs `tests/unit` and `tests/security` on Python 3.10, 3.11, and 3.12.
+`requires-python` is `>=3.10` — Parsl 2026.x dropped 3.9, so the old 3.8/3.9
+matrix entries could not have installed the package at all.
 
-The fourth stage tests across operating systems:
+`tests/security` is pure-mock and marked `unit`, so it belongs to this job rather
+than a separate one.
 
-* **Linux Testing**: Ubuntu latest
-* **macOS Testing**: Latest macOS version
-* **Windows Testing**: Windows Server
+**Selection is by path, not `-m unit`.** That distinction caused a long-running
+divergence: the Makefile selected `-m unit`, which collected 88 of 295 tests and
+passed, while CI ran the unmarked set and failed. Selecting by path means a
+newly-added file without a marker still runs.
 
-### 5. Python Version Testing
+This job carries the project's real coverage gate, `--cov-fail-under=65`. The
+`--cov-fail-under` in `pyproject.toml` is a lower smoke floor because `addopts`
+applies to *every* invocation, including narrow ones — `pytest tests/integration`
+alone measures 34%.
 
-The fifth stage tests across Python versions:
+### `integration-tests`
 
-* **Python 3.8**: Minimum supported version
-* **Python 3.9**: Established version
-* **Python 3.10**: Established version
-* **Python 3.11**: Established version
-* **Python 3.12**: Latest version
+Runs `tests/integration` against a LocalStack service container.
 
-### 6. Documentation Building
+Currently **not gated** (`continue-on-error: true`): the LocalStack-backed tests
+skip themselves when the endpoint is absent, so they have not run in CI since
+[#69](https://github.com/scttfrdmn/parsl-aws-provider/issues/69), and 46 mode
+constructions across 9 files still omit the now-required network IDs
+([#92](https://github.com/scttfrdmn/parsl-aws-provider/issues/92), v0.8.0).
+Gating before that lands would make every PR red on known debt.
 
-The sixth stage builds and validates documentation:
+Note that a pytest marker only *selects* tests — it never skips them. Each
+LocalStack file pairs its markers with a `skipif(not is_localstack_available())`
+guard; without one, a plain `pytest tests/integration` errors instead of skipping.
 
-* **API Docs**: Generates API documentation
-* **User Guides**: Builds user guides
-* **Example Validation**: Verifies examples are correct
-* **Link Checking**: Ensures all links are valid
+### `aws-e2e-tests`
 
-### 7. Package Building and Publishing
+The real-AWS E2E suite (`tests/aws`), **manual dispatch only** — it bills money
+and needs a pre-provisioned VPC, subnet, and security group.
+[#60](https://github.com/scttfrdmn/parsl-aws-provider/issues/60) closed with 51
+tests here that no workflow referenced.
 
-The final stage builds and publishes the package:
+Credentials come from OIDC via `aws-actions/configure-aws-credentials`, so no
+long-lived access keys live in secrets. Configure:
 
-* **Package Building**: Creates distribution packages
-* **Validation**: Verifies package contents
-* **Publication**: Publishes to PyPI (only on release)
+* **Secret** `AWS_E2E_ROLE_ARN` — the role the workflow assumes.
+* **Variables** `AWS_TEST_REGION`, `AWS_TEST_VPC_ID`, `AWS_TEST_SUBNET_ID`,
+  `AWS_TEST_SG_ID`.
 
-## GitHub Actions Configuration
+`tests/aws/conftest.py` skips when the three IDs are unset, so a dispatch without
+them configured is a no-op rather than a failure. It also validates the IDs
+against `AWS_TEST_REGION` up front — IDs from another region otherwise surface
+minutes in, from deep inside `RunInstances`, after instances have been billed.
+Pick a subnet in an AZ that offers your instance type (`us-east-1e` does not offer
+`t3.micro`).
 
-Below is the GitHub Actions workflow configuration:
+A final `always()` step runs `tools/cleanup_aws_resources.py --dry-run` to report
+orphans, since a failed test is exactly when instances are most likely to be left
+running. It reports without deleting, so CI never mutates a shared account.
 
-```yaml
-name: CI/CD Pipeline
+### `test-bats`
 
-on:
-  push:
-    branches: [ main ]
-  pull_request:
-    branches: [ main ]
-  release:
-    types: [ published ]
+Runs `bats tests/bats/` for the shell scripts under `scripts/`.
 
-jobs:
-  validate:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -e ".[dev]"
-      - name: Lint with ruff
-        run: ruff check .
-      - name: Check types with mypy
-        run: mypy parsl_ephemeral_aws
-      - name: Security scan with bandit
-        run: bandit -r parsl_ephemeral_aws
-      - name: Check formatting with black
-        run: black --check parsl_ephemeral_aws tests
+### `build`
 
-  unit-test:
-    runs-on: ubuntu-latest
-    needs: validate
-    steps:
-      - uses: actions/checkout@v4
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -e ".[dev,test]"
-      - name: Run unit tests
-        run: pytest -xvs tests/unit
-      - name: Generate coverage report
-        run: |
-          pytest --cov=parsl_ephemeral_aws tests/unit
-          python -m coverage xml
-      - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v3
-        with:
-          file: ./coverage.xml
-          fail_ci_if_error: false
+`uv build`, then `twine check`. Also asserts the CloudFormation templates are
+present in the built wheel: before
+[#112](https://github.com/scttfrdmn/parsl-aws-provider/issues/112),
+`get_cf_template()` resolved templates by filesystem path, so a wheel that omitted
+them failed only at runtime, on a real AWS call.
 
-  localstack-test:
-    runs-on: ubuntu-latest
-    needs: unit-test
-    services:
-      localstack:
-        image: localstack/localstack:latest
-        ports:
-          - 4566:4566
-        env:
-          SERVICES: ec2,s3,ssm,lambda,ecs,cloudformation
-          DEFAULT_REGION: us-east-1
-          AWS_DEFAULT_REGION: us-east-1
-          LOCALSTACK_PERSISTENCE: 1
-        options: >-
-          --health-cmd "curl -s http://localhost:4566/_localstack/health | grep -q '\"ec2\":\"running\"'"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-    steps:
-      - uses: actions/checkout@v4
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -e ".[dev,test]"
-      - name: Verify LocalStack
-        run: |
-          # Install AWS CLI v2
-          curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
-          unzip awscliv2.zip
-          sudo ./aws/install
+### `docs`
 
-          # Configure AWS CLI to use LocalStack
-          aws configure set aws_access_key_id test
-          aws configure set aws_secret_access_key test
-          aws configure set region us-east-1
-          aws configure set output json
+Builds the Sphinx documentation and uploads it as an artifact.
 
-          # Verify LocalStack is running correctly
-          aws --endpoint-url=http://localhost:4566 ec2 describe-regions
-      - name: Run integration tests with LocalStack
-        run: |
-          # Set environment variables for LocalStack
-          export AWS_ENDPOINT_URL=http://localhost:4566
-          export AWS_ACCESS_KEY_ID=test
-          export AWS_SECRET_ACCESS_KEY=test
-          export AWS_DEFAULT_REGION=us-east-1
+## `release.yml`
 
-          # Run the tests
-          pytest -xvs tests/integration
+Triggered by pushing a `v*` tag. Before anything else it **verifies the tag
+matches `parsl_ephemeral_aws.__version__`** — `bump-my-version` has silently
+missed `__init__.py` before (its `[tool.bumpversion]` search string drifted out of
+sync), and v0.6.0 shipped with `__version__ == "0.1.0"`. Catching that here
+matters because a PyPI version can never be reused. `make version-verify` runs the
+same check locally, and the `version-bump-*` targets call it automatically.
 
-  cross-platform:
-    needs: unit-test
-    strategy:
-      matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v4
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -e ".[dev,test]"
-      - name: Run platform-specific tests
-        run: pytest -xvs tests/unit
+PyPI publishing uses [trusted publishing](https://docs.pypi.org/trusted-publishers/)
+via OIDC, so no `PYPI_API_TOKEN` secret is needed. The GitHub release is created
+with `gh release create`; `actions/create-release` and
+`actions/upload-release-asset` are both archived and unmaintained.
 
-  python-versions:
-    needs: unit-test
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        python-version: ["3.8", "3.9", "3.10", "3.11", "3.12"]
-    steps:
-      - uses: actions/checkout@v4
-      - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v5
-        with:
-          python-version: ${{ matrix.python-version }}
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -e ".[dev,test]"
-      - name: Run tests with Python ${{ matrix.python-version }}
-        run: pytest -xvs tests/unit
+The old `ci-cd.yml` carried a second `build-and-publish` job on
+`release: published`, so a tag push followed by a published release ran two
+independent PyPI uploads. This is now the only publish path.
 
-  docs:
-    needs: validate
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -e ".[dev,docs]"
-      - name: Build documentation
-        run: |
-          cd docs
-          make html
-      - name: Check links
-        run: |
-          pip install linkchecker
-          linkchecker docs/_build/html/index.html
-      - name: Deploy documentation (on main only)
-        if: github.ref == 'refs/heads/main'
-        uses: peaceiris/actions-gh-pages@v3
-        with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          publish_dir: ./docs/_build/html
+## Running the same checks locally
 
-  build-and-publish:
-    needs: [unit-test, localstack-test, cross-platform, python-versions, docs]
-    runs-on: ubuntu-latest
-    if: github.event_name == 'release'
-    steps:
-      - uses: actions/checkout@v4
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - name: Install build dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install build twine
-      - name: Build package
-        run: python -m build
-      - name: Check package
-        run: twine check dist/*
-      - name: Publish to PyPI
-        if: startsWith(github.ref, 'refs/tags')
-        uses: pypa/gh-action-pypi-publish@release/v1
-        with:
-          password: ${{ secrets.PYPI_API_TOKEN }}
+The Makefile runs exactly what CI runs, through `uv`:
+
+```bash
+make lint-python      # ruff check + ruff format --check
+make type-check       # mypy
+make test-unit        # tests/unit + tests/security, with the 65% gate
+make test-integration # starts LocalStack, then tests/integration
+make test-aws         # tests/aws against real AWS (prompts first; costs money)
+make build            # uv build
+make version-verify   # pyproject and __init__ versions agree
 ```
 
-## Setting Up the Pipeline
+Never invoke `pytest`, `ruff`, or `mypy` bare — they resolve against whatever is
+on `PATH` rather than `.venv`. Use `uv run` (or the Makefile, which does).
 
-To set up the CI/CD pipeline for your fork or deployment:
-
-1. **Set Up GitHub Repository**:
-   - Enable GitHub Actions in your repository settings
-   - Configure branch protection rules for the main branch
-
-2. **Configure Secrets**:
-   - Add `PYPI_API_TOKEN` secret for PyPI publishing
-   - Add any AWS test account credentials if needed
-
-3. **Enable GitHub Pages**:
-   - Configure GitHub Pages to publish from the gh-pages branch
-
-4. **Configure Codecov**:
-   - Set up a Codecov account and add your repository
-   - Add the Codecov token as a secret if required
-
-## Interpreting CI/CD Results
-
-### Dashboard
-
-The GitHub Actions dashboard provides a visual representation of pipeline runs. Key components include:
-
-* **Workflow Status**: Overall success/failure of the run
-* **Job Details**: Individual job success/failure
-* **Logs**: Detailed logs for each step
-* **Artifacts**: Build artifacts (if any)
-
-### Badges
-
-Add these badges to your README.md to show pipeline status:
+## Badges
 
 ```markdown
-[![CI/CD Pipeline](https://github.com/owner/repo/actions/workflows/ci-cd.yml/badge.svg)](https://github.com/owner/repo/actions/workflows/ci-cd.yml)
-[![codecov](https://codecov.io/gh/owner/repo/branch/main/graph/badge.svg)](https://codecov.io/gh/owner/repo)
-[![Documentation](https://img.shields.io/badge/docs-latest-blue.svg)](https://owner.github.io/repo/)
+[![CI](https://github.com/scttfrdmn/parsl-aws-provider/actions/workflows/ci.yml/badge.svg)](https://github.com/scttfrdmn/parsl-aws-provider/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/scttfrdmn/parsl-aws-provider/branch/main/graph/badge.svg)](https://codecov.io/gh/scttfrdmn/parsl-aws-provider)
 [![PyPI version](https://badge.fury.io/py/parsl-ephemeral-aws.svg)](https://badge.fury.io/py/parsl-ephemeral-aws)
 ```
-
-## Custom Test Environments
-
-### LocalStack Configuration
-
-The LocalStack configuration in the CI/CD pipeline ensures proper testing of AWS interactions:
-
-```yaml
-services:
-  localstack:
-    image: localstack/localstack:latest
-    ports:
-      - 4566:4566
-    env:
-      SERVICES: ec2,s3,ssm,lambda,ecs,cloudformation
-      DEFAULT_REGION: us-east-1
-      AWS_DEFAULT_REGION: us-east-1
-      LOCALSTACK_PERSISTENCE: 1
-    options: >-
-      --health-cmd "curl -s http://localhost:4566/_localstack/health | grep -q '\"ec2\":\"running\"'"
-      --health-interval 10s
-      --health-timeout 5s
-      --health-retries 5
-```
-
-This configuration:
-- Starts LocalStack with the required AWS services
-- Configures health checks to ensure LocalStack is running properly
-- Sets up persistence to maintain state during tests
-
-## Extending the Pipeline
-
-To extend the pipeline for additional functionality:
-
-1. **Add Custom Jobs**:
-   - Add new job definitions to the workflow file
-   - Specify dependencies using the `needs` keyword
-
-2. **Add Environment-Specific Testing**:
-   - Use matrix strategies for testing across environments
-   - Configure environment variables for different test scenarios
-
-3. **Add Deployment Steps**:
-   - Configure deployment to test/staging environments
-   - Add approval steps for production deployment
-
-## Best Practices
-
-For optimal CI/CD performance:
-
-1. **Keep Tests Fast**:
-   - Optimize tests to run quickly
-   - Use parallelization where possible
-
-2. **Manage Dependencies**:
-   - Cache dependencies to speed up builds
-   - Use dependency locking for reproducible builds
-
-3. **Secure Secrets**:
-   - Use GitHub Secrets for sensitive information
-   - Rotate credentials regularly
-
-4. **Monitor Performance**:
-   - Track pipeline execution times
-   - Optimize slow-running jobs
 
 SPDX-License-Identifier: Apache-2.0
 SPDX-FileCopyrightText: 2025 Scott Friedman and Project Contributors

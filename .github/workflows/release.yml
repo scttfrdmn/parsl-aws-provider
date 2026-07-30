@@ -1,75 +1,69 @@
 name: Release
 
+# Tag-driven release. The former ci-cd.yml carried a second, overlapping
+# build-and-publish job triggered on `release: published`, so a tag push followed
+# by a published release ran two independent PyPI uploads. This is now the only
+# publish path.
+
 on:
   push:
     tags:
       - 'v*'
 
+permissions:
+  contents: write        # create the GitHub release
+  id-token: write        # PyPI trusted publishing -- no long-lived token needed
+
 jobs:
   release:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Set up Python
-        uses: actions/setup-python@v4
+      - uses: astral-sh/setup-uv@v5
         with:
-          python-version: '3.9'
+          enable-cache: true
 
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install build twine setuptools wheel
-          pip install -e ".[dev,test]"
+      - name: Sync environment
+        run: uv sync --locked --extra dev --extra test
 
-      - name: Run tests
+      - name: Verify the tag matches the packaged version
+        # bump-my-version has silently missed parsl_ephemeral_aws/__init__.py
+        # before -- its [tool.bumpversion] search string drifted out of sync, so
+        # v0.6.0 shipped with __version__ == "0.1.0". Catch that here rather than
+        # on PyPI, where a version can never be reused.
         run: |
-          pytest tests/unit
+          tag="${GITHUB_REF_NAME#v}"
+          pkg="$(uv run python -c 'import parsl_ephemeral_aws as p; print(p.__version__)')"
+          if [ "$tag" != "$pkg" ]; then
+            echo "::error::tag $GITHUB_REF_NAME disagrees with __version__ $pkg"
+            exit 1
+          fi
+          echo "Tag and package version agree: $pkg"
+
+      - name: Run unit and security tests
+        run: uv run pytest tests/unit tests/security -q
 
       - name: Build package
+        run: uv build
+
+      - name: Check package metadata
+        run: uvx twine check dist/*
+
+      - name: Create GitHub release
+        # actions/create-release and actions/upload-release-asset are both
+        # archived and unmaintained; gh uploads the artifacts in one call.
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          python -m build
-
-      - name: Create Release
-        id: create_release
-        uses: actions/create-release@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          tag_name: ${{ github.ref }}
-          release_name: Release ${{ github.ref }}
-          draft: false
-          prerelease: false
-
-      - name: Upload Release Asset
-        uses: actions/upload-release-asset@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ steps.create_release.outputs.upload_url }}
-          asset_path: ./dist/*.tar.gz
-          asset_name: parsl-ephemeral-aws-${{ github.ref_name }}.tar.gz
-          asset_content_type: application/gzip
+          gh release create "$GITHUB_REF_NAME" \
+            --title "Release $GITHUB_REF_NAME" \
+            --generate-notes \
+            dist/*
 
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
-          user: __token__
-          password: ${{ secrets.PYPI_API_TOKEN }}
-          skip_existing: true
-
-      - name: Build and push documentation
-        if: success()
-        run: |
-          if [ -d docs ]; then
-            pip install -e ".[dev,docs]"
-            cd docs
-            make html
-
-            # Deploy to GitHub Pages or ReadTheDocs
-            # This is a placeholder - configure based on your documentation hosting
-          else
-            echo "No docs directory found, skipping documentation deployment"
-          fi
+          skip-existing: true

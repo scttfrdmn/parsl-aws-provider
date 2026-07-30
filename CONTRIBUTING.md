@@ -10,32 +10,25 @@ Thank you for your interest in contributing to this project! Here's how you can 
    git clone https://github.com/your-username/parsl-aws-provider.git
    cd parsl-aws-provider
    ```
-3. Set up your Python environment (we recommend using pyenv)
+3. Install [uv](https://docs.astral.sh/uv/), which manages both the Python
+   interpreter and the dependencies for this project. Do not use `pip`,
+   `python -m venv`, or `pyenv` directly — the Python version comes from
+   `requires-python` in `pyproject.toml` and `.python-version`, and uv installs
+   it for you. Note the project requires Python 3.10+ (Parsl 2026.x dropped 3.9).
    ```bash
-   # Install pyenv (if not already installed)
-   # MacOS: brew install pyenv
-   # Linux: curl https://pyenv.run | bash
-   # Windows: See https://github.com/pyenv-win/pyenv-win#installation
-
-   # Install the appropriate Python version
-   pyenv install 3.9.16
-
-   # Set the local Python version for this project
-   pyenv local 3.9.16
+   # MacOS / Linux
+   curl -LsSf https://astral.sh/uv/install.sh | sh
    ```
-4. Create a virtual environment and install development dependencies
+4. Create the environment and install development dependencies
    ```bash
-   # Create a virtual environment in the project directory
-   python -m venv .venv
+   # Creates .venv/ and installs from the committed uv.lock
+   uv sync --extra dev --extra test
 
-   # Activate the virtual environment
-   source .venv/bin/activate  # On Linux/macOS
-   # OR
-   .venv\Scripts\activate     # On Windows
-
-   # Install development dependencies
-   pip install -e ".[dev,test]"
+   # Install the git hooks (format, lint, commit-message linting)
+   make install-dev
    ```
+   Prefix commands with `uv run` rather than activating the venv, so they always
+   resolve against `.venv` instead of whatever is on `PATH`.
 
 ## Development Workflow
 
@@ -46,26 +39,28 @@ Thank you for your interest in contributing to this project! Here's how you can 
 
 2. Make your changes and ensure they follow the project's coding standards
    ```bash
-   # Format code with black
-   black parsl_ephemeral_aws tests
-
-   # Sort imports with isort
-   isort parsl_ephemeral_aws tests
+   # Format code and sort imports (ruff covers both)
+   uv run ruff format parsl_ephemeral_aws
+   uv run ruff check --fix parsl_ephemeral_aws tests
 
    # Run linting
-   flake8 parsl_ephemeral_aws tests
+   uv run ruff check parsl_ephemeral_aws tests
 
    # Run type checking
-   mypy parsl_ephemeral_aws
+   uv run mypy parsl_ephemeral_aws
    ```
+   Or all at once, exactly as CI runs them: `make lint-python type-check`.
 
 3. Add tests for your changes
    ```bash
-   # Run tests
-   pytest tests/
+   # Unit + security tests, with the same coverage gate CI applies
+   make test-unit
 
-   # Run tests with coverage
-   pytest --cov=parsl_ephemeral_aws tests/
+   # Integration tests (starts LocalStack; they skip without it)
+   make test-integration
+
+   # A single file or test
+   uv run pytest tests/unit/test_provider_interface.py -v --no-cov
    ```
 
 4. Commit your changes
@@ -83,19 +78,24 @@ Thank you for your interest in contributing to this project! Here's how you can 
 
 ## Pull Request Guidelines
 
+- **All work goes on a feature branch and merges via a PR. Never commit directly
+  to `main`.** This holds for maintainers too.
 - Ensure your code passes all tests, linting, and type checking
 - Include tests for new functionality
 - Update documentation as needed
 - Keep pull requests focused on a single topic
-- Follow the project's coding style (PEP 8 with Black formatting)
+- Follow the project's coding style (PEP 8, formatted with ruff-format)
 - Add SPDX license headers to all new files
+- Reference the issue in your commit subject: `fix: correct spot fleet config (closes #N)`.
+  Commit messages are linted by commitlint (conventional commits), and the
+  subject line must be 72 characters or fewer.
 
 ## Code Style
 
 This project follows:
 - [PEP 8](https://www.python.org/dev/peps/pep-0008/) style guide for Python code
-- [Black](https://black.readthedocs.io/) code formatter with 100-character line length
-- [isort](https://pycqa.github.io/isort/) for import sorting
+- [ruff-format](https://docs.astral.sh/ruff/formatter/) at its default 88-character
+  line length, for both formatting and import sorting
 - [mypy](https://mypy.readthedocs.io/) for static type checking
 
 ## Adding New Features

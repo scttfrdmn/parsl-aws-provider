@@ -358,12 +358,15 @@ The virtual environment is created at `.venv/` automatically by `uv sync`.
 2. **Requirements management**: dependencies live in `pyproject.toml` only.
    Do not maintain separate `requirements.txt` or `requirements-dev.txt` files.
 
-3. **Linting and formatting**:
+3. **Linting and formatting**: `ruff` only — `flake8`, `black`, and `isort` are
+   not dependencies of this project. Scope to `parsl_ephemeral_aws tests`, not
+   `.`: `tools/` carries pre-existing errors that #93 prunes in v0.8.0.
    ```bash
-   uv run flake8 parsl_ephemeral_aws tests
+   uv run ruff check parsl_ephemeral_aws tests
+   uv run ruff format parsl_ephemeral_aws
    uv run mypy parsl_ephemeral_aws
-   uv run black parsl_ephemeral_aws tests
    ```
+   Or via the Makefile, which is what CI runs: `make lint-python type-check`.
 
 ## Best Practices
 
