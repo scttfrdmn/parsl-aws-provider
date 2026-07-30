@@ -908,29 +908,32 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
         List[JobStatus]
             List of JobStatus objects corresponding to each job_id.
         """
-        # Internal status map keyed by the job IDs as given.
-        internal_statuses: Dict[object, str] = {}
-
         # Narrow each opaque ID to the string key ``job_map`` uses, once, so the
-        # internal map stays string-keyed. An ID this provider never issued —
-        # or one that is not a string at all — narrows to None and falls through
-        # to UNKNOWN rather than raising.
-        job_keys = [(jid, jid if isinstance(jid, str) else None) for jid in job_ids]
+        # internal map stays string-keyed. An ID this provider never issued — or
+        # one that is not a string at all — narrows to None and falls through to
+        # UNKNOWN rather than raising.
+        job_keys = [jid if isinstance(jid, str) else None for jid in job_ids]
+
+        # Statuses are collected by *position*, not by ID. ``Sequence[object]``
+        # permits unhashable IDs, so keying this by the ID itself would raise
+        # ``TypeError: unhashable type`` on e.g. a list — and the return value is
+        # positional regardless, so duplicate IDs also stay correct.
+        internal_statuses: Dict[int, str] = {}
 
         try:
             # Short-circuit jobs already in a terminal state — avoids stale
             # re-queries when an instance has been reused for a different job.
             with self._lock:
-                for job_id, key in job_keys:
+                for i, key in enumerate(job_keys):
                     if key is not None and key in self.job_map:
                         cached = self.job_map[key].get("status", "UNKNOWN")
                         if cached in _TERMINAL_STATES:
-                            internal_statuses[job_id] = cached
+                            internal_statuses[i] = cached
 
                 # Only poll for non-terminal jobs
                 resource_ids = [
                     self.job_map[key]["resource_id"]
-                    for _, key in job_keys
+                    for key in job_keys
                     if key is not None
                     and key in self.job_map
                     and self.job_map[key].get("status") not in _TERMINAL_STATES
@@ -943,8 +946,8 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
 
             # Update internal state under lock
             with self._lock:
-                for job_id, key in job_keys:
-                    if job_id in internal_statuses:
+                for i, key in enumerate(job_keys):
+                    if i in internal_statuses:
                         continue  # already set by terminal short-circuit
                     if key is not None and key in self.job_map:
                         resource_id = self.job_map[key]["resource_id"]
@@ -953,20 +956,20 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
                             self.job_map[key]["status"] = status_str
                             if resource_id in self.resources:
                                 self.resources[resource_id]["status"] = status_str
-                            internal_statuses[job_id] = status_str
+                            internal_statuses[i] = status_str
                         else:
                             # Resource not found — likely already cleaned up
-                            internal_statuses[job_id] = "COMPLETED"
+                            internal_statuses[i] = "COMPLETED"
                     else:
-                        internal_statuses[job_id] = "UNKNOWN"
+                        internal_statuses[i] = "UNKNOWN"
 
             # Save the updated state
             self._save_state()
 
         except Exception as e:
             logger.error(f"Failed to get status for jobs {job_ids}: {e}")
-            for job_id in job_ids:
-                internal_statuses.setdefault(job_id, "UNKNOWN")
+            for i in range(len(job_keys)):
+                internal_statuses.setdefault(i, "UNKNOWN")
 
         # Trigger cleanup to process warm-pool transitions and TTL evictions, and
         # to terminate finished one-shot instances — their command is delivered
@@ -978,10 +981,10 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
         return [
             JobStatus(
                 _STRING_TO_JOB_STATE.get(
-                    internal_statuses.get(jid, "UNKNOWN"), JobState.UNKNOWN
+                    internal_statuses.get(i, "UNKNOWN"), JobState.UNKNOWN
                 )
             )
-            for jid in job_ids
+            for i in range(len(job_keys))
         ]
 
     def cancel(self, job_ids: Sequence[object]) -> List[bool]:
@@ -999,18 +1002,20 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
         List[bool]
             True for each job_id where cancellation was accepted, False otherwise.
         """
-        # Track success per job_id; defaults to False (unknown / not found)
-        cancel_results: Dict[object, bool] = {jid: False for jid in job_ids}
-
         # Narrow to ``job_map``'s string keys once — see status() for why.
-        job_keys = [(jid, jid if isinstance(jid, str) else None) for jid in job_ids]
+        job_keys = [jid if isinstance(jid, str) else None for jid in job_ids]
+
+        # Success tracked by position, not by ID: an unhashable ID is legal under
+        # ``Sequence[object]`` and would raise TypeError as a dict key. Defaults
+        # to False (unknown / not found).
+        cancel_results: Dict[int, bool] = {i: False for i in range(len(job_keys))}
 
         try:
             # Read resource IDs under lock
             with self._lock:
                 resources_to_terminate = [
                     self.job_map[key]["resource_id"]
-                    for _, key in job_keys
+                    for key in job_keys
                     if key is not None and key in self.job_map
                 ]
 
@@ -1019,7 +1024,7 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
 
             # Update internal state under lock
             with self._lock:
-                for job_id, key in job_keys:
+                for i, key in enumerate(job_keys):
                     if key is not None and key in self.job_map:
                         resource_id = self.job_map[key]["resource_id"]
                         if resource_id in cancel_map:
@@ -1027,7 +1032,7 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
                             self.job_map[key]["status"] = status_str
                             if resource_id in self.resources:
                                 self.resources[resource_id]["status"] = status_str
-                            cancel_results[job_id] = status_str != "UNKNOWN"
+                            cancel_results[i] = status_str != "UNKNOWN"
                         # else: resource not in cancel_map → remains False
 
             # Clean up completed/failed resources (acquires lock internally)
@@ -1039,7 +1044,7 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
         except Exception as e:
             logger.error(f"Failed to cancel jobs {job_ids}: {e}")
 
-        return [cancel_results[jid] for jid in job_ids]
+        return [cancel_results[i] for i in range(len(job_keys))]
 
     def _save_state(self) -> None:
         """Save the current state under the provider's own state key.

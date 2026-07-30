@@ -507,6 +507,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `"parsl.auto"` is treated as "no caller-chosen name", the same as the `None`
   this provider previously defaulted to. `self.resources` is widened to
   `Dict[object, Any]` to match the base declaration (closes #82).
+- `status()` and `cancel()` collect their per-job results by *position* rather
+  than in a dict keyed by the job ID. `Sequence[object]` admits unhashable IDs,
+  and using one as a dict key raised `TypeError: unhashable type: 'list'` — from
+  inside the `except` handler too, so it escaped the method rather than being
+  reported as UNKNOWN. Positional collection also means a repeated ID yields one
+  entry per occurrence, which is what Parsl indexes (refs #82).
 - Minimum Parsl raised from `2026.1.5` to `2026.4.20`. Not the `2026.7` #82
   proposed: `globus-compute-endpoint` pins Parsl *exactly* (4.15.0 →
   `parsl==2026.4.20`), so any floor above that makes the `globus` extra

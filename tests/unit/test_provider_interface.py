@@ -381,6 +381,43 @@ class TestExecutionProviderConformance:
 
         assert result == [False, False]
 
+    def test_status_accepts_unhashable_ids(self, tmp_dir):
+        """An unhashable ID reports UNKNOWN instead of raising TypeError.
+
+        ``Sequence[object]`` permits unhashable objects, so results cannot be
+        collected in a dict keyed by the ID itself — that raised
+        ``TypeError: unhashable type: 'list'`` before results were keyed by
+        position.
+        """
+        provider, _ = _make_provider(tmp_dir)
+
+        result = provider.status([["a"], {"b": 1}])
+
+        assert [s.state for s in result] == [JobState.UNKNOWN, JobState.UNKNOWN]
+
+    def test_cancel_accepts_unhashable_ids(self, tmp_dir):
+        """cancel() reports False for unhashable IDs instead of raising."""
+        provider, _ = _make_provider(tmp_dir)
+
+        assert provider.cancel([["a"], {"b": 1}]) == [False, False]
+
+    def test_status_duplicate_ids_returns_one_entry_each(self, tmp_dir):
+        """Repeated IDs each get their own positional entry.
+
+        Keying results by ID would collapse duplicates; Parsl indexes the
+        returned list positionally, so the lengths must match.
+        """
+        provider, mode = _make_provider(tmp_dir)
+        resource_id = "resource-dup"
+        mode.submit_job.return_value = resource_id
+        mode.get_job_status.return_value = {resource_id: "RUNNING"}
+
+        job_id = provider.submit("echo hello", tasks_per_node=1)
+        result = provider.status([job_id, job_id, job_id])
+
+        assert len(result) == 3
+        assert all(s.state == JobState.RUNNING for s in result)
+
     def test_status_mixed_ids_preserves_order(self, tmp_dir):
         """A real ID alongside opaque ones still resolves positionally."""
         provider, mode = _make_provider(tmp_dir)
