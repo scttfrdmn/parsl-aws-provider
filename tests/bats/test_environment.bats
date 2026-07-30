@@ -29,17 +29,18 @@ teardown() {
   cleanup_temp_dir
 }
 
-# Test environment variables
-@test "Required environment variables are set" {
-  # Skip if not in a CI environment to avoid failing local tests
-  if [[ -z "$CI" ]]; then
-    skip "Not in CI environment"
-  fi
-
-  # Check for required environment variables
-  [[ -n "$AWS_REGION" ]] || (echo "AWS_REGION is not set" && false)
-  [[ -n "$AWS_ACCESS_KEY_ID" || -n "$AWS_PROFILE" ]] || (echo "Neither AWS_ACCESS_KEY_ID nor AWS_PROFILE is set" && false)
-}
+# The "Required environment variables are set" test that used to sit here
+# asserted that AWS_REGION and AWS_ACCESS_KEY_ID/AWS_PROFILE were set in the
+# ambient environment, guarded by `if [[ -z "$CI" ]]; then skip`. So it ran only
+# in CI -- and it failed on every CI run since it was written, taking the whole
+# job with it even though the other 11 tests passed.
+#
+# It could not have done otherwise: this suite exercises shell scripts against
+# the mocked AWS CLI that `mock_aws` installs, so it needs no credentials and the
+# workflow supplies none. Exporting the variables in the job would have made it
+# pass while asserting nothing but that the workflow sets what the workflow sets.
+# The env-file contents the scripts actually depend on are covered by
+# test_setup_environment.bats.
 
 # Test AWS CLI is installed and configured
 @test "AWS CLI is installed and configured" {

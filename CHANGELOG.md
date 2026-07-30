@@ -408,6 +408,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `EC2Manager._get_or_create_instance_profile()` so `StandardMode` and
   `EC2Manager` share one implementation. Resolution order is explicit ARN, then
   auto-creation, then `None`.
+- `test_cf_templates.py` falls back to the `tomli` backport, since `tomllib` is
+  3.11+ and `requires-python` is `>=3.10`. This is not a new dependency: pytest
+  itself requires `tomli` below 3.11.
 - `tests/unit/test_manager_session.py` — 5 tests pinning
   `resolve_manager_session()`'s precedence directly: the provider's own session
   is returned by identity, a provider with no session (or no `session` attribute
@@ -515,6 +518,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   from the environment; tests are skipped (not failed) when these are unset.
 
 ### Removed
+- The bats test `Required environment variables are set`. It asserted that
+  `AWS_REGION` and `AWS_ACCESS_KEY_ID`/`AWS_PROFILE` were set in the ambient
+  environment, guarded so that it ran only when `CI` was set — so it failed on
+  every CI run since it was written, failing the whole `test-bats` job while the
+  other 11 tests passed. It could not have done otherwise: the suite exercises
+  shell scripts against a mocked AWS CLI, needs no credentials, and the workflow
+  supplies none. The env-file contents the scripts do depend on are covered by
+  `test_setup_environment.bats`.
 - `SpotFleetManager._create_vpc()`, `_create_subnet()`, `_create_security_group()`,
   and `_cleanup_network_resources()`. `_setup_network_resources()` now only
   resolves the caller-supplied IDs and raises `ResourceCreationError` if any are

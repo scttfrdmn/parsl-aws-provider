@@ -8,10 +8,17 @@ SPDX-License-Identifier: Apache-2.0
 SPDX-FileCopyrightText: 2025 Scott Friedman and Project Contributors
 """
 
-import tomllib
 from pathlib import Path
 
 import pytest
+
+# tomllib is 3.11+, and requires-python is >=3.10, so the matrix's 3.10 leg needs
+# the backport. It is never an extra dependency: pytest itself requires tomli on
+# <3.11, so it is present wherever this test can run at all.
+try:
+    import tomllib
+except ModuleNotFoundError:  # pragma: no cover - 3.10 only
+    import tomli as tomllib
 
 from parsl_ephemeral_aws.utils.aws import get_cf_template
 
