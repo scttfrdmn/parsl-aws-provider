@@ -171,7 +171,7 @@ class TestSpotInterruptionLocalstack:
             for i in range(state["iteration"], iterations):
                 state["result"] += i
                 state["iteration"] = i + 1
-                print(f"Iteration {i+1}/{iterations}, result: {state['result']}")
+                print(f"Iteration {i + 1}/{iterations}, result: {state['result']}")
 
                 # Yield checkpoint at each iteration
                 yield state
@@ -447,10 +447,10 @@ class TestSpotInterruptionLocalstack:
         # Allow some timing flexibility (between 0.4x and 2x the interval)
         # This is to account for test environment variability
         for interval in intervals:
-            assert (
-                interval >= checkpoint_interval * 0.4
-            ), f"Interval {interval} is too short"
+            assert interval >= checkpoint_interval * 0.4, (
+                f"Interval {interval} is too short"
+            )
             # Upper bound is more flexible as scheduling can delay things
-            assert (
-                interval <= checkpoint_interval * 2.0
-            ), f"Interval {interval} is too long"
+            assert interval <= checkpoint_interval * 2.0, (
+                f"Interval {interval} is too long"
+            )

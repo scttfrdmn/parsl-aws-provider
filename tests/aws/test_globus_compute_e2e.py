@@ -87,7 +87,7 @@ def _skip_if_no_globus_auth():
     storage_db = Path.home() / ".globus_compute" / "storage.db"
     if not storage_db.exists():
         pytest.skip(
-            "No Globus Compute auth tokens found. " "Run: globus-compute-endpoint login"
+            "No Globus Compute auth tokens found. Run: globus-compute-endpoint login"
         )
 
 
@@ -397,9 +397,9 @@ class TestGlobusComputeFunctionSubmission:
             futures = [executor.submit(square, x) for x in inputs]
             results = [f.result(timeout=FUNCTION_TIMEOUT_S) for f in futures]
 
-        assert (
-            results == expected
-        ), f"Concurrent results mismatch: {results} != {expected}"
+        assert results == expected, (
+            f"Concurrent results mismatch: {results} != {expected}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -631,6 +631,6 @@ class TestGlobusComputeEC2Cleanup:
             for res in response.get("Reservations", [])
             for inst in res.get("Instances", [])
         ]
-        assert (
-            remaining == []
-        ), f"EC2 instances still running after provider.shutdown(): {remaining}"
+        assert remaining == [], (
+            f"EC2 instances still running after provider.shutdown(): {remaining}"
+        )

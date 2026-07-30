@@ -5,27 +5,27 @@ SPDX-FileCopyrightText: 2025 Scott Friedman and Project Contributors
 """
 
 import pytest
-from unittest.mock import MagicMock, patch, call
+from unittest.mock import MagicMock, patch
 import boto3
 import time
 import json
+from botocore.exceptions import ClientError
 
 from parsl_ephemeral_aws.modes.detached import DetachedMode
 from parsl_ephemeral_aws.state.base import STATE_KEY_MODE
 from parsl_ephemeral_aws.exceptions import (
     OperatingModeError,
-    ResourceCreationError,
+    ResourceNotFoundError,
 )
 from parsl_ephemeral_aws.constants import (
-    RESOURCE_TYPE_VPC,
-    RESOURCE_TYPE_SUBNET,
-    RESOURCE_TYPE_SECURITY_GROUP,
     RESOURCE_TYPE_BASTION,
     STATUS_PENDING,
     STATUS_RUNNING,
     STATUS_CANCELLED,
     STATUS_COMPLETED,
 )
+
+pytestmark = pytest.mark.unit
 
 
 class TestDetachedMode:
@@ -203,7 +203,11 @@ class TestDetachedMode:
         assert mode.subnet_id == "subnet-12345"
         assert mode.security_group_id == "sg-12345"
         assert mode.bastion_id == "i-bastion"
-        assert mode.create_vpc is False
+
+        # #69 made all three network IDs caller-supplied and removed the
+        # create-on-demand switch entirely. The bastion is still this mode's own
+        # to create — that asymmetry is the point of the assertions above.
+        assert not hasattr(mode, "create_vpc")
 
     @patch("parsl_ephemeral_aws.modes.detached.get_default_ami")
     @patch("parsl_ephemeral_aws.modes.detached.get_cf_template")
@@ -215,7 +219,12 @@ class TestDetachedMode:
         mock_ec2_client,
         mock_cf_client,
     ):
-        """Test initialize method creates infrastructure including bastion via CloudFormation."""
+        """Initialize creates only the bastion stack; the network is the caller's.
+
+        The three ``create_vpc``/``create_subnet``/``create_security_group``
+        assertions this test used to make were removed by #69. The bastion is
+        still created here, so that half stands.
+        """
         # Setup mocks
         mock_get_default_ami.return_value = "ami-default"
         mock_get_cf_template.return_value = "CloudFormation Template"
@@ -231,11 +240,14 @@ class TestDetachedMode:
         assert detached_mode.bastion_id == "stack-12345"
         assert detached_mode.initialized is True
 
-        # Verify EC2 and CF client calls
-        mock_ec2_client.create_vpc.assert_called_once()
-        mock_ec2_client.create_subnet.assert_called_once()
-        mock_ec2_client.create_security_group.assert_called_once()
+        # The bastion stack is this mode's to create; the network is not.
         mock_cf_client.create_stack.assert_called_once()
+        mock_ec2_client.create_vpc.assert_not_called()
+        mock_ec2_client.create_subnet.assert_not_called()
+        mock_ec2_client.create_security_group.assert_not_called()
+
+        # It is verified instead.
+        mock_ec2_client.describe_vpcs.assert_called_once_with(VpcIds=["vpc-12345"])
 
         # Verify state was saved
         detached_mode.state_store.save_state.assert_called()
@@ -244,7 +256,7 @@ class TestDetachedMode:
     def test_initialize_direct(
         self, mock_get_default_ami, detached_mode, mock_ec2_client
     ):
-        """Test initialize method creates infrastructure including direct bastion host."""
+        """Initialize launches only the bastion instance; the network is the caller's."""
         # Setup mocks
         mock_get_default_ami.return_value = "ami-default"
         detached_mode.bastion_host_type = "direct"
@@ -259,30 +271,40 @@ class TestDetachedMode:
         assert detached_mode.bastion_id == "i-bastion"
         assert detached_mode.initialized is True
 
-        # Verify EC2 client calls
-        mock_ec2_client.create_vpc.assert_called_once()
-        mock_ec2_client.create_subnet.assert_called_once()
-        mock_ec2_client.create_security_group.assert_called_once()
+        # The bastion instance is this mode's to launch; the network is not (#69).
         mock_ec2_client.run_instances.assert_called_once()
+        mock_ec2_client.create_vpc.assert_not_called()
+        mock_ec2_client.create_subnet.assert_not_called()
+        mock_ec2_client.create_security_group.assert_not_called()
 
         # Verify state was saved
         detached_mode.state_store.save_state.assert_called()
 
-    @patch("parsl_ephemeral_aws.modes.detached.delete_resource")
-    def test_initialize_failure_cleanup(
-        self, mock_delete_resource, detached_mode, mock_ec2_client
+    def test_initialize_reports_a_missing_network_resource(
+        self, detached_mode, mock_ec2_client
     ):
-        """Test that resources are cleaned up if initialization fails."""
-        # Make subnet creation fail
-        mock_ec2_client.create_vpc.return_value = {"Vpc": {"VpcId": "vpc-12345"}}
-        mock_ec2_client.create_subnet.side_effect = Exception("Subnet creation failed")
+        """A missing VPC is named, and no bastion is launched into it.
 
-        # Call initialize and expect exception
-        with pytest.raises(ResourceCreationError):
+        Replaces ``test_initialize_failure_cleanup``, which failed
+        ``create_subnet`` and asserted a ``delete_resource`` rollback — neither
+        function is reachable from this mode any more, and patching the latter
+        raised ``AttributeError`` outright.
+        """
+        mock_ec2_client.describe_vpcs.side_effect = ClientError(
+            {"Error": {"Code": "InvalidVpcID.NotFound", "Message": "not found"}},
+            "DescribeVpcs",
+        )
+
+        with pytest.raises(ResourceNotFoundError) as exc_info:
             detached_mode.initialize()
 
-        # Verify cleanup was called
-        mock_delete_resource.assert_called()
+        assert "vpc-12345" in str(exc_info.value)
+
+        # Verification precedes creation, so nothing was launched, and the ID
+        # survives rather than being nulled out (#77).
+        mock_ec2_client.run_instances.assert_not_called()
+        assert detached_mode.vpc_id == "vpc-12345"
+        assert detached_mode.initialized is False
 
     def test_submit_job(self, detached_mode, mock_ssm_client):
         """Test job submission via SSM Parameter Store."""
@@ -414,11 +436,15 @@ class TestDetachedMode:
         # Verify state was saved
         detached_mode.state_store.save_state.assert_called()
 
-    @patch("parsl_ephemeral_aws.modes.detached.delete_resource")
     def test_cleanup_infrastructure(
-        self, mock_delete_resource, detached_mode, mock_ec2_client, mock_cf_client
+        self, detached_mode, mock_ec2_client, mock_cf_client
     ):
-        """Test infrastructure cleanup including bastion host."""
+        """Cleanup terminates the bastion this mode created, and nothing else.
+
+        The ``delete_resource`` patch and the SG/subnet/VPC deletion assertions
+        this test carried were removed by #69 — the module no longer imports that
+        function, so the patch raised ``AttributeError``.
+        """
         # Setup infrastructure resources
         detached_mode.vpc_id = "vpc-12345"
         detached_mode.subnet_id = "subnet-12345"
@@ -442,18 +468,15 @@ class TestDetachedMode:
             InstanceIds=["i-bastion"]
         )
 
-        # Verify resource deletion for networking
-        expected_calls = [
-            call("sg-12345", detached_mode.session, RESOURCE_TYPE_SECURITY_GROUP),
-            call("subnet-12345", detached_mode.session, RESOURCE_TYPE_SUBNET),
-            call("vpc-12345", detached_mode.session, RESOURCE_TYPE_VPC, force=True),
-        ]
-        mock_delete_resource.assert_has_calls(expected_calls, any_order=True)
+        # The caller's network is left intact and still configured (#69).
+        mock_ec2_client.delete_security_group.assert_not_called()
+        mock_ec2_client.delete_subnet.assert_not_called()
+        mock_ec2_client.delete_vpc.assert_not_called()
+        assert detached_mode.vpc_id == "vpc-12345"
+        assert detached_mode.subnet_id == "subnet-12345"
+        assert detached_mode.security_group_id == "sg-12345"
 
-        # Verify state was reset
-        assert detached_mode.vpc_id is None
-        assert detached_mode.subnet_id is None
-        assert detached_mode.security_group_id is None
+        # The bastion was this mode's, so its ID is cleared along with the rest.
         assert detached_mode.bastion_id is None
         assert detached_mode.initialized is False
         assert not detached_mode.resources  # Resources should be empty

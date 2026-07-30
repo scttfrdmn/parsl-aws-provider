@@ -213,7 +213,9 @@ class TestParameterStoreState:
         paginator = ssm.get_paginator("get_parameters_by_path")
         for page in paginator.paginate(Path=path, Recursive=True):
             pre_params.extend(page.get("Parameters", []))
-        assert pre_params, f"No parameters found under '{path}' before shutdown — state was never written."
+        assert pre_params, (
+            f"No parameters found under '{path}' before shutdown — state was never written."
+        )
 
         parameter_store_provider.shutdown()
 

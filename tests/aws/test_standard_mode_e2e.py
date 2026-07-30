@@ -90,9 +90,9 @@ class TestStandardModeComputeLifecycle:
         job_id = aws_provider.submit("echo hello-from-ec2", tasks_per_node=1)
         try:
             assert job_id, "job_id should be a non-empty string"
-            assert (
-                job_id in aws_provider.job_map
-            ), f"job_id {job_id} not found in provider.job_map"
+            assert job_id in aws_provider.job_map, (
+                f"job_id {job_id} not found in provider.job_map"
+            )
         finally:
             try:
                 aws_provider.cancel([job_id])
@@ -115,12 +115,12 @@ class TestStandardModeComputeLifecycle:
             assert instances, f"No instance found for {resource_id}"
 
             tags = {t["Key"]: t["Value"] for t in instances[0].get("Tags", [])}
-            assert (
-                tags.get("ProviderId") == aws_provider.provider_id
-            ), f"Tag 'ProviderId' expected '{aws_provider.provider_id}', got '{tags.get('ProviderId')}'"
-            assert (
-                tags.get("JobId") == job_id
-            ), f"Tag 'JobId' expected '{job_id}', got '{tags.get('JobId')}'"
+            assert tags.get("ProviderId") == aws_provider.provider_id, (
+                f"Tag 'ProviderId' expected '{aws_provider.provider_id}', got '{tags.get('ProviderId')}'"
+            )
+            assert tags.get("JobId") == job_id, (
+                f"Tag 'JobId' expected '{job_id}', got '{tags.get('JobId')}'"
+            )
         finally:
             try:
                 aws_provider.cancel([job_id])
@@ -138,9 +138,9 @@ class TestStandardModeComputeLifecycle:
             result = aws_provider.status([job_id])
             assert result, "status() returned an empty list"
             state = result[0].state
-            assert (
-                state == JobState.RUNNING
-            ), f"Expected RUNNING immediately after submit, got {state}"
+            assert state == JobState.RUNNING, (
+                f"Expected RUNNING immediately after submit, got {state}"
+            )
         finally:
             try:
                 aws_provider.cancel([job_id])
@@ -183,9 +183,9 @@ class TestStandardModeComputeLifecycle:
 
         # Confirm it is running first
         result = aws_provider.status([job_id])
-        assert (
-            result[0].state == JobState.RUNNING
-        ), "Expected RUNNING before cancellation"
+        assert result[0].state == JobState.RUNNING, (
+            "Expected RUNNING before cancellation"
+        )
 
         aws_provider.cancel([job_id])
 

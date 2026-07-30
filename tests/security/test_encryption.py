@@ -15,6 +15,8 @@ from parsl_ephemeral_aws.security.encryption import (
     SecureStateManager,
 )
 
+pytestmark = pytest.mark.unit
+
 
 class TestEncryptionConfiguration:
     """Tests for encryption configuration."""

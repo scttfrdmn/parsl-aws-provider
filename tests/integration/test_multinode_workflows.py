@@ -121,11 +121,8 @@ class TestMultiNodeWorkflows:
                     mode, "_create_ec2_instances_as_block"
                 ) as mock_create_block:
                     # Call the actual implementation but with our mock
-                    mock_create_block.side_effect = (
-                        lambda *args,
-                        **kwargs: mode._create_ec2_instances_as_block_impl(
-                            *args, **kwargs
-                        )
+                    mock_create_block.side_effect = lambda *args, **kwargs: (
+                        mode._create_ec2_instances_as_block_impl(*args, **kwargs)
                     )
 
                     # Should create one block with 4 nodes
@@ -170,11 +167,8 @@ class TestMultiNodeWorkflows:
                     mode, "_create_ec2_instances_as_block"
                 ) as mock_create_block:
                     # Call the actual implementation but with our mock
-                    mock_create_block.side_effect = (
-                        lambda *args,
-                        **kwargs: mode._create_ec2_instances_as_block_impl(
-                            *args, **kwargs
-                        )
+                    mock_create_block.side_effect = lambda *args, **kwargs: (
+                        mode._create_ec2_instances_as_block_impl(*args, **kwargs)
                     )
 
                     # Scale out by adding another block
@@ -292,11 +286,8 @@ class TestMultiNodeWorkflows:
                     mode, "_create_ec2_instances_as_block"
                 ) as mock_create_block:
                     # Call the actual implementation but with our mock
-                    mock_create_block.side_effect = (
-                        lambda *args,
-                        **kwargs: mode._create_ec2_instances_as_block_impl(
-                            *args, **kwargs
-                        )
+                    mock_create_block.side_effect = lambda *args, **kwargs: (
+                        mode._create_ec2_instances_as_block_impl(*args, **kwargs)
                     )
                     with patch.object(mode, "_create_ssm_parameter"):
                         # Should create one block with 4 nodes
@@ -422,11 +413,8 @@ class TestMultiNodeWorkflows:
                     with patch.object(
                         mode, "_create_ec2_instances_as_block"
                     ) as mock_create_block:
-                        mock_create_block.side_effect = (
-                            lambda *args,
-                            **kwargs: mode._create_ec2_instances_as_block_impl(
-                                *args, **kwargs
-                            )
+                        mock_create_block.side_effect = lambda *args, **kwargs: (
+                            mode._create_ec2_instances_as_block_impl(*args, **kwargs)
                         )
 
                         # Create initial blocks
@@ -550,11 +538,8 @@ class TestMultiNodeWorkflows:
                 with patch.object(
                     mode, "_create_ec2_instances_as_block"
                 ) as mock_create_block:
-                    mock_create_block.side_effect = (
-                        lambda *args,
-                        **kwargs: mode._create_ec2_instances_as_block_impl(
-                            *args, **kwargs
-                        )
+                    mock_create_block.side_effect = lambda *args, **kwargs: (
+                        mode._create_ec2_instances_as_block_impl(*args, **kwargs)
                     )
 
                     # Initialize through provider interface

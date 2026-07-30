@@ -10,6 +10,8 @@ from parsl_ephemeral_aws.security import NetworkSecurityPolicy, SecurityEnvironm
 from parsl_ephemeral_aws.security.cidr_manager import CIDRManager, CIDRValidationError
 from parsl_ephemeral_aws.config import SecurityConfig
 
+pytestmark = pytest.mark.unit
+
 
 class TestCIDRManager:
     """Tests for CIDR validation and management."""
@@ -75,7 +77,14 @@ class TestCIDRManager:
             manager.get_subnet_cidrs("10.0.0.0/30", 10)  # /30 can't fit 10 subnets
 
     def test_analyze_security_rules(self):
-        """Test security rule analysis."""
+        """An internet-open rule is reported as prohibited, a private one as private.
+
+        ``0.0.0.0/0`` is a key of ``PROHIBITED_CIDRS``, so it is classified as
+        *prohibited* -- an error -- and never reaches the ``public_access_rules``
+        branch, which tests for the same literal one ``elif`` later and is
+        therefore unreachable. This asserted ``public_access_rules == 1``, which
+        would only hold if the CIDR were downgraded from an error to a warning.
+        """
         manager = CIDRManager()
 
         rules = [
@@ -96,9 +105,19 @@ class TestCIDRManager:
         analysis = manager.analyze_security_rules(rules)
 
         assert analysis["total_rules"] == 2
-        assert len(analysis["public_access_rules"]) == 1
+
+        # World-open SSH is an error, not a warning, and names the rule and reason.
+        assert len(analysis["prohibited_cidrs"]) == 1
+        prohibited = analysis["prohibited_cidrs"][0]
+        assert prohibited["cidr"] == "0.0.0.0/0"
+        assert prohibited["rule_index"] == 0
+        assert prohibited["ports"] == "22-22"
+        assert len(analysis["errors"]) == 1
+        assert "0.0.0.0/0" in analysis["errors"][0]
+
+        # The VPC-internal rule is fine.
         assert len(analysis["private_rules"]) == 1
-        assert len(analysis["warnings"]) >= 1
+        assert analysis["private_rules"][0]["cidr"] == "10.0.0.0/16"
 
     def test_suggest_secure_alternatives(self):
         """Test secure alternative suggestions."""
@@ -131,16 +150,38 @@ class TestNetworkSecurityPolicy:
         assert policy.admin_cidr_blocks == admin_cidrs
 
     def test_strict_mode_validation(self):
-        """Test strict mode prevents prohibited CIDRs."""
+        """A prohibited CIDR is rejected at construction, not on later inspection.
+
+        ``__post_init__`` runs ``_validate_configuration()``, which calls
+        ``_check_strict_mode_violations()`` in strict mode -- so the constructor
+        itself raises and no policy object is ever handed back. This test built
+        the policy *outside* ``pytest.raises`` and then called the private
+        checker inside it, so the error escaped from the wrong line and the test
+        failed even though the package behaves correctly. Rejecting at
+        construction is the stronger guarantee: an invalid policy cannot exist.
+        """
+        with pytest.raises(CIDRValidationError, match="not allowed in strict mode"):
+            NetworkSecurityPolicy(
+                environment=SecurityEnvironment.PRODUCTION,
+                admin_cidr_blocks=["0.0.0.0/0"],  # This should fail
+                strict_mode=True,
+            )
+
+    def test_strict_mode_allows_scoped_admin_cidrs(self):
+        """Strict mode is not a blanket ban -- a scoped admin CIDR is accepted.
+
+        Guards the complement of the case above: the check must reject only the
+        prohibited literals, so a production policy with real admin ranges still
+        constructs.
+        """
         policy = NetworkSecurityPolicy(
             environment=SecurityEnvironment.PRODUCTION,
-            admin_cidr_blocks=["0.0.0.0/0"],  # This should fail
+            admin_cidr_blocks=["10.0.0.0/8"],
             strict_mode=True,
         )
 
-        # This should raise an error due to 0.0.0.0/0 in strict mode
-        with pytest.raises(CIDRValidationError, match="not allowed in strict mode"):
-            policy._check_strict_mode_violations()
+        assert policy.strict_mode
+        assert policy.admin_cidr_blocks == ["10.0.0.0/8"]
 
     def test_get_compute_worker_rules(self):
         """Test compute worker security rules."""

@@ -18,6 +18,8 @@ from parsl_ephemeral_aws.security.audit import (
     ComplianceFramework,
 )
 
+pytestmark = pytest.mark.unit
+
 
 class TestSecurityEvent:
     """Tests for security event class."""

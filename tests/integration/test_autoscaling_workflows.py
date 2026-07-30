@@ -134,7 +134,7 @@ class TestAutoscalingWorkflows:
             resource_ids = list(mode.resources.keys())
 
             for i, resource_id in enumerate(resource_ids):
-                job_id = f"job-{i+1}"
+                job_id = f"job-{i + 1}"
                 # Set resource job mapping
                 mode.resources[resource_id]["job_id"] = job_id
                 # Set to running status
@@ -270,7 +270,7 @@ class TestAutoscalingWorkflows:
             resource_ids = list(mode.resources.keys())
 
             for i, resource_id in enumerate(resource_ids):
-                job_id = f"job-{i+1}"
+                job_id = f"job-{i + 1}"
                 # Set resource job mapping
                 mode.resources[resource_id]["job_id"] = job_id
                 # Set to running status
@@ -379,8 +379,8 @@ class TestAutoscalingWorkflows:
                 with patch(
                     "builtins.open", MagicMock()
                 ):  # Mock writing Lambda code to file
-                    job_id = f"job-{i+1}"
-                    resource_id = mode.submit_job(job_id, f"echo 'Job {i+1}'", 1)
+                    job_id = f"job-{i + 1}"
+                    resource_id = mode.submit_job(job_id, f"echo 'Job {i + 1}'", 1)
                     job_ids.append(job_id)
                     resource_ids.append(resource_id)
 
@@ -591,8 +591,8 @@ class TestAutoscalingWorkflows:
                     # Submit 5 mixed jobs
                     job_ids = []
                     for i in range(5):
-                        job_id = f"job-{i+1}"
-                        command = f"echo 'Job {i+1}'"
+                        job_id = f"job-{i + 1}"
+                        command = f"echo 'Job {i + 1}'"
 
                         # Submit through provider interface
                         with patch.object(provider, "status"):  # Mock status calls

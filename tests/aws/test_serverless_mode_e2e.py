@@ -81,17 +81,17 @@ class TestServerlessModeInfrastructure:
         response = ec2.describe_vpcs(VpcIds=[vpc_id])
         vpcs = response.get("Vpcs", [])
         assert len(vpcs) == 1, f"Expected exactly one VPC for {vpc_id}, got {vpcs}"
-        assert (
-            vpcs[0]["State"] == "available"
-        ), f"VPC {vpc_id} is in state '{vpcs[0]['State']}', expected 'available'"
+        assert vpcs[0]["State"] == "available", (
+            f"VPC {vpc_id} is in state '{vpcs[0]['State']}', expected 'available'"
+        )
 
     def test_security_group_created(self, serverless_provider, aws_session, aws_region):
         """Provider creates a security group in the VPC."""
         sg_id = serverless_provider.operating_mode.security_group_id
         vpc_id = serverless_provider.operating_mode.vpc_id
-        assert (
-            sg_id is not None
-        ), "security_group_id should be set after initialize() for serverless mode"
+        assert sg_id is not None, (
+            "security_group_id should be set after initialize() for serverless mode"
+        )
         assert vpc_id is not None, "vpc_id must be set if security_group_id is set"
 
         ec2 = aws_session.client("ec2", region_name=aws_region)
@@ -124,9 +124,9 @@ class TestLambdaLifecycle:
         job_id = serverless_provider.submit("echo hello-from-lambda", tasks_per_node=1)
         try:
             assert job_id, "job_id should be a non-empty string"
-            assert (
-                job_id in serverless_provider.job_map
-            ), f"job_id {job_id} not found in provider.job_map"
+            assert job_id in serverless_provider.job_map, (
+                f"job_id {job_id} not found in provider.job_map"
+            )
         finally:
             try:
                 serverless_provider.cancel([job_id])
@@ -204,9 +204,9 @@ class TestLambdaLifecycle:
                     break
                 raise
 
-        assert (
-            fn_deleted
-        ), f"Lambda function '{expected_fn_name}' still exists 180s after cancel()"
+        assert fn_deleted, (
+            f"Lambda function '{expected_fn_name}' still exists 180s after cancel()"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -235,9 +235,9 @@ class TestServerlessModeCleanup:
             assert vpcs == [], f"VPC {vpc_id} still exists after shutdown(): {vpcs}"
         except ClientError as exc:
             error_code = exc.response["Error"]["Code"]
-            assert (
-                error_code == "InvalidVpcID.NotFound"
-            ), f"Unexpected ClientError checking VPC after shutdown(): {exc}"
+            assert error_code == "InvalidVpcID.NotFound", (
+                f"Unexpected ClientError checking VPC after shutdown(): {exc}"
+            )
 
     def test_shutdown_removes_lambda_functions(
         self, serverless_provider, aws_session, aws_region

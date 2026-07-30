@@ -32,6 +32,8 @@ from parsl_ephemeral_aws.exceptions import (
     StateStoreError,
 )
 
+pytestmark = pytest.mark.unit
+
 
 class TestFileStateStoreErrorHandling:
     """Tests for error handling in FileStateStore."""

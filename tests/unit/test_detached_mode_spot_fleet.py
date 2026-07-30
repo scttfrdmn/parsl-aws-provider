@@ -17,6 +17,8 @@ from parsl_ephemeral_aws.constants import (
     STATUS_CANCELED,
 )
 
+pytestmark = pytest.mark.unit
+
 
 class TestDetachedModeSpotFleet:
     """Tests for the SpotFleet functionality in DetachedMode class."""

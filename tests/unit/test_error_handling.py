@@ -39,62 +39,15 @@ from parsl_ephemeral_aws.exceptions import (
     SpotFleetRequestError,
     SpotFleetThrottlingError,
 )
+from tests.support import make_manager, mock_provider
 
+pytestmark = pytest.mark.unit
 
-def _mock_provider(**overrides):
-    """Build a mock provider that satisfies every compute manager's ``__init__``.
-
-    All four managers are ``__init__(self, provider)`` and read a fixed set of
-    attributes off it -- ``workflow_id``/``region`` for audit events, the four
-    ``aws_*`` credential fields, and the security fields that
-    ``SecurityConfig``/``CredentialConfig`` require. A bare ``MagicMock`` is not
-    enough: those two read the attributes as *values*, so a MagicMock where a
-    CIDR string or a bool belongs raises during construction.
-    """
-    provider = MagicMock()
-    provider.workflow_id = "test-workflow"
-    provider.region = "us-east-1"
-    provider.aws_access_key_id = None
-    provider.aws_secret_access_key = None
-    provider.aws_session_token = None
-    provider.aws_profile = None
-    # Read as values by SecurityConfig / CredentialConfig, not just passed along.
-    provider.security_config = None
-    provider.security_environment = "dev"
-    provider.vpc_cidr = "10.0.0.0/16"
-    provider.admin_cidr_blocks = None
-    provider.strict_security_mode = None
-    provider.role_arn = None
-    provider.vpc_id = "vpc-12345"
-    provider.subnet_id = "subnet-12345"
-    provider.security_group_id = "sg-12345"
-    provider.subnet_ids = ["subnet-12345"]
-    provider.use_spot_instances = False
-    provider.nodes_per_block = 1
-    provider.tags = {}
-    for name, value in overrides.items():
-        setattr(provider, name, value)
-    return provider
-
-
-def _make_manager(manager_cls, module, **provider_overrides):
-    """Construct *manager_cls* against a mocked session, returning it.
-
-    Patches ``CredentialManager`` in the manager's own module so no real
-    credential resolution or boto3 session is attempted; every ``client()`` and
-    ``resource()`` call on the session returns the same MagicMock, so the tests
-    can set ``side_effect`` on whichever client attribute they name.
-    """
-    provider = _mock_provider(**provider_overrides)
-    client = MagicMock()
-    session = MagicMock()
-    session.client.return_value = client
-    session.resource.return_value = MagicMock()
-    session.region_name = "us-east-1"
-
-    with patch(f"parsl_ephemeral_aws.compute.{module}.CredentialManager") as mock_cm:
-        mock_cm.return_value.create_boto3_session.return_value = session
-        return manager_cls(provider=provider)
+# Aliased so the many call sites below stay unchanged; the helpers themselves are
+# shared with tests/integration/test_error_handling_integration.py, which builds
+# the same managers the same way.
+_mock_provider = mock_provider
+_make_manager = make_manager
 
 
 class TestAWSConnectionErrors:
@@ -1320,7 +1273,6 @@ class TestCloudFormationErrors:
         )
 
 
-@pytest.mark.unit
 class TestEC2ManagerQuotaErrors:
     """Tests for EC2 quota, capacity, and instance-type error handling (closes #43)."""
 

@@ -21,6 +21,71 @@ AWS_TEST_REGION = os.environ.get("AWS_TEST_REGION", "us-west-2")
 AWS_TEST_PROFILE = os.environ.get("AWS_TEST_PROFILE", "aws")
 
 
+@pytest.fixture(scope="session", autouse=True)
+def moto_managed_policies():
+    """Make moto serve the real AWS managed-policy set.
+
+    Without ``MOTO_IAM_LOAD_MANAGED_POLICIES`` moto's IAM backend has *zero*
+    managed policies, so every ``attach_role_policy`` for an
+    ``arn:aws:iam::aws:policy/...`` ARN fails with ``NoSuchEntity``. That covers
+    the IAM half of Lambda (``AWSLambdaBasicExecutionRole``), ECS
+    (``AmazonECSTaskExecutionRolePolicy``), and Spot Fleet
+    (``AmazonEC2SpotFleetTaggingRole``) setup — i.e. the roles all three of those
+    managers create before they can do anything.
+
+    It is set here rather than per-module because moto reads it lazily, on first
+    IAM use, so a single session-wide value covers both the unit and integration
+    moto suites without ordering constraints.
+    """
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setenv("MOTO_IAM_LOAD_MANAGED_POLICIES", "true")
+        yield
+
+
+def pytest_collection_modifyitems(config, items):
+    """Neutralize real AWS credentials for every test that is not AWS-marked.
+
+    A ``@mock_aws``-decorated *class* only wraps its ``test_*`` methods; pytest
+    fixtures defined on that class run outside the mock. A fixture that calls
+    ``create_vpc`` therefore reaches real AWS with whatever ambient credentials
+    the developer has — which is exactly what happened: a moto integration test
+    hit the live account and failed ``VpcLimitExceeded`` against production VPCs.
+
+    Marking the fixture bug fixed is not enough, because nothing stops the next
+    one. Any test without ``@pytest.mark.aws`` gets synthetic credentials and a
+    fixed region, so an un-mocked call fails as an auth error against a fake
+    account instead of mutating a real one.
+    """
+    fake_env = {
+        "AWS_ACCESS_KEY_ID": "testing",
+        "AWS_SECRET_ACCESS_KEY": "testing",
+        "AWS_SECURITY_TOKEN": "testing",
+        "AWS_SESSION_TOKEN": "testing",
+        "AWS_DEFAULT_REGION": "us-east-1",
+    }
+    for item in items:
+        if item.get_closest_marker("aws") is None:
+            for name, value in fake_env.items():
+                item.add_marker(pytest.mark.setenv_aws(name, value))
+
+
+@pytest.fixture(autouse=True)
+def _neutralize_aws_credentials(request, monkeypatch):
+    """Apply the synthetic credentials chosen in ``pytest_collection_modifyitems``.
+
+    Autouse and function-scoped so it is torn down per test, and applied before
+    any test-local fixture that builds a boto3 client. ``AWS_PROFILE`` is dropped
+    too: a profile in ``~/.aws/credentials`` outranks these variables in
+    botocore's chain, so leaving it set would defeat the guard entirely.
+    """
+    if request.node.get_closest_marker("aws") is not None:
+        return
+    for marker in request.node.iter_markers("setenv_aws"):
+        monkeypatch.setenv(*marker.args)
+    monkeypatch.delenv("AWS_PROFILE", raising=False)
+    monkeypatch.delenv("AWS_DEFAULT_PROFILE", raising=False)
+
+
 @pytest.fixture
 def aws_credentials():
     """Mocked AWS Credentials for boto3."""

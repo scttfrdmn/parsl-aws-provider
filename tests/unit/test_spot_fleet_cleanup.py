@@ -7,12 +7,15 @@ SPDX-FileCopyrightText: 2025 Scott Friedman and Project Contributors
 import unittest
 from unittest.mock import MagicMock, patch
 import boto3
+import pytest
 from botocore.exceptions import ClientError
 
 from parsl_ephemeral_aws.compute.spot_fleet_cleanup import (
     cleanup_spot_fleet_role,
     cleanup_all_spot_fleet_resources,
 )
+
+pytestmark = pytest.mark.unit
 
 
 class TestSpotFleetCleanup(unittest.TestCase):
