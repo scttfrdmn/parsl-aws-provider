@@ -27,6 +27,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   live VPC and blackhole egress for unrelated workloads (closes #94).
 
 ### Fixed
+- The `integration-tests` CI job failed unconditionally. LocalStack OSS is
+  end-of-life — the upstream repository was archived read-only in March 2026,
+  `4.14.0` is the last community image, and `localstack/localstack:latest` now
+  resolves to the Pro build (byte-identical digest to
+  `localstack/localstack-pro`). The container exited 55 on
+  `License activation failed!` before any step ran, and `continue-on-error: true`
+  does not cover service-container startup. The service container is removed; the
+  moto-backed tests need no endpoint and still run, and the emulator-gated ones
+  skip themselves as they have since #69. Substrate replaces the endpoint in
+  #125 (refs #83, refs #125).
 - The `docs` CI job could never have built the documentation. `docs/conf.py` has
   listed `myst_parser` in `extensions` all along without it being declared
   anywhere, so `make -C docs html` died on

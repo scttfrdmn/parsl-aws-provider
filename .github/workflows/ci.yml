@@ -103,14 +103,16 @@ jobs:
   integration-tests:
     runs-on: ubuntu-latest
     needs: unit-tests
-    services:
-      localstack:
-        image: localstack/localstack:latest
-        env:
-          SERVICES: ec2,s3,ssm,lambda,ecs,iam,cloudformation
-          DEBUG: true
-        ports:
-          - 4566:4566
+    # No emulator service container. LocalStack OSS is end-of-life: the upstream
+    # repository was archived read-only in March 2026, `4.14.0` is the last
+    # community image, and `localstack/localstack:latest` now resolves to the Pro
+    # build (same digest as `localstack/localstack-pro`). It exits 55 on
+    # "License activation failed!" before any step runs, and `continue-on-error`
+    # does not cover service-container startup, so the job failed unconditionally.
+    #
+    # The moto-backed tests in this directory need no endpoint and still run; the
+    # emulator-gated ones skip themselves, exactly as they have since #69.
+    # Substrate replaces the endpoint in #125.
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
@@ -118,35 +120,23 @@ jobs:
           enable-cache: true
       - name: Sync environment
         run: uv sync --locked --extra dev --extra test
-      - name: Wait for LocalStack to be ready
-        timeout-minutes: 2
-        run: |
-          echo "Waiting for LocalStack to be ready..."
-          # The health payload is pretty-printed, so the old '"s3":"available"'
-          # pattern (no space) never matched and this loop relied on the timeout.
-          while ! curl -s http://localhost:4566/_localstack/health | grep -q '"s3": *"available"'; do
-            sleep 5
-          done
-          echo "LocalStack is ready!"
-      - name: Run integration tests with LocalStack
-        # Not gating yet: the LocalStack-backed tests skip themselves when the
-        # endpoint is absent, so they have not run in CI since #69 and 46 mode
-        # constructions across 9 files still omit the now-required network IDs
-        # (#92, v0.8.0). Gating here would make every PR red on known debt.
+      - name: Run integration tests
+        # Not gating yet: 46 mode constructions across 9 files still omit the
+        # network IDs #69 made required, so the emulator-backed tests cannot pass
+        # until they are repaired (#92, v0.8.0). Gating here would make every PR
+        # red on known debt.
         continue-on-error: true
         env:
           AWS_ACCESS_KEY_ID: test
           AWS_SECRET_ACCESS_KEY: test
           AWS_DEFAULT_REGION: us-east-1
-          AWS_ENDPOINT_URL: http://localhost:4566
-          LOCALSTACK_ENDPOINT: http://localhost:4566
         run: uv run pytest tests/integration -v
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v5
         with:
           files: ./coverage.xml
           flags: integration
-          name: localstack
+          name: integration
         continue-on-error: true
 
   aws-e2e-tests:
