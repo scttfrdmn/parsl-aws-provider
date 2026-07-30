@@ -24,7 +24,7 @@
 <!-- Describe the tests you ran to verify your changes -->
 
 - [ ] Unit tests added/updated
-- [ ] Integration tests with LocalStack
+- [ ] Integration tests against the substrate emulator
 - [ ] Manual testing in a real AWS environment
 - [ ] Documentation updated to reflect changes
 

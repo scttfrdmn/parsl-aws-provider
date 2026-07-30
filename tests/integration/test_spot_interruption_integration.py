@@ -1,4 +1,4 @@
-"""Integration tests for spot interruption handling using LocalStack.
+"""Integration tests for spot interruption handling using substrate.
 
 These tests verify that spot interruption handling works correctly across
 all operating modes, including detection, checkpointing, and recovery.
@@ -21,24 +21,24 @@ from parsl_ephemeral_aws.compute.spot_interruption import (
     ParslSpotInterruptionHandler,
 )
 from parsl_ephemeral_aws.state.file import FileStateStore
-from parsl_ephemeral_aws.utils.localstack import (
-    is_localstack_available,
-    get_localstack_session,
+from tests.substrate_support import (
+    get_substrate_session,
+    is_substrate_available,
 )
 
 
 @pytest.fixture(scope="session")
-def localstack_available():
-    """Check if LocalStack is available for testing."""
-    if not is_localstack_available():
-        pytest.skip("LocalStack is not available. Make sure it's running on port 4566.")
+def substrate_available():
+    """Check if substrate is available for testing."""
+    if not is_substrate_available():
+        pytest.skip("substrate not available - start with 'make substrate-up'")
     return True
 
 
 @pytest.fixture(scope="session")
-def localstack_session(localstack_available):
-    """Create a session connected to LocalStack."""
-    return get_localstack_session()
+def substrate_session(substrate_available):
+    """Create a session connected to substrate."""
+    return get_substrate_session()
 
 
 @pytest.fixture
@@ -55,10 +55,10 @@ def provider_id():
 
 
 @pytest.fixture
-def checkpoint_bucket(localstack_session, provider_id):
+def checkpoint_bucket(substrate_session, provider_id):
     """Create a temporary S3 bucket for checkpoints."""
     bucket_name = f"test-checkpoint-bucket-{provider_id.split('-')[-1]}"
-    s3_client = localstack_session.client("s3")
+    s3_client = substrate_session.client("s3")
 
     try:
         s3_client.create_bucket(Bucket=bucket_name)
@@ -84,27 +84,27 @@ def checkpoint_bucket(localstack_session, provider_id):
 
 
 @pytest.fixture
-def mock_spot_instance_id(localstack_session):
+def mock_spot_instance_id(substrate_session):
     """Create a spot instance ID for testing."""
     return f"i-spot-{uuid.uuid4().hex[:8]}"
 
 
 @pytest.fixture
-def mock_spot_fleet_id(localstack_session):
+def mock_spot_fleet_id(substrate_session):
     """Create a spot fleet ID for testing."""
     return f"sfr-{uuid.uuid4().hex[:8]}"
 
 
 @pytest.mark.integration
-class TestSpotInterruptionHandlingLocalstack:
-    """Integration tests for spot interruption handling using LocalStack."""
+class TestSpotInterruptionHandlingSubstrate:
+    """Integration tests for spot interruption handling using substrate."""
 
-    @pytest.mark.localstack
-    def test_spot_interruption_monitor_creation(self, localstack_session):
+    @pytest.mark.substrate
+    def test_spot_interruption_monitor_creation(self, substrate_session):
         """Test that SpotInterruptionMonitor can be initialized."""
-        monitor = SpotInterruptionMonitor(session=localstack_session)
+        monitor = SpotInterruptionMonitor(session=substrate_session)
         assert monitor is not None
-        assert monitor.session == localstack_session
+        assert monitor.session == substrate_session
         assert monitor.instance_handlers == {}
         assert monitor.fleet_handlers == {}
 
@@ -118,13 +118,13 @@ class TestSpotInterruptionHandlingLocalstack:
         time.sleep(0.5)  # Let thread terminate
         assert not monitor.monitoring_thread.is_alive()
 
-    @pytest.mark.localstack
+    @pytest.mark.substrate
     def test_spot_interruption_handler_with_s3(
-        self, localstack_session, checkpoint_bucket
+        self, substrate_session, checkpoint_bucket
     ):
         """Test that SpotInterruptionHandler can use S3 for checkpoints."""
         handler = SpotInterruptionHandler(
-            session=localstack_session,
+            session=substrate_session,
             checkpoint_bucket=checkpoint_bucket,
             checkpoint_prefix="test-checkpoints",
         )
@@ -145,13 +145,13 @@ class TestSpotInterruptionHandlingLocalstack:
         assert loaded_data["state"] == "running"
         assert loaded_data["progress"] == 50
 
-    @pytest.mark.localstack
+    @pytest.mark.substrate
     def test_parsl_handler_task_registration(
-        self, localstack_session, checkpoint_bucket, mock_spot_instance_id
+        self, substrate_session, checkpoint_bucket, mock_spot_instance_id
     ):
         """Test that tasks can be registered with the ParslSpotInterruptionHandler."""
         handler = ParslSpotInterruptionHandler(
-            session=localstack_session,
+            session=substrate_session,
             checkpoint_bucket=checkpoint_bucket,
             checkpoint_prefix="test-checkpoints",
         )
@@ -167,10 +167,10 @@ class TestSpotInterruptionHandlingLocalstack:
         for task_id in task_ids:
             assert task_id in handler.task_mapping[mock_spot_instance_id]
 
-    @pytest.mark.localstack
+    @pytest.mark.substrate
     def test_standard_mode_with_spot_interruption(
         self,
-        localstack_session,
+        substrate_session,
         temp_state_store,
         provider_id,
         checkpoint_bucket,
@@ -180,7 +180,7 @@ class TestSpotInterruptionHandlingLocalstack:
         # Create StandardMode instance with spot interruption handling
         mode = StandardMode(
             provider_id=provider_id,
-            session=localstack_session,
+            session=substrate_session,
             state_store=temp_state_store,
             region="us-east-1",
             instance_type="t2.micro",
@@ -272,10 +272,10 @@ class TestSpotInterruptionHandlingLocalstack:
 
             mode.cleanup_infrastructure()
 
-    @pytest.mark.localstack
+    @pytest.mark.substrate
     def test_detached_mode_with_spot_interruption(
         self,
-        localstack_session,
+        substrate_session,
         temp_state_store,
         provider_id,
         checkpoint_bucket,
@@ -286,7 +286,7 @@ class TestSpotInterruptionHandlingLocalstack:
         workflow_id = f"test-workflow-{uuid.uuid4().hex[:8]}"
         mode = DetachedMode(
             provider_id=provider_id,
-            session=localstack_session,
+            session=substrate_session,
             state_store=temp_state_store,
             region="us-east-1",
             instance_type="t2.micro",
@@ -341,7 +341,7 @@ class TestSpotInterruptionHandlingLocalstack:
             # Create a new mode instance to simulate restart
             mode2 = DetachedMode(
                 provider_id=provider_id,
-                session=localstack_session,
+                session=substrate_session,
                 state_store=temp_state_store,
                 region="us-east-1",
                 instance_type="t2.micro",
@@ -376,10 +376,10 @@ class TestSpotInterruptionHandlingLocalstack:
             mode.preserve_bastion = False  # Ensure bastion cleanup
             mode.cleanup_infrastructure()
 
-    @pytest.mark.localstack
+    @pytest.mark.substrate
     def test_serverless_mode_with_spot_fleet(
         self,
-        localstack_session,
+        substrate_session,
         temp_state_store,
         provider_id,
         checkpoint_bucket,
@@ -389,7 +389,7 @@ class TestSpotInterruptionHandlingLocalstack:
         # Create ServerlessMode instance with spot interruption handling
         mode = ServerlessMode(
             provider_id=provider_id,
-            session=localstack_session,
+            session=substrate_session,
             state_store=temp_state_store,
             region="us-east-1",
             worker_type="ecs",
@@ -422,7 +422,7 @@ class TestSpotInterruptionHandlingLocalstack:
                 }
 
                 # Mock CloudFormation stack description to include spot fleet ID
-                cf_client = localstack_session.client("cloudformation")
+                cf_client = substrate_session.client("cloudformation")
                 cf_client.describe_stacks.return_value = {
                     "Stacks": [
                         {
@@ -478,7 +478,7 @@ class TestSpotInterruptionHandlingLocalstack:
             # Create a new mode instance to simulate restart
             mode2 = ServerlessMode(
                 provider_id=provider_id,
-                session=localstack_session,
+                session=substrate_session,
                 state_store=temp_state_store,
                 region="us-east-1",
                 worker_type="ecs",

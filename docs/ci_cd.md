@@ -71,17 +71,24 @@ alone measures 34%.
 
 ### `integration-tests`
 
-Runs `tests/integration` against a LocalStack service container.
+Runs `tests/integration` against a pinned substrate service container
+(`ghcr.io/scttfrdmn/substrate`), plus a gated `tests/test_substrate_emulation.py`
+conformance step. Substrate replaced LocalStack in
+[#125](https://github.com/scttfrdmn/parsl-aws-provider/issues/125): LocalStack OSS
+is end-of-life and its `latest` community tag now resolves to the Pro build, which
+exits 55 without a license token -- before any step runs, and outside what
+`continue-on-error` covers.
 
-Currently **not gated** (`continue-on-error: true`): the LocalStack-backed tests
-skip themselves when the endpoint is absent, so they have not run in CI since
-[#69](https://github.com/scttfrdmn/parsl-aws-provider/issues/69), and 46 mode
-constructions across 9 files still omit the now-required network IDs
-([#92](https://github.com/scttfrdmn/parsl-aws-provider/issues/92), v0.8.0).
-Gating before that lands would make every PR red on known debt.
+The integration suite itself is **not gated** (`continue-on-error: true`): now that
+an endpoint is present these tests actually execute rather than skipping, and 46 mode
+constructions across 9 files still omit the network IDs
+[#69](https://github.com/scttfrdmn/parsl-aws-provider/issues/69) made required
+([#92](https://github.com/scttfrdmn/parsl-aws-provider/issues/92), v0.8.0). Gating
+before that lands would make every PR red on known debt. The conformance step *is*
+gated, because it drives raw boto3 and cannot be tripped by that test-side debt.
 
 Note that a pytest marker only *selects* tests — it never skips them. Each
-LocalStack file pairs its markers with a `skipif(not is_localstack_available())`
+emulator-backed file pairs its markers with a `skipif(not is_substrate_available())`
 guard; without one, a plain `pytest tests/integration` errors instead of skipping.
 
 ### `aws-e2e-tests`
@@ -151,7 +158,7 @@ The Makefile runs exactly what CI runs, through `uv`:
 make lint-python      # ruff check + ruff format --check
 make type-check       # mypy
 make test-unit        # tests/unit + tests/security, with the 65% gate
-make test-integration # starts LocalStack, then tests/integration
+make test-integration # starts substrate, then tests/integration
 make test-aws         # tests/aws against real AWS (prompts first; costs money)
 make build            # uv build
 make version-verify   # pyproject and __init__ versions agree

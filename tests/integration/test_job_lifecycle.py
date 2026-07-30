@@ -1,7 +1,7 @@
 """Integration tests for full job lifecycle and state recovery.
 
 These tests exercise the complete submit → status → cancel → shutdown cycle
-of EphemeralAWSProvider with a real FileStateStore (no LocalStack required).
+of EphemeralAWSProvider with a real FileStateStore (no emulator required).
 The operating mode is mocked to avoid EC2/Lambda API calls, letting us focus
 on the provider's state management and concurrency guarantees.
 
@@ -22,12 +22,12 @@ from parsl_ephemeral_aws.exceptions import ProviderError
 from parsl_ephemeral_aws.provider import EphemeralAWSProvider
 from parsl_ephemeral_aws.state.base import STATE_KEY_PROVIDER
 from parsl_ephemeral_aws.state.file import FileStateStore
-from parsl_ephemeral_aws.utils.localstack import is_localstack_available
+from tests.substrate_support import is_substrate_available
 
 
-# Skip the entire module only if LocalStack is unavailable AND a test
+# Skip the entire module only if substrate is unavailable AND a test
 # explicitly needs it.  The helper below lets individual tests opt-in.
-_LOCALSTACK_AVAILABLE = is_localstack_available()
+_SUBSTRATE_AVAILABLE = is_substrate_available()
 
 
 # ---------------------------------------------------------------------------
@@ -106,7 +106,7 @@ class TestJobLifecycle:
     # 1. Full lifecycle: submit → status → cleanup
     # ------------------------------------------------------------------
 
-    @pytest.mark.localstack
+    @pytest.mark.substrate
     def test_full_lifecycle_standard_mode_file_state(self, tmp_dir):
         """Submit a job, poll status until COMPLETED, verify cleanup."""
         provider, mode, state_store = _make_provider_with_file_state(tmp_dir)
@@ -141,7 +141,7 @@ class TestJobLifecycle:
     # 2. State recovery across provider restart
     # ------------------------------------------------------------------
 
-    @pytest.mark.localstack
+    @pytest.mark.substrate
     def test_provider_restart_recovers_state(self, tmp_dir):
         """State persisted by one provider instance is loaded by a new one."""
         provider_id = f"test-{uuid.uuid4().hex[:8]}"
@@ -197,7 +197,7 @@ class TestJobLifecycle:
     # 3. No orphaned entries on submit failure
     # ------------------------------------------------------------------
 
-    @pytest.mark.localstack
+    @pytest.mark.substrate
     def test_cleanup_on_submit_failure(self, tmp_dir):
         """If operating-mode submit_job() raises, no entry is left in resources."""
         provider, mode, _ = _make_provider_with_file_state(tmp_dir)
@@ -214,7 +214,7 @@ class TestJobLifecycle:
     # 4. Concurrent submits — all tracked
     # ------------------------------------------------------------------
 
-    @pytest.mark.localstack
+    @pytest.mark.substrate
     def test_concurrent_submits_all_tracked(self, tmp_dir):
         """5 concurrent submits via ThreadPoolExecutor all appear in resources."""
         provider, mode, _ = _make_provider_with_file_state(tmp_dir, max_blocks=20)

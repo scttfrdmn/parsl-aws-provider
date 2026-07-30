@@ -19,16 +19,16 @@ from parsl_ephemeral_aws.modes.standard import StandardMode
 from parsl_ephemeral_aws.modes.detached import DetachedMode
 from parsl_ephemeral_aws.modes.serverless import ServerlessMode
 from parsl_ephemeral_aws.state.file import FileStateStore
-from parsl_ephemeral_aws.utils.localstack import (
-    is_localstack_available,
-    get_localstack_session,
+from tests.substrate_support import (
+    get_substrate_session,
+    is_substrate_available,
 )
 
 
-# Skip all tests if LocalStack is not available
+# Skip all tests if the substrate emulator is not available
 pytestmark = pytest.mark.skipif(
-    not is_localstack_available(),
-    reason="LocalStack is not available. Make sure it's running on port 4566.",
+    not is_substrate_available(),
+    reason="substrate not available - start with 'make substrate-up'",
 )
 
 
@@ -37,9 +37,9 @@ class TestWorkflowStatePersistence:
     """Integration tests for workflow state persistence."""
 
     @pytest.fixture(scope="class")
-    def localstack_session(self):
-        """Create a session connected to LocalStack."""
-        return get_localstack_session()
+    def substrate_session(self):
+        """Create a session connected to substrate."""
+        return get_substrate_session()
 
     @pytest.fixture
     def temp_dir(self):
@@ -59,34 +59,34 @@ class TestWorkflowStatePersistence:
         return FileStateStore(file_path=state_file_path, provider_id=provider_id)
 
     @pytest.fixture
-    def mock_ec2_client(self, localstack_session):
-        """Create an EC2 client connected to LocalStack."""
-        return localstack_session.client("ec2")
+    def mock_ec2_client(self, substrate_session):
+        """Create a EC2 client connected to substrate."""
+        return substrate_session.client("ec2")
 
     @pytest.fixture
-    def mock_ssm_client(self, localstack_session):
-        """Create an SSM client connected to LocalStack."""
-        return localstack_session.client("ssm")
+    def mock_ssm_client(self, substrate_session):
+        """Create a SSM client connected to substrate."""
+        return substrate_session.client("ssm")
 
     @pytest.fixture
-    def mock_s3_client(self, localstack_session):
-        """Create an S3 client connected to LocalStack."""
-        return localstack_session.client("s3")
+    def mock_s3_client(self, substrate_session):
+        """Create a S3 client connected to substrate."""
+        return substrate_session.client("s3")
 
-    @pytest.mark.localstack
+    @pytest.mark.substrate
     def test_standard_mode_state_persistence(
-        self, localstack_session, file_state_store, mock_ec2_client
+        self, substrate_session, file_state_store, mock_ec2_client
     ):
         """Test state persistence with StandardMode."""
         # Create a StandardMode instance
         provider_id = f"test-provider-{uuid.uuid4().hex[:8]}"
 
-        # Set up mocks for AWS services using LocalStack
-        with patch("boto3.Session", return_value=localstack_session):
+        # Set up mocks for AWS services using substrate
+        with patch("boto3.Session", return_value=substrate_session):
             # Create a standard mode
             mode = StandardMode(
                 provider_id=provider_id,
-                session=localstack_session,
+                session=substrate_session,
                 state_store=file_state_store,
                 region="us-east-1",
                 instance_type="t2.micro",
@@ -140,7 +140,7 @@ class TestWorkflowStatePersistence:
             # Create a new mode instance
             mode2 = StandardMode(
                 provider_id=provider_id,
-                session=localstack_session,
+                session=substrate_session,
                 state_store=file_state_store,
                 region="us-east-1",
                 instance_type="t2.micro",
@@ -162,7 +162,7 @@ class TestWorkflowStatePersistence:
                 assert resource_id in mode2.resources
                 assert mode2.resources[resource_id]["job_id"] in job_ids
 
-            # Clean up - don't actually try to delete AWS resources in LocalStack
+            # Clean up - do not actually try to delete AWS resources in the emulator
             with patch.object(mode2, "_delete_ec2_instance"):
                 with patch.object(mode2, "_delete_security_group"):
                     with patch.object(mode2, "_delete_subnet"):
@@ -181,21 +181,19 @@ class TestWorkflowStatePersistence:
                 or os.path.getsize(file_state_store.file_path) == 0
             )
 
-    @pytest.mark.localstack
-    def test_detached_mode_state_persistence(
-        self, localstack_session, file_state_store
-    ):
+    @pytest.mark.substrate
+    def test_detached_mode_state_persistence(self, substrate_session, file_state_store):
         """Test state persistence with DetachedMode."""
         # Create a DetachedMode instance
         provider_id = f"test-provider-{uuid.uuid4().hex[:8]}"
         workflow_id = f"test-workflow-{uuid.uuid4().hex[:8]}"
 
-        # Set up mocks for AWS services using LocalStack
-        with patch("boto3.Session", return_value=localstack_session):
+        # Set up mocks for AWS services using substrate
+        with patch("boto3.Session", return_value=substrate_session):
             # Create a detached mode
             mode = DetachedMode(
                 provider_id=provider_id,
-                session=localstack_session,
+                session=substrate_session,
                 state_store=file_state_store,
                 region="us-east-1",
                 instance_type="t2.micro",
@@ -263,7 +261,7 @@ class TestWorkflowStatePersistence:
             # Create a new mode instance
             mode2 = DetachedMode(
                 provider_id=provider_id,
-                session=localstack_session,
+                session=substrate_session,
                 state_store=file_state_store,
                 region="us-east-1",
                 instance_type="t2.micro",
@@ -307,20 +305,20 @@ class TestWorkflowStatePersistence:
             assert mode2.security_group_id is None
             assert mode2.bastion_id is None
 
-    @pytest.mark.localstack
+    @pytest.mark.substrate
     def test_serverless_mode_state_persistence(
-        self, localstack_session, file_state_store
+        self, substrate_session, file_state_store
     ):
         """Test state persistence with ServerlessMode."""
         # Create a ServerlessMode instance
         provider_id = f"test-provider-{uuid.uuid4().hex[:8]}"
 
-        # Set up mocks for AWS services using LocalStack
-        with patch("boto3.Session", return_value=localstack_session):
+        # Set up mocks for AWS services using substrate
+        with patch("boto3.Session", return_value=substrate_session):
             # Create a serverless mode
             mode = ServerlessMode(
                 provider_id=provider_id,
-                session=localstack_session,
+                session=substrate_session,
                 state_store=file_state_store,
                 region="us-east-1",
                 worker_type="lambda",  # Use Lambda for simplicity
@@ -380,7 +378,7 @@ class TestWorkflowStatePersistence:
             # Create a new mode instance
             mode2 = ServerlessMode(
                 provider_id=provider_id,
-                session=localstack_session,
+                session=substrate_session,
                 state_store=file_state_store,
                 region="us-east-1",
                 worker_type="lambda",
@@ -409,18 +407,18 @@ class TestWorkflowStatePersistence:
             assert not mode2.initialized
             assert len(mode2.resources) == 0
 
-    @pytest.mark.localstack
-    def test_interruption_and_recovery(self, localstack_session, file_state_store):
+    @pytest.mark.substrate
+    def test_interruption_and_recovery(self, substrate_session, file_state_store):
         """Test interruption and recovery with state persistence."""
         # Create a StandardMode instance
         provider_id = f"test-provider-{uuid.uuid4().hex[:8]}"
 
-        # Set up mocks for AWS services using LocalStack
-        with patch("boto3.Session", return_value=localstack_session):
+        # Set up mocks for AWS services using substrate
+        with patch("boto3.Session", return_value=substrate_session):
             # Create a standard mode
             mode = StandardMode(
                 provider_id=provider_id,
-                session=localstack_session,
+                session=substrate_session,
                 state_store=file_state_store,
                 region="us-east-1",
                 instance_type="t2.micro",
@@ -495,7 +493,7 @@ class TestWorkflowStatePersistence:
             # Create a new mode instance to simulate restart
             mode2 = StandardMode(
                 provider_id=provider_id,
-                session=localstack_session,
+                session=substrate_session,
                 state_store=file_state_store,
                 region="us-east-1",
                 instance_type="t2.micro",

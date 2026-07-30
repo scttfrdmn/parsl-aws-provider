@@ -1,6 +1,6 @@
-"""Integration tests for operating modes using LocalStack.
+"""Integration tests for operating modes using substrate.
 
-These tests run against LocalStack, which provides a local simulation of AWS services.
+These tests run against substrate, which emulates AWS services locally.
 They verify that the operating modes can create resources, submit jobs, and clean up
 properly in an environment that mimics AWS APIs.
 
@@ -17,24 +17,24 @@ from parsl_ephemeral_aws.modes.standard import StandardMode
 from parsl_ephemeral_aws.modes.detached import DetachedMode
 from parsl_ephemeral_aws.modes.serverless import ServerlessMode
 from parsl_ephemeral_aws.state.file import FileStateStore
-from parsl_ephemeral_aws.utils.localstack import (
-    is_localstack_available,
-    get_localstack_session,
+from tests.substrate_support import (
+    get_substrate_session,
+    is_substrate_available,
 )
 
 
 @pytest.fixture(scope="session")
-def localstack_available():
-    """Check if LocalStack is available for testing."""
-    if not is_localstack_available():
-        pytest.skip("LocalStack is not available. Make sure it's running on port 4566.")
+def substrate_available():
+    """Check if substrate is available for testing."""
+    if not is_substrate_available():
+        pytest.skip("substrate not available - start with 'make substrate-up'")
     return True
 
 
 @pytest.fixture(scope="session")
-def localstack_session(localstack_available):
-    """Create a session connected to LocalStack."""
-    return get_localstack_session()
+def substrate_session(substrate_available):
+    """Create a session connected to substrate."""
+    return get_substrate_session()
 
 
 @pytest.fixture
@@ -51,18 +51,18 @@ def provider_id():
 
 
 @pytest.mark.integration
-class TestStandardModeLocalstack:
-    """Integration tests for StandardMode using LocalStack."""
+class TestStandardModeSubstrate:
+    """Integration tests for StandardMode using substrate."""
 
-    @pytest.mark.localstack
+    @pytest.mark.substrate
     def test_initialize_and_cleanup(
-        self, localstack_session, temp_state_store, provider_id
+        self, substrate_session, temp_state_store, provider_id
     ):
         """Test that StandardMode can initialize resources and clean them up."""
         # Create StandardMode instance
         mode = StandardMode(
             provider_id=provider_id,
-            session=localstack_session,
+            session=substrate_session,
             state_store=temp_state_store,
             region="us-east-1",
             instance_type="t2.micro",
@@ -79,8 +79,8 @@ class TestStandardModeLocalstack:
             assert mode.security_group_id is not None
             assert mode.initialized is True
 
-            # Verify resources exist in LocalStack
-            ec2 = localstack_session.client("ec2")
+            # Verify resources exist in substrate
+            ec2 = substrate_session.client("ec2")
             vpcs = ec2.describe_vpcs(VpcIds=[mode.vpc_id])
             assert len(vpcs["Vpcs"]) == 1
 
@@ -105,15 +105,15 @@ class TestStandardModeLocalstack:
             assert mode.security_group_id is None
             assert mode.initialized is False
 
-    @pytest.mark.localstack
+    @pytest.mark.substrate
     def test_submit_job_and_status(
-        self, localstack_session, temp_state_store, provider_id
+        self, substrate_session, temp_state_store, provider_id
     ):
         """Test job submission and status checking."""
         # Create StandardMode instance
         mode = StandardMode(
             provider_id=provider_id,
-            session=localstack_session,
+            session=substrate_session,
             state_store=temp_state_store,
             region="us-east-1",
             instance_type="t2.micro",
@@ -151,18 +151,18 @@ class TestStandardModeLocalstack:
 
 
 @pytest.mark.integration
-class TestDetachedModeLocalstack:
-    """Integration tests for DetachedMode using LocalStack."""
+class TestDetachedModeSubstrate:
+    """Integration tests for DetachedMode using substrate."""
 
-    @pytest.mark.localstack
+    @pytest.mark.substrate
     def test_initialize_and_cleanup(
-        self, localstack_session, temp_state_store, provider_id
+        self, substrate_session, temp_state_store, provider_id
     ):
         """Test that DetachedMode can initialize resources and clean them up."""
         # Create DetachedMode instance
         mode = DetachedMode(
             provider_id=provider_id,
-            session=localstack_session,
+            session=substrate_session,
             state_store=temp_state_store,
             region="us-east-1",
             instance_type="t2.micro",
@@ -183,8 +183,8 @@ class TestDetachedModeLocalstack:
             assert mode.bastion_id is not None
             assert mode.initialized is True
 
-            # Verify resources exist in LocalStack
-            ec2 = localstack_session.client("ec2")
+            # Verify resources exist in substrate
+            ec2 = substrate_session.client("ec2")
             vpcs = ec2.describe_vpcs(VpcIds=[mode.vpc_id])
             assert len(vpcs["Vpcs"]) == 1
 
@@ -213,16 +213,16 @@ class TestDetachedModeLocalstack:
             assert mode.bastion_id is None
             assert mode.initialized is False
 
-    @pytest.mark.localstack
+    @pytest.mark.substrate
     def test_submit_job_and_status(
-        self, localstack_session, temp_state_store, provider_id
+        self, substrate_session, temp_state_store, provider_id
     ):
         """Test job submission and status checking in detached mode."""
         # Create DetachedMode instance
         workflow_id = f"test-workflow-{uuid.uuid4().hex[:8]}"
         mode = DetachedMode(
             provider_id=provider_id,
-            session=localstack_session,
+            session=substrate_session,
             state_store=temp_state_store,
             region="us-east-1",
             instance_type="t2.micro",
@@ -246,7 +246,7 @@ class TestDetachedModeLocalstack:
             assert mode.resources[resource_id]["job_id"] == job_id
 
             # Verify SSM parameters were created
-            ssm = localstack_session.client("ssm")
+            ssm = substrate_session.client("ssm")
             try:
                 job_param = ssm.get_parameter(
                     Name=f"/parsl/workflows/{workflow_id}/jobs/{job_id}"
@@ -277,18 +277,18 @@ class TestDetachedModeLocalstack:
 
 
 @pytest.mark.integration
-class TestServerlessModeLocalstack:
-    """Integration tests for ServerlessMode using LocalStack."""
+class TestServerlessModeSubstrate:
+    """Integration tests for ServerlessMode using substrate."""
 
-    @pytest.mark.localstack
+    @pytest.mark.substrate
     def test_initialize_and_cleanup(
-        self, localstack_session, temp_state_store, provider_id
+        self, substrate_session, temp_state_store, provider_id
     ):
         """Test that ServerlessMode can initialize resources and clean them up."""
         # Create ServerlessMode instance
         mode = ServerlessMode(
             provider_id=provider_id,
-            session=localstack_session,
+            session=substrate_session,
             state_store=temp_state_store,
             region="us-east-1",
             worker_type="lambda",  # Use Lambda for simplicity
@@ -311,7 +311,7 @@ class TestServerlessModeLocalstack:
             # For ECS mode, test with network resources
             mode_ecs = ServerlessMode(
                 provider_id=f"{provider_id}-ecs",
-                session=localstack_session,
+                session=substrate_session,
                 state_store=temp_state_store,
                 region="us-east-1",
                 worker_type="ecs",
@@ -335,13 +335,13 @@ class TestServerlessModeLocalstack:
             # Verify resources were cleaned up
             assert mode.initialized is False
 
-    @pytest.mark.localstack
-    def test_submit_lambda_job(self, localstack_session, temp_state_store, provider_id):
+    @pytest.mark.substrate
+    def test_submit_lambda_job(self, substrate_session, temp_state_store, provider_id):
         """Test Lambda job submission with CloudFormation stacks."""
         # Create ServerlessMode instance for Lambda
         mode = ServerlessMode(
             provider_id=provider_id,
-            session=localstack_session,
+            session=substrate_session,
             state_store=temp_state_store,
             region="us-east-1",
             worker_type="lambda",

@@ -38,10 +38,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   resolves to the Pro build (byte-identical digest to
   `localstack/localstack-pro`). The container exited 55 on
   `License activation failed!` before any step ran, and `continue-on-error: true`
-  does not cover service-container startup. The service container is removed; the
-  moto-backed tests need no endpoint and still run, and the emulator-gated ones
-  skip themselves as they have since #69. Substrate replaces the endpoint in
-  #125 (refs #83, refs #125).
+  does not cover service-container startup. The LocalStack service container was
+  removed first, leaving the moto-backed tests running and the emulator-gated
+  ones skipping; substrate then replaced the endpoint outright, so the gated
+  tests now execute too (refs #83, closes #125).
 - The `docs` CI job could never have built the documentation. `docs/conf.py` has
   listed `myst_parser` in `extensions` all along without it being declared
   anywhere, so `make -C docs html` died on
@@ -367,6 +367,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a first run can proceed with no saved state (closes #122).
 
 ### Added
+- `tests/substrate_support.py` — emulator session/client helpers and VPC
+  setup/teardown, replacing the package-internal
+  `parsl_ephemeral_aws/utils/localstack.py`. It lives under `tests/` because no
+  package code has ever imported it; only test modules did. `SUBSTRATE_ENDPOINT`
+  selects the endpoint, with `LOCALSTACK_ENDPOINT` still honoured so an existing
+  developer environment keeps working (closes #125).
+- An `Emulator conformance` CI step running `tests/test_substrate_emulation.py`,
+  which drives raw boto3 and imports no package code — so a failure there means
+  the emulator regressed rather than the provider. Gated, since a substrate
+  change should not block a provider PR (closes #125).
 - **One-shot mode** for `StandardMode`: set `one_shot=True` to declare that each
   EC2 instance runs a single command and then terminates, regardless of the
   `auto_shutdown` setting (closes #66).
@@ -458,6 +468,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   template is caught (refs #112, #113).
 
 ### Changed
+- **The AWS emulator is now [substrate](https://github.com/scttfrdmn/substrate),
+  not LocalStack.** LocalStack OSS is end-of-life: the repository was archived
+  read-only in March 2026, `4.14.0` is the last community image, and
+  `localstack/localstack:latest` now shares a digest with the Pro build and exits
+  55 on `License activation failed!`. Substrate is a deliberate drop-in — it
+  serves `/_localstack/health` and `/_localstack/info` with LocalStack-shaped
+  payloads — so the change is largely a rename. It is also a single Go binary
+  rather than a Python package plus a bind-mounted Docker socket, which is what
+  lets CI run it as a pinned service container. `docker-compose.localstack.yml`
+  and `scripts/localstack-wait.sh` are replaced by
+  `docker-compose.substrate.yml` and `scripts/substrate-wait.sh`; the `make`
+  targets are `substrate-up`/`-wait`/`-down`/`-status`/`-reset`. Two behaviours
+  substrate emulates that LocalStack did not are load-bearing here: EC2 instance
+  state actually reaches `terminated` (which `EC2_STATUS_MAPPING` and one-shot
+  mode depend on), and Lambda `create_function` + `invoke` both work — the
+  Lambda conformance test was skipped under LocalStack and now runs
+  (closes #125).
+- The integration job in `ci.yml` runs a pinned
+  `ghcr.io/scttfrdmn/substrate:0.76.0` service container, so the
+  emulator-gated integration tests execute in CI for the first time since #69.
+  No `--health-cmd` is declared — the substrate image is Alpine-based and ships
+  no `curl` — so a `Wait for substrate` step polls `/health` from the runner
+  instead (refs #83, closes #125).
+- `docs/localstack_testing.md` → `docs/substrate_testing.md`, rewritten rather
+  than renamed. The old version documented `use_localstack=True` and
+  `localstack_endpoint=...` provider kwargs that have never existed in any
+  release. The endpoint is redirected with `AWS_ENDPOINT_URL`, which botocore
+  honours globally; the new document is written from a verified full provider
+  lifecycle (construct → `submit` → `status` → `cancel`) through that variable
+  (closes #125).
+- The `test` extra no longer depends on `localstack`, which dissolves the
+  `[tool.uv] conflicts` block: localstack pinned `dill==0.3.9` against the
+  `globus` extra's `0.3.2`/`0.3.6`, and that conflict was the block's only
+  reason to exist. The `globus` and `test` extras now co-resolve
+  (closes #125).
 - **CI is one workflow.** `ci.yml` and `ci-cd.yml` were near-duplicate pipelines
   that between them ran the same unit suite five times, over Python 3.8 and 3.9,
   which `requires-python = ">=3.10"` excludes. `ci-cd.yml` is deleted; `ci.yml`
@@ -548,6 +593,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   from the environment; tests are skipped (not failed) when these are unset.
 
 ### Removed
+- `parsl_ephemeral_aws/utils/localstack.py` (422 LOC). Test-only scaffolding that
+  shipped in every wheel; no package code has ever imported it. Its replacement,
+  `tests/substrate_support.py`, is not distributed (closes #125).
+- `localstack` from the `test` extra, and the `[tool.uv] conflicts` block it
+  required. Substrate is a container image, so there is no Python package to
+  install; dropping it also removes seven transitive dependencies from
+  `uv.lock` (closes #125).
+- `docker-compose.localstack.yml` and `scripts/localstack-wait.sh`. The wait
+  script's service-readiness greps matched on exact whitespace and never gated
+  anything — both branches ended in `exit 0` (closes #125).
 - The bats test `Required environment variables are set`. It asserted that
   `AWS_REGION` and `AWS_ACCESS_KEY_ID`/`AWS_PROFILE` were set in the ambient
   environment, guarded so that it ran only when `CI` was set — so it failed on

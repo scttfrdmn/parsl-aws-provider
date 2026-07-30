@@ -11,7 +11,7 @@ This document outlines the development roadmap for the Parsl Ephemeral AWS Provi
 - ✅ VPC and networking management
 - ✅ Spot instance support
 - ✅ Basic MPI capability
-- ✅ LocalStack integration for testing
+- ✅ Local AWS emulation for testing (substrate; LocalStack before v0.7.0)
 - ✅ CloudFormation and Terraform templates
 - ✅ Comprehensive documentation
 

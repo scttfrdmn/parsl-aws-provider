@@ -4,7 +4,7 @@ Exercises the full save → reload cycle: a provider submits jobs, its state is
 persisted to a FileStateStore, a second provider instance loads the same state
 file, and the recovered provider sees all original jobs and resources.
 
-No LocalStack or real AWS required — the operating mode is mocked.
+No emulator or real AWS required — the operating mode is mocked.
 
 SPDX-License-Identifier: Apache-2.0
 SPDX-FileCopyrightText: 2025 Scott Friedman and Project Contributors
