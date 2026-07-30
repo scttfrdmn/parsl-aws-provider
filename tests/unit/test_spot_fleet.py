@@ -9,8 +9,27 @@ from unittest.mock import patch, MagicMock
 from botocore.exceptions import ClientError
 import logging
 
+import pytest
+
 from parsl_ephemeral_aws.compute.spot_fleet import SpotFleetManager
+from parsl_ephemeral_aws.constants import TAG_PREFIX
 from parsl_ephemeral_aws.exceptions import SpotFleetThrottlingError
+
+pytestmark = pytest.mark.unit
+
+
+class _SimpleProvider:
+    """A provider stand-in that answers only the attributes it is given.
+
+    Mirrors the anonymous type StandardMode builds for SpotFleetManager
+    (``standard.py:220``). Unlike a MagicMock it raises ``AttributeError`` for
+    anything it was not given, so the manager's ``getattr(..., default)`` reads
+    fall through to their defaults exactly as they do in production.
+    """
+
+    def __init__(self, **attrs):
+        for name, value in attrs.items():
+            setattr(self, name, value)
 
 
 class TestSpotFleetManager(unittest.TestCase):
@@ -18,24 +37,38 @@ class TestSpotFleetManager(unittest.TestCase):
 
     def setUp(self):
         """Set up the test environment."""
-        # Create a mock provider
-        self.mock_provider = MagicMock()
-        self.mock_provider.workflow_id = "test-workflow-id"
-        self.mock_provider.region = "us-east-1"
-        self.mock_provider.aws_access_key_id = "test_access_key"
-        self.mock_provider.aws_secret_access_key = "test_secret_key"
-        self.mock_provider.aws_session_token = None
-        self.mock_provider.aws_profile = None
-        self.mock_provider.vpc_id = None
-        self.mock_provider.subnet_id = None
-        self.mock_provider.security_group_id = None
-        self.mock_provider.image_id = "ami-12345678"
-        self.mock_provider.instance_type = "t2.micro"
-        self.mock_provider.use_public_ips = True
-        self.mock_provider.nodes_per_block = 1
-        self.mock_provider.tags = {"ProjectTag": "TestProject"}
-        self.mock_provider.spot_max_price_percentage = 100
-        self.mock_provider.worker_init = "echo 'Worker init script'"
+        # A plain object, not a MagicMock. SpotFleetManager reads its optional
+        # security settings with getattr(provider, name, <default>) --
+        # `vpc_cidr`, `security_environment`, `admin_cidr_blocks`,
+        # `strict_security_mode` -- and a MagicMock answers every one of them
+        # with a MagicMock, so the default never applies and SecurityConfig
+        # raises `ValueError: Invalid VPC CIDR: <MagicMock ...>` during
+        # construction. That was every failure in this file.
+        #
+        # The single live caller (StandardMode, standard.py:220) builds exactly
+        # this shape: a bare namespace carrying only the attributes below, none
+        # of them security settings. Modelling it means the getattr defaults are
+        # exercised the way they are in production, instead of being masked.
+        self.mock_provider = _SimpleProvider(
+            workflow_id="test-workflow-id",
+            region="us-east-1",
+            aws_access_key_id="test_access_key",
+            aws_secret_access_key="test_secret_key",
+            aws_session_token=None,
+            aws_profile=None,
+            vpc_id=None,
+            subnet_id=None,
+            security_group_id=None,
+            image_id="ami-12345678",
+            instance_type="t2.micro",
+            instance_types=[],
+            key_name=None,
+            use_public_ips=True,
+            nodes_per_block=1,
+            tags={"ProjectTag": "TestProject"},
+            spot_max_price_percentage=100,
+            worker_init="echo 'Worker init script'",
+        )
 
         # Disable logging during tests
         logging.disable(logging.CRITICAL)
@@ -45,30 +78,43 @@ class TestSpotFleetManager(unittest.TestCase):
         # Re-enable logging
         logging.disable(logging.NOTSET)
 
-    @patch("boto3.Session")
-    def test_initialization(self, mock_session_cls):
-        """Test SpotFleetManager initialization."""
-        # Configure mocks
+    @patch("parsl_ephemeral_aws.compute.spot_fleet.CredentialManager")
+    def test_initialization(self, mock_credential_manager_cls):
+        """Test SpotFleetManager initialization.
+
+        The session is obtained from ``CredentialManager.create_boto3_session()``,
+        not by handing the provider's keys straight to ``boto3.Session`` -- the
+        manager derives a ``CredentialConfiguration`` from the provider and lets
+        the credential manager resolve it (which is what applies sanitization and
+        token refresh). This test used to assert the direct-``boto3.Session``
+        construction, a path that no longer exists.
+        """
         mock_session = MagicMock()
         mock_ec2_client = MagicMock()
         mock_ec2_resource = MagicMock()
 
-        mock_session_cls.return_value = mock_session
         mock_session.client.return_value = mock_ec2_client
         mock_session.resource.return_value = mock_ec2_resource
+        mock_manager = mock_credential_manager_cls.return_value
+        mock_manager.create_boto3_session.return_value = mock_session
 
         # Instantiate SpotFleetManager
         manager = SpotFleetManager(self.mock_provider)
 
-        # Verify initialization
-        mock_session_cls.assert_called_once_with(
-            region_name="us-east-1",
-            aws_access_key_id="test_access_key",
-            aws_secret_access_key="test_secret_key",
-        )
+        # The provider's region must reach the session, not a default.
+        mock_manager.create_boto3_session.assert_called_once_with(region="us-east-1")
+
+        # And the config handed to CredentialManager must be the one derived from
+        # the provider: the provider carries explicit keys, so environment-variable
+        # credentials are enabled and the (absent) profile is passed through.
+        credential_config = mock_credential_manager_cls.call_args.args[0]
+        self.assertTrue(credential_config.use_environment_variables)
+        self.assertEqual(credential_config.use_profile, self.mock_provider.aws_profile)
 
         mock_session.client.assert_called_with("ec2")
         mock_session.resource.assert_called_with("ec2")
+        self.assertIs(manager.ec2_client, mock_ec2_client)
+        self.assertIs(manager.ec2_resource, mock_ec2_resource)
 
         # Verify instance variables
         self.assertEqual(manager.provider, self.mock_provider)
@@ -129,7 +175,9 @@ class TestSpotFleetManager(unittest.TestCase):
         self.assertEqual(role_arn, "arn:aws:iam::123456789012:role/test-fleet-role")
 
         # Verify get_role was called
-        role_name = f"parsl-aws-spot-fleet-role-{self.mock_provider.workflow_id[:8]}"
+        # Derived from TAG_PREFIX, not spelled out, so a prefix change does not
+        # silently make this assertion stale again.
+        role_name = f"{TAG_PREFIX}-spot-fleet-role-{self.mock_provider.workflow_id[:8]}"
         mock_iam_client.get_role.assert_called_with(RoleName=role_name)
 
         # Verify create_role was not called
@@ -173,7 +221,9 @@ class TestSpotFleetManager(unittest.TestCase):
         self.assertEqual(role_arn, "arn:aws:iam::123456789012:role/new-fleet-role")
 
         # Verify get_role was called
-        role_name = f"parsl-aws-spot-fleet-role-{self.mock_provider.workflow_id[:8]}"
+        # Derived from TAG_PREFIX, not spelled out, so a prefix change does not
+        # silently make this assertion stale again.
+        role_name = f"{TAG_PREFIX}-spot-fleet-role-{self.mock_provider.workflow_id[:8]}"
         mock_iam_client.get_role.assert_called_with(RoleName=role_name)
 
         # Verify create_role was called
@@ -227,6 +277,7 @@ class TestSpotFleetManager(unittest.TestCase):
                     "security_group_id": "sg-12345678",
                 },
                 1,
+                "arn:aws:iam::123456789012:role/fleet-role",
             )
 
         # Verify the error message and attributes
