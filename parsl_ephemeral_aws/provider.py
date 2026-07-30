@@ -13,7 +13,7 @@ import threading
 import time
 import uuid
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 import botocore.session
 from parsl.jobs.states import JobState, JobStatus
@@ -51,7 +51,7 @@ from parsl_ephemeral_aws.state.base import (
 from parsl_ephemeral_aws.state.file import FileStateStore
 from parsl_ephemeral_aws.state.parameter_store import ParameterStoreStateStore
 from parsl_ephemeral_aws.state.s3 import S3StateStore
-from parsl_ephemeral_aws.utils.aws import create_session
+from parsl_ephemeral_aws.utils.aws import create_session, describe_instance_capacity
 
 
 logger = logging.getLogger(__name__)
@@ -283,6 +283,8 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
         bake_ami: bool = DEFAULT_BAKE_AMI,
         baked_ami_id: Optional[str] = None,
         one_shot: bool = DEFAULT_ONE_SHOT,
+        cores_per_node: Optional[int] = None,
+        mem_per_node: Optional[float] = None,
         **kwargs: Any,
     ) -> None:
         """Initialize the Ephemeral AWS Provider."""
@@ -318,7 +320,10 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
             init_blocks=init_blocks,
         )
 
-        # Set basic attributes - resolve image_id if not provided
+        # Set basic attributes - resolve image_id if not provided.
+        # Genuinely optional: serverless needs no AMI, and auto-detection can
+        # fail, in which case the mode raises at initialize() instead.
+        self.image_id: Optional[str]
         if (
             image_id is None
             and mode.lower() in ["standard", "detached"]
@@ -460,13 +465,35 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
         )
         self.state_store = self._initialize_state_store()
 
+        # cores_per_node / mem_per_node are declared by Parsl's
+        # ExecutionProvider so an executor can size its worker pool -- HTEX
+        # divides them by its per-worker requirements, and guesses 1 worker per
+        # node when both are None. EC2 knows the real figures for the chosen
+        # instance type, so resolve them unless the caller said otherwise. The
+        # lookup is best-effort: it must not stop the provider constructing.
+        if cores_per_node is not None or mem_per_node is not None:
+            self.cores_per_node = cores_per_node
+            self.mem_per_node = mem_per_node
+        elif self.mode_type == OperatingModeType.SERVERLESS:
+            # Lambda and Fargate have no "node" to describe; memory_size is the
+            # per-invocation allocation, which is not the same concept.
+            self.cores_per_node = None
+            self.mem_per_node = None
+        else:
+            self.cores_per_node, self.mem_per_node = describe_instance_capacity(
+                self.session, self.instance_type
+            )
+
         # Adopt any provider_id already recorded at this state location, before
         # the operating mode is built with it.
         if provider_id is None:
             self._adopt_persisted_provider_id()
 
         self.operating_mode = self._initialize_operating_mode()
-        self.resources: Dict[str, Dict[str, Any]] = {}
+        # ``Dict[object, Any]`` is the type the base class declares. Keys are
+        # always the mode's string resource IDs in practice; the wider
+        # annotation exists so the attribute is a valid override.
+        self.resources: Dict[object, Any] = {}
         self.job_map: Dict[str, Dict[str, Any]] = {}
         # Re-entrant lock so cancel() → _cleanup_resources() doesn't deadlock
         self._lock = threading.RLock()
@@ -791,7 +818,7 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
             )
 
     def submit(
-        self, command: str, tasks_per_node: int, job_name: Optional[str] = None
+        self, command: str, tasks_per_node: int, job_name: str = "parsl.auto"
     ) -> str:
         """Submit a job to execute the specified command.
 
@@ -801,15 +828,20 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
             Command to execute.
         tasks_per_node : int
             Number of tasks to run per node.
-        job_name : Optional[str]
-            Name for the job.
+        job_name : str
+            Human-friendly name for the job request. Defaults to Parsl's
+            ``"parsl.auto"`` sentinel, which is replaced with a unique
+            generated name.
 
         Returns
         -------
         str
             Job ID for tracking status.
         """
-        job_name = job_name or f"parsl-job-{str(uuid.uuid4())[:8]}"
+        # ``"parsl.auto"`` is the base class's default, and `None` was this
+        # provider's own former default; both mean "no caller-chosen name".
+        if not job_name or job_name == "parsl.auto":
+            job_name = f"parsl-job-{str(uuid.uuid4())[:8]}"
         job_id = f"{self.provider_id}-{str(uuid.uuid4())}"
 
         # Check if we have capacity (lock protects len(self.resources))
@@ -860,39 +892,48 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
             logger.error(f"Failed to submit job {job_name}: {e}")
             raise ProviderError(f"Failed to submit job: {e}")
 
-    def status(self, job_ids: List[str]) -> List[JobStatus]:
+    def status(self, job_ids: Sequence[object]) -> List[JobStatus]:
         """Get the status of a list of jobs.
 
         Parameters
         ----------
-        job_ids : List[str]
-            List of job IDs.
+        job_ids : Sequence[object]
+            Job identifiers as returned by :meth:`submit`. Typed as ``object``
+            to match Parsl's ``ExecutionProvider``, which treats job IDs as
+            opaque; this provider issues strings, so anything else resolves to
+            ``JobState.UNKNOWN`` rather than raising.
 
         Returns
         -------
         List[JobStatus]
             List of JobStatus objects corresponding to each job_id.
         """
-        # Internal string-keyed status map updated in-place; return value is
-        # rebuilt as List[JobStatus] at the end.
-        internal_statuses: Dict[str, str] = {}
+        # Internal status map keyed by the job IDs as given.
+        internal_statuses: Dict[object, str] = {}
+
+        # Narrow each opaque ID to the string key ``job_map`` uses, once, so the
+        # internal map stays string-keyed. An ID this provider never issued —
+        # or one that is not a string at all — narrows to None and falls through
+        # to UNKNOWN rather than raising.
+        job_keys = [(jid, jid if isinstance(jid, str) else None) for jid in job_ids]
 
         try:
             # Short-circuit jobs already in a terminal state — avoids stale
             # re-queries when an instance has been reused for a different job.
             with self._lock:
-                for job_id in job_ids:
-                    if job_id in self.job_map:
-                        cached = self.job_map[job_id].get("status", "UNKNOWN")
+                for job_id, key in job_keys:
+                    if key is not None and key in self.job_map:
+                        cached = self.job_map[key].get("status", "UNKNOWN")
                         if cached in _TERMINAL_STATES:
                             internal_statuses[job_id] = cached
 
                 # Only poll for non-terminal jobs
                 resource_ids = [
-                    self.job_map[job_id]["resource_id"]
-                    for job_id in job_ids
-                    if job_id in self.job_map
-                    and self.job_map[job_id].get("status") not in _TERMINAL_STATES
+                    self.job_map[key]["resource_id"]
+                    for _, key in job_keys
+                    if key is not None
+                    and key in self.job_map
+                    and self.job_map[key].get("status") not in _TERMINAL_STATES
                 ]
 
             # Fetch status outside lock (may involve network calls)
@@ -902,14 +943,14 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
 
             # Update internal state under lock
             with self._lock:
-                for job_id in job_ids:
+                for job_id, key in job_keys:
                     if job_id in internal_statuses:
                         continue  # already set by terminal short-circuit
-                    if job_id in self.job_map:
-                        resource_id = self.job_map[job_id]["resource_id"]
+                    if key is not None and key in self.job_map:
+                        resource_id = self.job_map[key]["resource_id"]
                         if resource_id in status_map:
                             status_str = status_map[resource_id]
-                            self.job_map[job_id]["status"] = status_str
+                            self.job_map[key]["status"] = status_str
                             if resource_id in self.resources:
                                 self.resources[resource_id]["status"] = status_str
                             internal_statuses[job_id] = status_str
@@ -943,13 +984,15 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
             for jid in job_ids
         ]
 
-    def cancel(self, job_ids: List[str]) -> List[bool]:
+    def cancel(self, job_ids: Sequence[object]) -> List[bool]:
         """Cancel specified jobs.
 
         Parameters
         ----------
-        job_ids : List[str]
-            List of job IDs to cancel.
+        job_ids : Sequence[object]
+            Job identifiers to cancel. Typed as ``object`` to match Parsl's
+            ``ExecutionProvider``; an ID this provider never issued reports
+            ``False`` rather than raising.
 
         Returns
         -------
@@ -957,15 +1000,18 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
             True for each job_id where cancellation was accepted, False otherwise.
         """
         # Track success per job_id; defaults to False (unknown / not found)
-        cancel_results: Dict[str, bool] = {jid: False for jid in job_ids}
+        cancel_results: Dict[object, bool] = {jid: False for jid in job_ids}
+
+        # Narrow to ``job_map``'s string keys once — see status() for why.
+        job_keys = [(jid, jid if isinstance(jid, str) else None) for jid in job_ids]
 
         try:
             # Read resource IDs under lock
             with self._lock:
                 resources_to_terminate = [
-                    self.job_map[job_id]["resource_id"]
-                    for job_id in job_ids
-                    if job_id in self.job_map
+                    self.job_map[key]["resource_id"]
+                    for _, key in job_keys
+                    if key is not None and key in self.job_map
                 ]
 
             # Cancel jobs outside lock (may involve network calls)
@@ -973,12 +1019,12 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
 
             # Update internal state under lock
             with self._lock:
-                for job_id in job_ids:
-                    if job_id in self.job_map:
-                        resource_id = self.job_map[job_id]["resource_id"]
+                for job_id, key in job_keys:
+                    if key is not None and key in self.job_map:
+                        resource_id = self.job_map[key]["resource_id"]
                         if resource_id in cancel_map:
                             status_str = cancel_map[resource_id]
-                            self.job_map[job_id]["status"] = status_str
+                            self.job_map[key]["status"] = status_str
                             if resource_id in self.resources:
                                 self.resources[resource_id]["status"] = status_str
                             cancel_results[job_id] = status_str != "UNKNOWN"
@@ -1110,6 +1156,11 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
         # Scan resources under lock to build action lists
         with self._lock:
             for resource_id, resource in self.resources.items():
+                # Parsl's base class declares ``resources`` as ``Dict[object, Any]``,
+                # but every key this provider inserts is a mode-issued string ID.
+                # Narrow here so cleanup_resources() and job_map stay string-typed.
+                if not isinstance(resource_id, str):
+                    continue
                 status = resource.get("status", "UNKNOWN")
 
                 if resource.get("warm_pool"):
@@ -1156,7 +1207,9 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
                 current_warm = [
                     rid
                     for rid, r in self.resources.items()
-                    if r.get("warm_pool") and r.get("status") == STATUS_WARM
+                    if isinstance(rid, str)
+                    and r.get("warm_pool")
+                    and r.get("status") == STATUS_WARM
                 ]
                 for resource_id in warm_transitions:
                     if resource_id not in self.resources:
@@ -1257,10 +1310,16 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
                 if resource.get("status") == "RUNNING"
             ]
             resources_to_terminate = running_resources[:blocks]
+            # Drop resources carrying no job_id rather than passing None down.
+            # A tracked resource normally has one, but a partially-restored
+            # state document or an interrupted submit can leave it absent, and
+            # `@typechecked` on this class turns that into a TypeCheckError from
+            # cancel() instead of a no-op.
             job_ids = [
-                self.resources[resource_id].get("job_id")
+                job_id
                 for resource_id in resources_to_terminate
-                if resource_id in self.resources
+                if (job_id := self.resources.get(resource_id, {}).get("job_id"))
+                is not None
             ]
 
         # Cancel the selected jobs (cancel() acquires the lock internally)

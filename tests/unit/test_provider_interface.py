@@ -316,3 +316,152 @@ class TestProviderInterface:
                 f.result()
 
         assert not errors, f"Errors during concurrent submit+status: {errors}"
+
+
+@pytest.mark.unit
+class TestExecutionProviderConformance:
+    """The provider must satisfy Parsl's ExecutionProvider contract (closes #82).
+
+    `@typechecked` on EphemeralAWSProvider makes the annotations load-bearing at
+    runtime, so a signature narrower than the base class's is not a typing nit —
+    it raises TypeCheckError on inputs Parsl is entitled to pass.
+    """
+
+    @pytest.fixture
+    def tmp_dir(self):
+        with tempfile.TemporaryDirectory() as d:
+            yield d
+
+    def test_signatures_match_base_class(self):
+        """submit/status/cancel accept everything ExecutionProvider declares."""
+        import inspect
+
+        from parsl.providers.base import ExecutionProvider
+
+        for name in ("submit", "status", "cancel"):
+            base = inspect.signature(getattr(ExecutionProvider, name))
+            ours = inspect.signature(getattr(EphemeralAWSProvider, name))
+            assert list(ours.parameters) == list(base.parameters), (
+                f"{name}() parameter names diverge from ExecutionProvider"
+            )
+            for pname, bparam in base.parameters.items():
+                assert ours.parameters[pname].default == bparam.default, (
+                    f"{name}() default for {pname} diverges from ExecutionProvider"
+                )
+
+    def test_submit_default_job_name_accepted(self, tmp_dir):
+        """The base class's "parsl.auto" default is treated as "no name given"."""
+        provider, mode = _make_provider(tmp_dir)
+        mode.submit_job.return_value = "resource-auto"
+
+        job_id = provider.submit("echo hello", tasks_per_node=1)
+
+        # Not the literal sentinel: a generated per-job name.
+        assert provider.job_map[job_id]["job_name"] != "parsl.auto"
+        assert provider.job_map[job_id]["job_name"].startswith("parsl-job-")
+
+    def test_status_accepts_non_string_ids(self, tmp_dir):
+        """status() reports UNKNOWN for opaque IDs rather than raising.
+
+        `Sequence[object]` is what the base declares, so a non-string ID must
+        not reach the string-keyed job_map.
+        """
+        provider, _ = _make_provider(tmp_dir)
+
+        result = provider.status([1, None, object()])
+
+        assert len(result) == 3
+        assert all(s.state == JobState.UNKNOWN for s in result)
+
+    def test_cancel_accepts_non_string_ids(self, tmp_dir):
+        """cancel() reports False for opaque IDs rather than raising."""
+        provider, _ = _make_provider(tmp_dir)
+
+        result = provider.cancel([1, None])
+
+        assert result == [False, False]
+
+    def test_status_mixed_ids_preserves_order(self, tmp_dir):
+        """A real ID alongside opaque ones still resolves positionally."""
+        provider, mode = _make_provider(tmp_dir)
+        resource_id = "resource-mixed"
+        mode.submit_job.return_value = resource_id
+        mode.get_job_status.return_value = {resource_id: "RUNNING"}
+
+        job_id = provider.submit("echo hello", tasks_per_node=1)
+        result = provider.status([None, job_id, 42])
+
+        assert [s.state for s in result] == [
+            JobState.UNKNOWN,
+            JobState.RUNNING,
+            JobState.UNKNOWN,
+        ]
+
+    def test_scale_in_skips_resources_without_job_id(self, tmp_dir):
+        """A resource missing job_id is skipped, not passed to cancel() as None.
+
+        An interrupted submit or a partially-restored state document can leave
+        job_id absent; passing None into cancel() raised TypeCheckError.
+        """
+        provider, mode = _make_provider(tmp_dir)
+        # No "job_id" key at all — the partial-state shape.
+        provider.resources["r-orphan"] = {"status": "RUNNING"}
+        provider.resources["r-good"] = {"job_id": "j-good", "status": "RUNNING"}
+        provider.job_map["j-good"] = {"resource_id": "r-good", "status": "RUNNING"}
+        mode.cancel_jobs.return_value = {"r-good": "CANCELED"}
+
+        terminated = provider.scale_in(2)
+
+        assert None not in terminated
+        assert terminated == ["j-good"]
+
+    def test_cores_and_mem_per_node_resolved(self, tmp_dir):
+        """The base class declares both; EC2 modes populate them from the API."""
+        with patch(
+            "parsl_ephemeral_aws.provider.describe_instance_capacity",
+            return_value=(2, 1.0),
+        ):
+            provider, _ = _make_provider(tmp_dir)
+
+        assert provider.cores_per_node == 2
+        assert provider.mem_per_node == 1.0
+
+    def test_explicit_cores_and_mem_override_lookup(self, tmp_dir):
+        """Caller-supplied values win; no EC2 call is made."""
+        provider_id = f"test-{uuid.uuid4().hex[:8]}"
+        state_file = os.path.join(tmp_dir, f"{provider_id}.json")
+        state_store = FileStateStore(file_path=state_file, provider_id=provider_id)
+
+        with (
+            patch("parsl_ephemeral_aws.provider.create_session"),
+            patch(
+                "parsl_ephemeral_aws.provider.describe_instance_capacity"
+            ) as mock_lookup,
+            patch.object(
+                EphemeralAWSProvider,
+                "_initialize_state_store",
+                return_value=state_store,
+            ),
+            patch.object(
+                EphemeralAWSProvider,
+                "_initialize_operating_mode",
+                return_value=MagicMock(),
+            ),
+        ):
+            provider = EphemeralAWSProvider(
+                provider_id=provider_id,
+                region="us-east-1",
+                image_id="ami-12345678",
+                instance_type="t3.micro",
+                mode="standard",
+                init_blocks=0,
+                vpc_id="vpc-test00001",
+                subnet_id="subnet-test001",
+                security_group_id="sg-test00001",
+                cores_per_node=8,
+                mem_per_node=16.0,
+            )
+
+        assert provider.cores_per_node == 8
+        assert provider.mem_per_node == 16.0
+        mock_lookup.assert_not_called()

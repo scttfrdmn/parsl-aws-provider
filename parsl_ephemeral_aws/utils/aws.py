@@ -9,7 +9,7 @@ import json
 import logging
 import os
 import time
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import boto3
 from botocore.exceptions import (
@@ -205,6 +205,53 @@ def get_default_ami(region: str) -> str:
         message = f"No default AMI found for region {region}"
         logger.error(message)
         raise AMINotFoundError(message)
+
+
+def describe_instance_capacity(
+    session: boto3.Session, instance_type: str
+) -> Tuple[Optional[int], Optional[float]]:
+    """Look up an instance type's vCPU count and memory in GB.
+
+    Parsl's ``ExecutionProvider`` declares ``cores_per_node`` and
+    ``mem_per_node`` so an executor can size its worker pool: HTEX divides them
+    by its per-worker requirements to pick ``workers_per_node``, and falls back
+    to a hardcoded guess of 1 when both are ``None``. EC2 already knows the real
+    numbers, so there is no reason to make the caller supply them.
+
+    Failure is not an error. This is an optimisation hint, and a provider that
+    cannot reach EC2 during ``__init__`` should still construct — so any
+    exception yields ``(None, None)``, which is exactly the base class's default.
+
+    Parameters
+    ----------
+    session : boto3.Session
+        Session used to call ``ec2:DescribeInstanceTypes``.
+    instance_type : str
+        Instance type to describe, e.g. ``"t3.micro"``.
+
+    Returns
+    -------
+    Tuple[Optional[int], Optional[float]]
+        ``(vcpus, memory_gb)``, or ``(None, None)`` if the lookup failed.
+    """
+    try:
+        response = session.client("ec2").describe_instance_types(
+            InstanceTypes=[instance_type]
+        )
+        info = response["InstanceTypes"][0]
+        vcpus = info["VCpuInfo"]["DefaultVCpus"]
+        # AWS reports memory in MiB; Parsl documents mem_per_node in GB.
+        memory_gb = info["MemoryInfo"]["SizeInMiB"] / 1024
+        logger.debug(
+            f"Instance type {instance_type} has {vcpus} vCPUs and {memory_gb:.2f} GB memory"
+        )
+        return vcpus, memory_gb
+    except Exception as e:
+        logger.debug(
+            f"Could not describe instance type {instance_type}: {e}. "
+            "cores_per_node/mem_per_node stay unset."
+        )
+        return None, None
 
 
 def wait_for_resource(
