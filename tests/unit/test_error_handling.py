@@ -1040,6 +1040,51 @@ class TestProviderConfigurationErrors:
         assert mode.spot_fleet_manager is not None
 
     @pytest.mark.parametrize(
+        "override, expected",
+        [
+            # Parsl's strategy reads min/max straight off the provider and
+            # validates neither, so an unreachable range pins the executor: it
+            # cannot scale out to min_blocks and will not scale in because it
+            # believes it is already there (#108).
+            ({"min_blocks": 10, "max_blocks": 5}, "cannot be less than min_blocks"),
+            ({"min_blocks": 0, "max_blocks": 5, "init_blocks": 9}, "init_blocks"),
+            ({"min_blocks": 3, "max_blocks": 5, "init_blocks": 1}, "init_blocks"),
+            ({"min_blocks": -3}, "min_blocks"),
+            ({"max_blocks": -1}, "max_blocks"),
+            ({"init_blocks": -1}, "init_blocks"),
+        ],
+    )
+    def test_unreachable_block_counts_are_rejected(
+        self, provider_config, override, expected
+    ):
+        """The three block counts have to describe a reachable range.
+
+        This check existed at ``f32eb23:232`` and was lost in the ``cc4a240``
+        rewrite; the only surviving record was a test in a file that had failed
+        at collection since ``MODE_STANDARD`` was removed from ``constants.py``,
+        so it had not run in a long time.
+        """
+        with pytest.raises(ProviderConfigurationError, match=expected):
+            self._construct({**provider_config, **override})
+
+    @pytest.mark.parametrize(
+        "blocks",
+        [
+            {"min_blocks": 0, "max_blocks": 1, "init_blocks": 1},
+            {"min_blocks": 0, "max_blocks": 0, "init_blocks": 0},
+            {"min_blocks": 2, "max_blocks": 2, "init_blocks": 2},
+            {"min_blocks": 1, "max_blocks": 10, "init_blocks": 4},
+        ],
+    )
+    def test_reachable_block_counts_accepted(self, provider_config, blocks):
+        """Equal bounds and a zero floor are all legitimate configurations."""
+        provider = self._construct({**provider_config, **blocks})
+
+        assert provider.min_blocks == blocks["min_blocks"]
+        assert provider.max_blocks == blocks["max_blocks"]
+        assert provider.init_blocks == blocks["init_blocks"]
+
+    @pytest.mark.parametrize(
         "override",
         [
             # Thousands of names, new families constantly; a local pattern check

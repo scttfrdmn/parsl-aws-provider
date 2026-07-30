@@ -226,6 +226,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   endpoint data across all five partitions, so GovCloud, China, and
   newly-launched regions are accepted without any in-tree list to maintain
   (closes #107).
+- `EphemeralAWSProvider` accepted contradictory and negative block counts:
+  `min_blocks=10, max_blocks=5` and `min_blocks=-3` both constructed. Parsl's
+  scaling strategy reads all three counts straight off the provider and validates
+  none of them, so an unreachable range pinned the executor — it could not scale
+  out to reach `min_blocks` (case 2a refuses at `active_blocks >= max_blocks`) and
+  would not scale in because case 1a's `active_blocks <= min_blocks` held at every
+  reachable count. The check existed before the v0.1.0 rewrite and was lost; the
+  only surviving record was a test in a file that had failed at collection since
+  `MODE_STANDARD` was removed from `constants.py` (closes #108).
 
 ### Added
 - **One-shot mode** for `StandardMode`: set `one_shot=True` to declare that each

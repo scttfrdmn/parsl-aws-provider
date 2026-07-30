@@ -313,6 +313,9 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
             state_store_type=state_store_type,
             s3_bucket=s3_bucket,
             region=region,
+            min_blocks=min_blocks,
+            max_blocks=max_blocks,
+            init_blocks=init_blocks,
         )
 
         # Set basic attributes - resolve image_id if not provided
@@ -488,6 +491,9 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
         state_store_type: str,
         s3_bucket: Optional[str],
         region: str,
+        min_blocks: int,
+        max_blocks: int,
+        init_blocks: int,
     ) -> None:
         """Validate the configuration parameters.
 
@@ -505,6 +511,12 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
             S3 bucket name when using 's3' state store.
         region : str
             AWS region name.
+        min_blocks : int
+            Minimum number of blocks to maintain.
+        max_blocks : int
+            Maximum number of blocks to provision.
+        init_blocks : int
+            Number of blocks to provision at start.
 
         Raises
         ------
@@ -561,6 +573,52 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
                 f"{', '.join([c.value for c in ComputeType])}"
             )
 
+        self._validate_block_counts(min_blocks, max_blocks, init_blocks)
+
+    @staticmethod
+    def _validate_block_counts(
+        min_blocks: int, max_blocks: int, init_blocks: int
+    ) -> None:
+        """Check that the three block counts describe a reachable range (#108).
+
+        Parsl's scaling strategy reads ``min_blocks``/``max_blocks`` straight off
+        the provider (``parsl/jobs/strategy.py:207``) and validates neither. With
+        ``min_blocks > max_blocks`` the executor is pinned: case 1a
+        (``active_blocks <= min_blocks``) holds at every reachable count so idle
+        scale-in never happens, while case 2a (``active_blocks >= max_blocks``)
+        refuses to scale out — it cannot grow to the minimum it is told to hold
+        and will not shrink because it believes it is already there. Negative
+        counts are nonsense outright, and since ``max_blocks`` doubles as the
+        submit-time capacity limit, a negative one rejects every job.
+
+        This check existed at ``f32eb23:232`` and was lost in the ``cc4a240``
+        rewrite.
+        """
+        negative = [
+            name
+            for name, value in (
+                ("min_blocks", min_blocks),
+                ("max_blocks", max_blocks),
+                ("init_blocks", init_blocks),
+            )
+            if value < 0
+        ]
+        if negative:
+            raise ProviderConfigurationError(f"{', '.join(negative)} must be >= 0")
+
+        if max_blocks < min_blocks:
+            raise ProviderConfigurationError(
+                f"max_blocks ({max_blocks}) cannot be less than min_blocks "
+                f"({min_blocks}): no block count satisfies both, and Parsl's "
+                "scaling strategy would refuse to scale out or in."
+            )
+
+        if not min_blocks <= init_blocks <= max_blocks:
+            raise ProviderConfigurationError(
+                f"init_blocks ({init_blocks}) must be between min_blocks "
+                f"({min_blocks}) and max_blocks ({max_blocks})"
+            )
+
     # Every partition botocore ships endpoint data for. The commercial
     # partition alone would reject GovCloud and China regions, which are
     # perfectly usable here.
@@ -605,8 +663,7 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
 
         if region not in known:
             raise ProviderConfigurationError(
-                f"Invalid region: {region}. Must be one of: "
-                f"{', '.join(sorted(known))}"
+                f"Invalid region: {region}. Must be one of: {', '.join(sorted(known))}"
             )
 
     def _parameter_store_prefix(self) -> str:

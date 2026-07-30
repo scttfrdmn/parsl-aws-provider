@@ -4,7 +4,11 @@ SPDX-License-Identifier: Apache-2.0
 SPDX-FileCopyrightText: 2025 Scott Friedman and Project Contributors
 """
 
+import pytest
+
 from parsl_ephemeral_aws import constants
+
+pytestmark = pytest.mark.unit
 
 
 def test_default_region():
@@ -14,13 +18,19 @@ def test_default_region():
 
 def test_default_instance_type():
     """Test that the default instance type is set."""
-    assert constants.DEFAULT_INSTANCE_TYPE == "t3.medium"
+    assert constants.DEFAULT_INSTANCE_TYPE == "t3.micro"
 
 
 def test_tag_values():
-    """Test that tag values are correctly formatted."""
+    """The tag keys are bare names, not prefixed ones.
+
+    This asserted ``parsl-ephemeral-workflow-id`` and friends, which no commit
+    has ever produced. ``TAG_PREFIX`` prefixes resource *names* (see
+    ``spot_fleet.py``'s IAM role); the tag *keys* are plain, and ``TAG_NAME`` is
+    EC2's reserved ``Name`` key.
+    """
     assert constants.TAG_PREFIX == "parsl-ephemeral"
-    assert constants.TAG_NAME == "parsl-ephemeral-resource"
-    assert constants.TAG_WORKFLOW_ID == "parsl-ephemeral-workflow-id"
-    assert constants.TAG_BLOCK_ID == "parsl-ephemeral-block-id"
-    assert constants.TAG_JOB_ID == "parsl-ephemeral-job-id"
+    assert constants.TAG_NAME == "Name"
+    assert constants.TAG_WORKFLOW_ID == "WorkflowId"
+    assert constants.TAG_BLOCK_ID == "BlockId"
+    assert constants.TAG_JOB_ID == "JobId"

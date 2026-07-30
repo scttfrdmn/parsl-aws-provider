@@ -7,6 +7,7 @@ SPDX-License-Identifier: Apache-2.0
 SPDX-FileCopyrightText: 2025 Scott Friedman and Project Contributors
 """
 
+import inspect
 import os
 import json
 import tempfile
@@ -16,7 +17,11 @@ import pytest
 from unittest.mock import MagicMock, patch
 from botocore.exceptions import ClientError
 
-from parsl_ephemeral_aws.state.base import STATE_KEY_MODE, STATE_KEY_PROVIDER
+from parsl_ephemeral_aws.state.base import (
+    STATE_KEY_MODE,
+    STATE_KEY_PROVIDER,
+    StateStore,
+)
 from parsl_ephemeral_aws.state.file import FileStateStore
 from parsl_ephemeral_aws.state.parameter_store import ParameterStoreState
 from parsl_ephemeral_aws.state.s3 import S3State
@@ -141,6 +146,38 @@ class TestFileStateStoreErrorHandling:
         loaded_state = store1.load_state(STATE_KEY_PROVIDER)
         assert loaded_state["owner"] == "provider2"
         assert loaded_state["data"] == [4, 5, 6]
+
+
+class TestStateStoreConformance:
+    """Every store must actually implement the ABC it declares (#77).
+
+    Before #77 only ``FileStateStore`` conformed: the two AWS stores were
+    *keyed* (``save_state(state_key, state_data)``) while ``state/base.py`` and
+    the provider's call sites were unkeyed, so passing either AWS store to the
+    provider raised ``TypeError`` on the first save. Nothing caught it because
+    no test asked whether the three stores shared an interface -- they were each
+    tested against their own signature.
+    """
+
+    KEYED_METHODS = ("save_state", "load_state", "delete_state")
+
+    @pytest.mark.parametrize(
+        "store_cls", [FileStateStore, ParameterStoreState, S3State]
+    )
+    def test_store_implements_the_abstract_interface(self, store_cls):
+        assert issubclass(store_cls, StateStore)
+        assert not getattr(store_cls, "__abstractmethods__", None)
+
+    @pytest.mark.parametrize(
+        "store_cls", [FileStateStore, ParameterStoreState, S3State]
+    )
+    @pytest.mark.parametrize("method", KEYED_METHODS)
+    def test_every_store_takes_a_state_key(self, store_cls, method):
+        """The keyed signature is the contract; an unkeyed store breaks the
+        provider/mode namespacing that #78 depends on."""
+        signature = inspect.signature(getattr(store_cls, method))
+
+        assert "state_key" in signature.parameters
 
 
 class TestFileStateStoreKeying:
