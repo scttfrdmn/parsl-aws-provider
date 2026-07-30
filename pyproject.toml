@@ -8,6 +8,15 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools.packages.find]
 include = ["parsl_ephemeral_aws*"]
 
+# packages.find collects modules, not data files, so without this the
+# CloudFormation and Terraform templates are omitted from the wheel and
+# get_cf_template() cannot find bastion.yml in an installed package (#112).
+[tool.setuptools.package-data]
+parsl_ephemeral_aws = [
+    "templates/cloudformation/*.yml",
+    "templates/terraform/*/*.tf",
+]
+
 [project]
 name = "parsl-ephemeral-aws"
 version = "0.6.0"

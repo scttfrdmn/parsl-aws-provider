@@ -15,7 +15,9 @@ from typing import Dict, Optional, Any
 from datetime import datetime, timedelta
 
 import boto3
-from botocore.exceptions import ClientError, NoCredentialsError
+from botocore.exceptions import ClientError
+
+from ..exceptions import CredentialResolutionError
 
 logger = logging.getLogger(__name__)
 
@@ -314,7 +316,7 @@ class CredentialManager:
 
         Raises
         ------
-        NoCredentialsError
+        CredentialResolutionError
             If no valid credentials can be obtained
         """
         # Check if current credentials are still valid
@@ -350,7 +352,7 @@ class CredentialManager:
 
         Raises
         ------
-        NoCredentialsError
+        CredentialResolutionError
             If no credentials can be obtained
         """
         # Try IAM role assumption first (most secure)
@@ -389,7 +391,7 @@ class CredentialManager:
             except Exception as e:
                 logger.debug(f"Profile credentials not available: {e}")
 
-        raise NoCredentialsError("No valid credentials found")
+        raise CredentialResolutionError("No valid credentials found")
 
     def _assume_role(self) -> CredentialInfo:
         """Assume IAM role for credentials.
@@ -434,7 +436,7 @@ class CredentialManager:
             )
         except ClientError as e:
             logger.error(f"Failed to assume role: {e}")
-            raise NoCredentialsError(f"Role assumption failed: {e}")
+            raise CredentialResolutionError(f"Role assumption failed: {e}")
 
     def _get_instance_profile_credentials(self) -> CredentialInfo:
         """Get credentials from EC2 instance profile.
@@ -449,7 +451,9 @@ class CredentialManager:
             credentials = session.get_credentials()
 
             if not credentials:
-                raise NoCredentialsError("No instance profile credentials available")
+                raise CredentialResolutionError(
+                    "No instance profile credentials available"
+                )
 
             # Instance profile credentials are automatically refreshed by boto3
             return CredentialInfo(
@@ -460,7 +464,9 @@ class CredentialManager:
                 source="instance_profile",
             )
         except Exception as e:
-            raise NoCredentialsError(f"Instance profile credentials not available: {e}")
+            raise CredentialResolutionError(
+                f"Instance profile credentials not available: {e}"
+            )
 
     def _get_environment_credentials(self) -> CredentialInfo:
         """Get credentials from environment variables.
@@ -477,7 +483,7 @@ class CredentialManager:
         session_token = os.environ.get("AWS_SESSION_TOKEN")
 
         if not access_key or not secret_key:
-            raise NoCredentialsError("Environment credentials not available")
+            raise CredentialResolutionError("Environment credentials not available")
 
         return CredentialInfo(
             access_key=access_key,
@@ -500,7 +506,7 @@ class CredentialManager:
             credentials = session.get_credentials()
 
             if not credentials:
-                raise NoCredentialsError(
+                raise CredentialResolutionError(
                     f"Profile {self.config.use_profile} not available"
                 )
 
@@ -512,7 +518,7 @@ class CredentialManager:
                 source=f"profile_{self.config.use_profile}",
             )
         except Exception as e:
-            raise NoCredentialsError(f"Profile credentials not available: {e}")
+            raise CredentialResolutionError(f"Profile credentials not available: {e}")
 
     def create_boto3_session(self, region: str = "us-east-1") -> boto3.Session:
         """Create a boto3 session with current credentials.

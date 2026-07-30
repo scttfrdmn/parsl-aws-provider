@@ -143,10 +143,11 @@ class RetryConfig:
         # Cap at max delay
         delay = min(delay, self.max_delay)
 
-        # Add jitter to avoid thundering herd
+        # Add jitter to avoid thundering herd. Retry spacing is not a security
+        # decision, so the non-cryptographic generator is the right tool.
         if self.jitter:
             jitter_amount = delay * self.jitter_factor
-            delay += random.uniform(-jitter_amount, jitter_amount)
+            delay += random.uniform(-jitter_amount, jitter_amount)  # nosec B311
 
         return max(0, delay)
 

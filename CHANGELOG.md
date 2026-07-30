@@ -258,6 +258,83 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Fargate tasks still have the outbound access they need. The ingress path in
   `network/security.py` already treated `InvalidPermission.Duplicate` as benign
   (closes #110).
+- A Lambda job that outlived its configured timeout could never reach a terminal
+  status. `LambdaManager.get_job_status()` is called with
+  `(function_name, request_id)` and locates the job record by scanning, but the
+  timeout branch's log message interpolated a `job_id` local that is never bound
+  there — raising `NameError`, which the method's blanket `except Exception`
+  converted into `"UNKNOWN"`. `status` was therefore never assigned, so the
+  stored record stayed `PENDING`: Parsl polled the job forever and never released
+  the block. Introduced in `90577ed` (closes #111).
+- `get_cf_template()` raised `ModuleNotFoundError` on every call, taking
+  `DetachedMode.initialize()` with it. It called `pkg_resources.resource_string`
+  but placed the `import pkg_resources` *outside* its own `try`, so once
+  setuptools 81 removed the module the `except ModuleNotFoundError` fallback
+  became unreachable. It now uses `importlib.resources`. The CloudFormation and
+  Terraform templates were also absent from the built wheel —
+  `[tool.setuptools.packages.find]` collects modules, not data files — which was
+  invisible in development because an editable install resolves to the source
+  tree. A missing template now raises `FileNotFoundError` instead of returning a
+  placeholder document with no `Outputs` section, which the bastion path then
+  indexed for `BastionHostId`, failing several steps from the real cause
+  (closes #112).
+- `ServerlessMode` loaded both of its CloudFormation templates by filesystem
+  path, computed from `__file__`, rather than through `get_cf_template()`. An
+  installed wheel raised `FileNotFoundError` on the first Lambda or ECS
+  submission (closes #113).
+- The Spot Fleet capacity check read `FulfilledCapacity` from the top level of
+  the `DescribeSpotFleetRequests` entry, where it does not exist — both
+  capacities live in the nested `SpotFleetRequestConfig`. The `.get(..., 0)`
+  default meant `0 >= target_capacity` was false for any capacity of 1 or more,
+  so a fully provisioned fleet reported `PENDING` forever, never reached a
+  terminal state, and Parsl never released the block (closes #114).
+- Every `ServerlessMode.submit_job()` raised `KeyError`. Both submit helpers
+  finish by calling `self.resources[resource_id].update(...)` to record the
+  stack name, but the tracking record was not created until after they returned
+  — so the update raised inside the helper's blanket `except Exception` and
+  surfaced as an opaque `Failed to submit ECS job: 'serverless-ecs-<job>'`. The
+  CloudFormation stack was created before that point and left untracked, so
+  nothing could clean it up. The record is now created before dispatch, and a
+  failed submit cleans up the partially created stack (closes #115).
+- Lambda deployment packages were passed to CloudFormation as a latin1-decoded
+  string in the `CodeZipContent` parameter. That is neither the base64 the
+  template documents nor legal XML — 117 of its codepoints are control
+  characters that XML 1.0 forbids in character data — so CloudFormation's own
+  `DescribeStacks` echo of the parameter came back unparseable and every Lambda
+  job reported `UNKNOWN` forever. `AWS::Lambda::Function`'s `ZipFile` also takes
+  inline source text capped at 4096 bytes, not archive bytes, so even correct
+  base64 would have deployed a broken function. Packages are now staged in S3
+  and referenced by `CodeS3Bucket`/`CodeS3Key`, which the template already
+  supported. A caller-supplied `checkpoint_bucket` is reused if present;
+  otherwise a provider-scoped bucket is created and removed on cleanup
+  (closes #116).
+- All four compute managers ignored `provider.session` and built their own from
+  the credential manager, so an explicitly configured session — temporary role
+  credentials, a chosen profile, a LocalStack `endpoint_url` — was silently
+  replaced by one assembled from ambient environment credentials, possibly
+  pointing at a different account. It also meant an injected test double was
+  ignored and the manager reached real AWS; a unit test created a live ECS
+  cluster this way. New `resolve_manager_session()` prefers the caller's
+  session, mirroring the fix already applied to the state stores. The dead
+  "legacy fallback" in `LambdaManager` — unreachable by its own `if`, but which
+  still dereferenced four provider attributes that `EphemeralAWSProvider` does
+  not define — is removed (closes #117).
+- `ServerlessMode.save_state()` omitted `worker_type`, the field that determines
+  whether the three network IDs are required at all, so a state document could
+  not be interpreted without it (closes #118).
+- Every credential-resolution failure raised `TypeError` rather than a
+  credentials error. `security/credential_manager.py` called
+  `NoCredentialsError(f"...")` at seven sites, but botocore's `BotoCoreError`
+  accepts keyword arguments only, so each raised
+  `TypeError: BotoCoreError.__init__() takes 1 positional argument but 2 were
+  given` and the reason never reached the caller. Handlers that catch
+  `NoCredentialsError` — in all four compute managers and `error_handling.py` —
+  did not catch it. A new `CredentialResolutionError` subclasses the botocore
+  class, so those handlers keep working and the message survives (closes #121).
+- `SecureStateManager.verify_state_integrity()` returned `True` for a path that
+  does not exist. It reported success when `load_secure_state()` raised nothing,
+  but that method deliberately swallows `FileNotFoundError` and returns `{}` so
+  a first run can proceed with no saved state (closes #122).
 
 ### Added
 - **One-shot mode** for `StandardMode`: set `one_shot=True` to declare that each
@@ -333,6 +410,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   auto-creation, then `None`.
 
 ### Changed
+- **CI is one workflow.** `ci.yml` and `ci-cd.yml` were near-duplicate pipelines
+  that between them ran the same unit suite five times, over Python 3.8 and 3.9,
+  which `requires-python = ">=3.10"` excludes. `ci-cd.yml` is deleted; `ci.yml`
+  now carries lint, type-check, unit, integration, real-AWS, bats, build, and
+  docs jobs, all on `uv sync --locked` rather than `pip install -e`. `ci-cd.yml`
+  also held a second PyPI publish job triggered by `release: published`, so a tag
+  push followed by a published release ran two independent uploads; `release.yml`
+  is now the only publish path (closes #83).
+- `release.yml` verifies the pushed tag against `parsl_ephemeral_aws.__version__`
+  before building. `bump-my-version` has silently missed `__init__.py` before —
+  v0.6.0 shipped with `__version__ == "0.1.0"` — and a PyPI version can never be
+  reused. Publishing now uses trusted publishing via OIDC instead of a
+  `PYPI_API_TOKEN` secret, and the release is created with `gh release create`;
+  `actions/create-release` and `actions/upload-release-asset` are both archived.
+- The build job asserts the CloudFormation templates are present in the wheel, so
+  a packaging regression fails in CI rather than at runtime on a real AWS call
+  (refs #112).
+- A `workflow_dispatch` job runs the 51 real-AWS tests in `tests/aws`, which no
+  workflow referenced — #60 closed with them unreachable in CI. Credentials come
+  from OIDC, and a final always-run step reports orphaned resources (refs #83).
+- Test selection is by path, not `-m unit`. The Makefile selected `-m unit`, which
+  collected 88 of 295 tests and passed while CI ran the full set and failed. An
+  unmarked new file now still runs. `pytestmark = pytest.mark.unit` was added to
+  the 11 unmarked unit files and to `tests/security`, which had 92 tests and no
+  markers at all.
+- `--cov-fail-under` in `pyproject.toml` is 25, a smoke floor, because `addopts`
+  applies to narrow invocations too — `pytest tests/integration` alone measures
+  34%. The gate that matters is `--cov-fail-under=65` on the CI unit-tests job,
+  which runs `tests/unit` and `tests/security` together at 68%.
+- Formatting is ruff-format only. `black` and `isort` are removed from the `dev`
+  extra and their config from `pyproject.toml`: `[tool.black] line-length = 100`
+  disagreed with the 88-character default that every file is actually formatted
+  to, so running black reformatted ~80 unrelated lines. The `ruff-pre-commit` pin
+  moved from v0.2.2 to the version `uv.lock` resolves, because the two disagreed
+  on comprehension-conditional parenthesization and each would undo the other's
+  output.
+- The two standing `bandit` findings are annotated with `# nosec` and a reason
+  rather than left to fail the new lint gate: retry jitter is not a security
+  decision, and LocalStack's `test`/`test` credentials authenticate against
+  nothing real. `bandit -r parsl_ephemeral_aws` now exits 0.
+- Non-AWS-marked tests now run with synthetic credentials and `AWS_PROFILE`
+  unset. A `@mock_aws`-decorated *class* only wraps its `test_*` methods, so a
+  fixture on that class runs outside the mock — one reached the live account and
+  failed `VpcLimitExceeded` against production VPCs. An un-mocked call now fails
+  as an auth error against a fake account instead of mutating a real one.
 - `vpc_id`, `subnet_id`, and `security_group_id` are no longer required for
   Lambda-only serverless mode. `compute/lambda_func.py` references none of them
   and `create_function` passes no `VpcConfig`, so functions run in the

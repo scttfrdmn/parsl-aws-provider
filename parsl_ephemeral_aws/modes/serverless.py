@@ -10,8 +10,6 @@ SPDX-FileCopyrightText: 2025 Scott Friedman and Project Contributors
 import logging
 import time
 import json
-import os
-import tempfile
 from typing import Any, Dict, List, Optional
 
 import boto3
@@ -52,6 +50,7 @@ from parsl_ephemeral_aws.compute.spot_interruption import (
     SpotInterruptionMonitor,
     ParslSpotInterruptionHandler,
 )
+from parsl_ephemeral_aws.utils.aws import get_cf_template
 
 
 logger = logging.getLogger(__name__)
@@ -270,6 +269,12 @@ class ServerlessMode(OperatingMode):
         self.ecs_manager: Optional[ECSManager] = None
         self.cf_client = self.session.client("cloudformation")
 
+        # Bucket that stages Lambda deployment packages, resolved on first use.
+        # _owns_lambda_code_bucket records whether we created it, so a
+        # caller-supplied checkpoint_bucket is never deleted on cleanup.
+        self._lambda_code_bucket: Optional[str] = None
+        self._owns_lambda_code_bucket = False
+
         # Initialize spot interruption handling if enabled
         self.spot_interruption_monitor = None
         self.spot_interruption_handler = None
@@ -427,13 +432,32 @@ class ServerlessMode(OperatingMode):
             f"Submitting job {job_id} ({job_name if job_name else 'unnamed'}) in serverless mode"
         )
 
+        # Select worker type
+        worker_type = self._select_worker_type(command, tasks_per_node)
+
+        # Resource ID will be the CloudFormation stack for the job
+        resource_id = f"serverless-{worker_type}-{job_id}"
+
+        # Track the resource *before* dispatching. Both submit helpers finish by
+        # calling self.resources[resource_id].update(...) to record the stack
+        # name, so creating the record afterwards made every submit -- Lambda and
+        # ECS alike -- raise KeyError from inside the helper's blanket
+        # `except Exception`, surfacing as an opaque
+        # "Failed to submit ECS job: 'serverless-ecs-<job>'". The stack was
+        # created before that point and left untracked, so nothing could ever
+        # clean it up (#115).
+        self.resources[resource_id] = {
+            "id": resource_id,
+            "job_id": job_id,
+            "job_name": job_name or "unnamed",
+            "worker_type": worker_type,
+            "command": command,
+            "tasks_per_node": tasks_per_node,
+            "status": STATUS_PENDING,
+            "created_at": time.time(),
+        }
+
         try:
-            # Select worker type
-            worker_type = self._select_worker_type(command, tasks_per_node)
-
-            # Resource ID will be the CloudFormation stack for the job
-            resource_id = f"serverless-{worker_type}-{job_id}"
-
             # Submit job to the appropriate service using CloudFormation
             if worker_type == WORKER_TYPE_LAMBDA:
                 if not self.lambda_manager:
@@ -455,18 +479,6 @@ class ServerlessMode(OperatingMode):
                     job_id, command, tasks_per_node, job_name, resource_id
                 )
 
-            # Add resource to tracking
-            self.resources[resource_id] = {
-                "id": resource_id,
-                "job_id": job_id,
-                "job_name": job_name or "unnamed",
-                "worker_type": worker_type,
-                "command": command,
-                "tasks_per_node": tasks_per_node,
-                "status": STATUS_PENDING,
-                "created_at": time.time(),
-            }
-
             # Save state
             self.save_state()
 
@@ -475,6 +487,16 @@ class ServerlessMode(OperatingMode):
 
         except Exception as e:
             logger.error(f"Failed to submit job {job_id}: {e}")
+            # A partially created stack must not outlive the failed submit.
+            # cleanup_resources() deletes the stack when one was recorded and
+            # drops the tracking entry either way.
+            try:
+                self.cleanup_resources([resource_id])
+            except Exception as cleanup_error:  # pragma: no cover - best effort
+                logger.error(
+                    f"Failed to clean up after failed submit of {job_id}: "
+                    f"{cleanup_error}"
+                )
             raise OperatingModeError(f"Failed to submit job {job_id}: {e}") from e
 
     def _submit_lambda_job(
@@ -504,88 +526,131 @@ class ServerlessMode(OperatingMode):
             # Generate Lambda function code
             code_zip = self.lambda_manager._generate_lambda_code(command)
 
-            # Create temporary file with code
-            with tempfile.NamedTemporaryFile(delete=False) as tmp:
-                tmp.write(code_zip)
-                tmp_path = tmp.name
+            # Stage the zip in S3 and reference it by key. The archive cannot
+            # travel through a CloudFormation string parameter: it was previously
+            # latin1-decoded into `CodeZipContent`, which is neither the base64
+            # the template documents nor legal XML -- 117 of its codepoints are
+            # control characters that XML 1.0 forbids in character data, so
+            # CloudFormation's own DescribeStacks echo of the parameter came back
+            # unparseable and every Lambda job reported UNKNOWN forever. And
+            # `AWS::Lambda::Function`'s ZipFile takes inline source text (capped
+            # at 4096 bytes), not archive bytes, so even correct base64 would
+            # deploy a broken function (#116).
+            code_bucket = self._ensure_lambda_code_bucket()
+            code_key = f"lambda-code/{self.provider_id}/{job_id}.zip"
+            self.session.client("s3").put_object(
+                Bucket=code_bucket, Key=code_key, Body=code_zip
+            )
 
-            try:
-                # Encode zip file for CloudFormation
-                with open(tmp_path, "rb") as f:
-                    code_content = f.read()
+            # Deploy Lambda function using CloudFormation
+            stack_name = f"parsl-lambda-{job_id[:8]}"
+            template_body = get_cf_template("lambda_worker.yml")
 
-                # Deploy Lambda function using CloudFormation
-                stack_name = f"parsl-lambda-{job_id[:8]}"
-                template_path = os.path.join(
-                    os.path.dirname(os.path.dirname(__file__)),
-                    "templates/cloudformation/lambda_worker.yml",
-                )
-
-                with open(template_path, "r") as f:
-                    template_body = f.read()
-
-                # Create CloudFormation stack
-                self.cf_client.create_stack(
-                    StackName=stack_name,
-                    TemplateBody=template_body,
-                    Parameters=[
-                        {
-                            "ParameterKey": "FunctionName",
-                            "ParameterValue": f"parsl-lambda-{job_id}",
-                        },
-                        {
-                            "ParameterKey": "Runtime",
-                            "ParameterValue": self.lambda_runtime,
-                        },
-                        {
-                            "ParameterKey": "Handler",
-                            "ParameterValue": DEFAULT_LAMBDA_HANDLER,
-                        },
-                        {
-                            "ParameterKey": "MemorySize",
-                            "ParameterValue": str(self.lambda_memory),
-                        },
-                        {
-                            "ParameterKey": "Timeout",
-                            "ParameterValue": str(self.lambda_timeout),
-                        },
-                        {
-                            "ParameterKey": "CodeZipContent",
-                            "ParameterValue": code_content.decode("latin1"),
-                        },
-                        {
-                            "ParameterKey": "WorkflowId",
-                            "ParameterValue": self.provider_id,
-                        },
-                        {"ParameterKey": "JobId", "ParameterValue": job_id},
-                    ],
-                    Tags=[
-                        {"Key": "CreatedBy", "Value": "ParslEphemeralAWSProvider"},
-                        {"Key": "ProviderId", "Value": self.provider_id},
-                        {"Key": "JobId", "Value": job_id},
-                    ],
-                    Capabilities=["CAPABILITY_IAM"],
-                )
-
-                # Store reference to stack in resource data
-                self.resources[resource_id].update(
+            # Create CloudFormation stack
+            self.cf_client.create_stack(
+                StackName=stack_name,
+                TemplateBody=template_body,
+                Parameters=[
                     {
-                        "stack_name": stack_name,
-                        "resource_type": RESOURCE_TYPE_LAMBDA_FUNCTION,
-                    }
-                )
+                        "ParameterKey": "FunctionName",
+                        "ParameterValue": f"parsl-lambda-{job_id}",
+                    },
+                    {
+                        "ParameterKey": "Runtime",
+                        "ParameterValue": self.lambda_runtime,
+                    },
+                    {
+                        "ParameterKey": "Handler",
+                        "ParameterValue": DEFAULT_LAMBDA_HANDLER,
+                    },
+                    {
+                        "ParameterKey": "MemorySize",
+                        "ParameterValue": str(self.lambda_memory),
+                    },
+                    {
+                        "ParameterKey": "Timeout",
+                        "ParameterValue": str(self.lambda_timeout),
+                    },
+                    {"ParameterKey": "CodeS3Bucket", "ParameterValue": code_bucket},
+                    {"ParameterKey": "CodeS3Key", "ParameterValue": code_key},
+                    {
+                        "ParameterKey": "WorkflowId",
+                        "ParameterValue": self.provider_id,
+                    },
+                    {"ParameterKey": "JobId", "ParameterValue": job_id},
+                ],
+                Tags=[
+                    {"Key": "CreatedBy", "Value": "ParslEphemeralAWSProvider"},
+                    {"Key": "ProviderId", "Value": self.provider_id},
+                    {"Key": "JobId", "Value": job_id},
+                ],
+                Capabilities=["CAPABILITY_IAM"],
+            )
 
-                logger.debug(
-                    f"Created CloudFormation stack {stack_name} for Lambda job {job_id}"
-                )
+            # Store reference to stack in resource data. The code location is
+            # recorded so cleanup_resources() can delete the object.
+            self.resources[resource_id].update(
+                {
+                    "stack_name": stack_name,
+                    "resource_type": RESOURCE_TYPE_LAMBDA_FUNCTION,
+                    "code_bucket": code_bucket,
+                    "code_key": code_key,
+                }
+            )
 
-            finally:
-                # Clean up temporary file
-                os.unlink(tmp_path)
+            logger.debug(
+                f"Created CloudFormation stack {stack_name} for Lambda job {job_id}"
+            )
 
         except Exception as e:
             logger.error(f"Failed to submit Lambda job {job_id}: {e}")
             raise JobSubmissionError(f"Failed to submit Lambda job: {e}") from e
+
+    def _ensure_lambda_code_bucket(self) -> str:
+        """Return the S3 bucket used to stage Lambda deployment packages.
+
+        Prefers ``checkpoint_bucket`` when the caller supplied one, so a
+        configured bucket is reused rather than a second one created. Otherwise a
+        provider-scoped bucket is created on first use and removed by
+        ``cleanup_infrastructure()``.
+
+        Returns
+        -------
+        str
+            Name of the bucket to stage deployment packages in.
+        """
+        if self._lambda_code_bucket:
+            return self._lambda_code_bucket
+
+        if self.checkpoint_bucket:
+            self._lambda_code_bucket = self.checkpoint_bucket
+            return self._lambda_code_bucket
+
+        s3 = self.session.client("s3")
+        region = self.session.region_name
+        bucket = f"parsl-lambda-code-{self.provider_id[:8]}"
+
+        try:
+            # us-east-1 is the one region CreateBucket rejects a
+            # LocationConstraint for.
+            if region and region != "us-east-1":
+                s3.create_bucket(
+                    Bucket=bucket,
+                    CreateBucketConfiguration={"LocationConstraint": region},
+                )
+            else:
+                s3.create_bucket(Bucket=bucket)
+            self._owns_lambda_code_bucket = True
+            logger.debug(f"Created Lambda code bucket {bucket}")
+        except ClientError as e:
+            code = e.response.get("Error", {}).get("Code")
+            # Already ours (a restart, or a second job in the same run).
+            if code not in ("BucketAlreadyOwnedByYou", "BucketAlreadyExists"):
+                raise
+            logger.debug(f"Reusing existing Lambda code bucket {bucket}")
+
+        self._lambda_code_bucket = bucket
+        return bucket
 
     def _submit_ecs_job(
         self,
@@ -625,13 +690,7 @@ class ServerlessMode(OperatingMode):
         try:
             # Deploy ECS task using CloudFormation
             stack_name = f"parsl-ecs-{job_id[:8]}"
-            template_path = os.path.join(
-                os.path.dirname(os.path.dirname(__file__)),
-                "templates/cloudformation/ecs_worker.yml",
-            )
-
-            with open(template_path, "r") as f:
-                template_body = f.read()
+            template_body = get_cf_template("ecs_worker.yml")
 
             # Create CloudFormation stack
             self.cf_client.create_stack(
@@ -763,9 +822,9 @@ class ServerlessMode(OperatingMode):
 
                             if fleet_request_id:
                                 # Save fleet ID in resource data
-                                self.resources[resource_id][
-                                    "fleet_request_id"
-                                ] = fleet_request_id
+                                self.resources[resource_id]["fleet_request_id"] = (
+                                    fleet_request_id
+                                )
 
                                 # Register with interruption monitor
                                 self.spot_interruption_monitor.register_fleet(
@@ -878,16 +937,16 @@ class ServerlessMode(OperatingMode):
                             if fleet_request_id:
                                 # If we haven't stored the fleet_request_id yet, do so
                                 if "fleet_request_id" not in resource:
-                                    self.resources[resource_id][
-                                        "fleet_request_id"
-                                    ] = fleet_request_id
+                                    self.resources[resource_id]["fleet_request_id"] = (
+                                        fleet_request_id
+                                    )
                                     from parsl_ephemeral_aws.constants import (
                                         RESOURCE_TYPE_SPOT_FLEET,
                                     )
 
-                                    self.resources[resource_id][
-                                        "resource_type"
-                                    ] = RESOURCE_TYPE_SPOT_FLEET
+                                    self.resources[resource_id]["resource_type"] = (
+                                        RESOURCE_TYPE_SPOT_FLEET
+                                    )
 
                                 # Check SpotFleet status
                                 status = self._get_spot_fleet_status(fleet_request_id)
@@ -1016,11 +1075,18 @@ class ServerlessMode(OperatingMode):
             if fleet_status == "submitted":
                 return STATUS_PENDING
             elif fleet_status == "active":
-                # Check if target capacity is fulfilled
-                fulfilled_capacity = fleet_config.get("FulfilledCapacity", 0)
-                target_capacity = fleet_config.get("SpotFleetRequestConfig", {}).get(
-                    "TargetCapacity", 0
-                )
+                # Check if target capacity is fulfilled. Both capacities live in
+                # the nested SpotFleetRequestConfig; the entry itself carries only
+                # ActivityStatus/CreateTime/SpotFleetRequestConfig/
+                # SpotFleetRequestId/SpotFleetRequestState/Tags. Reading
+                # FulfilledCapacity from the top level always yielded the 0
+                # default, so `0 >= target_capacity` was false for any capacity
+                # >= 1 and a fully provisioned fleet reported PENDING forever --
+                # never terminal, so Parsl polled it and never freed the block
+                # (#114).
+                config_data = fleet_config.get("SpotFleetRequestConfig", {})
+                fulfilled_capacity = config_data.get("FulfilledCapacity", 0)
+                target_capacity = config_data.get("TargetCapacity", 0)
 
                 if fulfilled_capacity >= target_capacity:
                     # All requested instances are running
@@ -1247,6 +1313,10 @@ class ServerlessMode(OperatingMode):
             if not resource:
                 continue
 
+            # Drop the staged Lambda deployment package, if any. Done before the
+            # stack delete so the object goes even when the stack is already gone.
+            self._delete_staged_lambda_code(resource)
+
             # Get stack name
             stack_name = resource.get("stack_name")
             if not stack_name:
@@ -1284,6 +1354,55 @@ class ServerlessMode(OperatingMode):
         # Save state with updated resources
         self.save_state()
 
+    def _delete_staged_lambda_code(self, resource: Dict[str, Any]) -> None:
+        """Delete the S3 object staging a job's Lambda deployment package.
+
+        Parameters
+        ----------
+        resource : Dict[str, Any]
+            Resource tracking record; ignored unless it carries both
+            ``code_bucket`` and ``code_key``.
+        """
+        bucket = resource.get("code_bucket")
+        key = resource.get("code_key")
+        if not bucket or not key:
+            return
+
+        try:
+            self.session.client("s3").delete_object(Bucket=bucket, Key=key)
+            logger.debug(f"Deleted staged Lambda code s3://{bucket}/{key}")
+        except Exception as e:
+            logger.warning(f"Failed to delete staged Lambda code {key}: {e}")
+
+    def _delete_lambda_code_bucket(self) -> None:
+        """Delete the Lambda code bucket, but only if this mode created it.
+
+        A caller-supplied ``checkpoint_bucket`` is left alone: it belongs to the
+        caller and may hold checkpoints.
+        """
+        if not self._owns_lambda_code_bucket or not self._lambda_code_bucket:
+            return
+
+        bucket = self._lambda_code_bucket
+        s3 = self.session.client("s3")
+
+        try:
+            # A bucket must be empty before it can be deleted; any objects left
+            # here are packages whose jobs never reached cleanup_resources().
+            paginator = s3.get_paginator("list_objects_v2")
+            for page in paginator.paginate(Bucket=bucket):
+                objects = [{"Key": obj["Key"]} for obj in page.get("Contents", [])]
+                if objects:
+                    s3.delete_objects(Bucket=bucket, Delete={"Objects": objects})
+
+            s3.delete_bucket(Bucket=bucket)
+            logger.debug(f"Deleted Lambda code bucket {bucket}")
+        except Exception as e:
+            logger.warning(f"Failed to delete Lambda code bucket {bucket}: {e}")
+        finally:
+            self._lambda_code_bucket = None
+            self._owns_lambda_code_bucket = False
+
     def cleanup_infrastructure(self) -> None:
         """Clean up infrastructure created by this mode.
 
@@ -1313,6 +1432,9 @@ class ServerlessMode(OperatingMode):
                 self.lambda_manager.cleanup_all_resources()
             except Exception as e:
                 logger.error(f"Error cleaning up Lambda manager resources: {e}")
+
+        # Drop the deployment-package bucket if this mode created it.
+        self._delete_lambda_code_bucket()
 
         if self.ecs_manager:
             try:
@@ -1472,9 +1594,20 @@ class ServerlessMode(OperatingMode):
             "subnet_id": self.subnet_id,
             "security_group_id": self.security_group_id,
             "initialized": self.initialized,
+            # The routing decision belongs in the document: it is what determines
+            # whether the three network IDs above were required at all (Lambda
+            # needs none of them, ECS needs subnet + SG), so a document without it
+            # cannot be interpreted. Not restored by load_state() — the
+            # constructor value is authoritative for every configuration field,
+            # the same rule _restore_network_ids() follows (#118).
+            "worker_type": self.worker_type,
             "use_spot": self.use_spot,
             "use_spot_fleet": self.use_spot_fleet,
             "spot_interruption_handling": self.spot_interruption_handling,
+            # Persisted so a restarted provider can still delete a bucket it
+            # created, rather than leaking it.
+            "lambda_code_bucket": self._lambda_code_bucket,
+            "owns_lambda_code_bucket": self._owns_lambda_code_bucket,
         }
 
         try:
@@ -1496,6 +1629,10 @@ class ServerlessMode(OperatingMode):
                 self.resources = state.get("resources", {})
                 self._restore_network_ids(state)
                 self.initialized = state.get("initialized", False)
+                self._lambda_code_bucket = state.get("lambda_code_bucket")
+                self._owns_lambda_code_bucket = state.get(
+                    "owns_lambda_code_bucket", False
+                )
 
                 # Check if spot interruption handling was previously enabled
                 previous_spot_handling = state.get("spot_interruption_handling", False)

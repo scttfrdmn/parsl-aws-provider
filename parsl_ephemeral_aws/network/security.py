@@ -35,9 +35,9 @@ class SecurityGroupManager:
         session_kwargs = {}
         if self.provider.aws_access_key_id and self.provider.aws_secret_access_key:
             session_kwargs["aws_access_key_id"] = self.provider.aws_access_key_id
-            session_kwargs[
-                "aws_secret_access_key"
-            ] = self.provider.aws_secret_access_key
+            session_kwargs["aws_secret_access_key"] = (
+                self.provider.aws_secret_access_key
+            )
 
         if self.provider.aws_session_token:
             session_kwargs["aws_session_token"] = self.provider.aws_session_token

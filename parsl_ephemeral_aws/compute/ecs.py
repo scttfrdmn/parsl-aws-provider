@@ -32,7 +32,7 @@ from ..security import (
     SecurityEvent,
 )
 from ..error_handling import RobustErrorHandler, RetryConfig
-from ..utils.aws import get_or_create_iam_role
+from ..utils.aws import get_or_create_iam_role, resolve_manager_session
 
 
 logger = logging.getLogger(__name__)
@@ -112,10 +112,16 @@ class ECSManager:
 
             raise ResourceCreationError(f"Credential initialization failed: {e}")
 
-        # Initialize AWS session using credential manager
+        # Resolve the AWS session. The caller's own session takes precedence;
+        # the credential manager is only a fallback for a provider that has
+        # none. Going straight to the credential manager discarded an
+        # explicitly configured session -- role credentials, a chosen profile,
+        # a LocalStack endpoint -- in favour of ambient environment
+        # credentials, so operations could land in a different account than the
+        # caller selected (#117).
         try:
-            self.aws_session = self.credential_manager.create_boto3_session(
-                region=self.provider.region
+            self.aws_session = resolve_manager_session(
+                self.provider, self.credential_manager
             )
         except NoCredentialsError as e:
             logger.error(f"No valid AWS credentials found: {e}")

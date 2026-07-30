@@ -1665,9 +1665,9 @@ if __name__ == '__main__':
                         self.resources[resource_id]["fleet_request_id"] = status_data[
                             "fleet_request_id"
                         ]
-                        self.resources[resource_id][
-                            "resource_type"
-                        ] = RESOURCE_TYPE_SPOT_FLEET
+                        self.resources[resource_id]["resource_type"] = (
+                            RESOURCE_TYPE_SPOT_FLEET
+                        )
 
                     if "all_instance_ids" in status_data:
                         self.resources[resource_id]["all_instance_ids"] = status_data[

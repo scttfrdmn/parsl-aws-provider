@@ -528,8 +528,19 @@ class SecureStateManager:
         Returns
         -------
         bool
-            True if state integrity is verified
+            True if state integrity is verified. A file that does not exist is
+            not verifiable, so this is False.
         """
+        # A missing file cannot be verified. ``load_secure_state`` deliberately
+        # swallows FileNotFoundError and returns {} so a first run can proceed
+        # with no saved state -- but that made the load below succeed, and this
+        # method reported a nonexistent path as intact.
+        if not os.path.exists(storage_path):
+            logger.error(
+                f"State integrity verification failed: no such file: {storage_path}"
+            )
+            return False
+
         try:
             # Try to load and decrypt the state
             self.load_secure_state(storage_path)

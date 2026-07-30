@@ -38,6 +38,7 @@ from ..constants import (
     DEFAULT_VPC_CIDR,
 )
 from ..config import SecurityConfig
+from ..utils.aws import resolve_manager_session
 from ..security import (
     CredentialManager,
     CredentialConfiguration,
@@ -141,10 +142,16 @@ class SpotFleetManager:
 
             raise ResourceCreationError(f"Credential initialization failed: {e}")
 
-        # Initialize AWS session using credential manager
+        # Resolve the AWS session. The caller's own session takes precedence;
+        # the credential manager is only a fallback for a provider that has
+        # none. Going straight to the credential manager discarded an
+        # explicitly configured session -- role credentials, a chosen profile,
+        # a LocalStack endpoint -- in favour of ambient environment
+        # credentials, so operations could land in a different account than the
+        # caller selected (#117).
         try:
-            self.aws_session = self.credential_manager.create_boto3_session(
-                region=self.provider.region
+            self.aws_session = resolve_manager_session(
+                self.provider, self.credential_manager
             )
         except NoCredentialsError as e:
             logger.error(f"No valid AWS credentials found: {e}")
@@ -638,9 +645,9 @@ class SpotFleetManager:
             ].append({"Key": key, "Value": value})
 
         # Configure fleet to terminate instances when the request is cancelled
-        request_params["SpotFleetRequestConfig"][
-            "TerminateInstancesWithExpiration"
-        ] = True
+        request_params["SpotFleetRequestConfig"]["TerminateInstancesWithExpiration"] = (
+            True
+        )
 
         # Set a max price if specified
         if self.provider.spot_max_price_percentage:
