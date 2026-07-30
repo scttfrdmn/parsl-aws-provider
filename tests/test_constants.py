@@ -34,3 +34,15 @@ def test_tag_values():
     assert constants.TAG_WORKFLOW_ID == "WorkflowId"
     assert constants.TAG_BLOCK_ID == "BlockId"
     assert constants.TAG_JOB_ID == "JobId"
+
+
+def test_managed_marker_is_not_the_name_key():
+    """The provider-managed marker must not collide with ``Name`` (#109).
+
+    Resources are tagged with both a descriptive ``Name`` and a marker meaning
+    "this provider created it". While the marker key *was* ``TAG_NAME``, every
+    such tag list sent ``Name`` twice and EC2 rejected the whole request with
+    ``Duplicate tag key 'Name' specified.``
+    """
+    assert constants.TAG_MANAGED == "ParslEphemeralManaged"
+    assert constants.TAG_MANAGED != constants.TAG_NAME

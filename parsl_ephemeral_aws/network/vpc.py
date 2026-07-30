@@ -13,7 +13,7 @@ from botocore.exceptions import ClientError
 from ..exceptions import ResourceCreationError, ResourceCleanupError
 from ..constants import (
     TAG_PREFIX,
-    TAG_NAME,
+    TAG_MANAGED,
     TAG_WORKFLOW_ID,
     DEFAULT_VPC_CIDR,
     DEFAULT_SUBNET_CIDR,
@@ -95,7 +95,7 @@ class VPCManager:
                                 "Key": "Name",
                                 "Value": f"{TAG_PREFIX}-vpc-{self.provider.workflow_id}",
                             },
-                            {"Key": TAG_NAME, "Value": "true"},
+                            {"Key": TAG_MANAGED, "Value": "true"},
                             {
                                 "Key": TAG_WORKFLOW_ID,
                                 "Value": self.provider.workflow_id,
@@ -162,7 +162,7 @@ class VPCManager:
                                 "Key": "Name",
                                 "Value": f"{TAG_PREFIX}-igw-{self.provider.workflow_id}",
                             },
-                            {"Key": TAG_NAME, "Value": "true"},
+                            {"Key": TAG_MANAGED, "Value": "true"},
                             {
                                 "Key": TAG_WORKFLOW_ID,
                                 "Value": self.provider.workflow_id,
@@ -233,7 +233,7 @@ class VPCManager:
                                 "Key": "Name",
                                 "Value": f"{TAG_PREFIX}-subnet-{self.provider.workflow_id}",
                             },
-                            {"Key": TAG_NAME, "Value": "true"},
+                            {"Key": TAG_MANAGED, "Value": "true"},
                             {
                                 "Key": TAG_WORKFLOW_ID,
                                 "Value": self.provider.workflow_id,
@@ -304,7 +304,7 @@ class VPCManager:
                                 "Key": "Name",
                                 "Value": f"{TAG_PREFIX}-rt-{self.provider.workflow_id}",
                             },
-                            {"Key": TAG_NAME, "Value": "true"},
+                            {"Key": TAG_MANAGED, "Value": "true"},
                             {
                                 "Key": TAG_WORKFLOW_ID,
                                 "Value": self.provider.workflow_id,

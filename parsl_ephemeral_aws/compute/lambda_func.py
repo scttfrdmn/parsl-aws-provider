@@ -25,7 +25,7 @@ from ..error_handling import RobustErrorHandler, RetryConfig
 from ..utils.aws import get_or_create_iam_role
 from ..constants import (
     TAG_PREFIX,
-    TAG_NAME,
+    TAG_MANAGED,
     TAG_WORKFLOW_ID,
     TAG_JOB_ID,
     DEFAULT_LAMBDA_RUNTIME,
@@ -241,7 +241,7 @@ class LambdaManager:
                 "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
             ],
             tags=[
-                {"Key": TAG_NAME, "Value": "true"},
+                {"Key": TAG_MANAGED, "Value": "true"},
                 {"Key": TAG_WORKFLOW_ID, "Value": self.provider.workflow_id},
             ],
             description=f"Execution role for Parsl Lambda functions ({self.provider.workflow_id})",
@@ -299,7 +299,7 @@ class LambdaManager:
                 ),  # Lambda max is 900s (15 min)
                 MemorySize=self.provider.lambda_memory,
                 Tags={
-                    TAG_NAME: "true",
+                    TAG_MANAGED: "true",
                     TAG_WORKFLOW_ID: self.provider.workflow_id,
                     TAG_JOB_ID: job_id,
                 },

@@ -235,6 +235,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reachable count. The check existed before the v0.1.0 rewrite and was lost; the
   only surviving record was a test in a file that had failed at collection since
   `MODE_STANDARD` was removed from `constants.py` (closes #108).
+- Every tagged resource was created with a duplicate `Name` tag key, which EC2
+  rejects. The marker tag identifying a resource as provider-managed was emitted
+  as `TAG_NAME`, and `TAG_NAME` is the literal string `"Name"` — so each tag list
+  carrying a descriptive `Name` *and* the marker sent `Name` twice. Verified
+  against real AWS: `run_instances` fails with `InvalidParameterValue: Duplicate
+  tag key 'Name' specified.`, `create_security_group` the same, and
+  `request_spot_fleet` with `InvalidSpotFleetRequestConfig`. `moto` accepts
+  duplicate keys and silently keeps the last value, so the collision was
+  invisible under test while overwriting the descriptive name with `"true"`. The
+  marker is now a distinct `TAG_MANAGED = "ParslEphemeralManaged"`. `TAG_NAME`
+  remains `"Name"` for descriptive tags. Introduced in `f9f7def`, which flattened
+  `TAG_NAME` from `"parsl-ephemeral-resource"` to `"Name"` "as an alias for
+  backward compatibility" (closes #109).
+- `ECSManager._get_or_create_network_resources()` called
+  `authorize_security_group_egress` on a security group it had just created. EC2
+  attaches an allow-all-outbound rule to every new security group, so
+  re-authorizing it raises `InvalidPermission.Duplicate: the specified rule
+  "peer: 0.0.0.0/0, ALL, ALLOW" already exists`, which was re-raised as
+  `ResourceCreationError` and then wrapped as `JobSubmissionError` — making the
+  create-security-group branch impossible to complete. The call is removed;
+  Fargate tasks still have the outbound access they need. The ingress path in
+  `network/security.py` already treated `InvalidPermission.Duplicate` as benign
+  (closes #110).
 
 ### Added
 - **One-shot mode** for `StandardMode`: set `one_shot=True` to declare that each

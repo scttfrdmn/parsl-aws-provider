@@ -131,6 +131,18 @@ DEFAULT_SPOT_MAX_RECOVERY_ATTEMPTS = 3
 DEFAULT_TAG_PREFIX = "parsl-ephemeral"
 TAG_PREFIX = DEFAULT_TAG_PREFIX  # Alias for compatibility
 TAG_NAME = "Name"
+# Marker tag identifying a resource as created by this provider (#109).
+#
+# This used to be TAG_NAME, which is the EC2-reserved "Name" key. Every tag list
+# that carried a descriptive Name *and* the marker therefore sent "Name" twice,
+# and EC2 rejects duplicate tag keys -- verified against real AWS:
+#
+#     request_spot_fleet  -> InvalidSpotFleetRequestConfig: Duplicate tag key 'Name'
+#     run_instances       -> InvalidParameterValue: Duplicate tag key 'Name'
+#
+# moto accepts duplicates and keeps the last value, so the collision was invisible
+# under test while silently overwriting the descriptive name with "true".
+TAG_MANAGED = "ParslEphemeralManaged"
 TAG_WORKFLOW_ID = "WorkflowId"
 TAG_JOB_ID = "JobId"
 TAG_BLOCK_ID = "BlockId"

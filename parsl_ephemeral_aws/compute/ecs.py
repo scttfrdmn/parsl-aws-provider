@@ -13,7 +13,7 @@ from botocore.exceptions import ClientError, NoCredentialsError
 from ..exceptions import ResourceCreationError, ResourceCleanupError, JobSubmissionError
 from ..constants import (
     TAG_PREFIX,
-    TAG_NAME,
+    TAG_MANAGED,
     TAG_WORKFLOW_ID,
     TAG_JOB_ID,
     STATUS_PENDING,
@@ -253,7 +253,7 @@ class ECSManager:
                     }
                 ],
                 tags=[
-                    {"key": TAG_NAME, "value": "true"},
+                    {"key": TAG_MANAGED, "value": "true"},
                     {"key": TAG_WORKFLOW_ID, "value": self.provider.workflow_id},
                 ],
             )
@@ -319,7 +319,7 @@ class ECSManager:
                 "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
             ],
             tags=[
-                {"Key": TAG_NAME, "Value": "true"},
+                {"Key": TAG_MANAGED, "Value": "true"},
                 {"Key": TAG_WORKFLOW_ID, "Value": self.provider.workflow_id},
             ],
             description=f"Execution role for Parsl ECS tasks ({self.provider.workflow_id})",
@@ -409,7 +409,7 @@ class ECSManager:
                 cpu=str(self.provider.ecs_task_cpu),
                 memory=str(self.provider.ecs_task_memory),
                 tags=[
-                    {"key": TAG_NAME, "value": "true"},
+                    {"key": TAG_MANAGED, "value": "true"},
                     {"key": TAG_WORKFLOW_ID, "value": self.provider.workflow_id},
                     {"key": TAG_JOB_ID, "value": job_id},
                 ],
@@ -505,7 +505,7 @@ class ECSManager:
                         {
                             "ResourceType": "security-group",
                             "Tags": [
-                                {"Key": TAG_NAME, "Value": "true"},
+                                {"Key": TAG_MANAGED, "Value": "true"},
                                 {
                                     "Key": TAG_WORKFLOW_ID,
                                     "Value": self.provider.workflow_id,
@@ -517,18 +517,11 @@ class ECSManager:
 
                 security_group_id = sg_create_response["GroupId"]
 
-                # Add outbound rule (allow all outbound traffic)
-                self.ec2_client.authorize_security_group_egress(
-                    GroupId=security_group_id,
-                    IpPermissions=[
-                        {
-                            "IpProtocol": "-1",
-                            "FromPort": -1,
-                            "ToPort": -1,
-                            "IpRanges": [{"CidrIp": "0.0.0.0/0"}],
-                        }
-                    ],
-                )
+                # No egress rule is added here: EC2 attaches allow-all-outbound
+                # to every new security group, so authorizing it again raises
+                # InvalidPermission.Duplicate -- which propagated out as
+                # JobSubmissionError and made this branch impossible to complete
+                # (#110). Fargate tasks need outbound access, and they have it.
 
             return {
                 "vpc_id": vpc_id,
@@ -584,7 +577,7 @@ class ECSManager:
                     }
                 },
                 tags=[
-                    {"key": TAG_NAME, "value": "true"},
+                    {"key": TAG_MANAGED, "value": "true"},
                     {"key": TAG_WORKFLOW_ID, "value": self.provider.workflow_id},
                     {"key": TAG_JOB_ID, "value": job_id},
                 ],

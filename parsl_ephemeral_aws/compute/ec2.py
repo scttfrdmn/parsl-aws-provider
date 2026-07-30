@@ -14,7 +14,7 @@ from botocore.exceptions import ClientError, NoCredentialsError
 from ..exceptions import ResourceCreationError, ResourceCleanupError
 from ..constants import (
     TAG_PREFIX,
-    TAG_NAME,
+    TAG_MANAGED,
     TAG_WORKFLOW_ID,
     TAG_BLOCK_ID,
     DEFAULT_VPC_CIDR,
@@ -247,7 +247,7 @@ class EC2Manager:
                                 "Key": "Name",
                                 "Value": f"{TAG_PREFIX}-vpc-{self.provider.workflow_id}",
                             },
-                            {"Key": TAG_NAME, "Value": "true"},
+                            {"Key": TAG_MANAGED, "Value": "true"},
                             {
                                 "Key": TAG_WORKFLOW_ID,
                                 "Value": self.provider.workflow_id,
@@ -364,7 +364,7 @@ class EC2Manager:
                                 "Key": "Name",
                                 "Value": f"{TAG_PREFIX}-subnet-{self.provider.workflow_id}",
                             },
-                            {"Key": TAG_NAME, "Value": "true"},
+                            {"Key": TAG_MANAGED, "Value": "true"},
                             {
                                 "Key": TAG_WORKFLOW_ID,
                                 "Value": self.provider.workflow_id,
@@ -386,7 +386,7 @@ class EC2Manager:
                                 "Key": "Name",
                                 "Value": f"{TAG_PREFIX}-igw-{self.provider.workflow_id}",
                             },
-                            {"Key": TAG_NAME, "Value": "true"},
+                            {"Key": TAG_MANAGED, "Value": "true"},
                             {
                                 "Key": TAG_WORKFLOW_ID,
                                 "Value": self.provider.workflow_id,
@@ -413,7 +413,7 @@ class EC2Manager:
                                 "Key": "Name",
                                 "Value": f"{TAG_PREFIX}-rt-{self.provider.workflow_id}",
                             },
-                            {"Key": TAG_NAME, "Value": "true"},
+                            {"Key": TAG_MANAGED, "Value": "true"},
                             {
                                 "Key": TAG_WORKFLOW_ID,
                                 "Value": self.provider.workflow_id,
@@ -450,7 +450,7 @@ class EC2Manager:
                                 "Key": "Name",
                                 "Value": f"{TAG_PREFIX}-sg-{self.provider.workflow_id}",
                             },
-                            {"Key": TAG_NAME, "Value": "true"},
+                            {"Key": TAG_MANAGED, "Value": "true"},
                             {
                                 "Key": TAG_WORKFLOW_ID,
                                 "Value": self.provider.workflow_id,
@@ -743,7 +743,7 @@ class EC2Manager:
                     "ResourceType": "instance",
                     "Tags": [
                         {"Key": "Name", "Value": f"{TAG_PREFIX}-node-{node_id}"},
-                        {"Key": TAG_NAME, "Value": "true"},
+                        {"Key": TAG_MANAGED, "Value": "true"},
                         {"Key": TAG_WORKFLOW_ID, "Value": self.provider.workflow_id},
                         {"Key": TAG_BLOCK_ID, "Value": block_id},
                     ],
@@ -840,7 +840,7 @@ class EC2Manager:
                     "ResourceType": "spot-instances-request",
                     "Tags": [
                         {"Key": "Name", "Value": f"{TAG_PREFIX}-spot-{node_id}"},
-                        {"Key": TAG_NAME, "Value": "true"},
+                        {"Key": TAG_MANAGED, "Value": "true"},
                         {"Key": TAG_WORKFLOW_ID, "Value": self.provider.workflow_id},
                         {"Key": TAG_BLOCK_ID, "Value": block_id},
                     ],
@@ -887,7 +887,7 @@ class EC2Manager:
             Resources=[instance_id],
             Tags=[
                 {"Key": "Name", "Value": f"{TAG_PREFIX}-node-{node_id}"},
-                {"Key": TAG_NAME, "Value": "true"},
+                {"Key": TAG_MANAGED, "Value": "true"},
                 {"Key": TAG_WORKFLOW_ID, "Value": self.provider.workflow_id},
                 {"Key": TAG_BLOCK_ID, "Value": block_id},
             ],
@@ -1093,7 +1093,7 @@ class EC2Manager:
                                 "Key": "Name",
                                 "Value": f"{TAG_PREFIX}-bastion-{self.provider.workflow_id}",
                             },
-                            {"Key": TAG_NAME, "Value": "true"},
+                            {"Key": TAG_MANAGED, "Value": "true"},
                             {
                                 "Key": TAG_WORKFLOW_ID,
                                 "Value": self.provider.workflow_id,

@@ -11,7 +11,7 @@ import boto3
 from botocore.exceptions import ClientError
 
 from ..exceptions import ResourceCreationError, ResourceCleanupError
-from ..constants import TAG_NAME, TAG_WORKFLOW_ID, DEFAULT_SG_NAME, DEFAULT_VPC_CIDR
+from ..constants import TAG_MANAGED, TAG_WORKFLOW_ID, DEFAULT_SG_NAME, DEFAULT_VPC_CIDR
 from ..config import SecurityConfig
 
 
@@ -128,7 +128,7 @@ class SecurityGroupManager:
                         "ResourceType": "security-group",
                         "Tags": [
                             {"Key": "Name", "Value": name},
-                            {"Key": TAG_NAME, "Value": "true"},
+                            {"Key": TAG_MANAGED, "Value": "true"},
                             {
                                 "Key": TAG_WORKFLOW_ID,
                                 "Value": self.provider.workflow_id,

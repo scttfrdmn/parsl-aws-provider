@@ -25,7 +25,7 @@ from ..exceptions import (
 )
 from ..constants import (
     TAG_PREFIX,
-    TAG_NAME,
+    TAG_MANAGED,
     TAG_WORKFLOW_ID,
     TAG_BLOCK_ID,
     RESOURCE_TYPE_SPOT_FLEET,
@@ -572,7 +572,7 @@ class SpotFleetManager:
                                     "Key": "Name",
                                     "Value": f"{TAG_PREFIX}-node-{block_id[:8]}",
                                 },
-                                {"Key": TAG_NAME, "Value": "true"},
+                                {"Key": TAG_MANAGED, "Value": "true"},
                                 {
                                     "Key": TAG_WORKFLOW_ID,
                                     "Value": self.provider.workflow_id,
@@ -619,7 +619,7 @@ class SpotFleetManager:
                                 "Key": "Name",
                                 "Value": f"{TAG_PREFIX}-fleet-{block_id[:8]}",
                             },
-                            {"Key": TAG_NAME, "Value": "true"},
+                            {"Key": TAG_MANAGED, "Value": "true"},
                             {
                                 "Key": TAG_WORKFLOW_ID,
                                 "Value": self.provider.workflow_id,
