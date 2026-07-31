@@ -9,15 +9,18 @@ SPDX-FileCopyrightText: 2025 Scott Friedman and Project Contributors
 
 import logging
 import time
-import json
 from typing import Any, Dict, List, Optional
 
 import boto3
 from botocore.exceptions import ClientError
 
 from parsl_ephemeral_aws.constants import (
+    DEFAULT_INSTANCE_TYPE,
+    DEFAULT_REGION,
+    LAUNCH_TEMPLATE_NAME_PREFIX,
     RESOURCE_TYPE_LAMBDA_FUNCTION,
     RESOURCE_TYPE_ECS_TASK,
+    RESOURCE_TYPE_SPOT_FLEET,
     WORKER_TYPE_LAMBDA,
     WORKER_TYPE_ECS,
     WORKER_TYPE_AUTO,
@@ -50,7 +53,19 @@ from parsl_ephemeral_aws.compute.spot_interruption import (
     SpotInterruptionMonitor,
     ParslSpotInterruptionHandler,
 )
-from parsl_ephemeral_aws.utils.aws import get_cf_template
+from parsl_ephemeral_aws.utils.aws import (
+    architecture_for_instance_type,
+    build_fleet_launch_template_configs,
+    build_launch_template_data,
+    create_ec2_fleet,
+    create_launch_template,
+    delete_ec2_fleet,
+    delete_launch_template,
+    describe_ec2_fleet,
+    get_cf_template,
+    get_default_ami,
+    get_ec2_fleet_instance_ids,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -288,7 +303,9 @@ class ServerlessMode(OperatingMode):
                 logger.debug(
                     "Initializing SpotInterruptionMonitor and Handler for ServerlessMode"
                 )
-                self.spot_interruption_monitor = SpotInterruptionMonitor(self.session)
+                self.spot_interruption_monitor = SpotInterruptionMonitor(
+                    self.session, provider_id=self.provider_id
+                )
                 self.spot_interruption_handler = ParslSpotInterruptionHandler(
                     session=self.session,
                     checkpoint_bucket=self.checkpoint_bucket,
@@ -687,6 +704,17 @@ class ServerlessMode(OperatingMode):
         """
         logger.debug(f"Submitting job {job_id} to ECS")
 
+        # An EC2 Fleet is created directly rather than through CloudFormation.
+        # CloudFormation cannot express this resource: the override list is
+        # variable-length, and CFN has no way to build one -- Fn::ForEach expands
+        # to a map, and padding a fixed set of !Select slots is rejected by EC2
+        # ("duplicate instance pools"). CreateFleet takes the list natively.
+        # Deploying the stack also created an ECS cluster, task definition, two
+        # IAM roles, and a log group that an EC2 fleet never uses.
+        if self.use_spot_fleet:
+            self._create_job_fleet(job_id, command, resource_id)
+            return
+
         try:
             # Deploy ECS task using CloudFormation
             stack_name = f"parsl-ecs-{job_id[:8]}"
@@ -741,31 +769,7 @@ class ServerlessMode(OperatingMode):
                     },
                     {
                         "ParameterKey": "UseSpot",
-                        "ParameterValue": "true"
-                        if self.use_spot and not self.use_spot_fleet
-                        else "false",
-                    },
-                    {
-                        "ParameterKey": "UseSpotFleet",
-                        "ParameterValue": "true" if self.use_spot_fleet else "false",
-                    },
-                    {
-                        "ParameterKey": "InstanceTypes",
-                        "ParameterValue": json.dumps(self.instance_types)
-                        if self.use_spot_fleet
-                        else "[]",
-                    },
-                    {
-                        "ParameterKey": "NodesPerBlock",
-                        "ParameterValue": str(self.nodes_per_block)
-                        if self.use_spot_fleet
-                        else "1",
-                    },
-                    {
-                        "ParameterKey": "SpotMaxPricePercentage",
-                        "ParameterValue": str(self.spot_max_price_percentage)
-                        if self.spot_max_price_percentage
-                        else "",
+                        "ParameterValue": "true" if self.use_spot else "false",
                     },
                 ],
                 Tags=[
@@ -777,80 +781,13 @@ class ServerlessMode(OperatingMode):
             )
 
             # Store reference to stack in resource data
-            resource_type = RESOURCE_TYPE_ECS_TASK
-            if self.use_spot_fleet:
-                from parsl_ephemeral_aws.constants import RESOURCE_TYPE_SPOT_FLEET
-
-                resource_type = RESOURCE_TYPE_SPOT_FLEET
-
             self.resources[resource_id].update(
                 {
                     "stack_name": stack_name,
-                    "resource_type": resource_type,
-                    "use_spot_fleet": self.use_spot_fleet,
+                    "resource_type": RESOURCE_TYPE_ECS_TASK,
+                    "use_spot_fleet": False,
                 }
             )
-
-            # Register with spot interruption monitor if needed
-            if (
-                self.use_spot_fleet
-                and self.spot_interruption_handling
-                and self.spot_interruption_monitor
-                and self.spot_interruption_handler
-            ):
-                # We need to wait for and fetch the fleet request ID from the outputs
-                start_time = time.time()
-                fleet_request_id = None
-
-                # Wait for up to 3 minutes for stack to create resources
-                while time.time() - start_time < 180 and not fleet_request_id:
-                    try:
-                        # Check if the stack has output values yet
-                        stack_response = self.cf_client.describe_stacks(
-                            StackName=stack_name
-                        )
-                        stack_status = stack_response["Stacks"][0]["StackStatus"]
-
-                        # Only check outputs if stack is complete
-                        if stack_status == "CREATE_COMPLETE":
-                            outputs = stack_response["Stacks"][0].get("Outputs", [])
-
-                            for output in outputs:
-                                if output["OutputKey"] == "SpotFleetRequestId":
-                                    fleet_request_id = output["OutputValue"]
-                                    break
-
-                            if fleet_request_id:
-                                # Save fleet ID in resource data
-                                self.resources[resource_id]["fleet_request_id"] = (
-                                    fleet_request_id
-                                )
-
-                                # Register with interruption monitor
-                                self.spot_interruption_monitor.register_fleet(
-                                    fleet_request_id,
-                                    self.spot_interruption_handler.handle_fleet_interruption,
-                                )
-                                logger.info(
-                                    f"Registered spot fleet {fleet_request_id} for interruption handling"
-                                )
-                                break
-
-                        # If stack is still being created, wait and check again
-                        if "CREATE_IN_PROGRESS" in stack_status:
-                            time.sleep(10)
-                        else:
-                            # If stack has failed or is in any other state, log and break
-                            if stack_status != "CREATE_COMPLETE":
-                                logger.warning(
-                                    f"Stack {stack_name} is in state {stack_status}, not waiting for fleet ID"
-                                )
-                            break
-                    except Exception as e:
-                        logger.error(
-                            f"Error getting spot fleet ID from stack {stack_name}: {e}"
-                        )
-                        break
 
             logger.debug(
                 f"Created CloudFormation stack {stack_name} for ECS job {job_id}"
@@ -882,6 +819,15 @@ class ServerlessMode(OperatingMode):
             resource = self.resources.get(resource_id)
             if not resource:
                 status_map[resource_id] = STATUS_UNKNOWN
+                continue
+
+            # A fleet-backed job has no stack: the fleet is created directly, so
+            # its status comes from the fleet rather than from CloudFormation.
+            fleet_request_id = resource.get("fleet_request_id")
+            if resource.get("use_spot_fleet") and fleet_request_id:
+                status = self._get_spot_fleet_status(fleet_request_id)
+                self.resources[resource_id]["status"] = status
+                status_map[resource_id] = status
                 continue
 
             # Get stack status
@@ -923,36 +869,9 @@ class ServerlessMode(OperatingMode):
                                 status = STATUS_RUNNING
 
                     elif worker_type == WORKER_TYPE_ECS:
-                        # Check if this is a SpotFleet resource
-                        if resource.get("use_spot_fleet"):
-                            # For SpotFleet resources, we need to check the fleet status
-                            outputs = response["Stacks"][0].get("Outputs", [])
-                            fleet_request_id = None
-
-                            for output in outputs:
-                                if output["OutputKey"] == "SpotFleetRequestId":
-                                    fleet_request_id = output["OutputValue"]
-                                    break
-
-                            if fleet_request_id:
-                                # If we haven't stored the fleet_request_id yet, do so
-                                if "fleet_request_id" not in resource:
-                                    self.resources[resource_id]["fleet_request_id"] = (
-                                        fleet_request_id
-                                    )
-                                    from parsl_ephemeral_aws.constants import (
-                                        RESOURCE_TYPE_SPOT_FLEET,
-                                    )
-
-                                    self.resources[resource_id]["resource_type"] = (
-                                        RESOURCE_TYPE_SPOT_FLEET
-                                    )
-
-                                # Check SpotFleet status
-                                status = self._get_spot_fleet_status(fleet_request_id)
-                            else:
-                                status = STATUS_RUNNING
-                        elif self.ecs_manager:
+                        # No fleet branch here: a fleet-backed job never reaches
+                        # this point, having been answered from the fleet above.
+                        if self.ecs_manager:
                             # For standard ECS, we get the cluster and service name from stack outputs
                             outputs = response["Stacks"][0].get("Outputs", [])
                             cluster_name = None
@@ -1044,13 +963,326 @@ class ServerlessMode(OperatingMode):
             # After timeout, assume success (in a real impl, we'd check CloudWatch)
             return STATUS_SUCCEEDED
 
+    def _create_job_fleet(self, job_id: str, command: str, resource_id: str) -> None:
+        """Launch this job's workers as an ``instant`` EC2 Fleet.
+
+        Bypasses CloudFormation, which the fleet used to go through. Two reasons,
+        both established against real AWS:
+
+        * The ``Overrides`` list is variable-length -- one entry per instance type
+          -- and CloudFormation cannot build one. ``Fn::ForEach`` expands to a map
+          rather than a list, and a fixed set of ``!Select`` slots cannot be left
+          partly unfilled because an out-of-range ``!Select`` fails validation even
+          in an untaken ``!If`` branch. Padding the slots by repeating a type is
+          what the previous revision did, and EC2 rejects it outright:
+          ``InvalidFleetConfig: The fleet configuration contains duplicate
+          instance pools``.
+        * The stack's other resources -- an ECS cluster, a task definition, two
+          IAM roles, a log group -- are Fargate machinery that an EC2 fleet never
+          touches, so deploying it to get one fleet created five resources to
+          leak and made the fleet ID reachable only by polling stack outputs.
+
+        The launch template is mandatory: ``CreateFleet`` has no
+        ``LaunchSpecifications`` member, and the per-job user data has nowhere
+        else to live -- ``Overrides`` cannot carry ``UserData``.
+
+        Parameters
+        ----------
+        job_id : str
+            Job this fleet serves; names the launch template.
+        command : str
+            Command the instances run, via user data.
+        resource_id : str
+            Resource record to annotate with the fleet and template IDs.
+
+        Raises
+        ------
+        JobSubmissionError
+            If the template or the fleet cannot be created, or if EC2 filled none
+            of the requested capacity.
+        """
+        ec2_client = self.session.client("ec2")
+        instance_types = self._fleet_instance_types()
+        tags = self._build_fleet_tags(job_id)
+
+        # Restated here rather than relied upon from the ECS guard in
+        # submit_job. Every fleet override names the subnet, so an unset one
+        # reaches CreateFleet as a null and is refused there -- after the launch
+        # template has already been created, leaving it to be cleaned up.
+        if not self.subnet_id:
+            raise JobSubmissionError(
+                "subnet_id is required to launch an EC2 Fleet; every launch "
+                "template override names the subnet to launch into."
+            )
+
+        template_name = f"{LAUNCH_TEMPLATE_NAME_PREFIX}-ecs-{job_id[:8]}"
+        template_id = None
+
+        try:
+            template_data = build_launch_template_data(
+                image_id=self._resolve_fleet_image_id(),
+                instance_type=instance_types[0],
+                subnet_id=self.subnet_id,
+                security_group_id=self.security_group_id,
+                associate_public_ip=self.use_public_ips,
+                # Fleet instances are reclaimed by deleting the fleet, which
+                # always terminates them, so one that shuts itself down should
+                # terminate too rather than linger as a billed volume.
+                shutdown_behavior="terminate",
+                user_data=self._build_fleet_user_data(command),
+            )
+            template_data["TagSpecifications"] = [
+                {"ResourceType": "instance", "Tags": list(tags)}
+            ]
+            template_id, version = create_launch_template(
+                ec2_client, template_name, template_data, list(tags)
+            )
+
+            max_total_price = self._resolve_max_total_price()
+            fleet_id, instance_ids = create_ec2_fleet(
+                ec2_client,
+                build_fleet_launch_template_configs(
+                    template_id, version, instance_types, self.subnet_id
+                ),
+                target_capacity=max(1, self.nodes_per_block),
+                allocation_strategy=self.spot_allocation_strategy,
+                tags=tags,
+                max_total_price=max_total_price or None,
+            )
+        except Exception as e:
+            # The template outlives a failed CreateFleet, so drop it here rather
+            # than leaving a per-job resource behind for the orphan sweep.
+            if template_id:
+                try:
+                    delete_launch_template(ec2_client, template_id)
+                except Exception as cleanup_error:
+                    logger.warning(
+                        f"Failed to delete launch template {template_id} after a "
+                        f"failed fleet submit: {cleanup_error}"
+                    )
+            logger.error(f"Failed to submit fleet job {job_id}: {e}")
+            raise JobSubmissionError(f"Failed to submit fleet job: {e}") from e
+
+        self.resources[resource_id].update(
+            {
+                "resource_type": RESOURCE_TYPE_SPOT_FLEET,
+                "use_spot_fleet": True,
+                "fleet_request_id": fleet_id,
+                "launch_template_id": template_id,
+                "instance_ids": instance_ids,
+                # No stack_name: there is no stack. get_job_status() keys off
+                # this, and cleanup_resources() must not try to delete one.
+            }
+        )
+
+        if not instance_ids:
+            # An instant fleet reports a pool it could not fill inline instead of
+            # failing, so an empty fleet is a successful API call. The fleet is
+            # still deleted, since it holds nothing and will never grow -- an
+            # instant fleet makes no further attempts.
+            try:
+                delete_ec2_fleet(ec2_client, fleet_id)
+            except Exception as e:
+                logger.warning(f"Failed to delete unfilled fleet {fleet_id}: {e}")
+            raise JobSubmissionError(
+                f"EC2 Fleet {fleet_id} launched no instances for job {job_id}; "
+                "no spot capacity was available in any of the requested pools "
+                f"({', '.join(instance_types)})."
+            )
+
+        # Registration is immediate now: the fleet ID comes back from CreateFleet
+        # itself. It used to require polling stack outputs for up to 3 minutes,
+        # during which an interruption would have gone unhandled.
+        if (
+            self.spot_interruption_handling
+            and self.spot_interruption_monitor
+            and self.spot_interruption_handler
+        ):
+            self.spot_interruption_monitor.register_fleet(
+                fleet_id,
+                self.spot_interruption_handler.handle_fleet_interruption,
+            )
+            logger.info(f"Registered EC2 Fleet {fleet_id} for interruption handling")
+
+        logger.info(
+            f"Created EC2 Fleet {fleet_id} with {len(instance_ids)} instance(s) "
+            f"for job {job_id}"
+        )
+
+    def _reclaim_fleet(self, ec2_client: Any, resource: Dict[str, Any]) -> None:
+        """Delete a job's fleet and its launch template.
+
+        Deleting the fleet terminates its instances; that is not optional for an
+        ``instant`` fleet, which AWS refuses to leave running without its fleet
+        (#86). The template is deleted afterwards -- doing so does not affect
+        instances already launched from it, but leaving it behind would strand a
+        per-job resource that only the orphan sweep could find.
+
+        Both steps log rather than raise: this runs from cancellation and cleanup
+        paths, where one unreclaimable resource must not prevent the rest from
+        being reclaimed.
+
+        Parameters
+        ----------
+        ec2_client : Any
+            A boto3 EC2 client.
+        resource : Dict[str, Any]
+            Resource record carrying ``fleet_request_id`` and, optionally,
+            ``launch_template_id``.
+        """
+        fleet_request_id = resource.get("fleet_request_id")
+        if fleet_request_id:
+            try:
+                delete_ec2_fleet(ec2_client, fleet_request_id)
+                logger.info(
+                    f"Deleted EC2 Fleet {fleet_request_id} for job "
+                    f"{resource.get('job_id')}"
+                )
+            except Exception as e:
+                logger.warning(f"Error deleting EC2 Fleet {fleet_request_id}: {e}")
+
+        template_id = resource.get("launch_template_id")
+        if template_id:
+            try:
+                delete_launch_template(ec2_client, template_id)
+            except Exception as e:
+                logger.warning(f"Error deleting launch template {template_id}: {e}")
+
+    def _build_fleet_tags(self, job_id: str) -> List[Dict[str, str]]:
+        """Build the tags applied to a job's fleet, instances, and template.
+
+        The keys match what the orphan sweep looks for, so anything this leaves
+        behind is findable: ``ParslWorkflowId`` is one of
+        ``spot_fleet_cleanup.WORKFLOW_ID_TAG_KEYS``.
+        """
+        return [
+            {"Key": "ParslResource", "Value": "true"},
+            {"Key": "ParslWorkflowId", "Value": self.provider_id},
+            {"Key": "ParslJobId", "Value": job_id},
+            {
+                "Key": "Name",
+                "Value": f"parsl-fleet-{self.provider_id[:8]}-{job_id[:8]}",
+            },
+        ]
+
+    def _build_fleet_user_data(self, command: str) -> str:
+        """Build the user data a fleet instance runs.
+
+        Mirrors what the template's ``UserData`` did, with the command written to
+        a file and executed. ``shutdown -h now`` is deliberate and pairs with the
+        template's ``InstanceInitiatedShutdownBehavior=terminate``: the instance
+        exists to run one command, so it should terminate when that is done
+        instead of idling at full price.
+        """
+        return (
+            "#!/bin/bash\n"
+            'echo "Starting Parsl worker..."\n'
+            "mkdir -p /tmp/parsl\n"
+            f"cat > /tmp/parsl/command.sh <<'PARSL_EOF'\n{command}\nPARSL_EOF\n"
+            "chmod +x /tmp/parsl/command.sh\n"
+            "/tmp/parsl/command.sh\n"
+            'echo "Parsl worker completed."\n'
+            "shutdown -h now\n"
+        )
+
+    def _resolve_fleet_image_id(self) -> str:
+        """Return the AMI the EC2 Fleet's instances should boot.
+
+        Prefers an explicitly configured ``image_id``, otherwise resolves the
+        current Amazon Linux 2023 image for the session's region from AWS's
+        public SSM alias (#83).
+
+        This has to be resolved here rather than in the template: the template's
+        old ``RegionMap`` was never wired to a ``FindInMap``, so its fleet
+        launched with no ``ImageId`` at all and EC2 rejected every request with
+        "Parameter 'amiIdList' cannot be empty" -- confirmed against both fleet
+        APIs. The fleet path in this mode has therefore never worked.
+
+        Returns
+        -------
+        str
+            AMI ID.
+        """
+        if self.image_id:
+            return self.image_id
+
+        region = self.session.region_name or DEFAULT_REGION
+        architecture = architecture_for_instance_type(self.instance_types[0])
+        return get_default_ami(region, architecture, session=self.session)
+
+    def _fleet_instance_types(self) -> List[str]:
+        """Return the instance types the fleet may draw from, deduplicated.
+
+        Order is preserved, since the allocation strategy treats the list as a
+        preference order. Duplicates are dropped because ``CreateFleet`` rejects
+        the request outright when two overrides name the same capacity pool:
+
+            InvalidFleetConfig: The fleet configuration contains duplicate
+            instance pools.
+
+        A ``DryRun`` does *not* catch this -- verified against real EC2, which
+        accepted the identical duplicate-bearing request with ``DryRun=True`` and
+        rejected it without. This is why the fleet is no longer built by
+        CloudFormation at all; see :meth:`_create_job_fleet`.
+
+        Returns
+        -------
+        List[str]
+            Instance types in preference order, each appearing once.
+        """
+        seen: Dict[str, None] = {}
+        for instance_type in self.instance_types:
+            seen.setdefault(instance_type, None)
+        return list(seen) or [DEFAULT_INSTANCE_TYPE]
+
+    def _resolve_max_total_price(self) -> str:
+        """Translate ``spot_max_price_percentage`` into a fleet ``MaxTotalPrice``.
+
+        Returns an empty string when no cap is configured, which is the
+        recommended setting -- AWS: "We do not recommend using this parameter
+        because it can lead to increased interruptions." An uncapped fleet pays
+        the prevailing spot price, already far below on-demand.
+
+        The percentage is of on-demand, which is what the setting has always
+        documented. There is no cheap API for an on-demand price, so the same
+        3x-current-spot proxy that ``SpotFleetManager`` uses is applied here.
+        Unlike the legacy per-instance-hour ``SpotPrice``, ``MaxTotalPrice``
+        covers the whole fleet, so it is multiplied by the node count.
+
+        Returns
+        -------
+        str
+            Fleet-wide hourly maximum in USD, or "" for no cap.
+        """
+        if not self.spot_max_price_percentage:
+            return ""
+
+        try:
+            history = (
+                self.session.client("ec2")
+                .describe_spot_price_history(
+                    InstanceTypes=[self.instance_types[0]],
+                    ProductDescriptions=["Linux/UNIX"],
+                    MaxResults=1,
+                )
+                .get("SpotPriceHistory", [])
+            )
+            current_spot = float(history[0]["SpotPrice"]) if history else 1.0
+            on_demand_price = current_spot * 3
+        except Exception as e:
+            logger.warning(f"Could not read spot price history, assuming $1.00/hr: {e}")
+            on_demand_price = 1.0
+
+        per_instance = on_demand_price * (self.spot_max_price_percentage / 100.0)
+        return str(per_instance * max(1, self.nodes_per_block))
+
     def _get_spot_fleet_status(self, fleet_request_id: str) -> str:
-        """Get the status of a Spot Fleet request.
+        """Get the status of an EC2 Fleet.
 
         Parameters
         ----------
         fleet_request_id : str
-            ID of the Spot Fleet request
+            ID of the EC2 Fleet
 
         Returns
         -------
@@ -1060,60 +1292,42 @@ class ServerlessMode(OperatingMode):
         ec2_client = self.session.client("ec2")
 
         try:
-            # Get Spot Fleet request details
-            response = ec2_client.describe_spot_fleet_requests(
-                SpotFleetRequestIds=[fleet_request_id]
-            )
+            fleet = describe_ec2_fleet(ec2_client, fleet_request_id)
+            if fleet is None:
+                # EC2 has forgotten the fleet, so its instances are long gone.
+                # Terminal, so Parsl can free the block.
+                return STATUS_COMPLETED
 
-            if not response.get("SpotFleetRequestConfigs"):
-                return STATUS_UNKNOWN
+            fleet_status = fleet["FleetState"]
 
-            fleet_config = response["SpotFleetRequestConfigs"][0]
-            fleet_status = fleet_config["SpotFleetRequestState"]
-
-            # Map fleet status to Parsl status
-            if fleet_status == "submitted":
+            if fleet_status in ("submitted", "modifying"):
                 return STATUS_PENDING
             elif fleet_status == "active":
-                # Check if target capacity is fulfilled. Both capacities live in
-                # the nested SpotFleetRequestConfig; the entry itself carries only
-                # ActivityStatus/CreateTime/SpotFleetRequestConfig/
-                # SpotFleetRequestId/SpotFleetRequestState/Tags. Reading
-                # FulfilledCapacity from the top level always yielded the 0
-                # default, so `0 >= target_capacity` was false for any capacity
-                # >= 1 and a fully provisioned fleet reported PENDING forever --
-                # never terminal, so Parsl polled it and never freed the block
-                # (#114).
-                config_data = fleet_config.get("SpotFleetRequestConfig", {})
-                fulfilled_capacity = config_data.get("FulfilledCapacity", 0)
-                target_capacity = config_data.get("TargetCapacity", 0)
-
-                if fulfilled_capacity >= target_capacity:
-                    # All requested instances are running
-                    # To determine if job is complete, ideally we'd check instance status
-                    # For now, we assume running
+                # An instant fleet does not maintain capacity, so FleetState
+                # stays "active" for the fleet's whole life regardless of what
+                # became of its instances. Capacity counters cannot decide this
+                # either: they reflect the original launch. Only the instances
+                # can, so ask them.
+                #
+                # The capacity comparison this replaced was also the site of
+                # #114: FulfilledCapacity was read from the wrong nesting level
+                # and always came back 0, so a fully provisioned fleet reported
+                # PENDING forever and Parsl never freed the block.
+                if get_ec2_fleet_instance_ids(ec2_client, fleet_request_id):
                     return STATUS_RUNNING
-                else:
-                    # Still waiting for instances
-                    return STATUS_PENDING
-            elif fleet_status == "cancelled_running":
-                # Fleet is being cancelled but instances still running
+                return STATUS_COMPLETED
+            elif fleet_status == "deleted_running":
+                # Fleet is being deleted but instances are still running
                 return STATUS_RUNNING
-            elif fleet_status == "cancelled_terminating":
-                # Fleet is cancelled and instances are terminating
-                return STATUS_CANCELLED
-            elif fleet_status == "cancelled":
-                # Fleet is fully cancelled
+            elif fleet_status in ("deleted", "deleted_terminating"):
                 return STATUS_CANCELLED
             elif fleet_status == "failed":
                 return STATUS_FAILED
-            elif fleet_status == "modify_in_progress":
-                return STATUS_RUNNING
             else:
                 return STATUS_UNKNOWN
 
         except Exception as e:
-            logger.error(f"Error getting Spot Fleet status for {fleet_request_id}: {e}")
+            logger.error(f"Error getting EC2 Fleet status for {fleet_request_id}: {e}")
             return STATUS_UNKNOWN
 
     def _get_ecs_status(self, cluster_name: str, service_name: str) -> str:
@@ -1236,6 +1450,15 @@ class ServerlessMode(OperatingMode):
                 cancel_map[resource_id] = STATUS_UNKNOWN
                 continue
 
+            # A fleet-backed job has no stack; deleting the fleet *is* the
+            # cancellation. Handled before the stack_name check below, which
+            # would otherwise report UNKNOWN and leave the instances running.
+            if resource.get("resource_type") == RESOURCE_TYPE_SPOT_FLEET:
+                self._reclaim_fleet(ec2_client, resource)
+                self.resources[resource_id]["status"] = STATUS_CANCELLED
+                cancel_map[resource_id] = STATUS_CANCELLED
+                continue
+
             # Get stack name
             stack_name = resource.get("stack_name")
             if not stack_name:
@@ -1243,29 +1466,7 @@ class ServerlessMode(OperatingMode):
                 continue
 
             try:
-                # Check if this is a SpotFleet resource and handle it specially
-                from parsl_ephemeral_aws.constants import RESOURCE_TYPE_SPOT_FLEET
-
-                if resource.get(
-                    "resource_type"
-                ) == RESOURCE_TYPE_SPOT_FLEET and resource.get("fleet_request_id"):
-                    fleet_request_id = resource.get("fleet_request_id")
-
-                    # Cancel the Spot Fleet request directly for immediate termination
-                    try:
-                        ec2_client.cancel_spot_fleet_requests(
-                            SpotFleetRequestIds=[fleet_request_id],
-                            TerminateInstances=True,
-                        )
-                        logger.info(
-                            f"Cancelled Spot Fleet request {fleet_request_id} for job {resource.get('job_id')}"
-                        )
-                    except Exception as e:
-                        logger.warning(
-                            f"Error cancelling Spot Fleet request {fleet_request_id}: {e}"
-                        )
-
-                # Always delete the CloudFormation stack to cancel the job
+                # Delete the CloudFormation stack to cancel the job
                 self.cf_client.delete_stack(StackName=stack_name)
 
                 # Mark as cancelled
@@ -1316,6 +1517,15 @@ class ServerlessMode(OperatingMode):
             # Drop the staged Lambda deployment package, if any. Done before the
             # stack delete so the object goes even when the stack is already gone.
             self._delete_staged_lambda_code(resource)
+
+            # A fleet-backed job has no stack, so it has to be reclaimed here.
+            # Falling through to the stack_name check below would delete the
+            # tracking record and leave the fleet's instances running with
+            # nothing left that knows their IDs.
+            if resource.get("resource_type") == RESOURCE_TYPE_SPOT_FLEET:
+                self._reclaim_fleet(self.session.client("ec2"), resource)
+                del self.resources[resource_id]
+                continue
 
             # Get stack name
             stack_name = resource.get("stack_name")
@@ -1442,10 +1652,9 @@ class ServerlessMode(OperatingMode):
             except Exception as e:
                 logger.error(f"Error cleaning up ECS manager resources: {e}")
 
-        # Cleanup SpotFleet resources if needed
+        # Sweep any fleet resources the per-job stack deletes missed.
         if self.use_spot_fleet:
             try:
-                # Import and use SpotFleet cleanup utility
                 from parsl_ephemeral_aws.compute.spot_fleet_cleanup import (
                     cleanup_all_spot_fleet_resources,
                 )
@@ -1459,10 +1668,16 @@ class ServerlessMode(OperatingMode):
 
                 # Log cleanup results
                 if cleanup_result:
-                    # Log successful operations
+                    if cleanup_result.get("deleted_fleets"):
+                        logger.info(
+                            f"Deleted {len(cleanup_result['deleted_fleets'])} EC2 Fleets"
+                        )
+
+                    # Only non-empty for a workflow that predates #86.
                     if cleanup_result.get("cancelled_requests"):
                         logger.info(
-                            f"Cancelled {len(cleanup_result['cancelled_requests'])} SpotFleet requests"
+                            f"Cancelled {len(cleanup_result['cancelled_requests'])} "
+                            "legacy Spot Fleet requests"
                         )
 
                     if cleanup_result.get("cleaned_roles"):
@@ -1473,9 +1688,9 @@ class ServerlessMode(OperatingMode):
                     # Log errors
                     if cleanup_result.get("errors"):
                         for error in cleanup_result["errors"]:
-                            logger.warning(f"SpotFleet cleanup error: {error}")
+                            logger.warning(f"Fleet cleanup error: {error}")
             except Exception as e:
-                logger.error(f"Error cleaning up SpotFleet resources: {e}")
+                logger.error(f"Error cleaning up fleet resources: {e}")
 
         # Clear initialization flag
         self.initialized = False
@@ -1527,8 +1742,10 @@ class ServerlessMode(OperatingMode):
                             "job_name": resource.get("job_name"),
                             "status": resource.get("status"),
                             "created_at": resource.get("created_at"),
-                            "stack_name": resource.get("stack_name"),
+                            # No stack_name: a fleet is created directly (#86).
                             "fleet_request_id": resource.get("fleet_request_id"),
+                            "launch_template_id": resource.get("launch_template_id"),
+                            "instance_ids": resource.get("instance_ids", []),
                         }
                     )
                 else:
@@ -1650,7 +1867,8 @@ class ServerlessMode(OperatingMode):
                                 "Initializing SpotInterruptionMonitor and Handler after state load"
                             )
                             self.spot_interruption_monitor = SpotInterruptionMonitor(
-                                self.session
+                                self.session,
+                                provider_id=self.provider_id,
                             )
                             self.spot_interruption_handler = (
                                 ParslSpotInterruptionHandler(

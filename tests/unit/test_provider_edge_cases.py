@@ -14,6 +14,10 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from parsl_ephemeral_aws.constants import (
+    DEFAULT_WARM_POOL_SIZE,
+    DEFAULT_WARM_POOL_TTL,
+)
 from parsl_ephemeral_aws.exceptions import ProviderConfigurationError, ProviderError
 from parsl_ephemeral_aws.provider import EphemeralAWSProvider
 from parsl_ephemeral_aws.state.base import STATE_KEY_MODE, STATE_KEY_PROVIDER
@@ -173,11 +177,26 @@ class TestWarmPool:
     # --- parameter / guard tests ---
 
     def test_warm_pool_disabled_by_default(self, tmp_dir):
-        """warm_pool_size defaults to 0 and warm_pool_ttl to 600."""
+        """The pool is off by default, and a warm instance's TTL is short.
+
+        A warm instance is *Running*, not Stopped, so it bills at the full rate
+        for the whole TTL -- AWS calls keeping warm instances running "highly
+        discouraged to avoid incurring unnecessary charges". This package cannot
+        use the native ASG warm pool that holds them Stopped, because dispatch is
+        SSM ``SendCommand`` and a Stopped instance runs no agent (#130 tracks the
+        pull model that would allow it). So the cost is bounded instead: the TTL
+        default was cut from the 600s v0.6.0 shipped with to
+        ``DEFAULT_WARM_POOL_TTL`` (#86).
+
+        Asserted against the constant rather than a literal, so the intent -- off
+        by default, and short-lived when on -- survives the next revision of the
+        number.
+        """
         provider, _ = _make_provider(tmp_dir)
 
-        assert provider.warm_pool_size == 0
-        assert provider.warm_pool_ttl == 600
+        assert provider.warm_pool_size == DEFAULT_WARM_POOL_SIZE == 0
+        assert provider.warm_pool_ttl == DEFAULT_WARM_POOL_TTL
+        assert DEFAULT_WARM_POOL_TTL <= 120
 
     def test_warm_pool_iam_guard_raises(self, tmp_dir):
         """warm_pool_size > 0 without an IAM profile raises ValueError."""
@@ -1126,11 +1145,15 @@ class TestStandardOnlyOptionGuard:
 
         The guard compares against the default rather than testing presence, so
         ``warm_pool_size=0`` -- which asks for nothing -- must be allowed.
+
+        The values come from the constants, not literals: the TTL default moved
+        600 -> 120 in #86, and a hardcoded 600 here stopped being "the default"
+        without ceasing to look like it.
         """
         provider = _construct(
             mode,
-            warm_pool_size=0,
-            warm_pool_ttl=600,
+            warm_pool_size=DEFAULT_WARM_POOL_SIZE,
+            warm_pool_ttl=DEFAULT_WARM_POOL_TTL,
             bake_ami=False,
             baked_ami_id=None,
             one_shot=False,

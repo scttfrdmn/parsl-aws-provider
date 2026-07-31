@@ -146,6 +146,10 @@ RESOURCE_TYPE_CLOUDFORMATION = "cloudformation"
 RESOURCE_TYPE_LAMBDA_FUNCTION = "lambda_function"
 RESOURCE_TYPE_ECS_TASK = "ecs_task"
 RESOURCE_TYPE_LAUNCH_TEMPLATE = "launch-template"
+# EC2's tag resource type for an EC2 Fleet (#86). Distinct from
+# RESOURCE_TYPE_SPOT_FLEET above, which is this package's own internal label for
+# a fleet-backed resource record and is persisted in state documents.
+RESOURCE_TYPE_FLEET = "fleet"
 
 # Instance metadata service options applied to every launch (#85).
 #
@@ -172,6 +176,67 @@ IMDSV2_METADATA_OPTIONS = {
 SPOT_FLEET_TARGET_CAPACITY_TYPE = "TargetCapacity"
 SPOT_FLEET_FULFILLED_CAPACITY_TYPE = "FulfilledCapacity"
 
+# EC2 Fleet constants (#86).
+#
+# AWS's guidance on the API this package used to call: "Spot Fleet ... uses a
+# legacy API with no planned investment." CreateFleet replaces it. The migration
+# was only possible once #85 put a launch template in place, because CreateFleet
+# has no LaunchSpecifications member at all -- a template is mandatory.
+#
+# Fleet type ``instant`` is what this package uses. It places a *synchronous*
+# one-time request and returns the launched instance IDs in the CreateFleet
+# response, which preserves the block -> instance-ID mapping the rest of the
+# package is built on. The alternatives are asynchronous and would require
+# polling before a block could report its instances.
+#
+# Verified against real EC2 in us-east-1, and these are not merely ignored --
+# CreateFleet rejects them outright with InvalidParameter:
+#
+#   ReplaceUnhealthyInstances        -> "not supported for given fleet type"
+#   TerminateInstancesWithExpiration -> "not supported for given fleet type"
+#   SpotOptions.MaintenanceStrategies (Capacity Rebalance)
+#                                    -> "only compatible with fleet type maintain"
+#
+# So an instant fleet gets no capacity rebalancing; the two-minute interruption
+# warning is delivered instead through the EventBridge route below.
+EC2_FLEET_TYPE_INSTANT = "instant"
+
+# Deleting an instant fleet always terminates its instances -- AWS: "A deleted
+# instant fleet with running instances is not supported." NoTerminateInstances is
+# rejected for this fleet type, so the flag is always True.
+EC2_FLEET_TERMINATE_INSTANCES = True
+
+# Why no fleet is built by CloudFormation (#86).
+#
+# Every fleet in this package is created by calling CreateFleet directly. The
+# override list is variable-length -- one entry per instance type -- and
+# CloudFormation cannot build one. Three routes were tried against real AWS:
+#
+#   ``Fn::ForEach`` (Transform: AWS::LanguageExtensions) expands to a *map*, not
+#   a list -- reading the processed template off a change set returned
+#   ``{"InstanceTypeOverridet3.small": {...}, ...}`` where a list was needed.
+#
+#   A fixed number of ``!Select`` slots cannot be left partly filled: an
+#   out-of-range ``!Select`` fails validation even inside the untaken branch of
+#   an ``!If`` -- "Fn::Select cannot select nonexistent value at index 2".
+#
+#   Padding those slots by repeating a type is rejected by EC2 --
+#   "InvalidFleetConfig: The fleet configuration contains duplicate instance
+#   pools". Note a DryRun does *not* catch this: EC2 accepted the identical
+#   duplicate-bearing request with DryRun=True and rejected it without.
+#
+# Tag EC2 applies to every instance a fleet launches, without being asked.
+#
+# This is the only way to find an instant fleet's instances after the fact.
+# Verified against real EC2: ``describe_fleets()`` with no FleetIds returns an
+# *empty* list for instant fleets (AWS: "If a fleet is of type instant, you must
+# specify the fleet ID in the request, otherwise the fleet does not appear in
+# the response"), a tag filter on describe_fleets does not find them either, and
+# ``describe_fleet_instances`` refuses them with ``Unsupported``. Filtering
+# describe_instances on this tag does work, so the orphan sweep goes through the
+# instances rather than the fleets.
+TAG_AWS_FLEET_ID = "aws:ec2:fleet-id"
+
 # Allocation strategy (#84). ``price-capacity-optimized`` is AWS's current
 # recommendation: it picks from the pools with the deepest spare capacity and
 # then the lowest price among those, so it interrupts far less often than
@@ -185,9 +250,15 @@ SPOT_FLEET_FULFILLED_CAPACITY_TYPE = "FulfilledCapacity"
 #   CreateFleet       SpotOptions.AllocationStrategy            -> kebab-case
 #       "priceCapacityOptimized"   => InvalidParameter
 #
-# So there cannot be one constant for both. SPOT_FLEET_* is the camelCase form
-# for the legacy RequestSpotFleet path this package uses today; EC2_FLEET_* is
-# the kebab-case form for the CreateFleet migration in #86.
+# So there cannot be one constant for both. EC2_FLEET_* is the kebab-case form
+# CreateFleet takes, which is what this package now uses (#86). SPOT_FLEET_* is
+# the camelCase form for the legacy RequestSpotFleet API, still needed by the
+# CloudFormation templates and the detached mode's bastion manager, which drive
+# AWS::EC2::SpotFleet resources.
+#
+# Note that neither DryRun nor TotalTargetCapacity=0 validates these enums --
+# both accepted the wrong spelling in probes, and describe_fleets showed EC2 had
+# stored it verbatim. Only a real launch rejects it.
 SPOT_FLEET_DEFAULT_ALLOCATION_STRATEGY = "priceCapacityOptimized"
 EC2_FLEET_DEFAULT_ALLOCATION_STRATEGY = "price-capacity-optimized"
 
@@ -211,6 +282,35 @@ EC2_FLEET_ALLOCATION_STRATEGIES = frozenset(
         "price-capacity-optimized",
     }
 )
+
+# Spot interruption warning delivery (#86).
+#
+# An ``instant`` fleet gets no Capacity Rebalance, so the two-minute warning is
+# taken from EventBridge instead: a rule matching the interruption event, with an
+# SQS queue as its target, which the driver polls. Verified end to end against
+# real EC2 with a Fault Injection Simulator experiment
+# (``aws:ec2:send-spot-instance-interruptions``) -- the warning reached the queue
+# 15.2s after the experiment started, with the instance still ``running``. That
+# is the whole point: the EC2-state poll this supplements cannot see anything
+# until ``shutting-down``, by which time checkpointing is already too late.
+#
+# ``EC2 Instance Rebalance Recommendation`` is deliberately *not* matched. It is
+# a separate detail-type that signals elevated interruption risk, not an
+# impending reclaim, and confirmed via ``test_event_pattern`` not to match this
+# pattern. Treating it as an interruption would checkpoint and tear down workers
+# that were never going away.
+SPOT_INTERRUPTION_EVENT_SOURCE = "aws.ec2"
+SPOT_INTERRUPTION_EVENT_DETAIL_TYPE = "EC2 Spot Instance Interruption Warning"
+
+# Retention is short on purpose: a warning is worthless once its two minutes are
+# up, so an undelivered message should expire rather than be replayed against a
+# long-dead instance on the next run.
+SPOT_INTERRUPTION_QUEUE_RETENTION_SECONDS = 300
+
+# SQS long-poll ceiling. 20s is the maximum ReceiveMessage accepts, and long
+# polling is what keeps warning latency near-zero without spending an API call
+# per second.
+SPOT_INTERRUPTION_QUEUE_WAIT_SECONDS = 20
 
 # Cleanup constants
 CLEANUP_BATCH_SIZE = 10
@@ -238,6 +338,16 @@ TAG_NAME = "Name"
 # Launch template naming (#85). The provider ID is appended, keeping the whole
 # name unique per provider instance and well inside EC2's 128-character limit.
 LAUNCH_TEMPLATE_NAME_PREFIX = f"{DEFAULT_TAG_PREFIX}-lt"
+# Names both the EventBridge rule and the SQS queue carrying spot interruption
+# warnings (#86); the provider ID is appended, keeping them unique per provider.
+#
+# The warning cannot be filtered any more narrowly than by detail-type. The
+# event's ``detail`` carries only ``instance-id`` and ``instance-action``, and
+# instance IDs are not known until the fleet launches, so the rule necessarily
+# matches every spot interruption in the account and region. Each monitor
+# therefore discards warnings for instances it does not track, and two providers
+# in one account each see the other's warnings and ignore them.
+SPOT_INTERRUPTION_RULE_NAME_PREFIX = f"{DEFAULT_TAG_PREFIX}-spot-warning"
 # Marker tag identifying a resource as created by this provider (#109).
 #
 # This used to be TAG_NAME, which is the EC2-reserved "Name" key. Every tag list
@@ -278,9 +388,33 @@ STATUS_UNKNOWN = "UNKNOWN"
 STATUS_SUCCEEDED = "COMPLETED"  # Alias for compatibility
 STATUS_WARM = "WARM"  # instance running, job done, ready for reuse
 
-# Warm pool defaults
+# Warm pool defaults.
+#
+# A warm instance is *Running*, not Stopped, and so bills at the full on-demand
+# or spot rate for every second it waits. AWS is blunt about this shape --
+# keeping warm instances running is "highly discouraged to avoid incurring
+# unnecessary charges" -- and the native ASG warm pool it recommends instead
+# holds them Stopped or Hibernated.
+#
+# This package cannot use the native pool: dispatch is SSM SendCommand, and a
+# Stopped instance runs no SSM agent, so it cannot receive one. Moving to a pull
+# model would let the pool be Stopped and is tracked as #130 for v0.8.0.
+#
+# Until then the cost is bounded rather than eliminated: the TTL default is cut
+# to 120s from the 600s it shipped with in v0.6.0, so an idle pool costs at most
+# a fifth of what it did, and MAX_WARM_POOL_SIZE caps the blast radius of a
+# mistyped size.
 DEFAULT_WARM_POOL_SIZE = 0  # 0 = disabled
-DEFAULT_WARM_POOL_TTL = 600  # seconds a warm idle instance stays alive
+DEFAULT_WARM_POOL_TTL = 120  # seconds a warm *running* instance stays alive
+
+# Hard ceiling on warm_pool_size.
+#
+# Every warm instance is a running instance, so an accidental warm_pool_size=200
+# is a bill, not an error -- nothing in EC2 refuses it and no quota is
+# necessarily hit. The limit is deliberately low: a warm pool is a latency
+# optimisation for a handful of instances, and wanting dozens of idle machines
+# means wanting a different mechanism.
+MAX_WARM_POOL_SIZE = 20
 
 # AMI baking defaults
 DEFAULT_BAKE_AMI = False  # bake worker_init into a custom AMI during initialize()

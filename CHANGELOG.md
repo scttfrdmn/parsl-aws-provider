@@ -40,6 +40,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   live VPC and blackhole egress for unrelated workloads (closes #94).
 
 ### Fixed
+- `ServerlessMode`'s spot fleet path could never have launched an instance. Its
+  CloudFormation template declared a `RegionMap` of AMIs that no `FindInMap`
+  ever read, so the fleet's launch template carried no `ImageId` and EC2 refused
+  every request with `Parameter 'amiIdList' cannot be empty` — confirmed against
+  both fleet APIs. The template also padded a fixed set of `!Select` slots by
+  repeating an instance type, which EC2 rejects outright with
+  `InvalidFleetConfig: The fleet configuration contains duplicate instance
+  pools`; a `DryRun` does not catch that, having accepted the identical
+  duplicate-bearing request. The fleet is now created directly by
+  `_create_job_fleet()`, which resolves the AMI from SSM and deduplicates the
+  override list (closes #86).
+- The detached mode's default bastion path always failed. `_create_bastion_stack()`
+  sent `UseSpotFleet`, `InstanceTypes`, `NodesPerBlock`, and
+  `SpotMaxPricePercentage` to `bastion.yml`, which declares none of them, and
+  CloudFormation rejects an undeclared parameter outright:
+  `ValidationError: Parameters: [UseSpotFleet] do not exist in the template`.
+  Since `bastion_host_type` defaults to `"cloudformation"`, this was the default
+  path. All four describe a *worker fleet* and the bastion is a single host, so
+  they are dropped rather than added to the template; the fleet settings already
+  reach the workers through the bastion manager script (refs #86).
+- No spot fleet was ever registered with the interruption monitor.
+  `StandardMode` iterated a `"fleet_requests"` list on each block — at submit
+  time and again after a state load — but the manager records a single
+  `"fleet_request_id"` and nothing has ever written `"fleet_requests"`. The loop
+  body was therefore unreachable, so every fleet ran unmonitored while
+  `spot_interruption_handling=True` reported otherwise (refs #86).
+- The orphan sweep missed both kinds of fleet resource it was meant to find.
+  `cleanup_all_spot_fleet_resources()` looked for IAM roles named
+  `parsl-aws-spot-fleet-role-*` only, but the bastion manager script created
+  them as `parsl-ephemeral-spot-fleet-role-*`, so every role that path made was
+  leaked. It also enumerated fleets with `describe_spot_fleet_requests`, which
+  cannot see an EC2 Fleet at all. Both prefixes are now swept, and fleets are
+  found through the `aws:ec2:fleet-id` tag on their instances (refs #86).
+- The synthesised "similar instance types" in the bastion manager script
+  produced invalid type names for most families. Slicing off the first
+  character assumes a single-character family, so `m5a.large` became
+  `mm5a.large`/`rm5a.large` and `c6i.large` became `c7i.large` via a
+  generation bump that ignored the suffix. Each bad name was a pool the fleet
+  could not draw from. The script now uses the configured instance types, or
+  the job's single type (refs #86).
 - A spot instance that shut itself down was left `stopped` with a billed EBS
   volume that the provider had already forgotten about. `InstanceInitiatedShutdownBehavior`
   is not a member of the `LaunchSpecification` shape `RequestSpotInstances`
@@ -426,6 +466,75 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a first run can proceed with no saved state (closes #122).
 
 ### Added
+- **Spot interruption warnings now arrive before the instance dies.** An
+  EventBridge rule matching `EC2 Spot Instance Interruption Warning` delivers to
+  an SQS queue that the driver long-polls, giving roughly two minutes of notice
+  while the instance is still `running` — the only window in which checkpointing
+  can succeed. `SpotInterruptionMonitor` creates the rule and queue in
+  `start_monitoring()` and deletes them in `stop_monitoring()`, including when no
+  thread was running, since nothing else in the package would reclaim them.
+  This **requires new IAM permissions**: `events:PutRule`, `events:PutTargets`,
+  `events:RemoveTargets`, `events:DeleteRule`, `events:TagResource`,
+  `sqs:CreateQueue`, `sqs:GetQueueAttributes`, `sqs:SetQueueAttributes`,
+  `sqs:ReceiveMessage`, `sqs:DeleteMessage`, and `sqs:DeleteQueue`. Failing to
+  create the notifier is logged and does **not** fail the workflow: detection
+  degrades to the pre-existing EC2-state poll, which still works but can only
+  report an interruption post-facto. Set `use_event_bridge=False` on the monitor
+  to skip creation deliberately. Verified end to end against real AWS with a
+  Fault Injection Simulator experiment
+  (`aws:ec2:send-spot-instance-interruptions`): the warning reached the queue
+  15.2s after the experiment started, with the instance still `running`, and a
+  handler registered through the provider's own monitor fired with
+  `Source: "eventbridge"` (closes #86).
+  - **No IAM role is created for the target, and none is needed.** Delivery to
+    SQS is authorised by the *queue's* resource policy, unlike most target
+    types; `put_targets` with an SQS ARN and no `RoleArn` returns
+    `FailedEntryCount=0`. The queue policy grants `events.amazonaws.com`
+    `sqs:SendMessage` conditioned on `aws:SourceArn` being this rule, so no
+    other rule in any account can post to it.
+  - **The rule cannot be scoped to this provider's instances.** The event's
+    `detail` carries only `instance-id` and `instance-action`, and instance IDs
+    are not known until the fleet launches, so the rule necessarily matches
+    every spot interruption in the account and region. Each monitor discards
+    warnings for instances it does not track; two providers in one account each
+    see the other's warnings and ignore them.
+  - `EC2 Instance Rebalance Recommendation` is deliberately **not** matched. It
+    signals elevated interruption risk rather than an impending reclaim, so
+    treating it as an interruption would checkpoint and tear down workers that
+    were never going away.
+  - A fake warning cannot be used to test this. `put_events` refuses any
+    `aws.`-prefixed source with `NotAuthorizedForSourceException`, which is why
+    the E2E test drives a real interruption through FIS. Set
+    `AWS_TEST_FIS_ROLE_ARN` to run those two tests; the other nine in
+    `tests/aws/test_spot_warning_e2e.py` need only the standard E2E network.
+- `create_ec2_fleet()`, `describe_ec2_fleet()`, `get_ec2_fleet_instance_ids()`,
+  `delete_ec2_fleet()`, `build_fleet_launch_template_configs()`,
+  `normalize_ec2_fleet_allocation_strategy()`,
+  `create_spot_interruption_notifier()`, and
+  `delete_spot_interruption_notifier()` in `utils/aws.py`, plus
+  `find_fleet_ids_for_workflow()` and `find_legacy_spot_fleet_request_ids()` in
+  `compute/spot_fleet_cleanup.py` (refs #86).
+- `tests/unit/test_spot_warning_notifier.py` — 43 tests. The notifier had none.
+  Four claims a live probe proves once and that then rot silently are pinned
+  here: the queue policy is set *before* the target is added (a warning arriving
+  in that window is dropped as unauthorised and never retried, so the two
+  minutes elapse and the instance is gone — and a live probe cannot catch this,
+  since it creates the rule long before any interruption fires); `put_targets`
+  reports refusal in `FailedEntryCount` rather than by raising, so an unchecked
+  call wires nothing and the absence of warnings is indistinguishable from the
+  absence of interruptions; every message is deleted *before* it is parsed,
+  because the rule matches the whole account and an unparseable body would
+  otherwise be redelivered on every poll, crowding out usable warnings via
+  `MaxNumberOfMessages`; and the notifier is torn down even when no thread was
+  running. Ordering assertions span two clients, so both are attached to a
+  shared parent mock whose `mock_calls` interleaves them (refs #86).
+- `tests/aws/test_spot_warning_e2e.py` — 11 tests against real AWS. Reads back
+  what AWS actually stored rather than what was sent: the target has no
+  `RoleArn`, the rule is `ENABLED` with the exact pattern, the queue policy's
+  `aws:SourceArn` matches the ARN AWS assigned, and the retention period is
+  whatever SQS clamped it to (SQS clamps rather than rejects, so reading it back
+  is the only way to know). Deletion is asserted inside the tests, not only in
+  teardown, so a silent teardown failure cannot hide a leaked rule (refs #86).
 - **Launch templates.** `StandardMode.initialize()` now builds one launch template
   that every launch path shares — on-demand, spot, and spot fleet — carrying the
   AMI, instance type, network interface, key pair, IMDSv2 settings,
@@ -604,6 +713,91 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   template is caught (refs #112, #113).
 
 ### Changed
+- **Spot Fleet is replaced by EC2 Fleet.** AWS: "Spot Fleet … uses a legacy API
+  with no planned investment." Every `request_spot_fleet` call is now
+  `create_fleet` — in `SpotFleetManager`, `ServerlessMode`, and the detached
+  mode's bastion manager script — backed by the launch template #85 introduced.
+  The migration was only possible after that, because `CreateFleet` has no
+  `LaunchSpecifications` member at all: a template is mandatory, not preferred.
+  Requires `ec2:CreateFleet`, `ec2:DescribeFleets`, and `ec2:DeleteFleets` in
+  place of `ec2:RequestSpotFleet`, `ec2:DescribeSpotFleetRequests`, and
+  `ec2:CancelSpotFleetRequests`; the legacy permissions are still used by the
+  orphan sweep, which cancels pre-upgrade requests. The `use_spot_fleet` kwarg,
+  the `SpotFleetManager` class name, and the `fleet_request_id` state key are all
+  unchanged, so existing configuration and state documents keep working.
+  Consequences worth knowing:
+  - **No IAM service role is created any more.** `CreateFleet` has no
+    `IamFleetRole` member, so `_get_iam_fleet_role()` and its
+    `AmazonEC2SpotFleetTaggingRole` attachment are gone from both the manager and
+    the bastion script, along with the 10-second IAM propagation sleep. The
+    orphan sweep still deletes roles left by a pre-upgrade workflow.
+  - **Fleet type is `instant`.** It returns the launched instance IDs
+    synchronously in the `CreateFleet` response, which is what preserves the
+    block → instance-ID mapping the rest of the package is built on; the
+    alternatives are asynchronous and would need polling before a block could
+    report its instances. The 300-second `_wait_for_fleet_instances()` poll is
+    gone with it, and `StandardMode` now fails a block immediately when the fleet
+    launched nothing, instead of waiting out a timeout that conflated "no spot
+    capacity" with "slow to boot".
+  - **An `instant` fleet gets no Capacity Rebalance.** `ReplaceUnhealthyInstances`,
+    `TerminateInstancesWithExpiration`, and `SpotOptions.MaintenanceStrategies`
+    are not merely ignored for this fleet type — EC2 rejects each with
+    `InvalidParameter` ("only compatible with fleet type maintain"), verified
+    against real EC2. The two-minute interruption warning is delivered through
+    the EventBridge route above instead.
+  - **An unfilled fleet is a successful API call.** An `instant` fleet reports
+    pools it could not fill in the response body rather than failing, and makes
+    no further attempts, so both `StandardMode` and `ServerlessMode` now treat an
+    empty fleet as a submission failure and delete it rather than leaving an
+    empty fleet behind.
+  - **`aws:ec2:fleet-id` is the only way to find an instant fleet's instances.**
+    `describe_fleets` with no `FleetIds` returns an empty list for instant fleets
+    (AWS: "you must specify the fleet ID in the request, otherwise the fleet does
+    not appear in the response"), a tag filter on `describe_fleets` does not find
+    them either, and `describe_fleet_instances` refuses them with `Unsupported`.
+    The orphan sweep therefore goes through `describe_instances` filtered on that
+    reserved tag. moto 5.1.21 supports `create_fleet(Type="instant")` but does
+    not apply the tag, so this path is asserted against real AWS only.
+  - **`MaxTotalPrice` replaces `SpotPrice`, and is fleet-wide.** The legacy value
+    was per instance-hour, so `spot_max_price_percentage` is now multiplied by
+    the node count. AWS advises against setting it at all ("can lead to increased
+    interruptions"), so it is sent only when configured.
+  - **The fleet is no longer built by CloudFormation on any path.** The
+    `Overrides` list is variable-length, one entry per instance type, and CFN
+    cannot build one: `Fn::ForEach` (`AWS::LanguageExtensions`) expands to a
+    *map*, confirmed by reading the processed template off a change set; a fixed
+    set of `!Select` slots cannot be left partly filled, because an out-of-range
+    `!Select` fails validation even inside the untaken branch of an `!If`; and
+    padding the slots by repeating a type is rejected by EC2 as duplicate
+    instance pools. `ServerlessMode` calls `CreateFleet` directly, which also
+    stops it deploying an ECS cluster, task definition, two IAM roles, and a log
+    group that an EC2 fleet never touches — and makes the fleet ID available
+    immediately instead of after up to three minutes of polling stack outputs,
+    during which an interruption would have gone unhandled.
+  - The spot bastion is now an `AWS::EC2::Instance` referencing a launch template
+    with `InstanceMarketOptions`, replacing the `AWS::EC2::SpotFleet` resource
+    `bastion.yml` used to carry for that case. `AWS::EC2::Instance` does not
+    accept `InstanceMarketOptions` directly, but a launch template does, and an
+    instance referencing that template launches as spot. One template now serves
+    both bastion variants, and the spot bastion gains IMDSv2 with it.
+  - Failing to build a fleet's launch template now fails the block. The old
+    `LaunchSpecifications` fallback silently launched without IMDSv2 —
+    `SpotFleetLaunchSpecification` has no `MetadataOptions` member — and there is
+    nothing to fall back to under `CreateFleet` anyway.
+- **`warm_pool_ttl` now defaults to 120 seconds, down from 600.** A warm instance
+  is left *Running*, not Stopped, so it bills at the full instance rate for the
+  whole window whether or not another job arrives. AWS is blunt about this shape
+  — keeping warm instances running is "highly discouraged to avoid incurring
+  unnecessary charges" — and the native ASG warm pool it recommends instead holds
+  them Stopped or Hibernated. This package cannot use the native pool yet:
+  dispatch is SSM `SendCommand`, and a Stopped instance runs no SSM agent, so it
+  cannot receive one. Moving to a pull model is tracked as #130 for v0.8.0. Until
+  then the cost is bounded rather than eliminated — an idle pool costs a fifth of
+  what it did, `warm_pool_size` is capped at `MAX_WARM_POOL_SIZE` (20) with a
+  `ValueError` above it, and enabling a pool logs a warning stating the instance
+  count, the window, and the resulting idle instance-seconds. The docstring says
+  so too; the kwarg name alone does not convey that it costs money while doing
+  nothing (refs #86).
 - Plain spot instances are requested with `RunInstances` +
   `InstanceMarketOptions` instead of `RequestSpotInstances`. The old API cannot
   express either IMDSv2 or the shutdown behaviour, as above. `RequestSpotInstances`
@@ -811,6 +1005,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   from the environment; tests are skipped (not failed) when these are unset.
 
 ### Removed
+- `SpotFleetManager._get_iam_fleet_role()` and `_create_spot_fleet_request()`,
+  `_wait_for_fleet_instances()`, and the bastion manager script's
+  `get_spot_fleet_role()` and `wait_for_fleet_instances()`. `CreateFleet` needs no
+  service role and reports its instances synchronously, so all five became
+  unreachable (refs #86).
+- `SpotFleetRole` and `SpotFleetRequest` from `ecs_worker.yml`, `SpotBastionHost`
+  from `bastion.yml`, and the `UseSpotFleet`/`InstanceTypes`/`NodesPerBlock`/
+  `SpotMaxPricePercentage` parameters both templates carried. The
+  `SpotFleetLaunchTemplate` in `ecs_worker.yml` goes with them; the fleet is
+  created by `CreateFleet` directly. `ecs_worker.yml` also loses a `RegionMap` of
+  15 Python-3.9-era AMIs that no `FindInMap` referenced (refs #86).
 - `parsl_ephemeral_aws/utils/localstack.py` (422 LOC). Test-only scaffolding that
   shipped in every wheel; no package code has ever imported it. Its replacement,
   `tests/substrate_support.py`, is not distributed (closes #125).

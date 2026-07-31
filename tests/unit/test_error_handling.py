@@ -504,8 +504,32 @@ class TestSpotFleetManagerErrors:
             spot_max_price_percentage=80,
         )
 
+    def _fail_create_fleet(self, manager, code, message):
+        """Make ``CreateFleet`` fail with *code*, answering the mandatory template.
+
+        The launch template has to be answered even on a failure path: it is
+        created *before* the fleet, and ``CreateFleet`` has no
+        ``LaunchSpecifications`` member, so there is no launch form that skips it
+        (#86). An unstubbed ``create_launch_template`` would fail the test on the
+        template's MagicMock return rather than on the error under test.
+        """
+        manager.ec2_client.create_launch_template.return_value = {
+            "LaunchTemplate": {"LaunchTemplateId": "lt-12345", "LatestVersionNumber": 1}
+        }
+        manager.ec2_client.describe_spot_price_history.return_value = {
+            "SpotPriceHistory": [{"SpotPrice": "0.01"}]
+        }
+        manager.ec2_client.create_fleet.side_effect = ClientError(
+            {"Error": {"Code": code, "Message": message}}, "CreateFleet"
+        )
+
     def _request_fleet(self, manager):
-        """Call ``_create_spot_fleet_request`` -- the layer that classifies errors.
+        """Call ``_create_fleet`` -- the layer that classifies errors.
+
+        Retargeted from ``_create_spot_fleet_request``, which is gone with the
+        legacy API (#86). Note the shorter signature: there is no
+        ``fleet_role_arn`` parameter any more, because ``CreateFleet`` has no
+        ``IamFleetRole`` member and an EC2 Fleet needs no service role at all.
 
         ``create_blocks`` deliberately wraps everything it catches as
         ``ResourceCreationError``, and because ``SpotFleetError`` descends from
@@ -514,7 +538,7 @@ class TestSpotFleetManagerErrors:
         itself is asserted separately in
         ``test_create_blocks_wraps_fleet_errors``.
         """
-        return manager._create_spot_fleet_request(
+        return manager._create_fleet(
             block_id="block-1",
             network={
                 "vpc_id": "vpc-12345",
@@ -522,19 +546,22 @@ class TestSpotFleetManagerErrors:
                 "security_group_id": "sg-12345",
             },
             target_capacity=1,
-            fleet_role_arn="arn:aws:iam::123456789012:role/fleet",
         )
 
     def test_spot_fleet_request_error(self, spot_fleet_manager):
-        """An invalid fleet configuration surfaces as SpotFleetError."""
-        spot_fleet_manager.ec2_client.request_spot_fleet.side_effect = ClientError(
-            {
-                "Error": {
-                    "Code": "InvalidSpotFleetRequestConfig",
-                    "Message": "Invalid Spot Fleet request configuration",
-                }
-            },
-            "RequestSpotFleet",
+        """An invalid fleet configuration surfaces as SpotFleetError.
+
+        The code is ``InvalidFleetConfig``, not the ``InvalidSpotFleetRequestConfig``
+        this asserted before: that code belongs to ``RequestSpotFleet``, and
+        ``CreateFleet`` never returns it. Verified against real EC2 -- a fleet
+        whose ``Overrides`` repeat an instance pool comes back as
+        ``InvalidFleetConfig: The fleet configuration contains duplicate instance
+        pools``, and ``DryRun=True`` does not catch it.
+        """
+        self._fail_create_fleet(
+            spot_fleet_manager,
+            "InvalidFleetConfig",
+            "The fleet configuration contains duplicate instance pools",
         )
 
         with pytest.raises(SpotFleetError):
@@ -547,29 +574,29 @@ class TestSpotFleetManagerErrors:
         distinguishing it -- a caller can back off for the interval AWS named
         instead of retrying blind.
         """
-        spot_fleet_manager.ec2_client.request_spot_fleet.side_effect = ClientError(
-            {
-                "Error": {
-                    "Code": "RequestLimitExceeded",
-                    "Message": "Request limit exceeded",
-                }
-            },
-            "RequestSpotFleet",
+        self._fail_create_fleet(
+            spot_fleet_manager, "RequestLimitExceeded", "Request limit exceeded"
         )
 
         with pytest.raises(SpotFleetThrottlingError):
             self._request_fleet(spot_fleet_manager)
 
     def test_spot_fleet_instance_limit_error(self, spot_fleet_manager):
-        """InstanceLimitExceeded surfaces as the request subclass."""
-        spot_fleet_manager.ec2_client.request_spot_fleet.side_effect = ClientError(
-            {
-                "Error": {
-                    "Code": "InstanceLimitExceeded",
-                    "Message": "You have reached your instance limit",
-                }
-            },
-            "RequestSpotFleet",
+        """A spot quota rejection surfaces as the request subclass.
+
+        ``MaxSpotInstanceCountExceeded`` replaces the ``InstanceLimitExceeded``
+        this used to send: that code is ``RunInstances``', and a fleet that
+        exceeds the account's spot limit is refused with the spot-specific one.
+
+        The distinction from ``InsufficientInstanceCapacity`` matters to callers
+        and is why this maps to the request subclass rather than the base: a
+        quota is not a transient shortage, so the fix is a limit increase, not a
+        retry or a different pool.
+        """
+        self._fail_create_fleet(
+            spot_fleet_manager,
+            "MaxSpotInstanceCountExceeded",
+            "Max spot instance count exceeded",
         )
 
         with pytest.raises(SpotFleetRequestError):
@@ -580,16 +607,18 @@ class TestSpotFleetManagerErrors:
 
         Pinning the wrapping is what makes the subclass tests above meaningful:
         callers of ``create_blocks`` get the generic type, callers of
-        ``_create_spot_fleet_request`` get the specific one.
+        ``_create_fleet`` get the specific one.
+
+        Only ``_setup_network_resources`` is patched now. This also patched
+        ``_get_iam_fleet_role``, which no longer exists -- and ``patch.object``
+        raises ``AttributeError`` for a missing attribute rather than creating
+        one, so the patch itself is what failed, before the fleet was ever
+        requested.
         """
-        spot_fleet_manager.ec2_client.request_spot_fleet.side_effect = ClientError(
-            {
-                "Error": {
-                    "Code": "InvalidSpotFleetRequestConfig",
-                    "Message": "Invalid Spot Fleet request configuration",
-                }
-            },
-            "RequestSpotFleet",
+        self._fail_create_fleet(
+            spot_fleet_manager,
+            "InvalidFleetConfig",
+            "The fleet configuration contains duplicate instance pools",
         )
         network = {
             "vpc_id": "vpc-12345",
@@ -597,69 +626,147 @@ class TestSpotFleetManagerErrors:
             "security_group_id": "sg-12345",
         }
 
-        with (
-            patch.object(
-                spot_fleet_manager, "_setup_network_resources", return_value=network
-            ),
-            patch.object(
-                spot_fleet_manager,
-                "_get_iam_fleet_role",
-                return_value="arn:aws:iam::123456789012:role/fleet",
-            ),
+        with patch.object(
+            spot_fleet_manager, "_setup_network_resources", return_value=network
         ):
             with pytest.raises(ResourceCreationError):
                 spot_fleet_manager.create_blocks(1)
 
     def test_spot_fleet_cancellation_error(self, spot_fleet_manager):
-        """A refused cancellation surfaces as SpotFleetError."""
-        spot_fleet_manager.blocks["block-1"] = {
-            "id": "block-1",
-            "fleet_request_id": "sfr-12345",
-            "status": "running",
-            "instance_ids": [],
-        }
-        spot_fleet_manager.ec2_client.cancel_spot_fleet_requests.side_effect = (
-            ClientError(
-                {
-                    "Error": {
-                        "Code": "UnauthorizedOperation",
-                        "Message": "You are not authorized to cancel this request",
-                    }
-                },
-                "CancelSpotFleetRequests",
-            )
-        )
+        """A refused deletion surfaces as SpotFleetError.
 
-        with pytest.raises(SpotFleetError):
-            spot_fleet_manager.terminate_block("block-1")
+        Retargeted at ``DeleteFleets``; ``CancelSpotFleetRequests`` cannot reach
+        a fleet ``CreateFleet`` made, and would answer
+        ``InvalidSpotFleetRequestId.NotFound``.
 
-    def test_cancelling_an_absent_fleet_is_not_an_error(self, spot_fleet_manager):
-        """A fleet AWS has already forgotten counts as cancelled, not as failure.
-
-        Termination has to be idempotent -- cleanup runs it on paths that may
-        have already run it.
+        This one caught a live defect rather than just a renamed API.
+        ``terminate_block`` calls ``delete_ec2_fleet``, which wraps the
+        ``ClientError`` in ``ResourceDeletionError`` -- so the
+        ``except ClientError`` branch that classifies these errors could never
+        run, and every refused deletion fell through to the generic
+        ``ResourceCleanupError`` handler. ``ResourceCleanupError`` is *not* a
+        ``SpotFleetError`` (it descends from ``ResourceDeletionError``, not
+        ``EC2InstanceError``), so this test failed as ``DID NOT RAISE`` even
+        though the deletion had genuinely failed. The handler now catches the
+        wrapper and reads the original from ``__cause__``.
         """
         spot_fleet_manager.blocks["block-1"] = {
             "id": "block-1",
-            "fleet_request_id": "sfr-12345",
+            "fleet_request_id": "fleet-12345",
             "status": "running",
             "instance_ids": [],
         }
-        spot_fleet_manager.ec2_client.cancel_spot_fleet_requests.side_effect = (
-            ClientError(
-                {
-                    "Error": {
-                        "Code": "InvalidSpotFleetRequestId.NotFound",
-                        "Message": "The spot fleet request does not exist",
-                    }
-                },
-                "CancelSpotFleetRequests",
-            )
+        spot_fleet_manager.ec2_client.delete_fleets.side_effect = ClientError(
+            {
+                "Error": {
+                    "Code": "UnauthorizedOperation",
+                    "Message": "You are not authorized to delete this fleet",
+                }
+            },
+            "DeleteFleets",
         )
+
+        with pytest.raises(SpotFleetError) as excinfo:
+            spot_fleet_manager.terminate_block("block-1")
+
+        # The EC2 code must survive the double wrapping, or the message names
+        # only the wrapper and the operator cannot tell a permissions failure
+        # from a transient one.
+        assert "UnauthorizedOperation" in str(excinfo.value)
+
+    def test_a_throttled_deletion_surfaces_its_retry_interval(self, spot_fleet_manager):
+        """Throttling must stay distinguishable through the wrapper.
+
+        Same defect as above, but this is the case where the erasure cost
+        something concrete: ``SpotFleetThrottlingError`` carries the
+        ``retry_after`` AWS supplied, and reporting it as a generic
+        ``ResourceCleanupError`` discarded that value -- leaving a caller to
+        retry blind against a throttle.
+        """
+        spot_fleet_manager.blocks["block-1"] = {
+            "id": "block-1",
+            "fleet_request_id": "fleet-12345",
+            "status": "running",
+            "instance_ids": [],
+        }
+        spot_fleet_manager.ec2_client.delete_fleets.side_effect = ClientError(
+            {
+                "Error": {"Code": "RequestLimitExceeded", "Message": "Slow down"},
+                "ResponseMetadata": {"RetryAfter": 45},
+            },
+            "DeleteFleets",
+        )
+
+        with pytest.raises(SpotFleetThrottlingError) as excinfo:
+            spot_fleet_manager.terminate_block("block-1")
+
+        assert excinfo.value.retry_after == 45
+        assert excinfo.value.operation == "delete_fleets"
+
+    def test_deleting_an_absent_fleet_is_not_an_error(self, spot_fleet_manager):
+        """A fleet AWS has already forgotten counts as deleted, not as failure.
+
+        Termination has to be idempotent -- cleanup runs it on paths that may
+        have already run it.
+
+        Retargeted at ``DeleteFleets`` (#86), which also makes the test do
+        something: stubbing ``cancel_spot_fleet_requests`` was inert once the
+        manager stopped calling it, and it passed vacuously because the
+        unstubbed ``delete_fleets`` returned a MagicMock whose
+        ``UnsuccessfulFleetDeletions`` iterated as empty.
+
+        EC2 reports the absent fleet two different ways, and both are exercised
+        here because only one of them is an exception: an ID that never existed
+        raises ``InvalidFleetId.NotFound``, while a well-formed one EC2 has
+        forgotten comes back as a ``fleetIdDoesNotExist`` entry in
+        ``UnsuccessfulFleetDeletions`` on an otherwise successful call -- so a
+        handler that only caught the raise would treat the ordinary case as a
+        cleanup failure.
+        """
+        spot_fleet_manager.ec2_client.delete_fleets.side_effect = ClientError(
+            {
+                "Error": {
+                    "Code": "InvalidFleetId.NotFound",
+                    "Message": "The fleet does not exist",
+                }
+            },
+            "DeleteFleets",
+        )
+        spot_fleet_manager.blocks["block-1"] = {
+            "id": "block-1",
+            "fleet_request_id": "fleet-12345",
+            "status": "running",
+            "instance_ids": [],
+        }
 
         spot_fleet_manager.terminate_block("block-1")
 
         assert spot_fleet_manager.blocks["block-1"]["status"] == STATUS_CANCELLED
+
+        # The inline form, on a call that did not raise at all.
+        spot_fleet_manager.ec2_client.delete_fleets.side_effect = None
+        spot_fleet_manager.ec2_client.delete_fleets.return_value = {
+            "SuccessfulFleetDeletions": [],
+            "UnsuccessfulFleetDeletions": [
+                {
+                    "FleetId": "fleet-67890",
+                    "Error": {
+                        "Code": "fleetIdDoesNotExist",
+                        "Message": "The fleet ID does not exist",
+                    },
+                }
+            ],
+        }
+        spot_fleet_manager.blocks["block-2"] = {
+            "id": "block-2",
+            "fleet_request_id": "fleet-67890",
+            "status": "running",
+            "instance_ids": [],
+        }
+
+        spot_fleet_manager.terminate_block("block-2")
+
+        assert spot_fleet_manager.blocks["block-2"]["status"] == STATUS_CANCELLED
 
 
 class TestLambdaManagerErrors:

@@ -683,7 +683,13 @@ class TestStandardModeLaunchPaths:
 
 
 class TestSpotFleetLaunchTemplate:
-    """Spot Fleet reaches IMDSv2 only through a launch template."""
+    """An EC2 Fleet reaches its instances only through a launch template.
+
+    True by construction since #86: ``CreateFleet`` has no
+    ``LaunchSpecifications`` member, so there is nothing to fall back to and no
+    way to launch without a template. Under the legacy ``RequestSpotFleet`` the
+    template was merely preferred, and the fallback silently dropped IMDSv2.
+    """
 
     @pytest.fixture
     def ec2(self):
@@ -691,7 +697,13 @@ class TestSpotFleetLaunchTemplate:
         client.create_launch_template.return_value = {
             "LaunchTemplate": {"LaunchTemplateId": "lt-fleet", "LatestVersionNumber": 1}
         }
-        client.request_spot_fleet.return_value = {"SpotFleetRequestId": "sfr-1"}
+        client.create_fleet.return_value = {
+            "FleetId": "fleet-1",
+            "Instances": [{"InstanceIds": ["i-1"]}],
+        }
+        client.describe_spot_price_history.return_value = {
+            "SpotPriceHistory": [{"SpotPrice": "0.01"}]
+        }
         return client
 
     @pytest.fixture
@@ -728,7 +740,7 @@ class TestSpotFleetLaunchTemplate:
             return SpotFleetManager(provider)
 
     def _request(self, manager):
-        manager._create_spot_fleet_request(
+        manager._create_fleet(
             "block-1",
             {
                 "vpc_id": "vpc-1",
@@ -736,23 +748,25 @@ class TestSpotFleetLaunchTemplate:
                 "security_group_id": "sg-1",
             },
             1,
-            "arn:aws:iam::1:role/fleet",
         )
-        return manager.ec2_client.request_spot_fleet.call_args.kwargs[
-            "SpotFleetRequestConfig"
-        ]
+        return manager.ec2_client.create_fleet.call_args.kwargs
 
     def test_fleet_request_sends_only_the_template_form(self, manager):
-        """EC2 accepts both keys, then silently ignores the template.
+        """There is no other form to send.
 
-        DryRun against real EC2 returns ``DryRunOperation`` for a request
-        carrying ``LaunchSpecifications`` *and* ``LaunchTemplateConfigs`` -- and
-        the specifications win, taking IMDSv2 with them.
+        Under ``RequestSpotFleet`` this was a real hazard: EC2 accepted a request
+        carrying ``LaunchSpecifications`` *and* ``LaunchTemplateConfigs`` --
+        DryRun against real EC2 returned ``DryRunOperation`` -- then let the
+        specifications win, taking IMDSv2 with them. ``CreateFleet`` has no
+        ``LaunchSpecifications`` member at all, so the hazard is structural now
+        rather than a matter of care (#86). Asserted anyway: the legacy key would
+        be rejected outright, so sending it would fail every launch.
         """
         config = self._request(manager)
 
         assert "LaunchTemplateConfigs" in config
         assert "LaunchSpecifications" not in config
+        assert "SpotFleetRequestConfig" not in config
 
     def test_fleet_template_requires_imdsv2(self, manager, ec2):
         """The only route: ``SpotFleetLaunchSpecification`` has no
@@ -783,34 +797,56 @@ class TestSpotFleetLaunchTemplate:
         }
 
     def test_every_instance_type_becomes_an_override(self, manager):
-        """One template covers every pool the fleet may draw from."""
+        """One template covers every pool the fleet may draw from.
+
+        Each type must appear exactly once. ``CreateFleet`` rejects a repeated
+        pool -- "InvalidFleetConfig: The fleet configuration contains duplicate
+        instance pools" -- and ``DryRun=True`` does *not* catch it, so a
+        duplicate would only surface on a real launch.
+        """
         config = self._request(manager)
 
         overrides = config["LaunchTemplateConfigs"][0]["Overrides"]
+        pools = [(o["InstanceType"], o["SubnetId"]) for o in overrides]
+        assert len(pools) == len(set(pools))
         assert [o["InstanceType"] for o in overrides] == ["t3.micro", "t3.small"]
         assert all(o["SubnetId"] == "subnet-1" for o in overrides)
 
-    def test_template_failure_falls_back_to_launch_specifications(self, manager, ec2):
-        """Unavoidably without IMDSv2, but a working fleet beats no fleet."""
+    def test_template_failure_fails_the_block(self, manager, ec2):
+        """A template that cannot be created must fail the block, not degrade it.
+
+        This inverts what the legacy path did. ``RequestSpotFleet`` accepted
+        inline ``LaunchSpecifications``, so a failed template fell back to them
+        -- launching a working fleet, but silently without IMDSv2, since
+        ``SpotFleetLaunchSpecification`` has no ``MetadataOptions`` member.
+        ``CreateFleet`` has no such member either, so there is nothing to fall
+        back to and the failure surfaces (#86). Worth asserting rather than
+        assuming: a fallback reintroduced here would be an unannounced security
+        downgrade.
+        """
         ec2.create_launch_template.side_effect = _client_error(
             "UnauthorizedOperation", "CreateLaunchTemplate"
         )
 
+        with pytest.raises(ResourceCreationError):
+            self._request(manager)
+
+        ec2.create_fleet.assert_not_called()
+
+    def test_no_fleet_is_requested_without_a_template(self, manager, ec2):
+        """Every launch goes through the template, so every launch gets IMDSv2.
+
+        The one property the fallback used to break. Asserting on the encoded
+        UserData is how the launch is shown to be template-borne: the fleet
+        request itself carries none, because ``CreateFleet``'s ``Overrides``
+        shape has no ``UserData`` member.
+        """
         config = self._request(manager)
 
-        assert "LaunchSpecifications" in config
-        assert "LaunchTemplateConfigs" not in config
-
-    def test_fallback_user_data_is_encoded(self, manager, ec2):
-        """``SpotFleetLaunchSpecification`` is not auto-encoded either."""
-        ec2.create_launch_template.side_effect = _client_error(
-            "UnauthorizedOperation", "CreateLaunchTemplate"
-        )
-
-        config = self._request(manager)
-
-        spec = config["LaunchSpecifications"][0]
-        assert base64.b64decode(spec["UserData"]).decode().startswith("#!/bin/bash")
+        assert "UserData" not in config
+        data = ec2.create_launch_template.call_args.kwargs["LaunchTemplateData"]
+        assert base64.b64decode(data["UserData"]).decode().startswith("#!/bin/bash")
+        assert data["MetadataOptions"]["HttpTokens"] == "required"
 
     def test_template_is_tracked_per_block(self, manager):
         self._request(manager)
@@ -820,7 +856,7 @@ class TestSpotFleetLaunchTemplate:
     def test_terminating_a_block_deletes_its_template(self, manager, ec2):
         self._request(manager)
         manager.blocks["block-1"] = {
-            "fleet_request_id": "sfr-1",
+            "fleet_request_id": "fleet-1",
             "instance_ids": [],
             "status": "RUNNING",
         }

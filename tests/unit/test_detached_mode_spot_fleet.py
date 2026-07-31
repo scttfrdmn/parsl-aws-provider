@@ -244,7 +244,23 @@ class TestDetachedModeSpotFleet:
         mock_ec2_client,
         mock_cf_client,
     ):
-        """Test initialize method with SpotFleet options."""
+        """The bastion stack must carry no fleet parameters at all.
+
+        This used to assert the opposite -- that ``UseSpotFleet``,
+        ``NodesPerBlock``, ``SpotMaxPricePercentage`` and ``InstanceTypes`` were
+        sent. ``bastion.yml`` declares none of them, and CloudFormation rejects an
+        undeclared parameter outright: "ValidationError: Parameters:
+        [UseSpotFleet] do not exist in the template". Since ``bastion_host_type``
+        defaults to ``"cloudformation"``, that made the default bastion path fail
+        on every initialize.
+
+        They were dropped rather than added to the template because all four
+        describe a *worker fleet* and the bastion is a single host; the fleet
+        settings reach the workers through the manager script's environment. So
+        the assertion is inverted, and the network parameters the stack does need
+        are checked in their place -- an empty ``Parameters`` list would satisfy a
+        purely negative test.
+        """
         # Setup mocks
         mock_get_default_ami.return_value = "ami-default"
         mock_get_cf_template.return_value = "CloudFormation Template"
@@ -260,20 +276,24 @@ class TestDetachedModeSpotFleet:
         assert detached_mode_with_spot_fleet.bastion_id == "stack-12345"
         assert detached_mode_with_spot_fleet.initialized is True
 
-        # Verify CloudFormation parameters include SpotFleet options
+        assert mock_cf_client.create_stack.call_args_list
         for call_args in mock_cf_client.create_stack.call_args_list:
             cf_params = call_args[1].get("Parameters", [])
-
-            # Convert parameters to a dict for easier checking
             param_dict = {p["ParameterKey"]: p["ParameterValue"] for p in cf_params}
 
-            # Verify SpotFleet parameters are present
-            assert param_dict.get("UseSpotFleet") == "true"
-            assert param_dict.get("NodesPerBlock") == "2"
-            assert param_dict.get("SpotMaxPricePercentage") == "80"
-            assert "t3.small" in param_dict.get("InstanceTypes", "")
-            assert "t3.medium" in param_dict.get("InstanceTypes", "")
-            assert "m5.small" in param_dict.get("InstanceTypes", "")
+            for fleet_param in (
+                "UseSpotFleet",
+                "NodesPerBlock",
+                "SpotMaxPricePercentage",
+                "InstanceTypes",
+            ):
+                assert fleet_param not in param_dict
+
+            # What the bastion genuinely needs, so this is not vacuously true.
+            assert param_dict["VpcId"] == "vpc-12345"
+            assert param_dict["SubnetId"] == "subnet-12345"
+            assert param_dict["SecurityGroupId"] == "sg-12345"
+            assert param_dict["WorkflowId"] == "test-workflow"
 
     def test_submit_job_with_spot_fleet(
         self, detached_mode_with_spot_fleet, mock_ssm_client
@@ -404,7 +424,15 @@ class TestDetachedModeSpotFleet:
     def test_cleanup_spot_fleet_resources(
         self, detached_mode_with_spot_fleet, mock_ec2_client, mock_ssm_client
     ):
-        """Test cleaning up SpotFleet resources."""
+        """Cleanup must delete the fleet through the EC2 Fleet API (#86).
+
+        The fleet a job holds is now created by ``CreateFleet``, so
+        ``CancelSpotFleetRequests`` cannot reach it -- it would answer
+        ``InvalidSpotFleetRequestId.NotFound`` and the instances would keep
+        running and billing. ``DeleteFleets`` is the counterpart, and
+        ``TerminateInstances=True`` is not optional: it is a required member, and
+        omitting it leaves the instances behind.
+        """
         # Setup mock resource with SpotFleet details
         resource_id = "spot-fleet-job-1"
         detached_mode_with_spot_fleet.resources = {
@@ -420,10 +448,10 @@ class TestDetachedModeSpotFleet:
         # Cleanup the resource
         detached_mode_with_spot_fleet.cleanup_resources([resource_id])
 
-        # Verify EC2 cancel_spot_fleet_requests was called
-        mock_ec2_client.cancel_spot_fleet_requests.assert_called_once_with(
-            SpotFleetRequestIds=["sfr-12345"], TerminateInstances=True
+        mock_ec2_client.delete_fleets.assert_called_once_with(
+            FleetIds=["sfr-12345"], TerminateInstances=True
         )
+        mock_ec2_client.cancel_spot_fleet_requests.assert_not_called()
 
         # Verify SSM parameters were deleted
         mock_ssm_client.delete_parameter.assert_any_call(
@@ -442,16 +470,41 @@ class TestDetachedModeSpotFleet:
     def test_bastion_script_includes_spot_fleet_support(
         self, detached_mode_with_spot_fleet
     ):
-        """Test that the bastion manager script includes SpotFleet support."""
+        """The bastion script must carry the EC2 Fleet helpers, not the old ones.
+
+        Two of the three functions this asserted on are gone with the legacy API
+        (#86). ``get_spot_fleet_role()`` provisioned the ``IamFleetRole`` that
+        ``RequestSpotFleet`` requires; ``CreateFleet`` has no such member at all,
+        so the role -- and the IAM permissions to create it -- are no longer
+        needed. ``wait_for_fleet_instances()`` polled
+        ``describe_spot_fleet_instances``; an ``instant`` fleet returns its
+        instance IDs in the ``CreateFleet`` response, so there is nothing to wait
+        for, and ``get_fleet_instance_ids()`` looks them up by the reserved
+        ``aws:ec2:fleet-id`` tag -- the only way to find an instant fleet's
+        instances, since ``DescribeFleetInstances`` refuses them outright.
+
+        Checked against the generated text rather than the module source because
+        the bastion cannot import from this package: the script is assembled by
+        string substitution and runs standalone on the instance, where a missing
+        helper surfaces only as a ``NameError`` in that instance's log.
+        """
         # Generate the bastion manager script
         manager_script = detached_mode_with_spot_fleet._get_bastion_manager_script()
 
-        # Verify script content includes SpotFleet functionality
-        assert "def get_spot_fleet_role()" in manager_script
-        assert "def wait_for_fleet_instances(" in manager_script
         assert "def launch_spot_fleet(" in manager_script
+        assert "def get_fleet_instance_ids(" in manager_script
+        assert "def delete_launch_template(" in manager_script
         assert "RESOURCE_TYPE_SPOT_FLEET" in manager_script
         assert "USE_SPOT_FLEET" in manager_script
+
+        assert "get_spot_fleet_role" not in manager_script
+        assert "wait_for_fleet_instances" not in manager_script
+
+        # Scoped to the two ways the role could be *passed* rather than a bare
+        # substring check: the script's own header explains why CreateFleet has
+        # no IamFleetRole member, and that explanation should not fail this.
+        assert "'IamFleetRole'" not in manager_script
+        assert "IamFleetRole=" not in manager_script
 
     def test_load_state_with_spot_fleet(
         self, detached_mode_with_spot_fleet, mock_state_store

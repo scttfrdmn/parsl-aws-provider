@@ -38,8 +38,9 @@ from parsl_ephemeral_aws.modes.base import OperatingMode
 from parsl_ephemeral_aws.state.base import STATE_KEY_MODE, StateStore
 from parsl_ephemeral_aws.utils.aws import (
     architecture_for_instance_type,
+    delete_ec2_fleet,
     get_default_ami,
-    normalize_spot_fleet_allocation_strategy,
+    normalize_ec2_fleet_allocation_strategy,
     wait_for_resource,
     get_cf_template,
 )
@@ -158,7 +159,9 @@ class DetachedMode(OperatingMode):
                 logger.debug(
                     "Initializing SpotInterruptionMonitor and Handler for DetachedMode"
                 )
-                self.spot_interruption_monitor = SpotInterruptionMonitor(self.session)
+                self.spot_interruption_monitor = SpotInterruptionMonitor(
+                    self.session, provider_id=self.provider_id
+                )
                 self.spot_interruption_handler = ParslSpotInterruptionHandler(
                     session=self.session,
                     checkpoint_bucket=self.checkpoint_bucket,
@@ -504,26 +507,18 @@ class DetachedMode(OperatingMode):
                         "ParameterKey": "Tags",
                         "ParameterValue": json.dumps(self.additional_tags),
                     },
-                    {
-                        "ParameterKey": "UseSpotFleet",
-                        "ParameterValue": "true" if self.use_spot_fleet else "false",
-                    },
-                    {
-                        "ParameterKey": "InstanceTypes",
-                        "ParameterValue": json.dumps(self.instance_types)
-                        if self.instance_types
-                        else "[]",
-                    },
-                    {
-                        "ParameterKey": "NodesPerBlock",
-                        "ParameterValue": str(self.nodes_per_block),
-                    },
-                    {
-                        "ParameterKey": "SpotMaxPricePercentage",
-                        "ParameterValue": str(self.spot_max_price_percentage)
-                        if self.spot_max_price_percentage
-                        else "",
-                    },
+                    # UseSpotFleet/InstanceTypes/NodesPerBlock/
+                    # SpotMaxPricePercentage used to be sent here. bastion.yml
+                    # declares none of them, and CloudFormation rejects an
+                    # undeclared parameter outright -- verified:
+                    # "ValidationError: Parameters: [UseSpotFleet] do not exist
+                    # in the template". Since bastion_host_type defaults to
+                    # "cloudformation", the default bastion path always failed.
+                    #
+                    # They are dropped rather than added to the template: all
+                    # four describe a *worker fleet*, and the bastion is a
+                    # single host. The fleet settings reach the workers through
+                    # the bastion manager script's environment instead.
                 ],
                 Capabilities=["CAPABILITY_IAM"],
                 OnFailure="DELETE",
@@ -744,10 +739,13 @@ JOB_COMMAND_PREFIX = f'{SSM_PARAMETER_PREFIX}/jobs'
 JOB_STATUS_PREFIX = f'{SSM_PARAMETER_PREFIX}/status'
 TAG_PREFIX = "parsl-ephemeral"
 RESOURCE_TYPE_SPOT_FLEET = "spot_fleet"
-# Spot Fleet allocation strategy, overwritten at script generation time with the
-# mode's spot_allocation_strategy (#84). RequestSpotFleet accepts only the
-# camelCase spelling, so the value substituted here is already normalised.
-ALLOCATION_STRATEGY = 'priceCapacityOptimized'
+# Fleet allocation strategy, overwritten at script generation time with the
+# mode's spot_allocation_strategy (#84). CreateFleet accepts only the kebab-case
+# spelling, so the value substituted here is already normalised.
+ALLOCATION_STRATEGY = 'price-capacity-optimized'
+# Tag EC2 applies to every fleet-launched instance. The only way to enumerate an
+# instant fleet's instances -- describe_fleet_instances rejects that fleet type.
+TAG_AWS_FLEET_ID = 'aws:ec2:fleet-id'
 # IMDSv2 options for workers this bastion launches, overwritten at script
 # generation time from the package constant (#85). Defined as a literal because
 # the bastion runs this script standalone and cannot import from the package.
@@ -760,7 +758,6 @@ EC2_STATUS_MAPPING = {
     'stopping': 'CANCELED',
     'stopped': 'CANCELED',
 }
-SPOT_FLEET_IAM_ROLE_ARN = None  # Will be populated dynamically
 
 def get_session():
     """Get AWS session."""
@@ -864,74 +861,15 @@ def update_job_status(job_id, status, instance_id=None, error=None, fleet_reques
         logger.error(f"Error updating job status: {e}")
         traceback.print_exc()
 
-def get_spot_fleet_role():
-    """Get or create the IAM role for Spot Fleet requests.
-
-    Returns
-    -------
-    str
-        ARN of the IAM role for Spot Fleet
-    """
-    global SPOT_FLEET_IAM_ROLE_ARN
-
-    # Return cached value if available
-    if SPOT_FLEET_IAM_ROLE_ARN:
-        return SPOT_FLEET_IAM_ROLE_ARN
-
-    # Create a new role
-    session = get_session()
-    iam = session.client('iam')
-    role_name = f"{TAG_PREFIX}-spot-fleet-role-{WORKFLOW_ID[:8]}"
-
-    try:
-        # Check if the role already exists
-        try:
-            response = iam.get_role(RoleName=role_name)
-            SPOT_FLEET_IAM_ROLE_ARN = response['Role']['Arn']
-            logger.info(f"Using existing IAM role for Spot Fleet: {role_name}")
-            return SPOT_FLEET_IAM_ROLE_ARN
-        except ClientError as e:
-            if e.response['Error']['Code'] != 'NoSuchEntity':
-                raise
-
-            # Role doesn't exist, create it
-            trust_policy = {
-                "Version": "2012-10-17",
-                "Statement": [
-                    {
-                        "Effect": "Allow",
-                        "Principal": {"Service": "spotfleet.amazonaws.com"},
-                        "Action": "sts:AssumeRole"
-                    }
-                ]
-            }
-
-            response = iam.create_role(
-                RoleName=role_name,
-                AssumeRolePolicyDocument=json.dumps(trust_policy),
-                Description=f"Role for Parsl Spot Fleet ({WORKFLOW_ID})"
-            )
-
-            # Attach the required policy
-            iam.attach_role_policy(
-                RoleName=role_name,
-                PolicyArn="arn:aws:iam::aws:policy/service-role/AmazonEC2SpotFleetTaggingRole"
-            )
-
-            # Get the role ARN
-            SPOT_FLEET_IAM_ROLE_ARN = response['Role']['Arn']
-            logger.info(f"Created IAM role for Spot Fleet: {role_name}")
-
-            # Wait for role to be ready (IAM changes can take time to propagate)
-            time.sleep(10)
-
-            return SPOT_FLEET_IAM_ROLE_ARN
-    except Exception as e:
-        logger.error(f"Error getting or creating IAM role for Spot Fleet: {e}")
-        raise
-
 def launch_spot_fleet(job_data):
-    """Launch a Spot Fleet for the job.
+    """Launch an EC2 Fleet for the job.
+
+    Uses CreateFleet with type 'instant', replacing RequestSpotFleet -- an API
+    AWS describes as legacy with no planned investment (#86). Three consequences
+    for this function: there is no IAM service role to create (CreateFleet has no
+    IamFleetRole member), the launch template is mandatory rather than optional
+    (there is no LaunchSpecifications member either), and the instance IDs come
+    back from the create call itself, so the old 300-second polling loop is gone.
 
     Parameters
     ----------
@@ -941,11 +879,12 @@ def launch_spot_fleet(job_data):
     Returns
     -------
     str
-        Instance ID or Spot Fleet request ID
+        Primary instance ID, or None if the fleet launched nothing
     """
     session = get_session()
     ec2 = session.client('ec2')
     job_id = job_data['id']
+    template_id = None
 
     try:
         # Prepare user data script
@@ -963,40 +902,16 @@ export PARSL_WORKER_ID=$(hostname)
 {f"shutdown -h now" if job_data.get('auto_shutdown', True) else "# Auto-shutdown disabled"}
 """
 
-        # Get IAM fleet role
-        fleet_role_arn = get_spot_fleet_role()
-
         # Generate a unique client token
         client_token = f"{WORKFLOW_ID}-{job_id}"
 
-        # Prepare launch specifications for multiple instance types
-        launch_specifications = []
-
-        # Use instance types from job data or default to a set of common types
+        # Use instance types from job data, or the job's single instance type.
+        # Alternatives are not synthesized from the type string: that only works
+        # for single-character families, and produces invalid names like
+        # "mm5a.large" or "c6h.large" for anything else.
         instance_types = job_data.get('instance_types', [])
         if not instance_types:
-            # If no instance types specified, use the job's instance type
             instance_types = [job_data['instance_type']]
-
-            # Add similar instance types for better availability
-            instance_type = job_data['instance_type']
-            if instance_type.startswith(('c', 'm', 'r', 't')) and len(instance_type) > 3:
-                family = instance_type[0]
-                size = instance_type.split('.')[1]
-
-                # Add similar types
-                if family == 'c':
-                    instance_types.extend([f"m{instance_type[1:]}", f"r{instance_type[1:]}"])
-                elif family == 'm':
-                    instance_types.extend([f"c{instance_type[1:]}", f"r{instance_type[1:]}"])
-                elif family == 'r':
-                    instance_types.extend([f"m{instance_type[1:]}", f"c{instance_type[1:]}"])
-
-                # Try to add a newer generation if possible
-                gen = instance_type[1]
-                if gen.isdigit() and int(gen) < 9:
-                    next_gen = str(int(gen) + 1)
-                    instance_types.append(f"{family}{next_gen}.{size}")
 
         # Common tags for all instances
         tags = [
@@ -1007,86 +922,104 @@ export PARSL_WORKER_ID=$(hostname)
             {'Key': 'ParslJobId', 'Value': job_id},
         ]
 
-        # Generate specs for each instance type
-        for instance_type in instance_types:
-            try:
-                launch_spec = {
-                    'ImageId': job_data['image_id'],
-                    'InstanceType': instance_type,
-                    'SubnetId': job_data['subnet_id'],
-                    'SecurityGroups': [
-                        {'GroupId': job_data['security_group_id']}
-                    ],
-                    'UserData': base64.b64encode(user_data.encode()).decode(),
-                    'TagSpecifications': [
-                        {
-                            'ResourceType': 'instance',
-                            'Tags': tags
-                        }
-                    ],
-                    'Monitoring': {'Enabled': True},
-                    'InstanceInitiatedShutdownBehavior': 'terminate',
-                }
-
-                # Add key name if provided
-                if job_data.get('key_name'):
-                    launch_spec['KeyName'] = job_data['key_name']
-
-                launch_specifications.append(launch_spec)
-            except Exception as e:
-                logger.warning(f"Skipping instance type {instance_type} due to error: {e}")
-
-        if not launch_specifications:
-            raise Exception("No valid launch specifications could be created")
-
-        # Prepare Spot Fleet request parameters
-        nodes_per_block = job_data.get('nodes_per_block', 1)
-        request_params = {
-            'SpotFleetRequestConfig': {
-                'ClientToken': client_token,
-                'TargetCapacity': nodes_per_block,
-                'OnDemandTargetCapacity': 0,  # Use only spot instances
-                'IamFleetRole': fleet_role_arn,
-                'LaunchSpecifications': launch_specifications,
-                'TerminateInstancesWithExpiration': True,
-                'Type': 'maintain',  # Maintain target capacity
-                'AllocationStrategy': ALLOCATION_STRATEGY,
-                'ReplaceUnhealthyInstances': True,
-                'TagSpecifications': [
-                    {
-                        'ResourceType': 'spot-fleet-request',
-                        'Tags': tags
-                    }
-                ]
-            }
+        # The launch template is the only launch form CreateFleet accepts, and
+        # the only place the per-job user data can live: an Overrides entry
+        # carries just InstanceType/SubnetId/price/priority.
+        template_data = {
+            'ImageId': job_data['image_id'],
+            'UserData': base64.b64encode(user_data.encode()).decode(),
+            'Monitoring': {'Enabled': True},
+            'InstanceInitiatedShutdownBehavior': 'terminate',
+            'MetadataOptions': METADATA_OPTIONS,
+            'NetworkInterfaces': [{
+                'DeviceIndex': 0,
+                'Groups': [job_data['security_group_id']],
+                'SubnetId': job_data['subnet_id'],
+            }],
+            'TagSpecifications': [{'ResourceType': 'instance', 'Tags': tags}],
         }
+        if job_data.get('key_name'):
+            template_data['KeyName'] = job_data['key_name']
 
-        # Set a max price if specified
+        template_response = ec2.create_launch_template(
+            LaunchTemplateName=f"{TAG_PREFIX}-lt-{job_id[:8]}",
+            LaunchTemplateData=template_data,
+            TagSpecifications=[{'ResourceType': 'launch-template', 'Tags': tags}],
+        )
+        template_id = template_response['LaunchTemplate']['LaunchTemplateId']
+        # Pin the version rather than using $Latest, so the fleet launches the
+        # definition built here even if something else adds a version.
+        template_version = str(
+            template_response['LaunchTemplate']['LatestVersionNumber']
+        )
+
+        spot_options = {
+            'AllocationStrategy': ALLOCATION_STRATEGY,
+            'InstanceInterruptionBehavior': 'terminate',
+        }
+        # MaxTotalPrice is fleet-wide, unlike the legacy per-instance-hour
+        # SpotPrice. AWS advises against setting it at all ("can lead to
+        # increased interruptions"), so it is only sent when asked for.
+        nodes_per_block = job_data.get('nodes_per_block', 1)
         if job_data.get('spot_max_price'):
-            request_params['SpotFleetRequestConfig']['SpotPrice'] = job_data['spot_max_price']
+            spot_options['MaxTotalPrice'] = str(
+                float(job_data['spot_max_price']) * nodes_per_block
+            )
         elif job_data.get('spot_max_price_percentage'):
-            # Convert percentage to actual price (rough approximation)
-            # In practice, you would query the price API for accurate pricing
             percent = float(job_data['spot_max_price_percentage']) / 100.0
-            request_params['SpotFleetRequestConfig']['SpotPrice'] = str(percent)
+            spot_options['MaxTotalPrice'] = str(percent * nodes_per_block)
 
-        # Create the Spot Fleet request
-        response = ec2.request_spot_fleet(**request_params)
-        fleet_request_id = response['SpotFleetRequestId']
-        logger.info(f"Created Spot Fleet request: {fleet_request_id} for job {job_id}")
+        # ReplaceUnhealthyInstances, TerminateInstancesWithExpiration, and
+        # SpotOptions.MaintenanceStrategies are all rejected outright for fleet
+        # type 'instant' -- verified against real EC2 -- so none are sent.
+        response = ec2.create_fleet(
+            Type='instant',
+            ClientToken=client_token,
+            LaunchTemplateConfigs=[{
+                'LaunchTemplateSpecification': {
+                    'LaunchTemplateId': template_id,
+                    'Version': template_version,
+                },
+                'Overrides': [
+                    {'InstanceType': instance_type, 'SubnetId': job_data['subnet_id']}
+                    for instance_type in instance_types
+                ],
+            }],
+            TargetCapacitySpecification={
+                'TotalTargetCapacity': nodes_per_block,
+                'DefaultTargetCapacityType': 'spot',
+            },
+            SpotOptions=spot_options,
+            TagSpecifications=[{'ResourceType': 'fleet', 'Tags': tags}],
+        )
+        fleet_request_id = response['FleetId']
+        logger.info(f"Created EC2 Fleet: {fleet_request_id} for job {job_id}")
 
-        # Wait for Spot Fleet instances to be created
-        logger.info(f"Waiting for Spot Fleet instances for fleet {fleet_request_id}")
-        instance_ids = wait_for_fleet_instances(fleet_request_id)
+        # An instant fleet reports per-instance failures inline rather than
+        # failing the call, so a partly-filled or empty fleet looks like success.
+        for error in response.get('Errors', []):
+            logger.warning(
+                f"EC2 Fleet {fleet_request_id} could not launch an instance: "
+                f"{error.get('ErrorCode')} - {error.get('ErrorMessage')}"
+            )
+
+        instance_ids = [
+            instance_id
+            for entry in response.get('Instances', [])
+            for instance_id in entry.get('InstanceIds', [])
+        ]
 
         if not instance_ids:
             update_job_status(
                 job_id,
                 'FAILED',
                 None,
-                error=f"No instances were created in the Spot Fleet {fleet_request_id}",
+                error=f"No instances were created in EC2 Fleet {fleet_request_id}",
                 fleet_request_id=fleet_request_id
             )
+            # The template is useless without the fleet it was built for, and
+            # nothing else will reclaim it.
+            delete_launch_template(template_id)
             return None
 
         # Update job status with the first instance ID and the fleet request ID
@@ -1102,76 +1035,55 @@ export PARSL_WORKER_ID=$(hostname)
 
         return primary_instance_id
     except Exception as e:
-        logger.error(f"Error creating Spot Fleet for job {job_id}: {e}")
+        logger.error(f"Error creating EC2 Fleet for job {job_id}: {e}")
         traceback.print_exc()
         update_job_status(job_id, 'FAILED', None, error=str(e))
+        if template_id:
+            delete_launch_template(template_id)
         return None
 
-def wait_for_fleet_instances(fleet_request_id, max_wait=300):
-    """Wait for Spot Fleet instances to be created.
+def delete_launch_template(template_id):
+    """Delete a launch template, tolerating one that is already gone."""
+    session = get_session()
+    ec2 = session.client('ec2')
+    try:
+        ec2.delete_launch_template(LaunchTemplateId=template_id)
+        logger.debug(f"Deleted launch template {template_id}")
+    except Exception as e:
+        logger.warning(f"Could not delete launch template {template_id}: {e}")
+
+def get_fleet_instance_ids(fleet_id):
+    """Return the non-terminated instances belonging to an EC2 Fleet.
+
+    Goes through the aws:ec2:fleet-id tag rather than describe_fleet_instances,
+    which refuses a fleet of type 'instant' outright with 'Unsupported'.
 
     Parameters
     ----------
-    fleet_request_id : str
-        Spot Fleet request ID
-    max_wait : int, optional
-        Maximum wait time in seconds, by default 300
+    fleet_id : str
+        Fleet ID
 
     Returns
     -------
     list
-        List of instance IDs
+        Instance IDs
     """
-    start_time = time.time()
-    instance_ids = []
-
     session = get_session()
     ec2 = session.client('ec2')
+    instance_ids = []
 
-    logger.info(f"Waiting for Spot Fleet instances for fleet {fleet_request_id}")
-
-    while time.time() - start_time < max_wait:
-        try:
-            # Check fleet status
-            response = ec2.describe_spot_fleet_requests(
-                SpotFleetRequestIds=[fleet_request_id]
-            )
-
-            if not response['SpotFleetRequestConfigs']:
-                logger.warning(f"No Spot Fleet request found with ID {fleet_request_id}")
-                break
-
-            config = response['SpotFleetRequestConfigs'][0]
-            status = config['SpotFleetRequestState']
-
-            if status == 'active':
-                # Get instances in the fleet
-                instances_response = ec2.describe_spot_fleet_instances(
-                    SpotFleetRequestId=fleet_request_id
-                )
-
-                # Extract instance IDs
-                instance_ids = [instance['InstanceId'] for instance in instances_response.get('ActiveInstances', [])]
-
-                if instance_ids:
-                    logger.info(f"Spot Fleet {fleet_request_id} is active with {len(instance_ids)} instances")
-                    break
-
-            elif status in ['cancelled', 'cancelled_running', 'cancelled_terminating', 'error']:
-                logger.error(f"Spot Fleet request {fleet_request_id} failed with status {status}")
-                break
-
-            # Wait before checking again
-            time.sleep(10)
-
-        except Exception as e:
-            logger.error(f"Error checking Spot Fleet status: {e}")
-            # Continue waiting, might be temporary
-            time.sleep(10)
-
-    # If we've waited too long without success
-    if time.time() - start_time >= max_wait and not instance_ids:
-        logger.error(f"Timeout waiting for Spot Fleet instances for fleet {fleet_request_id}")
+    try:
+        paginator = ec2.get_paginator('describe_instances')
+        for page in paginator.paginate(Filters=[
+            {'Name': f'tag:{TAG_AWS_FLEET_ID}', 'Values': [fleet_id]},
+            {'Name': 'instance-state-name',
+             'Values': ['pending', 'running', 'stopping', 'stopped']},
+        ]):
+            for reservation in page.get('Reservations', []):
+                for instance in reservation.get('Instances', []):
+                    instance_ids.append(instance['InstanceId'])
+    except Exception as e:
+        logger.warning(f"Could not list instances for EC2 Fleet {fleet_id}: {e}")
 
     return instance_ids
 
@@ -1309,39 +1221,44 @@ def update_running_job_status():
                 else:
                     raise
 
-        # Check Spot Fleet statuses if there are any
+        # Check EC2 Fleet statuses if there are any
         fleet_statuses = {}
-        if spot_fleet_jobs:
-            # Get all fleet request IDs
-            fleet_request_ids = list(spot_fleet_jobs.values())
+        for fleet_id in set(spot_fleet_jobs.values()):
+            # One fleet per call. describe_fleets accepts a list, but AWS
+            # documents that "if a fleet is of type instant, you must specify the
+            # fleet ID in the request, otherwise the fleet does not appear in the
+            # response" -- so a partial response cannot be distinguished from a
+            # deleted fleet when several IDs are batched.
+            try:
+                fleets = ec2.describe_fleets(FleetIds=[fleet_id]).get('Fleets', [])
+            except ClientError as e:
+                if 'InvalidFleetId.NotFound' in str(e):
+                    fleet_statuses[fleet_id] = 'COMPLETED'
+                    continue
+                raise
 
-            # Process in batches of 100 (AWS API limit)
-            for i in range(0, len(fleet_request_ids), 100):
-                batch = fleet_request_ids[i:i+100]
-                try:
-                    response = ec2.describe_spot_fleet_requests(SpotFleetRequestIds=batch)
+            if not fleets:
+                fleet_statuses[fleet_id] = 'COMPLETED'
+                continue
 
-                    for config in response.get('SpotFleetRequestConfigs', []):
-                        fleet_id = config['SpotFleetRequestId']
-                        state = config['SpotFleetRequestState']
-
-                        # Map fleet state to job status
-                        if state == 'active':
-                            fleet_statuses[fleet_id] = 'RUNNING'
-                        elif state in ['cancelled', 'cancelled_running', 'cancelled_terminating']:
-                            fleet_statuses[fleet_id] = 'CANCELED'
-                        elif state == 'error':
-                            fleet_statuses[fleet_id] = 'FAILED'
-                        else:
-                            fleet_statuses[fleet_id] = 'UNKNOWN'
-                except ClientError as e:
-                    if 'InvalidSpotFleetRequestId.NotFound' in str(e):
-                        # Mark fleets not found as completed
-                        for fleet_id in batch:
-                            if fleet_id not in fleet_statuses:
-                                fleet_statuses[fleet_id] = 'COMPLETED'
-                    else:
-                        raise
+            state = fleets[0]['FleetState']
+            if state in ['deleted', 'deleted_running', 'deleted_terminating']:
+                fleet_statuses[fleet_id] = 'CANCELED'
+            elif state == 'failed':
+                fleet_statuses[fleet_id] = 'FAILED'
+            elif state in ['submitted', 'modifying']:
+                fleet_statuses[fleet_id] = 'PENDING'
+            elif state == 'active':
+                # An instant fleet does not maintain capacity, so FleetState
+                # stays 'active' for the fleet's whole life no matter what
+                # happened to its instances. Only the instances can say whether
+                # the job is still running.
+                if get_fleet_instance_ids(fleet_id):
+                    fleet_statuses[fleet_id] = 'RUNNING'
+                else:
+                    fleet_statuses[fleet_id] = 'COMPLETED'
+            else:
+                fleet_statuses[fleet_id] = 'UNKNOWN'
 
         # Update job statuses
         for job_id, status_data in running_jobs_data:
@@ -1453,21 +1370,18 @@ def handle_cancel_requests():
                     if e.response['Error']['Code'] != 'ParameterNotFound':
                         raise
 
-            # First cancel Spot Fleet requests
-            if fleet_request_ids:
+            # First delete the EC2 Fleets. Instance termination is not optional
+            # for type 'instant': NoTerminateInstances is rejected, and AWS
+            # states "a deleted instant fleet with running instances is not
+            # supported".
+            for fleet_id in fleet_request_ids:
                 try:
-                    ec2.cancel_spot_fleet_requests(
-                        SpotFleetRequestIds=fleet_request_ids,
-                        TerminateInstances=True
-                    )
-                    logger.info(f"Canceled Spot Fleet requests: {fleet_request_ids}")
+                    ec2.delete_fleets(FleetIds=[fleet_id], TerminateInstances=True)
+                    logger.info(f"Deleted EC2 Fleet: {fleet_id}")
                 except Exception as fleet_error:
-                    logger.error(f"Error canceling Spot Fleet requests: {fleet_error}")
-                    # Continue to terminate any instances we know about
-
-                    # If we have the all_instance_ids, add them to our list
+                    logger.error(f"Error deleting EC2 Fleet {fleet_id}: {fleet_error}")
+                    # Fall back to terminating the instances directly.
                     if all_fleet_instance_ids:
-                        # Remove duplicates
                         unique_ids = set(all_fleet_instance_ids) - set(instance_ids)
                         instance_ids.extend(list(unique_ids))
 
@@ -1535,11 +1449,12 @@ if __name__ == '__main__':
         # package -- the strategy has to be substituted in as a literal. The
         # fleet request used to hardcode 'lowestPrice' here, ignoring the
         # configured spot_allocation_strategy entirely and choosing the pools
-        # with the least spare capacity (#84).
+        # with the least spare capacity (#84). Kebab-case since the script now
+        # calls CreateFleet, which rejects the camelCase spelling (#86).
         script = script.replace(
-            "ALLOCATION_STRATEGY = 'priceCapacityOptimized'",
+            "ALLOCATION_STRATEGY = 'price-capacity-optimized'",
             "ALLOCATION_STRATEGY = "
-            f"'{normalize_spot_fleet_allocation_strategy(self.spot_allocation_strategy)}'"
+            f"'{normalize_ec2_fleet_allocation_strategy(self.spot_allocation_strategy)}'"
             "  # injected at script generation time",
         )
         # Same reason as above: injected as a literal so the workers the bastion
@@ -1859,22 +1774,20 @@ if __name__ == '__main__':
         if active_resources:
             self.cancel_jobs(active_resources)
 
-        # Ensure all Spot Fleet requests are cancelled explicitly
+        # Ensure all fleets are deleted explicitly
         for resource_id in spot_fleet_resources:
             resource = self.resources.get(resource_id)
-            if resource and resource.get("fleet_request_id"):
-                fleet_request_id = resource.get("fleet_request_id")
+            if resource and (fleet_request_id := resource.get("fleet_request_id")):
                 try:
-                    # Cancel the Spot Fleet request and terminate instances
-                    ec2.cancel_spot_fleet_requests(
-                        SpotFleetRequestIds=[fleet_request_id], TerminateInstances=True
-                    )
+                    # Deleting the fleet terminates its instances; that is not
+                    # optional for an instant fleet (#86).
+                    delete_ec2_fleet(ec2, fleet_request_id)
                     logger.info(
-                        f"Explicitly cancelled Spot Fleet request {fleet_request_id} during cleanup"
+                        f"Explicitly deleted EC2 Fleet {fleet_request_id} during cleanup"
                     )
                 except Exception as e:
                     logger.error(
-                        f"Error cancelling Spot Fleet request {fleet_request_id} during cleanup: {e}"
+                        f"Error deleting EC2 Fleet {fleet_request_id} during cleanup: {e}"
                     )
 
         # Now clean up tracking in SSM
@@ -2171,7 +2084,8 @@ if __name__ == '__main__':
                                 "Initializing SpotInterruptionMonitor and Handler after state load"
                             )
                             self.spot_interruption_monitor = SpotInterruptionMonitor(
-                                self.session
+                                self.session,
+                                provider_id=self.provider_id,
                             )
                             self.spot_interruption_handler = (
                                 ParslSpotInterruptionHandler(

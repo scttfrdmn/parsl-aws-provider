@@ -25,7 +25,6 @@ import json
 import os
 import uuid
 from types import SimpleNamespace
-from unittest.mock import patch
 
 import boto3
 import pytest
@@ -345,43 +344,76 @@ class TestSpotFleetWithMoto:
 
     @mock_aws
     def test_fleet_block_lifecycle(self, moto_session):
-        """``create_blocks`` requests the fleet; ``terminate_block`` cancels it.
+        """``create_blocks`` creates an EC2 Fleet; ``terminate_block`` deletes it.
 
-        The public surface is ``create_blocks``/``get_block_status``/
-        ``terminate_block``, not ``request_spot_fleet``/
-        ``get_spot_fleet_request_status``/``cancel_spot_fleet_request``.
-        ``time.sleep`` is patched out because ``_get_iam_fleet_role`` sleeps 10s
-        for IAM propagation.
+        Retargeted from the legacy Spot Fleet API onto ``CreateFleet`` (#86). The
+        two assertions that went with the old API are gone for good reasons
+        rather than convenience:
+
+        * ``describe_spot_fleet_requests`` cannot see this fleet at all -- the two
+          APIs keep separate registries, so the call returns nothing and indexing
+          ``[0]`` is the ``IndexError`` this test failed with.
+        * the IAM-role assertions had nothing left to assert. ``CreateFleet`` has
+          no ``IamFleetRole`` member, so no service role is created; that is now
+          pinned negatively here, and the surviving cleanup of a role named by a
+          pre-#86 state document is covered in ``test_spot_fleet.py``.
+
+        Kept under moto because this is the only unit test where the
+        ``CreateFleet`` request *shape* is validated by something other than a
+        MagicMock -- a launch template really has to exist, and be referenced by
+        ID and version, for the call to succeed.
+
+        ``time.sleep`` is no longer patched: the 10-second IAM propagation wait
+        belonged to the role fetch that is gone.
         """
         vpc_id, subnet_id, sg_id = provision_network(moto_session)
+        # A real AMI: moto validates the ID at launch, and the fleet resolves its
+        # image through the launch template, so a placeholder would fail the call.
+        image_id = moto_session.client("ec2").describe_images()["Images"][0]["ImageId"]
         manager = SpotFleetManager(
-            make_provider(vpc_id=vpc_id, subnet_id=subnet_id, security_group_id=sg_id)
+            make_provider(
+                vpc_id=vpc_id,
+                subnet_id=subnet_id,
+                security_group_id=sg_id,
+                image_id=image_id,
+                instance_types=["t3.micro", "t3.small"],
+            )
         )
         ec2 = moto_session.client("ec2")
 
-        with patch("parsl_ephemeral_aws.compute.spot_fleet.time.sleep"):
-            blocks = manager.create_blocks(1)
+        blocks = manager.create_blocks(1)
 
         block_id, block = next(iter(blocks.items()))
-        fleet_request_id = block["fleet_request_id"]
+        fleet_id = block["fleet_request_id"]
+        assert fleet_id.startswith("fleet-")
 
-        config = ec2.describe_spot_fleet_requests(
-            SpotFleetRequestIds=[fleet_request_id]
-        )["SpotFleetRequestConfigs"][0]
-        assert config["SpotFleetRequestState"] == "active"
+        fleet = ec2.describe_fleets(FleetIds=[fleet_id])["Fleets"][0]
+        assert fleet["FleetState"] == "active"
+        # Type "instant" is what makes the instance IDs available synchronously,
+        # which every caller here relies on.
+        assert fleet["Type"] == "instant"
+
+        # The instances came back from the create call itself rather than from a
+        # polling loop, and the block records them.
+        assert block["instance_ids"]
+        instances = ec2.describe_instances(InstanceIds=block["instance_ids"])
+        instance = instances["Reservations"][0]["Instances"][0]
+        tags = tag_dict(instance["Tags"])
+        assert tags[TAG_MANAGED] == "true"
+        assert tags[TAG_WORKFLOW_ID] == manager.provider.workflow_id
+
         assert manager.get_block_status(block_id) in ("PENDING", "RUNNING")
 
-        # The fleet role was created and the managed policy attached -- the whole
-        # reason MOTO_IAM_LOAD_MANAGED_POLICIES has to be set.
+        # No IAM role was created for the fleet, and none was asked for.
+        assert manager.iam_fleet_role_arn is None
         iam = moto_session.client("iam")
-        role_name = manager.iam_fleet_role_arn.split("/")[-1]
-        attached = iam.list_attached_role_policies(RoleName=role_name)[
-            "AttachedPolicies"
-        ]
-        assert any("SpotFleet" in p["PolicyName"] for p in attached)
+        assert iam.list_roles()["Roles"] == []
 
         manager.terminate_block(block_id)
         assert manager.blocks[block_id]["status"] == STATUS_CANCELLED
+        assert ec2.describe_fleets(FleetIds=[fleet_id])["Fleets"][0][
+            "FleetState"
+        ].startswith("deleted")
 
     @mock_aws
     def test_missing_network_is_rejected(self, moto_session):
