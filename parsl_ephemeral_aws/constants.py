@@ -62,30 +62,67 @@ DEFAULT_OUTBOUND_RULES = [
     }
 ]
 
-# AMI mappings for different regions (Amazon Linux 2023)
-# Updated 2026-03-01 — al2023-ami-2023.10.20260216.1-kernel-6.12-x86_64
+# Amazon Linux 2023 AMI resolution (#84).
+#
+# AMIs are resolved at runtime from AWS's public SSM Parameter Store aliases,
+# which every account can read without credentials of its own for the parameter
+# and which AWS repoints at each new AL2023 release. A hardcoded region->AMI
+# table cannot work: the previous one was stamped 2026-03-01 and by 2026-07-30
+# *all 21 entries* were unusable -- 9 carried a DeprecationTime of 2026-05-17,
+# 6 returned InvalidAMIID.NotFound, 2 were InvalidAMIID.Malformed, and the rest
+# were unreachable. Nothing in the package noticed, because a deprecated AMI
+# still launches until AWS deletes it.
+#
+# ``kernel-default`` is AWS's version-independent alias. Naming a specific
+# kernel here (6.1, 6.12, 6.18, ...) would only re-create the staleness this
+# change removes.
+AMI_SSM_PARAMETER_PREFIX = "/aws/service/ami-amazon-linux-latest"
+AMI_SSM_PARAMETER_TEMPLATE = (
+    AMI_SSM_PARAMETER_PREFIX + "/al2023-ami-kernel-default-{architecture}"
+)
+
+# EC2 architecture identifiers, as ``describe_instance_types`` reports them in
+# ProcessorInfo.SupportedArchitectures.
+ARCHITECTURE_X86_64 = "x86_64"
+ARCHITECTURE_ARM64 = "arm64"
+DEFAULT_ARCHITECTURE = ARCHITECTURE_X86_64
+
+# Instance families that are Graviton (arm64) despite carrying no "g" in their
+# generation suffix. a1 is the original Graviton family and predates the naming
+# convention that every later arm64 family follows.
+ARM64_INSTANCE_FAMILIES = frozenset({"a1"})
+
+# Offline fallback for ``get_default_ami()``, used only when the SSM lookup
+# above fails -- chiefly so moto- and substrate-backed tests need no network.
+#
+# Treat these as expiring the day they are written. Refreshed 2026-07-30 from
+# the kernel-default SSM alias, but AWS deprecates each AL2023 AMI roughly two
+# months after release, so this table is a last resort and not a source of
+# truth. It is x86_64-only, and get_default_ami() deliberately refuses rather
+# than hand one of these to an arm64 instance type.
+#
+# The four opt-in regions the previous table listed (af-south-1, ap-east-1,
+# eu-south-1, me-south-1) are omitted: they cannot be read without enabling the
+# region, so no value could be verified. SSM resolves them normally from an
+# account that has them enabled.
 DEFAULT_AMI_MAPPING = {
-    "us-east-1": "ami-0f3caa1cf4417e51b",  # N. Virginia
-    "us-east-2": "ami-0d5503fb907719409",  # Ohio
-    "us-west-1": "ami-0e2de80e7636c4837",  # N. California
-    "us-west-2": "ami-075b5421f670d735c",  # Oregon
-    "af-south-1": "ami-08d7290d17859bd2e",  # Cape Town
-    "ap-east-1": "ami-0d96ec8a788679eb2",  # Hong Kong
-    "ap-southeast-2": "ami-0a11f7293cd9a562e",  # Sydney
-    "ap-southeast-1": "ami-0ac0e4288aa341886",  # Singapore
-    "ap-northeast-1": "ami-088103e734f7e0529",  # Tokyo
-    "ap-northeast-2": "ami-0ef0d6b9c5b7d9c81",  # Seoul
-    "ap-northeast-3": "ami-088a969d6f085cca3",  # Osaka
-    "ap-south-1": "ami-07e8927ba33de363c",  # Mumbai
-    "ca-central-1": "ami-0b512d33ad3b7b983",  # Canada
-    "eu-central-1": "ami-0c42fad2ea005202d",  # Frankfurt
-    "eu-west-1": "ami-09c20105c9b62f893",  # Ireland
-    "eu-west-2": "ami-06f89d8f36d17aa27",  # London
-    "eu-west-3": "ami-0a13801de97493e85",  # Paris
-    "eu-north-1": "ami-03df6dab118053bcb",  # Stockholm
-    "eu-south-1": "ami-079fed56921cf99b9",  # Milan
-    "me-south-1": "ami-03509ba459e8172c7",  # Bahrain
-    "sa-east-1": "ami-0a4cf2f3770eb3f5e",  # São Paulo
+    "us-east-1": "ami-0006118602dfc1c09",  # N. Virginia
+    "us-east-2": "ami-06dd88604c99ec11f",  # Ohio
+    "us-west-1": "ami-0be92a0ad760d0371",  # N. California
+    "us-west-2": "ami-0b76d82b547c3c077",  # Oregon
+    "ap-northeast-1": "ami-03107d83a97af3820",  # Tokyo
+    "ap-northeast-2": "ami-04bb4ddfc0e51bb5e",  # Seoul
+    "ap-northeast-3": "ami-0cd939ceb3b70a09d",  # Osaka
+    "ap-south-1": "ami-0884624fc54d115f3",  # Mumbai
+    "ap-southeast-1": "ami-094819e1130d6d35b",  # Singapore
+    "ap-southeast-2": "ami-0cb938ea8bf5b7973",  # Sydney
+    "ca-central-1": "ami-06171593517b6bb1f",  # Canada
+    "eu-central-1": "ami-0352a6b853b4367b3",  # Frankfurt
+    "eu-north-1": "ami-0c783070b2e26d98c",  # Stockholm
+    "eu-west-1": "ami-02c25106ee38f6087",  # Ireland
+    "eu-west-2": "ami-0e3771f9c18926b8e",  # London
+    "eu-west-3": "ami-033623a76c8038cf0",  # Paris
+    "sa-east-1": "ami-0b44997419d0b0d38",  # Sao Paulo
 }
 
 # EC2 status mapping to Parsl job states
@@ -112,15 +149,60 @@ RESOURCE_TYPE_ECS_TASK = "ecs_task"
 # Spot fleet constants
 SPOT_FLEET_TARGET_CAPACITY_TYPE = "TargetCapacity"
 SPOT_FLEET_FULFILLED_CAPACITY_TYPE = "FulfilledCapacity"
-SPOT_FLEET_DEFAULT_ALLOCATION_STRATEGY = "capacity-optimized"
+
+# Allocation strategy (#84). ``price-capacity-optimized`` is AWS's current
+# recommendation: it picks from the pools with the deepest spare capacity and
+# then the lowest price among those, so it interrupts far less often than
+# ``lowest-price`` at close to the same cost.
+#
+# The two fleet APIs spell the same enum differently, and each rejects the
+# other's spelling. Verified against real EC2 in us-east-1:
+#
+#   RequestSpotFleet  SpotFleetRequestConfig.AllocationStrategy -> camelCase
+#       "price-capacity-optimized" => InvalidParameterValue
+#   CreateFleet       SpotOptions.AllocationStrategy            -> kebab-case
+#       "priceCapacityOptimized"   => InvalidParameter
+#
+# So there cannot be one constant for both. SPOT_FLEET_* is the camelCase form
+# for the legacy RequestSpotFleet path this package uses today; EC2_FLEET_* is
+# the kebab-case form for the CreateFleet migration in #86.
+SPOT_FLEET_DEFAULT_ALLOCATION_STRATEGY = "priceCapacityOptimized"
+EC2_FLEET_DEFAULT_ALLOCATION_STRATEGY = "price-capacity-optimized"
+
+# Accepted values for each API, so a caller-supplied strategy can be rejected
+# with a useful message instead of an opaque InvalidParameterValue from EC2.
+SPOT_FLEET_ALLOCATION_STRATEGIES = frozenset(
+    {
+        "lowestPrice",
+        "diversified",
+        "capacityOptimized",
+        "capacityOptimizedPrioritized",
+        "priceCapacityOptimized",
+    }
+)
+EC2_FLEET_ALLOCATION_STRATEGIES = frozenset(
+    {
+        "lowest-price",
+        "diversified",
+        "capacity-optimized",
+        "capacity-optimized-prioritized",
+        "price-capacity-optimized",
+    }
+)
 
 # Cleanup constants
 CLEANUP_BATCH_SIZE = 10
 MAX_CLEANUP_RETRIES = 3
 CLEANUP_RETRY_DELAY = 5  # seconds
 
-# Spot instance defaults
-DEFAULT_SPOT_ALLOCATION_STRATEGY = "capacity-optimized"
+# Spot instance defaults.
+#
+# This is the *user-facing* default for the ``spot_allocation_strategy`` kwarg.
+# It stays kebab-case -- that is what the provider and mode docstrings have
+# always documented, and what CreateFleet takes -- and
+# ``normalize_spot_fleet_allocation_strategy()`` translates it to camelCase at
+# the RequestSpotFleet boundary. See SPOT_FLEET_DEFAULT_ALLOCATION_STRATEGY.
+DEFAULT_SPOT_ALLOCATION_STRATEGY = "price-capacity-optimized"
 DEFAULT_SPOT_INSTANCE_INTERRUPTION_BEHAVIOR = "terminate"
 DEFAULT_SPOT_INTERRUPTION_CHECK_INTERVAL = 30  # seconds
 DEFAULT_SPOT_INTERRUPTION_LEAD_TIME = 120  # seconds

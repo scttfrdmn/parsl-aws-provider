@@ -8,6 +8,7 @@ SPDX-FileCopyrightText: 2025 Scott Friedman and Project Contributors
 import json
 import logging
 import os
+import re
 import time
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -21,7 +22,16 @@ from botocore.exceptions import (
     TokenRetrievalError,
 )
 
-from parsl_ephemeral_aws.constants import DEFAULT_AMI_MAPPING, DEFAULT_REGION
+from parsl_ephemeral_aws.constants import (
+    AMI_SSM_PARAMETER_TEMPLATE,
+    ARCHITECTURE_ARM64,
+    ARCHITECTURE_X86_64,
+    ARM64_INSTANCE_FAMILIES,
+    DEFAULT_AMI_MAPPING,
+    DEFAULT_ARCHITECTURE,
+    DEFAULT_REGION,
+    SPOT_FLEET_ALLOCATION_STRATEGIES,
+)
 from parsl_ephemeral_aws.exceptions import (
     AMINotFoundError,
     AWSAuthenticationError,
@@ -181,30 +191,193 @@ def create_session(
         raise AWSConnectionError(f"Failed to create AWS session: {e}") from e
 
 
-def get_default_ami(region: str) -> str:
-    """Get the default AMI ID for the given region.
+def architecture_for_instance_type(instance_type: str) -> str:
+    """Return the CPU architecture an instance type needs an AMI for.
+
+    An AMI is architecture-specific, so launching a Graviton instance with an
+    x86_64 image fails. Nothing in this package distinguished the two before
+    #84, which made every arm64 instance type unusable.
+
+    The family suffix is the signal: AWS appends ``g`` to the generation of
+    every Graviton family (``c7g``, ``m8g``, ``r7gd``, ``c8gn``, ...) and to no
+    x86_64 family. Validated against ``describe_instance_types`` for all 1,346
+    types AWS offers in us-east-1: 396 arm64 and 950 x86_64, zero mistakes.
+
+    The only exceptions are the eight ``mac*.metal`` types, which report
+    ``arm64_mac`` and need a macOS AMI rather than AL2023 -- so classifying
+    them as x86_64 is no worse than the arm64 answer would be. A caller wanting
+    a Mac instance must pass ``image_id`` explicitly either way.
 
     Parameters
     ----------
-    region : str
-        AWS region
+    instance_type : str
+        EC2 instance type, e.g. ``"c7g.xlarge"`` or ``"t3.micro"``.
 
     Returns
     -------
     str
-        Default AMI ID for the region
+        ``"arm64"`` or ``"x86_64"``.
+    """
+    family = instance_type.split(".")[0].lower()
+
+    if family in ARM64_INSTANCE_FAMILIES:
+        return ARCHITECTURE_ARM64
+
+    # Split "c7gd" into prefix "c", generation "7", suffix "gd". A type we
+    # cannot parse is assumed x86_64, which is what it was before #84.
+    match = re.match(r"^([a-z]+)(\d+)([a-z]*)$", family)
+    if match is None:
+        logger.debug(
+            f"Unrecognised instance family {family!r}; assuming {DEFAULT_ARCHITECTURE}"
+        )
+        return DEFAULT_ARCHITECTURE
+
+    return ARCHITECTURE_ARM64 if "g" in match.group(3) else ARCHITECTURE_X86_64
+
+
+def normalize_spot_fleet_allocation_strategy(strategy: str) -> str:
+    """Translate an allocation strategy to the spelling RequestSpotFleet takes.
+
+    The two fleet APIs disagree on the casing of the same enum, and each
+    rejects the other's spelling. Verified against real EC2 in us-east-1 --
+    ``RequestSpotFleet`` with ``"price-capacity-optimized"`` returns
+    ``InvalidParameterValue``, and ``CreateFleet`` with
+    ``"priceCapacityOptimized"`` returns ``InvalidParameter``.
+
+    The provider's ``spot_allocation_strategy`` kwarg is documented in
+    kebab-case, so it needs converting at the RequestSpotFleet boundary. Values
+    already in camelCase pass through, so a caller who supplied the API-native
+    spelling is not punished for it.
+
+    Parameters
+    ----------
+    strategy : str
+        Allocation strategy in either spelling, e.g.
+        ``"price-capacity-optimized"`` or ``"priceCapacityOptimized"``.
+
+    Returns
+    -------
+    str
+        The camelCase spelling ``RequestSpotFleet`` accepts.
+
+    Raises
+    ------
+    ValueError
+        If the strategy is not one EC2 recognises, or is not a string. Raised
+        here rather than letting EC2 reject it, because a spot fleet request
+        fails several seconds and one IAM role later.
+    """
+    if strategy in SPOT_FLEET_ALLOCATION_STRATEGIES:
+        return strategy
+
+    # Checked explicitly: a non-string reaches ``.split()`` and, for a MagicMock,
+    # returns another mock that unpacks to nothing -- "not enough values to
+    # unpack", which names neither the argument nor the caller.
+    if not isinstance(strategy, str):
+        raise ValueError(
+            f"Spot allocation strategy must be a string, got "
+            f"{type(strategy).__name__}: {strategy!r}"
+        )
+
+    # "price-capacity-optimized" -> "priceCapacityOptimized"
+    head, *rest = strategy.split("-")
+    camel = head + "".join(word.capitalize() for word in rest)
+    if camel in SPOT_FLEET_ALLOCATION_STRATEGIES:
+        return camel
+
+    raise ValueError(
+        f"Unsupported spot allocation strategy {strategy!r}. Expected one of "
+        f"{sorted(SPOT_FLEET_ALLOCATION_STRATEGIES)} or their kebab-case "
+        f"equivalents."
+    )
+
+
+def get_default_ami(
+    region: str,
+    architecture: str = DEFAULT_ARCHITECTURE,
+    session: Optional[boto3.Session] = None,
+) -> str:
+    """Resolve the latest Amazon Linux 2023 AMI for a region and architecture.
+
+    Resolution order:
+
+    1. AWS's public SSM Parameter Store alias
+       ``/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-<arch>``,
+       which AWS repoints at every new AL2023 release. This is the only source
+       that stays correct without maintenance.
+    2. ``DEFAULT_AMI_MAPPING``, retained purely so offline test runs against
+       moto or substrate need no network. It is *not* a reliable source of live
+       AMIs -- see the note in ``constants.py`` -- and is x86_64-only, so it is
+       skipped for arm64 rather than returning an image that cannot boot.
+
+    Parameters
+    ----------
+    region : str
+        AWS region.
+    architecture : str, optional
+        ``"x86_64"`` (default) or ``"arm64"``. Use
+        ``architecture_for_instance_type()`` to derive it from an instance type.
+    session : boto3.Session, optional
+        Session to query SSM with. A new one is created for ``region`` when
+        omitted; pass an existing session to reuse its credentials and any
+        custom endpoint.
+
+    Returns
+    -------
+    str
+        AMI ID.
 
     Raises
     ------
     AMINotFoundError
-        If no default AMI is found for the region
+        If SSM cannot be reached and no usable fallback exists for the region
+        and architecture.
     """
-    if region in DEFAULT_AMI_MAPPING:
-        return DEFAULT_AMI_MAPPING[region]
-    else:
-        message = f"No default AMI found for region {region}"
-        logger.error(message)
-        raise AMINotFoundError(message)
+    if architecture not in (ARCHITECTURE_X86_64, ARCHITECTURE_ARM64):
+        raise AMINotFoundError(
+            f"Unsupported architecture {architecture!r}: expected "
+            f"{ARCHITECTURE_X86_64!r} or {ARCHITECTURE_ARM64!r}"
+        )
+
+    parameter_name = AMI_SSM_PARAMETER_TEMPLATE.format(architecture=architecture)
+
+    try:
+        if session is None:
+            session = boto3.Session(region_name=region)
+        value = session.client("ssm", region_name=region).get_parameter(
+            Name=parameter_name
+        )["Parameter"]["Value"]
+        logger.debug(
+            f"Resolved {architecture} AL2023 AMI {value} for {region} from "
+            f"{parameter_name}"
+        )
+        return str(value)
+    except Exception as e:
+        # Any failure here is recoverable if a fallback exists, so log at debug
+        # and fall through; the raise below carries the real diagnosis.
+        logger.debug(f"SSM AMI lookup failed for {region}/{architecture}: {e}")
+        ssm_error: Exception = e
+
+    # The fallback table is x86_64-only. Handing an x86_64 AMI to an arm64
+    # instance produces an opaque launch failure, so refuse instead.
+    if architecture == ARCHITECTURE_X86_64 and region in DEFAULT_AMI_MAPPING:
+        fallback = DEFAULT_AMI_MAPPING[region]
+        logger.warning(
+            f"Could not resolve the current AL2023 AMI for {region} from SSM "
+            f"({ssm_error}); falling back to the offline table entry "
+            f"{fallback}. This AMI may be deprecated or deleted -- set "
+            f"image_id explicitly if the launch fails."
+        )
+        return fallback
+
+    message = (
+        f"No AMI found for region {region} architecture {architecture}: SSM "
+        f"lookup of {parameter_name} failed ({ssm_error})"
+    )
+    if architecture == ARCHITECTURE_ARM64:
+        message += " and the offline fallback table has no arm64 entries"
+    logger.error(message)
+    raise AMINotFoundError(message)
 
 
 def describe_instance_capacity(
@@ -994,7 +1167,8 @@ def _wait_for_instance_profile(
     error on a profile that is about to work.
     """
     ec2 = session.client("ec2")
-    image_id = get_default_ami(session.region_name or DEFAULT_REGION)
+    # t3.micro below is x86_64, so the default architecture is the right one.
+    image_id = get_default_ami(session.region_name or DEFAULT_REGION, session=session)
     deadline = time.time() + timeout
 
     while time.time() < deadline:

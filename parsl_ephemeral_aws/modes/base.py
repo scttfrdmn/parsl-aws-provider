@@ -13,6 +13,7 @@ import boto3
 
 from botocore.exceptions import ClientError
 
+from parsl_ephemeral_aws.constants import DEFAULT_SPOT_ALLOCATION_STRATEGY
 from parsl_ephemeral_aws.exceptions import OperatingModeError, ResourceNotFoundError
 from parsl_ephemeral_aws.state.base import STATE_KEY_MODE, StateStore
 
@@ -91,7 +92,7 @@ class OperatingMode(abc.ABC):
         key_name: Optional[str] = None,
         use_spot: bool = False,
         spot_max_price: Optional[str] = None,
-        spot_allocation_strategy: str = "capacity-optimized",
+        spot_allocation_strategy: str = DEFAULT_SPOT_ALLOCATION_STRATEGY,
         spot_interruption_handling: bool = False,
         checkpoint_bucket: Optional[str] = None,
         checkpoint_prefix: str = "parsl/checkpoints",
@@ -135,7 +136,8 @@ class OperatingMode(abc.ABC):
         spot_max_price : Optional[str], optional
             Maximum price for spot instances, by default None
         spot_allocation_strategy : str, optional
-            Allocation strategy for spot instances, by default "capacity-optimized"
+            Allocation strategy for spot instances, in kebab-case, by default
+            "price-capacity-optimized"
         spot_interruption_handling : bool, optional
             Whether to enable spot interruption handling, by default False
         checkpoint_bucket : Optional[str], optional

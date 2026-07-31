@@ -30,6 +30,7 @@ from parsl_ephemeral_aws.constants import (
     DEFAULT_MODE,
     DEFAULT_ONE_SHOT,
     DEFAULT_REGION,
+    DEFAULT_SPOT_ALLOCATION_STRATEGY,
     DEFAULT_WARM_POOL_SIZE,
     DEFAULT_WARM_POOL_TTL,
     DEFAULT_WORKER_INIT,
@@ -51,7 +52,12 @@ from parsl_ephemeral_aws.state.base import (
 from parsl_ephemeral_aws.state.file import FileStateStore
 from parsl_ephemeral_aws.state.parameter_store import ParameterStoreStateStore
 from parsl_ephemeral_aws.state.s3 import S3StateStore
-from parsl_ephemeral_aws.utils.aws import create_session, describe_instance_capacity
+from parsl_ephemeral_aws.utils.aws import (
+    architecture_for_instance_type,
+    create_session,
+    describe_instance_capacity,
+    get_default_ami,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -112,9 +118,13 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
     Parameters
     ----------
     image_id : str, optional
-        EC2 AMI ID to use for instances. Required when using EC2 instances.
+        EC2 AMI ID to use for instances. When omitted, the latest Amazon Linux
+        2023 AMI matching ``instance_type``'s architecture is resolved from AWS's
+        public SSM parameters. Supply one explicitly for a custom image, or for
+        an instance family AL2023 does not cover (``mac*.metal``).
     instance_type : str, optional
-        EC2 instance type. Default is 't3.micro'.
+        EC2 instance type. Default is 't3.micro'. Graviton (arm64) families are
+        supported; the matching arm64 AMI is selected automatically.
     region : str, optional
         AWS region. Default is 'us-east-1'.
     mode : str, optional
@@ -151,7 +161,11 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
     spot_max_price : str, optional
         Maximum price for spot instances. Default is on-demand price.
     spot_allocation_strategy : str, optional
-        Allocation strategy for spot instances. Default is 'capacity-optimized'.
+        Allocation strategy for spot instances, in kebab-case: one of
+        'price-capacity-optimized' (the default, and AWS's recommendation),
+        'capacity-optimized', 'capacity-optimized-prioritized', 'diversified',
+        or 'lowest-price'. Converted to the camelCase spelling Spot Fleet
+        requires at the API boundary.
     spot_interruption_handling : bool, optional
         Whether to enable spot interruption handling. Default is False.
     checkpoint_bucket : Optional[str], optional
@@ -254,7 +268,7 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
         parameter_store_path: str = "/parsl/ephemeral_aws_state",
         use_spot: bool = False,
         spot_max_price: Optional[str] = None,
-        spot_allocation_strategy: str = "capacity-optimized",
+        spot_allocation_strategy: str = DEFAULT_SPOT_ALLOCATION_STRATEGY,
         spot_interruption_handling: bool = False,
         use_spot_fleet: bool = False,
         instance_types: Optional[List[str]] = None,
@@ -320,28 +334,17 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
             init_blocks=init_blocks,
         )
 
-        # Set basic attributes - resolve image_id if not provided.
-        # Genuinely optional: serverless needs no AMI, and auto-detection can
-        # fail, in which case the mode raises at initialize() instead.
-        self.image_id: Optional[str]
-        if (
-            image_id is None
-            and mode.lower() in ["standard", "detached"]
-            and compute_type.lower() == "ec2"
-        ):
-            # Auto-detect default AMI for the region
-            from parsl_ephemeral_aws.utils.aws import get_default_ami
-
-            try:
-                self.image_id = get_default_ami(region)
-                logger.info(f"Auto-detected AMI {self.image_id} for region {region}")
-            except Exception as e:
-                logger.warning(
-                    f"Failed to auto-detect AMI: {e}. Will need to be set later."
-                )
-                self.image_id = None
-        else:
-            self.image_id = image_id
+        # image_id is genuinely optional: serverless needs no AMI, and
+        # auto-detection can fail, in which case the mode raises at
+        # initialize() instead. Resolution itself is deferred until after
+        # self.session exists, below -- it now queries SSM, and must do so with
+        # the caller's profile and endpoint rather than a bare default session.
+        self.image_id: Optional[str] = image_id
+        # The AMI must match the instance type's architecture, or the launch
+        # fails: arm64 was unusable before #84 because only x86_64 AMIs existed
+        # anywhere in the package. This lookup is pure string parsing, so it is
+        # safe this early.
+        self.architecture = architecture_for_instance_type(instance_type)
         self.instance_type = instance_type
         self.region = region
         self.mode_type = OperatingModeType(mode.lower())
@@ -463,6 +466,29 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
         self.session = create_session(
             region=self.region, profile_name=self.profile_name
         )
+
+        # Resolve the AMI now that a credentialed session exists. Deferred from
+        # the attribute block above because get_default_ami() queries SSM (#84).
+        if (
+            self.image_id is None
+            and self.mode_type
+            in (OperatingModeType.STANDARD, OperatingModeType.DETACHED)
+            and self.compute_type == ComputeType.EC2
+        ):
+            try:
+                self.image_id = get_default_ami(
+                    self.region, self.architecture, session=self.session
+                )
+                logger.info(
+                    f"Auto-detected {self.architecture} AMI {self.image_id} for "
+                    f"region {self.region}"
+                )
+            except Exception as e:
+                logger.warning(
+                    f"Failed to auto-detect AMI: {e}. Will need to be set later."
+                )
+                self.image_id = None
+
         self.state_store = self._initialize_state_store()
 
         # cores_per_node / mem_per_node are declared by Parsl's

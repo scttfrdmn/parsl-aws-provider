@@ -10,6 +10,8 @@ SPDX-FileCopyrightText: 2025 Scott Friedman and Project Contributors
 
 from unittest.mock import MagicMock, patch
 
+from parsl_ephemeral_aws.constants import DEFAULT_SPOT_ALLOCATION_STRATEGY
+
 
 def mock_provider(**overrides):
     """Build a mock provider that satisfies every compute manager's ``__init__``.
@@ -55,6 +57,10 @@ def mock_provider(**overrides):
     provider.use_spot_instances = False
     provider.nodes_per_block = 1
     provider.tags = {}
+    # Read as a value and normalised to the camelCase spelling RequestSpotFleet
+    # accepts (#84); a MagicMock here fails inside the normaliser rather than at
+    # the API, so the real default has to be present.
+    provider.spot_allocation_strategy = DEFAULT_SPOT_ALLOCATION_STRATEGY
     # Every manager now resolves its session through resolve_manager_session,
     # which prefers ``provider.session`` and only falls back to the credential
     # manager when there is none (#117). A bare MagicMock always *has* a

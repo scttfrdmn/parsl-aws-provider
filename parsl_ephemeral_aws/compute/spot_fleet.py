@@ -36,9 +36,13 @@ from ..constants import (
     STATUS_CANCELLED,
     STATUS_UNKNOWN,
     DEFAULT_VPC_CIDR,
+    DEFAULT_SPOT_ALLOCATION_STRATEGY,
 )
 from ..config import SecurityConfig
-from ..utils.aws import resolve_manager_session
+from ..utils.aws import (
+    normalize_spot_fleet_allocation_strategy,
+    resolve_manager_session,
+)
 from ..security import (
     CredentialManager,
     CredentialConfiguration,
@@ -616,7 +620,17 @@ class SpotFleetManager:
                 "LaunchSpecifications": launch_specifications,
                 "TerminateInstancesWithExpiration": True,
                 "Type": "maintain",  # Maintain target capacity
-                "AllocationStrategy": "lowestPrice",  # Use the lowest price instance types
+                # Honour the provider's spot_allocation_strategy instead of
+                # hardcoding lowestPrice, which ignored the documented setting
+                # and chose the most interruption-prone pools (#84). Normalised
+                # because RequestSpotFleet takes only the camelCase spelling.
+                "AllocationStrategy": normalize_spot_fleet_allocation_strategy(
+                    getattr(
+                        self.provider,
+                        "spot_allocation_strategy",
+                        DEFAULT_SPOT_ALLOCATION_STRATEGY,
+                    )
+                ),
                 "ReplaceUnhealthyInstances": True,
                 "TagSpecifications": [
                     {

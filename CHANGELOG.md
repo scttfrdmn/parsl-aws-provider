@@ -27,6 +27,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   live VPC and blackhole egress for unrelated workloads (closes #94).
 
 ### Fixed
+- Spot fleet requests ignored `spot_allocation_strategy` entirely. Both
+  `SpotFleetManager._create_spot_fleet_request()` and the fleet request inside
+  the generated bastion-manager script hardcoded `lowestPrice`, so the
+  configured value was never read at any call site — meaning every spot fleet
+  drew from the pools with the *least* spare capacity, the most
+  interruption-prone choice available. Both now send the configured strategy
+  (closes #84).
+- `get_default_ami()` raised `AMINotFoundError` for any region absent from its
+  hardcoded table, including regions AWS has added since the table was written.
+  It now resolves from SSM and falls back to the table only when that fails
+  (closes #84).
 - `scale_in()` passed `None` into `cancel()` for any tracked resource carrying no
   `job_id`, which `@typechecked` turned into
   `TypeCheckError: item 0 of argument "job_ids" ... is not an instance of str` —
@@ -376,6 +387,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a first run can proceed with no saved state (closes #122).
 
 ### Added
+- AMIs are resolved at runtime from AWS's public SSM Parameter Store aliases
+  (`/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-{arch}`), which
+  AWS repoints at every AL2023 release. Any region works, including ones no
+  hardcoded table ever listed — verified by booting an instance in
+  `ap-southeast-4`. The version-independent `kernel-default` alias is used
+  deliberately: naming `6.1`/`6.12`/`6.18` would only become the next stale
+  constant (closes #84).
+- **arm64/Graviton support.** Nothing in the package distinguished architectures
+  before, and every AMI it could reach was x86_64, so a Graviton `instance_type`
+  could not launch at all. `architecture_for_instance_type()` derives the
+  architecture from the instance-type family and `get_default_ami()` takes an
+  `architecture` argument; the provider exposes the resolved value as
+  `EphemeralAWSProvider.architecture`. Graviton is a 20–40% price/performance
+  gain on the same workload. The classification reads the family's *generation
+  suffix* — AWS appends `g` to every arm64 family (`c7g`, `m8g`, `r7gd`, `c8gn`)
+  and to no x86_64 one — so the `g5`/`g6e` GPU families, where the `g` is a
+  prefix, are correctly x86_64. Validated against `describe_instance_types` for
+  all 1,346 types offered in us-east-1: 396 arm64, 950 x86_64, zero
+  misclassifications (closes #84).
+- `normalize_spot_fleet_allocation_strategy()` in `utils/aws.py`, translating the
+  documented kebab-case strategy names to the camelCase spelling
+  `RequestSpotFleet` requires, and rejecting unknown values with a message that
+  lists the accepted ones rather than waiting for EC2's `InvalidParameterValue`.
+- `tests/unit/test_ami_resolution.py` (35 tests) and
+  `tests/unit/test_allocation_strategy.py` (25 tests). The allocation-strategy
+  suite asserts on the request boto3 actually receives and on the generated
+  bastion script's injected literal, not only on the helper — both defects were
+  that the configured value was never read, which a helper-level test cannot
+  catch.
 - `cores_per_node` and `mem_per_node` constructor arguments. Parsl's
   `ExecutionProvider` declares both and `HighThroughputExecutor` sizes its worker
   count from them — with both `None` it takes the
@@ -495,6 +535,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   template is caught (refs #112, #113).
 
 ### Changed
+- The default spot allocation strategy is now `price-capacity-optimized`, AWS's
+  current recommendation, replacing the documented-but-unused
+  `capacity-optimized`. It draws from the pools with the deepest spare capacity
+  and then the lowest price among those, so it interrupts far less often than
+  `lowest-price` at close to the same cost.
+- The two fleet APIs spell this enum differently and each rejects the other's
+  spelling, verified against real EC2: `RequestSpotFleet` takes camelCase
+  (`priceCapacityOptimized`; the kebab-case form returns
+  `InvalidParameterValue`), while `CreateFleet` takes kebab-case (the camelCase
+  form returns `InvalidParameter`). `spot_allocation_strategy` therefore stays
+  kebab-case — as every docstring has always documented — and is normalised at
+  the `RequestSpotFleet` boundary. `SPOT_FLEET_DEFAULT_ALLOCATION_STRATEGY` holds
+  the camelCase form for the current path and
+  `EC2_FLEET_DEFAULT_ALLOCATION_STRATEGY` the kebab-case form for the
+  `CreateFleet` migration in #86.
+- `DEFAULT_AMI_MAPPING` is demoted from the AMI source of truth to an offline
+  fallback for `get_default_ami()`, used only when the SSM lookup fails —
+  chiefly so moto- and substrate-backed tests need no network. It has been
+  refreshed, but a hardcoded table cannot be kept current: **all 21 entries of
+  the previous one, stamped 2026-03-01, were unusable by 2026-07-30** — 9 carried
+  a `DeprecationTime` of 2026-05-17, 6 returned `InvalidAMIID.NotFound`, 2 were
+  `InvalidAMIID.Malformed`, and the rest were in regions that could not be
+  reached. Nothing noticed, because a deprecated AMI still launches until AWS
+  deletes it. (The table's header also claimed `kernel-6.12`, while
+  `describe_images` reported the us-east-1 entry was built from `kernel-6.1`.)
+  The four opt-in regions it listed are dropped, since no value for them could be
+  verified; SSM resolves them normally from an account that has them enabled. The
+  table is x86_64-only, and `get_default_ami()` raises rather than hand one of
+  its entries to an arm64 instance type.
 - `submit()`, `status()`, and `cancel()` now carry Parsl's own signatures:
   `submit(command, tasks_per_node, job_name="parsl.auto")`,
   `status(job_ids: Sequence[object])`, and `cancel(job_ids: Sequence[object])`.
