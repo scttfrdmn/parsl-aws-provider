@@ -17,6 +17,7 @@ import boto3
 from botocore.exceptions import ClientError
 
 from parsl_ephemeral_aws.constants import (
+    DEFAULT_SPOT_ALLOCATION_STRATEGY,
     EC2_STATUS_MAPPING,
     RESOURCE_TYPE_EC2,
     RESOURCE_TYPE_SPOT_FLEET,
@@ -41,6 +42,7 @@ from parsl_ephemeral_aws.compute.spot_interruption import (
     ParslSpotInterruptionHandler,
 )
 from parsl_ephemeral_aws.utils.aws import (
+    architecture_for_instance_type,
     get_default_ami,
     get_or_create_ssm_instance_profile,
     wait_for_resource,
@@ -74,7 +76,7 @@ class StandardMode(OperatingMode):
         key_name: Optional[str] = None,
         use_spot: bool = False,
         spot_max_price: Optional[str] = None,
-        spot_allocation_strategy: str = "capacity-optimized",
+        spot_allocation_strategy: str = DEFAULT_SPOT_ALLOCATION_STRATEGY,
         additional_tags: Optional[Dict[str, str]] = None,
         auto_shutdown: bool = True,
         max_idle_time: int = 300,
@@ -123,7 +125,8 @@ class StandardMode(OperatingMode):
         spot_max_price : Optional[str], optional
             Maximum price for spot instances, by default None
         spot_allocation_strategy : str, optional
-            Allocation strategy for spot instances, by default "capacity-optimized"
+            Allocation strategy for spot instances, in kebab-case, by default
+            "price-capacity-optimized"
         additional_tags : Optional[Dict[str, str]], optional
             Tags to apply to created resources, by default None
         auto_shutdown : bool, optional
@@ -754,7 +757,13 @@ class StandardMode(OperatingMode):
 
         # Validate image_id
         if not self.image_id:
-            self.image_id = get_default_ami(self.session.region_name)
+            # Architecture-matched and SSM-resolved (#84): an x86_64 AMI on a
+            # Graviton instance type fails to launch.
+            self.image_id = get_default_ami(
+                self.session.region_name,
+                architecture_for_instance_type(self.instance_type),
+                session=self.session,
+            )
             logger.info(
                 f"Using default AMI {self.image_id} for region {self.session.region_name}"
             )

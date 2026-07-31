@@ -36,7 +36,9 @@ from parsl_ephemeral_aws.exceptions import (
 from parsl_ephemeral_aws.modes.base import OperatingMode
 from parsl_ephemeral_aws.state.base import STATE_KEY_MODE, StateStore
 from parsl_ephemeral_aws.utils.aws import (
+    architecture_for_instance_type,
     get_default_ami,
+    normalize_spot_fleet_allocation_strategy,
     wait_for_resource,
     get_cf_template,
 )
@@ -329,7 +331,13 @@ class DetachedMode(OperatingMode):
 
         # Validate image_id
         if not self.image_id:
-            self.image_id = get_default_ami(self.session.region_name)
+            # Architecture-matched and SSM-resolved (#84): an x86_64 AMI on a
+            # Graviton instance type fails to launch.
+            self.image_id = get_default_ami(
+                self.session.region_name,
+                architecture_for_instance_type(self.instance_type),
+                session=self.session,
+            )
             logger.info(
                 f"Using default AMI {self.image_id} for region {self.session.region_name}"
             )
@@ -422,7 +430,13 @@ class DetachedMode(OperatingMode):
 
         # Validate image_id
         if not self.image_id:
-            self.image_id = get_default_ami(self.session.region_name)
+            # Architecture-matched and SSM-resolved (#84): an x86_64 AMI on a
+            # Graviton instance type fails to launch.
+            self.image_id = get_default_ami(
+                self.session.region_name,
+                architecture_for_instance_type(self.instance_type),
+                session=self.session,
+            )
             logger.info(
                 f"Using default AMI {self.image_id} for region {self.session.region_name}"
             )
@@ -723,6 +737,10 @@ JOB_COMMAND_PREFIX = f'{SSM_PARAMETER_PREFIX}/jobs'
 JOB_STATUS_PREFIX = f'{SSM_PARAMETER_PREFIX}/status'
 TAG_PREFIX = "parsl-ephemeral"
 RESOURCE_TYPE_SPOT_FLEET = "spot_fleet"
+# Spot Fleet allocation strategy, overwritten at script generation time with the
+# mode's spot_allocation_strategy (#84). RequestSpotFleet accepts only the
+# camelCase spelling, so the value substituted here is already normalised.
+ALLOCATION_STRATEGY = 'priceCapacityOptimized'
 EC2_STATUS_MAPPING = {
     'pending': 'PENDING',
     'running': 'RUNNING',
@@ -1021,7 +1039,7 @@ export PARSL_WORKER_ID=$(hostname)
                 'LaunchSpecifications': launch_specifications,
                 'TerminateInstancesWithExpiration': True,
                 'Type': 'maintain',  # Maintain target capacity
-                'AllocationStrategy': 'lowestPrice',  # Use the lowest price instance types
+                'AllocationStrategy': ALLOCATION_STRATEGY,
                 'ReplaceUnhealthyInstances': True,
                 'TagSpecifications': [
                     {
@@ -1501,6 +1519,17 @@ if __name__ == '__main__':
             "PROVIDER_ID = os.environ.get('PARSL_PROVIDER_ID')",
             f"PROVIDER_ID = '{self.provider_id}'  # injected at script generation time",
         )
+        # The bastion runs this script standalone, so it cannot import from this
+        # package -- the strategy has to be substituted in as a literal. The
+        # fleet request used to hardcode 'lowestPrice' here, ignoring the
+        # configured spot_allocation_strategy entirely and choosing the pools
+        # with the least spare capacity (#84).
+        script = script.replace(
+            "ALLOCATION_STRATEGY = 'priceCapacityOptimized'",
+            "ALLOCATION_STRATEGY = "
+            f"'{normalize_spot_fleet_allocation_strategy(self.spot_allocation_strategy)}'"
+            "  # injected at script generation time",
+        )
         return script
 
     def submit_job(
@@ -1541,7 +1570,13 @@ if __name__ == '__main__':
 
         # Validate image_id
         if not self.image_id:
-            self.image_id = get_default_ami(self.session.region_name)
+            # Architecture-matched and SSM-resolved (#84): an x86_64 AMI on a
+            # Graviton instance type fails to launch.
+            self.image_id = get_default_ami(
+                self.session.region_name,
+                architecture_for_instance_type(self.instance_type),
+                session=self.session,
+            )
             logger.info(
                 f"Using default AMI {self.image_id} for region {self.session.region_name}"
             )

@@ -12,7 +12,10 @@ import logging
 import pytest
 
 from parsl_ephemeral_aws.compute.spot_fleet import SpotFleetManager
-from parsl_ephemeral_aws.constants import TAG_PREFIX
+from parsl_ephemeral_aws.constants import (
+    SPOT_FLEET_DEFAULT_ALLOCATION_STRATEGY,
+    TAG_PREFIX,
+)
 from parsl_ephemeral_aws.exceptions import SpotFleetThrottlingError
 
 pytestmark = pytest.mark.unit
@@ -339,6 +342,73 @@ class TestSpotFleetManager(unittest.TestCase):
             # services that tolerate them.
             name = next(tag["Value"] for tag in spec["Tags"] if tag["Key"] == "Name")
             self.assertTrue(name.startswith(TAG_PREFIX))
+
+    def _request_fleet_with(self, mock_credential_manager_cls, provider):
+        """Drive ``_create_spot_fleet_request`` and return the config it sent."""
+        mock_ec2_client = MagicMock()
+        mock_session = MagicMock()
+        mock_session.client.return_value = mock_ec2_client
+        mock_session.resource.return_value = MagicMock()
+        mock_credential_manager_cls.return_value.create_boto3_session.return_value = (
+            mock_session
+        )
+        mock_ec2_client.request_spot_fleet.return_value = {
+            "SpotFleetRequestId": "sfr-123"
+        }
+
+        SpotFleetManager(provider)._create_spot_fleet_request(
+            "block-123",
+            {
+                "vpc_id": "vpc-12345678",
+                "subnet_id": "subnet-12345678",
+                "security_group_id": "sg-12345678",
+            },
+            1,
+            "arn:aws:iam::123456789012:role/fleet-role",
+        )
+        return mock_ec2_client.request_spot_fleet.call_args.kwargs[
+            "SpotFleetRequestConfig"
+        ]
+
+    @patch("parsl_ephemeral_aws.compute.spot_fleet.CredentialManager")
+    def test_configured_allocation_strategy_reaches_the_api(
+        self, mock_credential_manager_cls
+    ):
+        """The provider's ``spot_allocation_strategy`` must actually be sent (#84).
+
+        It was hardcoded to ``lowestPrice`` here, so the configured value was
+        never read at all -- which is why this asserts on the request boto3
+        received rather than on the helper that converts the spelling.
+        """
+        self.mock_provider.spot_allocation_strategy = "capacity-optimized"
+
+        config = self._request_fleet_with(
+            mock_credential_manager_cls, self.mock_provider
+        )
+
+        # Converted to the only spelling RequestSpotFleet accepts.
+        self.assertEqual(config["AllocationStrategy"], "capacityOptimized")
+
+    @patch("parsl_ephemeral_aws.compute.spot_fleet.CredentialManager")
+    def test_allocation_strategy_defaults_when_provider_omits_it(
+        self, mock_credential_manager_cls
+    ):
+        """StandardMode's provider stand-in may not carry the attribute at all.
+
+        ``_SimpleProvider`` raises ``AttributeError`` for anything it was not
+        given, so this exercises the ``getattr(..., default)`` fall-through the
+        way production does.
+        """
+        self.assertFalse(hasattr(self.mock_provider, "spot_allocation_strategy"))
+
+        config = self._request_fleet_with(
+            mock_credential_manager_cls, self.mock_provider
+        )
+
+        self.assertEqual(
+            config["AllocationStrategy"], SPOT_FLEET_DEFAULT_ALLOCATION_STRATEGY
+        )
+        self.assertNotEqual(config["AllocationStrategy"], "lowestPrice")
 
 
 if __name__ == "__main__":
