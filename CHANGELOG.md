@@ -27,6 +27,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   live VPC and blackhole egress for unrelated workloads (closes #94).
 
 ### Fixed
+- `scale_in()` passed `None` into `cancel()` for any tracked resource carrying no
+  `job_id`, which `@typechecked` turned into
+  `TypeCheckError: item 0 of argument "job_ids" ... is not an instance of str` —
+  aborting the whole scale-in rather than skipping the one resource. A resource
+  normally has a `job_id`, but an interrupted `submit()` or a partially-restored
+  state document can leave it absent. Such resources are now filtered out. (This,
+  not Parsl, was the real source of the non-string-ID hazard #82 describes:
+  `BlockProviderExecutor.blocks_to_job_id` is `Dict[str, str]` and `submit()`
+  returns `str`, so Parsl round-trips strings safely) (closes #82).
 - The `test-bats` CI job failed in setup, before running a test. `sudo` was
   applied to the `npm install` line only, so `mkdir -p /usr/local/lib/bats` ran
   unprivileged and died on `Permission denied` once the runner image stopped
@@ -367,6 +376,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a first run can proceed with no saved state (closes #122).
 
 ### Added
+- `cores_per_node` and `mem_per_node` constructor arguments. Parsl's
+  `ExecutionProvider` declares both and `HighThroughputExecutor` sizes its worker
+  count from them — with both `None` it takes the
+  `# our best guess-- we do not have any provider hints` branch and runs **one
+  worker per node** however large the instance. When not supplied they are
+  resolved from `ec2:DescribeInstanceTypes` via the new
+  `utils.aws.describe_instance_capacity()`, which returns `(None, None)` on any
+  failure: it runs during `__init__`, so an unreachable or unauthorized EC2 must
+  not stop the provider from constructing. Serverless mode leaves both `None`
+  deliberately — Lambda and Fargate have no node to describe, and `memory_size`
+  is a per-invocation allocation rather than the same concept (closes #82).
+- `TestExecutionProviderConformance` in `tests/unit/test_provider_interface.py`
+  asserts the three signatures against `inspect.signature(ExecutionProvider.*)`
+  rather than restating them, so a future base-class change surfaces as a test
+  failure instead of a runtime `TypeCheckError`. Also covers opaque job IDs
+  through `status()`/`cancel()`, positional ordering when opaque and real IDs are
+  mixed, and `tests/unit/test_instance_capacity.py` for the capacity lookup
+  (closes #82).
 - `tests/substrate_support.py` — emulator session/client helpers and VPC
   setup/teardown, replacing the package-internal
   `parsl_ephemeral_aws/utils/localstack.py`. It lives under `tests/` because no
@@ -468,6 +495,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   template is caught (refs #112, #113).
 
 ### Changed
+- `submit()`, `status()`, and `cancel()` now carry Parsl's own signatures:
+  `submit(command, tasks_per_node, job_name="parsl.auto")`,
+  `status(job_ids: Sequence[object])`, and `cancel(job_ids: Sequence[object])`.
+  They were `List[str]` with `job_name: Optional[str] = None`, which is narrower
+  than the base class — and `@typechecked` on the class makes annotations
+  load-bearing at runtime, so a non-`str` ID raised `TypeCheckError` instead of
+  being reported as unknown. `job_map` stays string-keyed: each incoming ID is
+  narrowed once at the method boundary, and anything that is not a `str` resolves
+  to `JobState.UNKNOWN` (or `False` from `cancel()`) rather than raising.
+  `"parsl.auto"` is treated as "no caller-chosen name", the same as the `None`
+  this provider previously defaulted to. `self.resources` is widened to
+  `Dict[object, Any]` to match the base declaration (closes #82).
+- `status()` and `cancel()` collect their per-job results by *position* rather
+  than in a dict keyed by the job ID. `Sequence[object]` admits unhashable IDs,
+  and using one as a dict key raised `TypeError: unhashable type: 'list'` — from
+  inside the `except` handler too, so it escaped the method rather than being
+  reported as UNKNOWN. Positional collection also means a repeated ID yields one
+  entry per occurrence, which is what Parsl indexes (refs #82).
+- Minimum Parsl raised from `2026.1.5` to `2026.4.20`. Not the `2026.7` #82
+  proposed: `globus-compute-endpoint` pins Parsl *exactly* (4.15.0 →
+  `parsl==2026.4.20`), so any floor above that makes the `globus` extra
+  unresolvable. The signatures above are identical across the whole range —
+  2026.7.x only widened `status`/`cancel` from `List[object]` to
+  `Sequence[object]`, and `Sequence` is the wider type, so one declaration
+  satisfies every version in the range (refs #82).
 - **The AWS emulator is now [substrate](https://github.com/scttfrdmn/substrate),
   not LocalStack.** LocalStack OSS is end-of-life: the repository was archived
   read-only in March 2026, `4.14.0` is the last community image, and
