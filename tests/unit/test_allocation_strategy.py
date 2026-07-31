@@ -174,6 +174,14 @@ class TestBastionScriptInjection:
     the replacement actually substitutes. A substitution whose search string
     drifts from the template fails silently -- ``str.replace`` finding nothing is
     not an error -- so the generated text is what has to be asserted on.
+
+    The spelling asserted on is kebab-case, and the *whole point* of these two
+    tests is which one. The bastion called ``RequestSpotFleet`` when they were
+    written, which takes camelCase; it now calls ``CreateFleet`` (#86), which
+    rejects camelCase outright with ``InvalidParameter``. So the conversion these
+    tests used to demand would break every fleet the bastion launches -- and it
+    would break it *on the bastion*, in a standalone script on a remote instance,
+    where the error surfaces only in that instance's log.
     """
 
     def _script(self, **kwargs):
@@ -202,16 +210,29 @@ class TestBastionScriptInjection:
                 )
         raise AssertionError("script defines no ALLOCATION_STRATEGY constant")
 
-    def test_configured_strategy_is_injected_as_camel_case(self):
+    def test_configured_strategy_is_injected_as_kebab_case(self):
+        """The value must reach the script in the spelling CreateFleet takes."""
         script = self._script(spot_allocation_strategy="capacity-optimized")
 
-        assert self._injected_value(script) == "capacityOptimized"
+        assert self._injected_value(script) == "capacity-optimized"
 
     def test_default_strategy_is_injected(self):
         assert (
             self._injected_value(self._script())
-            == SPOT_FLEET_DEFAULT_ALLOCATION_STRATEGY
+            == EC2_FLEET_DEFAULT_ALLOCATION_STRATEGY
         )
+
+    def test_a_camel_case_strategy_is_converted_for_the_bastion(self):
+        """A caller may supply either spelling; only one works on the bastion.
+
+        ``normalize_ec2_fleet_allocation_strategy`` runs at the substitution, so a
+        caller who passed the ``RequestSpotFleet`` spelling still gets a script
+        that ``CreateFleet`` accepts. Without it the value would travel verbatim
+        and fail on the instance rather than here.
+        """
+        script = self._script(spot_allocation_strategy="capacityOptimized")
+
+        assert self._injected_value(script) == "capacity-optimized"
 
     def test_generated_script_is_valid_python(self):
         """The substitution must not break the script the bastion has to run."""
@@ -222,3 +243,17 @@ class TestBastionScriptInjection:
 
         assert "'AllocationStrategy': 'lowestPrice'" not in script
         assert "lowestPrice" not in script
+
+    def test_the_script_calls_create_fleet_and_not_the_legacy_api(self):
+        """The strategy's spelling only makes sense against one of the two APIs.
+
+        Pinning which API the script calls is what makes the kebab-case
+        assertions above meaningful rather than arbitrary -- if the bastion went
+        back to ``RequestSpotFleet``, they would be asserting the spelling that
+        breaks it.
+        """
+        script = self._script()
+
+        assert "ec2.create_fleet(" in script
+        assert "request_spot_fleet" not in script
+        assert "cancel_spot_fleet_requests" not in script

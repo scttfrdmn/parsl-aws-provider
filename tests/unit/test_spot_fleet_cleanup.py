@@ -5,7 +5,7 @@ SPDX-FileCopyrightText: 2025 Scott Friedman and Project Contributors
 """
 
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 import boto3
 import pytest
 from botocore.exceptions import ClientError
@@ -121,13 +121,53 @@ class TestSpotFleetCleanup(unittest.TestCase):
         self.assertEqual(self.mock_iam.delete_role.call_count, 2)
 
     def test_cleanup_all_spot_fleet_resources(self):
-        """Test cleanup of all Spot Fleet resources."""
-        # Configure mock EC2 client for paginator
-        mock_paginator = MagicMock()
-        self.mock_ec2.get_paginator.return_value = mock_paginator
+        """Test cleanup of all fleet resources, EC2 Fleet and legacy alike.
 
-        # Configure paginator to return Spot Fleet requests
-        mock_paginator.paginate.return_value = [
+        The sweep now covers two generations of API (#86), so the paginator has
+        to be dispatched by operation rather than answering every call with the
+        same pages. It makes three calls: ``describe_instances`` once per
+        workflow-tag key -- ``describe_instances`` ANDs its filters, so
+        ``WorkflowId`` and ``ParslWorkflowId`` cannot be asked for together --
+        and then ``describe_spot_fleet_requests`` for anything predating #86.
+
+        An EC2 Fleet is found through its *instances*, never through
+        ``describe_fleets``: an ``instant`` fleet does not appear in a
+        fleet-level listing at all unless its ID is already known, and a tag
+        filter does not find it either (both verified against real EC2). The
+        ``aws:ec2:fleet-id`` tag EC2 stamps on every fleet-launched instance is
+        the only route, which is why the mock returns reservations carrying it.
+        """
+        # Configure mock EC2 paginators, dispatched by operation.
+        instances_paginator = MagicMock()
+        instances_paginator.paginate.return_value = [
+            {
+                "Reservations": [
+                    {
+                        "Instances": [
+                            {
+                                "InstanceId": "i-11111111",
+                                "Tags": [
+                                    {"Key": "WorkflowId", "Value": "test-workflow"},
+                                    {"Key": "aws:ec2:fleet-id", "Value": "fleet-abc"},
+                                ],
+                            },
+                            # Two instances from one fleet must yield one
+                            # deletion, not two.
+                            {
+                                "InstanceId": "i-22222222",
+                                "Tags": [
+                                    {"Key": "WorkflowId", "Value": "test-workflow"},
+                                    {"Key": "aws:ec2:fleet-id", "Value": "fleet-abc"},
+                                ],
+                            },
+                        ]
+                    }
+                ]
+            }
+        ]
+
+        legacy_paginator = MagicMock()
+        legacy_paginator.paginate.return_value = [
             {
                 "SpotFleetRequestConfigs": [
                     {
@@ -141,6 +181,22 @@ class TestSpotFleetCleanup(unittest.TestCase):
                 ]
             }
         ]
+
+        self.mock_ec2.get_paginator.side_effect = lambda operation: {
+            "describe_instances": instances_paginator,
+            "describe_spot_fleet_requests": legacy_paginator,
+        }[operation]
+
+        self.mock_ec2.delete_fleets.return_value = {
+            "SuccessfulFleetDeletions": [
+                {
+                    "FleetId": "fleet-abc",
+                    "CurrentFleetState": "deleted_terminating",
+                    "PreviousFleetState": "active",
+                }
+            ],
+            "UnsuccessfulFleetDeletions": [],
+        }
 
         # Configure describe_tags to identify requests from our workflow
         self.mock_ec2.describe_tags.side_effect = [
@@ -193,7 +249,9 @@ class TestSpotFleetCleanup(unittest.TestCase):
                 cleanup_iam_roles=True,
             )
 
-        # Verify result
+        # Verify result. The fleet is reported once even though two of its
+        # instances carried its tag, and both tag-key passes saw both.
+        self.assertEqual(result["deleted_fleets"], ["fleet-abc"])
         self.assertEqual(len(result["cancelled_requests"]), 1)
         self.assertEqual(result["cancelled_requests"][0], "sfr-12345")
         self.assertEqual(len(result["cleaned_roles"]), 1)
@@ -202,9 +260,39 @@ class TestSpotFleetCleanup(unittest.TestCase):
         )
         self.assertEqual(len(result["errors"]), 0)
 
-        # Verify client calls
-        self.mock_ec2.get_paginator.assert_called_once_with(
-            "describe_spot_fleet_requests"
+        # Verify client calls. Both workflow tag keys must be swept -- resources
+        # created before the key was renamed carry the other one, and missing a
+        # pass leaks every fleet tagged with it.
+        self.assertEqual(
+            self.mock_ec2.get_paginator.call_args_list,
+            [
+                call("describe_instances"),
+                call("describe_instances"),
+                call("describe_spot_fleet_requests"),
+            ],
+        )
+        self.assertEqual(
+            [
+                c.kwargs["Filters"][0]
+                for c in instances_paginator.paginate.call_args_list
+            ],
+            [
+                {"Name": "tag:WorkflowId", "Values": ["test-workflow"]},
+                {"Name": "tag:ParslWorkflowId", "Values": ["test-workflow"]},
+            ],
+        )
+        # Every pass also requires the fleet-id tag to be present, so a
+        # non-fleet instance of the same workflow is not mistaken for one.
+        for paginate_call in instances_paginator.paginate.call_args_list:
+            self.assertEqual(
+                paginate_call.kwargs["Filters"][1],
+                {"Name": "tag-key", "Values": ["aws:ec2:fleet-id"]},
+            )
+
+        # Deleting an instant fleet always terminates its instances; AWS rejects
+        # NoTerminateInstances for the type, so the flag is not optional.
+        self.mock_ec2.delete_fleets.assert_called_once_with(
+            FleetIds=["fleet-abc"], TerminateInstances=True
         )
         self.mock_ec2.describe_tags.assert_called_with(
             Filters=[{"Name": "resource-id", "Values": ["sfr-67890"]}]

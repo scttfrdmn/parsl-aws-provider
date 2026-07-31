@@ -17,6 +17,7 @@ import boto3
 from botocore.exceptions import ClientError
 
 from parsl_ephemeral_aws.constants import (
+    DEFAULT_RESOURCE_CREATION_TIMEOUT,
     DEFAULT_SPOT_ALLOCATION_STRATEGY,
     EC2_STATUS_MAPPING,
     IMDSV2_METADATA_OPTIONS,
@@ -275,7 +276,9 @@ class StandardMode(OperatingMode):
                 )
             else:
                 logger.debug("Initializing SpotInterruptionMonitor and Handler")
-                self.spot_interruption_monitor = SpotInterruptionMonitor(self.session)
+                self.spot_interruption_monitor = SpotInterruptionMonitor(
+                    self.session, provider_id=self.provider_id
+                )
                 self.spot_interruption_handler = ParslSpotInterruptionHandler(
                     session=self.session,
                     checkpoint_bucket=self.checkpoint_bucket,
@@ -669,7 +672,8 @@ class StandardMode(OperatingMode):
                                 "Initializing SpotInterruptionMonitor and Handler after state load"
                             )
                             self.spot_interruption_monitor = SpotInterruptionMonitor(
-                                self.session
+                                self.session,
+                                provider_id=self.provider_id,
                             )
                             self.spot_interruption_handler = (
                                 ParslSpotInterruptionHandler(
@@ -716,25 +720,28 @@ class StandardMode(OperatingMode):
                         f"Loaded SpotFleetManager state with {len(self.spot_fleet_manager.blocks)} blocks"
                     )
 
-                    # Re-register spot fleets with interruption monitor if needed
+                    # Re-register fleets with the interruption monitor. Reads the
+                    # block's "fleet_request_id", which is the key the manager
+                    # actually writes; this used to iterate a "fleet_requests"
+                    # list that nothing has ever produced, so a resumed workflow
+                    # silently monitored none of its fleets.
                     if (
                         self.spot_interruption_handling
                         and self.spot_interruption_monitor
                         and self.spot_interruption_handler
                     ):
-                        for (
-                            block_id,
-                            block_data,
-                        ) in self.spot_fleet_manager.blocks.items():
-                            fleet_requests = block_data.get("fleet_requests", [])
-                            for fleet_request_id in fleet_requests:
-                                self.spot_interruption_monitor.register_fleet(
-                                    fleet_request_id,
-                                    self.spot_interruption_handler.handle_fleet_interruption,
-                                )
-                                logger.info(
-                                    f"Re-registered spot fleet {fleet_request_id} for interruption handling"
-                                )
+                        for block_data in self.spot_fleet_manager.blocks.values():
+                            fleet_id = block_data.get("fleet_request_id")
+                            if not fleet_id:
+                                continue
+                            self.spot_interruption_monitor.register_fleet(
+                                fleet_id,
+                                self.spot_interruption_handler.handle_fleet_interruption,
+                            )
+                            logger.info(
+                                f"Re-registered EC2 Fleet {fleet_id} for "
+                                "interruption handling"
+                            )
 
                 logger.debug(f"Loaded state with {len(self.resources)} resources")
                 return True
@@ -1603,68 +1610,99 @@ class StandardMode(OperatingMode):
             # Get the block ID (should be only one)
             block_id = next(iter(blocks.keys()))
 
-            logger.info(f"Created Spot Fleet block {block_id} for job {job_id}")
+            logger.info(f"Created EC2 Fleet block {block_id} for job {job_id}")
 
-            # Wait for block to be running
-            max_wait = 300  # 5 minutes
+            # An instant fleet reports fulfilment synchronously, so a block with
+            # no instances means EC2 could not fill the request at all -- fail
+            # now rather than after a timeout (#86).
+            if not blocks[block_id].get("instance_ids"):
+                self._discard_failed_fleet_block(block_id)
+                raise ResourceCreationError(
+                    f"EC2 Fleet block {block_id} launched no instances; no spot "
+                    "capacity was available for the requested instance types"
+                )
+
+            # The instances exist but have yet to reach "running". This wait now
+            # covers only that transition -- fulfilment was settled synchronously
+            # above -- so a timeout here no longer conflates "no spot capacity"
+            # with "slow to boot".
+            max_wait = DEFAULT_RESOURCE_CREATION_TIMEOUT
             start_time = time.time()
 
             while time.time() - start_time < max_wait:
                 status = self.spot_fleet_manager.get_block_status(block_id)
-                logger.debug(f"Spot Fleet block {block_id} status: {status}")
+                logger.debug(f"EC2 Fleet block {block_id} status: {status}")
 
                 if status == STATUS_RUNNING:
                     break
                 elif status in [STATUS_FAILED, STATUS_CANCELED, STATUS_COMPLETED]:
+                    self._discard_failed_fleet_block(block_id)
                     raise ResourceCreationError(
-                        f"Spot Fleet block failed with status {status}"
+                        f"EC2 Fleet block failed with status {status}"
                     )
 
                 time.sleep(10)
-
-            if time.time() - start_time >= max_wait:
+            else:
                 logger.error(
-                    f"Timeout waiting for Spot Fleet block {block_id} to reach RUNNING"
+                    f"Timeout waiting for EC2 Fleet block {block_id} to reach RUNNING"
                 )
-                try:
-                    self.spot_fleet_manager.terminate_block(block_id)
-                    self.blocks.pop(block_id, None)
-                except Exception as cleanup_err:
-                    logger.error(
-                        f"Failed to clean up timed-out fleet block {block_id}: {cleanup_err}"
-                    )
+                self._discard_failed_fleet_block(block_id)
                 raise ResourceCreationError(
-                    f"Spot Fleet block {block_id} did not reach RUNNING "
+                    f"EC2 Fleet block {block_id} did not reach RUNNING "
                     f"state within {max_wait}s"
                 )
 
-            # Register spot fleet with spot interruption monitor if enabled
+            # Register the fleet with the spot interruption monitor if enabled.
+            # The block records a single "fleet_request_id"; this used to read a
+            # "fleet_requests" list that no code has ever written, so no fleet
+            # was ever actually registered.
             if (
                 self.spot_interruption_handling
                 and self.spot_interruption_monitor
                 and self.spot_interruption_handler
             ):
-                # Get fleet instances
-                fleet_requests = self.spot_fleet_manager.blocks.get(block_id, {}).get(
-                    "fleet_requests", []
+                fleet_id = self.spot_fleet_manager.blocks.get(block_id, {}).get(
+                    "fleet_request_id"
                 )
-                for fleet_request_id in fleet_requests:
+                if fleet_id:
                     self.spot_interruption_monitor.register_fleet(
-                        fleet_request_id,
+                        fleet_id,
                         self.spot_interruption_handler.handle_fleet_interruption,
                     )
                     logger.info(
-                        f"Registered spot fleet {fleet_request_id} for interruption handling"
+                        f"Registered EC2 Fleet {fleet_id} for interruption handling"
                     )
 
             return block_id
 
         except SpotFleetError as e:
-            logger.error(f"Failed to create Spot Fleet: {e}")
+            logger.error(f"Failed to create EC2 Fleet: {e}")
             raise
         except Exception as e:
-            logger.error(f"Unexpected error creating Spot Fleet: {e}")
-            raise ResourceCreationError(f"Failed to create Spot Fleet: {e}") from e
+            logger.error(f"Unexpected error creating EC2 Fleet: {e}")
+            raise ResourceCreationError(f"Failed to create EC2 Fleet: {e}") from e
+
+    def _discard_failed_fleet_block(self, block_id: str) -> None:
+        """Tear down a fleet block that will never become usable.
+
+        Deletes the fleet, terminating any instances it did launch, and drops the
+        manager's record of the block so a later ``cleanup_all_resources`` does
+        not report a fleet that is already gone. Never raises: the caller is
+        already on its way to raising something more informative.
+
+        Parameters
+        ----------
+        block_id : str
+            Block to discard.
+        """
+        if not self.spot_fleet_manager:
+            return
+        try:
+            self.spot_fleet_manager.terminate_block(block_id)
+        except Exception as e:
+            logger.error(f"Failed to clean up failed fleet block {block_id}: {e}")
+        finally:
+            self.spot_fleet_manager.blocks.pop(block_id, None)
 
     def get_job_status(self, resource_ids: List[str]) -> Dict[str, str]:
         """Get the status of jobs.

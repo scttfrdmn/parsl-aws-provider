@@ -63,13 +63,25 @@ class TestSpotInterruptionMonitor:
             ]
         }
 
-        # Mock describe_spot_fleet_instances response
-        client.describe_spot_fleet_instances.return_value = {
-            "ActiveInstances": [
-                {"InstanceId": "i-test1", "SpotInstanceRequestId": "sir-test1"},
-                {"InstanceId": "i-test2", "SpotInstanceRequestId": "sir-test2"},
-            ]
-        }
+        # A fleet's instances are found by filtering describe_instances on the
+        # aws:ec2:fleet-id tag, not by describe_spot_fleet_instances, which
+        # refuses an EC2 Fleet of type instant outright with ``Unsupported``
+        # (#86, verified against real EC2). The paginator is what
+        # get_ec2_fleet_instance_ids drives.
+        fleet_paginator = MagicMock()
+        fleet_paginator.paginate.return_value = [
+            {
+                "Reservations": [
+                    {
+                        "Instances": [
+                            {"InstanceId": "i-test1"},
+                            {"InstanceId": "i-test2"},
+                        ]
+                    }
+                ]
+            }
+        ]
+        client.get_paginator.return_value = fleet_paginator
 
         return client
 
@@ -112,10 +124,10 @@ class TestSpotInterruptionMonitor:
         """Test registering a spot fleet for monitoring."""
         handler = MagicMock()
 
-        monitor.register_fleet("sfr-test1", handler)
+        monitor.register_fleet("fleet-test1", handler)
 
-        assert "sfr-test1" in monitor.fleet_handlers
-        assert monitor.fleet_handlers["sfr-test1"] == handler
+        assert "fleet-test1" in monitor.fleet_handlers
+        assert monitor.fleet_handlers["fleet-test1"] == handler
 
     def test_deregister_instance(self, monitor):
         """Test deregistering a spot instance."""
@@ -131,11 +143,11 @@ class TestSpotInterruptionMonitor:
         """Test deregistering a spot fleet."""
         handler = MagicMock()
 
-        monitor.register_fleet("sfr-test1", handler)
-        assert "sfr-test1" in monitor.fleet_handlers
+        monitor.register_fleet("fleet-test1", handler)
+        assert "fleet-test1" in monitor.fleet_handlers
 
-        monitor.deregister_fleet("sfr-test1")
-        assert "sfr-test1" not in monitor.fleet_handlers
+        monitor.deregister_fleet("fleet-test1")
+        assert "fleet-test1" not in monitor.fleet_handlers
 
     @patch("threading.Thread")
     def test_start_monitoring(self, mock_thread, monitor):
@@ -185,21 +197,47 @@ class TestSpotInterruptionMonitor:
 
     @patch("threading.Thread")
     def test_check_fleet_interruptions(self, mock_thread, monitor, mock_ec2_client):
-        """Test checking for fleet interruptions."""
-        # Register a fleet handler
-        handler = MagicMock()
-        monitor.register_fleet("sfr-test1", handler)
+        """A fleet's instances are found by tag, not by the Spot Fleet API (#86).
 
-        # Call the method directly
+        ``describe_spot_fleet_instances`` used to be the route, and this test
+        asserted on it. It cannot be: it rejects an EC2 Fleet of type instant
+        with ``Unsupported`` -- "Describe fleet instances is not supported by
+        this type of fleet" -- verified against real EC2. The reserved
+        ``aws:ec2:fleet-id`` tag EC2 stamps on every fleet-launched instance is
+        the only workable route.
+        """
+        handler = MagicMock()
+        monitor.register_fleet("fleet-test1", handler)
+
         monitor._check_fleet_interruptions(mock_ec2_client)
 
-        # Verify that describe_spot_fleet_instances was called
-        mock_ec2_client.describe_spot_fleet_instances.assert_called_with(
-            SpotFleetRequestId="sfr-test1"
+        # The legacy call must not be made at all -- it would raise.
+        mock_ec2_client.describe_spot_fleet_instances.assert_not_called()
+
+        mock_ec2_client.get_paginator.assert_called_with("describe_instances")
+        paginate_kwargs = (
+            mock_ec2_client.get_paginator.return_value.paginate.call_args.kwargs
+        )
+        assert {
+            "Name": "tag:aws:ec2:fleet-id",
+            "Values": ["fleet-test1"],
+        } in paginate_kwargs["Filters"]
+
+        # And the instances the tag search found are then described for state.
+        mock_ec2_client.describe_instances.assert_called_with(
+            InstanceIds=["i-test1", "i-test2"]
         )
 
-        # Verify that describe_instances was called with the fleet instances
-        mock_ec2_client.describe_instances.assert_called()
+        # i-test2 is shutting-down in the fixture, so the fleet handler is due an
+        # event -- naming only that instance, not the whole fleet.
+        assert not monitor.event_queue.empty()
+        event_type, fleet_id, instance_ids, event_details = monitor.event_queue.get()
+        assert event_type == "fleet"
+        assert fleet_id == "fleet-test1"
+        assert instance_ids == ["i-test2"]
+        # Marked as the post-facto track: this instance is already dying, so a
+        # handler must not assume it has the two minutes a warning would give.
+        assert event_details["Source"] == "ec2-state"
 
     @patch("threading.Thread")
     def test_process_interruption_events(self, mock_thread, monitor):
@@ -209,15 +247,15 @@ class TestSpotInterruptionMonitor:
         fleet_handler = MagicMock()
 
         monitor.register_instance("i-test1", instance_handler)
-        monitor.register_fleet("sfr-test1", fleet_handler)
+        monitor.register_fleet("fleet-test1", fleet_handler)
 
         # Add events to the queue
         instance_event = ("instance", "i-test1", {"InstanceId": "i-test1"})
         fleet_event = (
             "fleet",
-            "sfr-test1",
+            "fleet-test1",
             ["i-test1", "i-test2"],
-            {"FleetRequestId": "sfr-test1"},
+            {"FleetRequestId": "fleet-test1"},
         )
 
         monitor.event_queue.put(instance_event)
@@ -229,7 +267,7 @@ class TestSpotInterruptionMonitor:
         # Verify handlers were called
         instance_handler.assert_called_once_with("i-test1", {"InstanceId": "i-test1"})
         fleet_handler.assert_called_once_with(
-            "sfr-test1", ["i-test1", "i-test2"], {"FleetRequestId": "sfr-test1"}
+            "fleet-test1", ["i-test1", "i-test2"], {"FleetRequestId": "fleet-test1"}
         )
 
 
@@ -404,7 +442,7 @@ class TestSpotInterruptionHandler:
     def test_handle_fleet_interruption(self, handler):
         """Test the base implementation of handle_fleet_interruption."""
         # This is just a placeholder in the base class, so no real logic to test
-        fleet_id = "sfr-test1"
+        fleet_id = "fleet-test1"
         instance_ids = ["i-test1", "i-test2"]
         event = {"FleetRequestId": fleet_id, "InstanceAction": "terminate"}
 
@@ -513,7 +551,7 @@ class TestParslSpotInterruptionHandler:
         handler.handle_instance_interruption = MagicMock()
 
         # Handle fleet interruption
-        fleet_id = "sfr-test1"
+        fleet_id = "fleet-test1"
         instance_ids = ["i-test1", "i-test2"]
         event = {"FleetRequestId": fleet_id, "InstanceAction": "terminate"}
 

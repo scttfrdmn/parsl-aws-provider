@@ -31,9 +31,17 @@ from parsl_ephemeral_aws.constants import (
     DEFAULT_AMI_MAPPING,
     DEFAULT_ARCHITECTURE,
     DEFAULT_REGION,
+    EC2_FLEET_ALLOCATION_STRATEGIES,
+    EC2_FLEET_TERMINATE_INSTANCES,
+    EC2_FLEET_TYPE_INSTANT,
     IMDSV2_METADATA_OPTIONS,
+    RESOURCE_TYPE_FLEET,
     RESOURCE_TYPE_LAUNCH_TEMPLATE,
     SPOT_FLEET_ALLOCATION_STRATEGIES,
+    SPOT_INTERRUPTION_EVENT_DETAIL_TYPE,
+    SPOT_INTERRUPTION_EVENT_SOURCE,
+    SPOT_INTERRUPTION_QUEUE_RETENTION_SECONDS,
+    TAG_AWS_FLEET_ID,
 )
 from parsl_ephemeral_aws.exceptions import (
     AMINotFoundError,
@@ -293,6 +301,539 @@ def normalize_spot_fleet_allocation_strategy(strategy: str) -> str:
         f"{sorted(SPOT_FLEET_ALLOCATION_STRATEGIES)} or their kebab-case "
         f"equivalents."
     )
+
+
+def normalize_ec2_fleet_allocation_strategy(strategy: str) -> str:
+    """Translate an allocation strategy to the spelling CreateFleet takes.
+
+    The mirror image of :func:`normalize_spot_fleet_allocation_strategy`:
+    ``CreateFleet`` accepts only kebab-case, and rejects the camelCase spelling
+    ``RequestSpotFleet`` demands. The provider's ``spot_allocation_strategy``
+    kwarg is documented in kebab-case, so the common case is a pass-through --
+    but a caller who supplied the camelCase form (or read it off the legacy
+    constant) is converted rather than punished.
+
+    Validating here matters more than it does on the legacy path, because EC2
+    does *not* catch this for you until real capacity is requested: verified
+    against real EC2 that both ``DryRun=True`` and
+    ``TotalTargetCapacity=0`` accept ``"priceCapacityOptimized"``, and
+    ``describe_fleets`` then shows the bad value stored verbatim.
+
+    Parameters
+    ----------
+    strategy : str
+        Allocation strategy in either spelling.
+
+    Returns
+    -------
+    str
+        The kebab-case spelling ``CreateFleet`` accepts.
+
+    Raises
+    ------
+    ValueError
+        If the strategy is not one EC2 recognises, or is not a string.
+    """
+    if strategy in EC2_FLEET_ALLOCATION_STRATEGIES:
+        return strategy
+
+    if not isinstance(strategy, str):
+        raise ValueError(
+            f"Spot allocation strategy must be a string, got "
+            f"{type(strategy).__name__}: {strategy!r}"
+        )
+
+    # "priceCapacityOptimized" -> "price-capacity-optimized"
+    kebab = re.sub(r"(?<!^)(?=[A-Z])", "-", strategy).lower()
+    if kebab in EC2_FLEET_ALLOCATION_STRATEGIES:
+        return kebab
+
+    raise ValueError(
+        f"Unsupported spot allocation strategy {strategy!r}. Expected one of "
+        f"{sorted(EC2_FLEET_ALLOCATION_STRATEGIES)} or their camelCase "
+        f"equivalents."
+    )
+
+
+def build_fleet_launch_template_configs(
+    template_id: str,
+    template_version: str,
+    instance_types: List[str],
+    subnet_id: str,
+) -> List[Dict[str, Any]]:
+    """Build the ``LaunchTemplateConfigs`` for a CreateFleet request (#86).
+
+    One config referencing one template, with an override per instance type so a
+    single template still covers every pool the fleet may draw from.
+
+    ``CreateFleet``'s override shape is richer than Spot Fleet's -- it also
+    accepts ``ImageId``, ``MaxPrice``, and ``BlockDeviceMappings`` -- but it
+    still has no ``UserData``, which is why the per-block user data has to live
+    in the template rather than here.
+
+    Parameters
+    ----------
+    template_id : str
+        Launch template to draw the baseline definition from.
+    template_version : str
+        Pinned version. Not ``$Latest``: a fleet must launch the definition the
+        caller built, not whatever a concurrent provider added afterwards.
+    instance_types : List[str]
+        Types to emit as overrides, in preference order.
+    subnet_id : str
+        Subnet every override launches into.
+
+    Returns
+    -------
+    List[Dict[str, Any]]
+        A single-element ``LaunchTemplateConfigs`` list.
+    """
+    return [
+        {
+            "LaunchTemplateSpecification": {
+                "LaunchTemplateId": template_id,
+                "Version": template_version,
+            },
+            "Overrides": [
+                {"InstanceType": instance_type, "SubnetId": subnet_id}
+                for instance_type in instance_types
+            ],
+        }
+    ]
+
+
+def create_ec2_fleet(
+    ec2_client: Any,
+    launch_template_configs: List[Dict[str, Any]],
+    target_capacity: int,
+    allocation_strategy: str,
+    client_token: Optional[str] = None,
+    tags: Optional[List[Dict[str, str]]] = None,
+    max_total_price: Optional[str] = None,
+) -> Tuple[str, List[str]]:
+    """Create an ``instant`` EC2 Fleet and return its ID and instance IDs.
+
+    Replaces ``RequestSpotFleet``, which AWS describes as "a legacy API with no
+    planned investment" (#86).
+
+    Fleet type ``instant`` is deliberate: it places a synchronous request and
+    returns the launched instance IDs in the response, so a block knows its
+    instances without polling. That is what the rest of this package assumes,
+    and the asynchronous types cannot provide it.
+
+    Several parameters the legacy path sent are *rejected* for this fleet type --
+    verified against real EC2, with ``InvalidParameter`` rather than silent
+    acceptance -- so they are deliberately absent here:
+
+    * ``ReplaceUnhealthyInstances`` and ``TerminateInstancesWithExpiration``
+      ("not supported for given fleet type")
+    * ``SpotOptions.MaintenanceStrategies``, i.e. Capacity Rebalance ("only
+      compatible with fleet type maintain")
+
+    Parameters
+    ----------
+    ec2_client : Any
+        A boto3 EC2 client.
+    launch_template_configs : List[Dict[str, Any]]
+        As returned by :func:`build_fleet_launch_template_configs`.
+    target_capacity : int
+        Number of instances to request, all spot.
+    allocation_strategy : str
+        Spot allocation strategy; normalised to the kebab-case spelling
+        ``CreateFleet`` requires.
+    client_token : Optional[str]
+        Idempotency token. EC2 generates one when omitted.
+    tags : Optional[List[Dict[str, str]]]
+        Applied to both the fleet resource and the instances it launches, so
+        either can be found by the cleanup sweep.
+    max_total_price : Optional[str]
+        Maximum hourly spot price for the whole fleet. Left unset by default:
+        AWS warns that capping the price increases interruptions.
+
+    Returns
+    -------
+    Tuple[str, List[str]]
+        The fleet ID, and the IDs of the instances it launched. The instance
+        list may be shorter than *target_capacity*, or empty, if EC2 could not
+        fill the request; the caller decides whether that is fatal.
+
+    Raises
+    ------
+    ClientError
+        Propagated unchanged from ``CreateFleet``, so the caller can discriminate
+        on the EC2 error code. See the note at the call itself.
+    ValueError
+        If *allocation_strategy* is not one EC2 recognises.
+    """
+    spot_options: Dict[str, Any] = {
+        "AllocationStrategy": normalize_ec2_fleet_allocation_strategy(
+            allocation_strategy
+        ),
+        # An interrupted worker's instance should go away, not linger stopped
+        # with a billed EBS volume that nothing is tracking.
+        "InstanceInterruptionBehavior": "terminate",
+    }
+    if max_total_price is not None:
+        spot_options["MaxTotalPrice"] = max_total_price
+
+    kwargs: Dict[str, Any] = {
+        "Type": EC2_FLEET_TYPE_INSTANT,
+        "LaunchTemplateConfigs": launch_template_configs,
+        "TargetCapacitySpecification": {
+            "TotalTargetCapacity": target_capacity,
+            "DefaultTargetCapacityType": "spot",
+        },
+        "SpotOptions": spot_options,
+    }
+    if client_token:
+        kwargs["ClientToken"] = client_token
+    if tags:
+        kwargs["TagSpecifications"] = [
+            {"ResourceType": RESOURCE_TYPE_FLEET, "Tags": tags},
+            {"ResourceType": "instance", "Tags": tags},
+        ]
+
+    # ClientError is deliberately *not* caught and wrapped here. Callers
+    # discriminate on the EC2 error code -- SpotFleetManager._create_fleet maps it
+    # onto this package's exception hierarchy, audit-logs the failure, and deletes
+    # the launch template the fleet was built for. Wrapping it in
+    # ResourceCreationError made all three unreachable, since the caller's
+    # ``except ClientError`` no longer matched.
+    response = ec2_client.create_fleet(**kwargs)
+
+    fleet_id = str(response["FleetId"])
+    instance_ids = [
+        instance_id
+        for entry in response.get("Instances", [])
+        for instance_id in entry.get("InstanceIds", [])
+    ]
+
+    # An instant fleet reports per-instance failures inline instead of failing
+    # the call, so a partially-filled fleet looks like success. Surface them:
+    # "no capacity in this pool" is the single most common fleet outcome and is
+    # otherwise invisible.
+    for error in response.get("Errors", []):
+        logger.warning(
+            f"EC2 Fleet {fleet_id} could not launch an instance: "
+            f"{error.get('ErrorCode')} - {error.get('ErrorMessage')}"
+        )
+
+    logger.info(
+        f"Created EC2 Fleet {fleet_id} with {len(instance_ids)}/{target_capacity} "
+        f"instances: {instance_ids}"
+    )
+    return fleet_id, instance_ids
+
+
+def describe_ec2_fleet(ec2_client: Any, fleet_id: str) -> Optional[Dict[str, Any]]:
+    """Return the fleet's ``FleetData``, or None if EC2 has forgotten it.
+
+    The ID is always passed explicitly, and not merely as an optimisation: AWS
+    documents that "if a fleet is of type instant, you must specify the fleet ID
+    in the request, otherwise the fleet does not appear in the response".
+    Verified -- ``describe_fleets()`` with no ``FleetIds`` returned an empty list
+    while an instant fleet was active.
+
+    Parameters
+    ----------
+    ec2_client : Any
+        A boto3 EC2 client.
+    fleet_id : str
+        Fleet to describe.
+
+    Returns
+    -------
+    Optional[Dict[str, Any]]
+        The ``FleetData`` document, or None when the fleet no longer exists.
+    """
+    try:
+        fleets = ec2_client.describe_fleets(FleetIds=[fleet_id]).get("Fleets", [])
+    except ClientError as e:
+        if e.response["Error"]["Code"] == "InvalidFleetId.NotFound":
+            logger.debug(f"EC2 Fleet {fleet_id} no longer exists")
+            return None
+        raise
+    return fleets[0] if fleets else None
+
+
+def get_ec2_fleet_instance_ids(ec2_client: Any, fleet_id: str) -> List[str]:
+    """Return the IDs of instances belonging to *fleet_id*.
+
+    Goes through ``describe_instances`` filtered on the ``aws:ec2:fleet-id`` tag
+    EC2 applies to every fleet-launched instance, because the two obvious
+    routes do not work for an instant fleet -- verified against real EC2:
+
+    * ``describe_fleet_instances`` refuses it outright with ``Unsupported``:
+      "Describe fleet instances is not supported by this type of fleet."
+    * ``describe_fleets`` does return an ``Instances`` list, but only reflects
+      the original launch; it does not drop instances that have since
+      terminated.
+
+    Terminated instances are excluded, so the result answers "what is this fleet
+    still running" rather than "what did it ever launch".
+
+    Parameters
+    ----------
+    ec2_client : Any
+        A boto3 EC2 client.
+    fleet_id : str
+        Fleet whose instances to list.
+
+    Returns
+    -------
+    List[str]
+        Instance IDs that are not terminated. Empty if the fleet launched
+        nothing, or everything it launched is gone.
+    """
+    instance_ids: List[str] = []
+    try:
+        paginator = ec2_client.get_paginator("describe_instances")
+        pages = paginator.paginate(
+            Filters=[
+                {"Name": f"tag:{TAG_AWS_FLEET_ID}", "Values": [fleet_id]},
+                {
+                    "Name": "instance-state-name",
+                    "Values": ["pending", "running", "stopping", "stopped"],
+                },
+            ]
+        )
+        for page in pages:
+            for reservation in page.get("Reservations", []):
+                for instance in reservation.get("Instances", []):
+                    instance_ids.append(instance["InstanceId"])
+    except ClientError as e:
+        logger.warning(f"Could not list instances for EC2 Fleet {fleet_id}: {e}")
+    return instance_ids
+
+
+def delete_ec2_fleet(ec2_client: Any, fleet_id: str) -> None:
+    """Delete an EC2 Fleet, terminating its instances.
+
+    Instance termination is not optional for an instant fleet: AWS rejects
+    ``NoTerminateInstances`` for this type, and "a deleted instant fleet with
+    running instances is not supported".
+
+    Tolerates a fleet that is already gone, and a repeat call on one already
+    deleting -- verified that deleting twice succeeds both times, reporting
+    ``deleted_terminating``, and that an unknown ID comes back as a
+    ``fleetIdDoesNotExist`` entry in ``UnsuccessfulFleetDeletions`` rather than
+    as a raised error. Both are the desired outcome for a cleanup path, so
+    neither raises.
+
+    Parameters
+    ----------
+    ec2_client : Any
+        A boto3 EC2 client.
+    fleet_id : str
+        Fleet to delete.
+
+    Raises
+    ------
+    ResourceDeletionError
+        If EC2 refuses the deletion for any reason other than the fleet not
+        existing.
+    """
+    try:
+        response = ec2_client.delete_fleets(
+            FleetIds=[fleet_id],
+            TerminateInstances=EC2_FLEET_TERMINATE_INSTANCES,
+        )
+    except ClientError as e:
+        if e.response["Error"]["Code"] == "InvalidFleetId.NotFound":
+            logger.debug(f"EC2 Fleet {fleet_id} already deleted")
+            return
+        raise ResourceDeletionError(
+            f"Failed to delete EC2 Fleet {fleet_id}: {e}"
+        ) from e
+
+    for failure in response.get("UnsuccessfulFleetDeletions", []):
+        code = failure.get("Error", {}).get("Code")
+        if code == "fleetIdDoesNotExist":
+            logger.debug(f"EC2 Fleet {fleet_id} already deleted")
+            continue
+        raise ResourceDeletionError(
+            f"Failed to delete EC2 Fleet {fleet_id}: {code} - "
+            f"{failure.get('Error', {}).get('Message')}"
+        )
+
+    for success in response.get("SuccessfulFleetDeletions", []):
+        logger.info(
+            f"Deleted EC2 Fleet {fleet_id}: "
+            f"{success.get('PreviousFleetState')} -> "
+            f"{success.get('CurrentFleetState')}"
+        )
+
+
+def create_spot_interruption_notifier(
+    events_client: Any,
+    sqs_client: Any,
+    name: str,
+    tags: Optional[List[Dict[str, str]]] = None,
+) -> Tuple[str, str, str]:
+    """Wire an EventBridge spot-interruption rule to a fresh SQS queue (#86).
+
+    This is what supplies the two-minute advance warning. Polling EC2 state
+    cannot: an interrupted instance is only observable once it reaches
+    ``shutting-down``, which is after the reclaim, far too late to checkpoint.
+    An ``instant`` fleet also gets no Capacity Rebalance -- ``CreateFleet``
+    rejects ``SpotOptions.MaintenanceStrategies`` for the type -- so EventBridge
+    is the mechanism, and it has the further advantage of working for instances
+    that are already running.
+
+    **No IAM role is created, and none is needed.** Verified against real
+    EventBridge: ``put_targets`` with an SQS ARN and no ``RoleArn`` returned
+    ``FailedEntryCount=0``. Unlike most target types, delivery to SQS is
+    authorised by the *queue's* resource policy, which is why this sets one
+    granting ``events.amazonaws.com`` permission to ``sqs:SendMessage``,
+    conditioned on ``aws:SourceArn`` being this rule -- so no other rule, in this
+    account or any other, can post to the queue.
+
+    Verified end to end with a Fault Injection Simulator experiment
+    (``aws:ec2:send-spot-instance-interruptions``): the warning reached the queue
+    15.2s after the experiment started, while the instance was still
+    ``running``.
+
+    Parameters
+    ----------
+    events_client : Any
+        A boto3 EventBridge client.
+    sqs_client : Any
+        A boto3 SQS client.
+    name : str
+        Name for both the rule and the queue. Must be unique per provider.
+    tags : Optional[List[Dict[str, str]]]
+        Applied to the rule so a leaked one is traceable. Not applied to the
+        queue: SQS takes tags as a flat mapping, and the queue is named after
+        the same provider anyway.
+
+    Returns
+    -------
+    Tuple[str, str, str]
+        The rule name, the queue URL, and the queue ARN.
+
+    Raises
+    ------
+    ResourceCreationError
+        If the rule, the queue, or the wiring between them cannot be created.
+    """
+    pattern = json.dumps(
+        {
+            "source": [SPOT_INTERRUPTION_EVENT_SOURCE],
+            "detail-type": [SPOT_INTERRUPTION_EVENT_DETAIL_TYPE],
+        }
+    )
+
+    try:
+        queue_url = sqs_client.create_queue(
+            QueueName=name,
+            Attributes={
+                # A warning is worthless once its two minutes are up, so let an
+                # undelivered message expire rather than be replayed against a
+                # long-dead instance.
+                "MessageRetentionPeriod": str(
+                    SPOT_INTERRUPTION_QUEUE_RETENTION_SECONDS
+                ),
+            },
+        )["QueueUrl"]
+        queue_arn = sqs_client.get_queue_attributes(
+            QueueUrl=queue_url, AttributeNames=["QueueArn"]
+        )["Attributes"]["QueueArn"]
+
+        rule_kwargs: Dict[str, Any] = {
+            "Name": name,
+            "EventPattern": pattern,
+            "State": "ENABLED",
+            "Description": "Parsl ephemeral AWS provider spot interruption warnings",
+        }
+        if tags:
+            rule_kwargs["Tags"] = tags
+        rule_arn = events_client.put_rule(**rule_kwargs)["RuleArn"]
+
+        # Set the queue policy *before* adding the target, so no window exists in
+        # which EventBridge has a target it cannot deliver to.
+        sqs_client.set_queue_attributes(
+            QueueUrl=queue_url,
+            Attributes={
+                "Policy": json.dumps(
+                    {
+                        "Version": "2012-10-17",
+                        "Statement": [
+                            {
+                                "Sid": "AllowEventBridgeRule",
+                                "Effect": "Allow",
+                                "Principal": {"Service": "events.amazonaws.com"},
+                                "Action": "sqs:SendMessage",
+                                "Resource": queue_arn,
+                                "Condition": {"ArnEquals": {"aws:SourceArn": rule_arn}},
+                            }
+                        ],
+                    }
+                )
+            },
+        )
+
+        response = events_client.put_targets(
+            Rule=name, Targets=[{"Id": "parsl-spot-warning-queue", "Arn": queue_arn}]
+        )
+        if response.get("FailedEntryCount"):
+            failures = response.get("FailedEntries", [])
+            raise ResourceCreationError(
+                f"EventBridge refused the SQS target for rule {name}: {failures}"
+            )
+    except ClientError as e:
+        raise ResourceCreationError(
+            f"Failed to create spot interruption notifier {name}: {e}"
+        ) from e
+
+    logger.info(
+        f"Created spot interruption notifier {name}: EventBridge rule -> {queue_arn}"
+    )
+    return name, queue_url, queue_arn
+
+
+def delete_spot_interruption_notifier(
+    events_client: Any,
+    sqs_client: Any,
+    rule_name: Optional[str],
+    queue_url: Optional[str],
+) -> None:
+    """Tear down what :func:`create_spot_interruption_notifier` built.
+
+    Order matters: the target has to go before the rule, because EventBridge
+    refuses to delete a rule that still has one. Every step logs rather than
+    raises -- this runs from cleanup paths, where a rule that is already gone is
+    the desired end state and must not stop the queue from being deleted too.
+
+    Parameters
+    ----------
+    events_client : Any
+        A boto3 EventBridge client.
+    sqs_client : Any
+        A boto3 SQS client.
+    rule_name : Optional[str]
+        Rule to delete. Ignored when None.
+    queue_url : Optional[str]
+        Queue to delete. Ignored when None.
+    """
+    if rule_name:
+        try:
+            events_client.remove_targets(
+                Rule=rule_name, Ids=["parsl-spot-warning-queue"]
+            )
+        except ClientError as e:
+            logger.warning(f"Could not remove targets from rule {rule_name}: {e}")
+        try:
+            events_client.delete_rule(Name=rule_name)
+            logger.info(f"Deleted spot interruption rule {rule_name}")
+        except ClientError as e:
+            logger.warning(f"Could not delete rule {rule_name}: {e}")
+
+    if queue_url:
+        try:
+            sqs_client.delete_queue(QueueUrl=queue_url)
+            logger.info(f"Deleted spot interruption queue {queue_url}")
+        except ClientError as e:
+            logger.warning(f"Could not delete queue {queue_url}: {e}")
 
 
 def encode_user_data(user_data: str) -> str:

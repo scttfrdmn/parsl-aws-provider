@@ -122,19 +122,61 @@ Resources:
       Roles:
         - !Ref BastionHostRole
 
+  # A single template serves both the on-demand and the spot bastion. The spot
+  # variant differs only by InstanceMarketOptions, which AWS::EC2::Instance does
+  # not accept directly -- verified against the resource schema -- but which a
+  # launch template does, and an Instance referencing that template launches as
+  # spot. That replaces the AWS::EC2::SpotFleet resource this template used to
+  # carry for the spot case (#86), which is on an API AWS describes as legacy and
+  # which needed a service role the template never correctly provided.
+  #
+  # IMDSv2 is required here for the same reason as on every other launch path
+  # (#85): the bastion holds an IAM role that can terminate instances.
+  BastionLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub 'parsl-bastion-lt-${WorkflowId}'
+      LaunchTemplateData:
+        InstanceType: !Ref InstanceType
+        ImageId: !Ref ImageId
+        IamInstanceProfile:
+          Arn: !GetAtt BastionHostInstanceProfile.Arn
+        KeyName: !If [HasKeyName, !Ref KeyName, !Ref 'AWS::NoValue']
+        UserData: !If [HasUserData, !Ref UserData, !Ref 'AWS::NoValue']
+        InstanceInitiatedShutdownBehavior: terminate
+        Monitoring:
+          Enabled: true
+        MetadataOptions:
+          HttpTokens: required
+          HttpEndpoint: enabled
+        InstanceMarketOptions: !If
+          - UseSpot
+          - MarketType: spot
+            SpotOptions:
+              SpotInstanceType: one-time
+              InstanceInterruptionBehavior: terminate
+              MaxPrice: !If
+                - HasSpotMaxPrice
+                - !Ref SpotMaxPrice
+                - !Ref 'AWS::NoValue'
+          - !Ref 'AWS::NoValue'
+      TagSpecifications:
+        - ResourceType: launch-template
+          Tags:
+            - Key: ParslResource
+              Value: 'true'
+            - Key: ParslWorkflowId
+              Value: !Ref WorkflowId
+
   BastionHost:
     Type: AWS::EC2::Instance
     Properties:
-      InstanceType: !Ref InstanceType
-      ImageId: !Ref ImageId
+      LaunchTemplate:
+        LaunchTemplateId: !Ref BastionLaunchTemplate
+        Version: !GetAtt BastionLaunchTemplate.LatestVersionNumber
       SubnetId: !Ref SubnetId
       SecurityGroupIds:
         - !Ref SecurityGroupId
-      IamInstanceProfile: !Ref BastionHostInstanceProfile
-      KeyName: !If [HasKeyName, !Ref KeyName, !Ref 'AWS::NoValue']
-      UserData: !If [HasUserData, !Ref UserData, !Ref 'AWS::NoValue']
-      InstanceInitiatedShutdownBehavior: terminate
-      Monitoring: true
       Tags:
         - Key: Name
           Value: !Sub 'parsl-bastion-${WorkflowId}'
@@ -147,47 +189,10 @@ Resources:
         - Key: ParslIdleTimeout
           Value: !Ref IdleTimeout
 
-  SpotBastionHost:
-    Type: AWS::EC2::SpotFleet
-    Condition: UseSpot
-    Properties:
-      SpotFleetRequestConfigData:
-        IamFleetRole: !GetAtt BastionHostRole.Arn
-        AllocationStrategy: lowestPrice
-        TargetCapacity: 1
-        SpotPrice: !If [HasSpotMaxPrice, !Ref SpotMaxPrice, !Ref 'AWS::NoValue']
-        TerminateInstancesWithExpiration: true
-        Type: maintain
-        LaunchSpecifications:
-          - InstanceType: !Ref InstanceType
-            ImageId: !Ref ImageId
-            SubnetId: !Ref SubnetId
-            SecurityGroups:
-              - GroupId: !Ref SecurityGroupId
-            IamInstanceProfile:
-              Arn: !GetAtt BastionHostInstanceProfile.Arn
-            KeyName: !If [HasKeyName, !Ref KeyName, !Ref 'AWS::NoValue']
-            UserData: !If [HasUserData, !Ref UserData, !Ref 'AWS::NoValue']
-            Monitoring:
-              Enabled: true
-            TagSpecifications:
-              - ResourceType: instance
-                Tags:
-                  - Key: Name
-                    Value: !Sub 'parsl-bastion-spot-${WorkflowId}'
-                  - Key: ParslResource
-                    Value: 'true'
-                  - Key: ParslWorkflowId
-                    Value: !Ref WorkflowId
-                  - Key: ParslResourceType
-                    Value: 'bastion'
-                  - Key: ParslIdleTimeout
-                    Value: !Ref IdleTimeout
-
 Outputs:
   BastionHostId:
     Description: ID of the bastion host
-    Value: !If [UseSpot, !Ref SpotBastionHost, !Ref BastionHost]
+    Value: !Ref BastionHost
 
   BastionHostRole:
     Description: IAM role for the bastion host

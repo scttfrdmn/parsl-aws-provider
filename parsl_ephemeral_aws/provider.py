@@ -34,6 +34,7 @@ from parsl_ephemeral_aws.constants import (
     DEFAULT_WARM_POOL_SIZE,
     DEFAULT_WARM_POOL_TTL,
     DEFAULT_WORKER_INIT,
+    MAX_WARM_POOL_SIZE,
     STATUS_WARM,
 )
 from parsl_ephemeral_aws.exceptions import (
@@ -218,9 +219,21 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
         Requires ``auto_create_instance_profile=True`` or
         ``iam_instance_profile_arn`` (SSM SendCommand needs an IAM role).
         Default is 0 (disabled).  ``mode="standard"`` only.
+
+        **This costs money while idle.** A warm instance is left *Running*, not
+        Stopped, so it bills at the full instance rate for up to
+        ``warm_pool_ttl`` seconds after its job finishes — ``warm_pool_size``
+        instances × ``warm_pool_ttl`` seconds of instance time per idle period,
+        whether or not another job ever arrives to use them. Capped at
+        ``MAX_WARM_POOL_SIZE`` (20). Instances must stay Running because
+        dispatch is SSM ``SendCommand`` and a Stopped instance runs no SSM
+        agent; issue #130 tracks moving to a pull model so the pool can be
+        Stopped instead.
     warm_pool_ttl : int, optional
-        Seconds a warm idle instance stays alive before being terminated.
-        Default is 600 (10 minutes).  ``mode="standard"`` only.
+        Seconds a warm *running* instance stays alive before being terminated.
+        Default is 120 (2 minutes); this was 600 in v0.6.0 and was reduced
+        because the instance bills for the whole window.  ``mode="standard"``
+        only.
     bake_ami : bool, optional
         When True, run ``worker_init`` on a builder instance during
         ``initialize()``, snapshot it into a custom AMI, and use that AMI for
@@ -437,6 +450,39 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
                 "The option would be silently ignored by the mode while the "
                 "provider still acted on it, leaking instances that no mode "
                 "would clean up."
+            )
+
+        # Guard: cap the warm pool. Every warm instance is a *running* instance,
+        # billing for up to warm_pool_ttl seconds after its job ends, so an
+        # oversized pool is a silent cost rather than an error -- EC2 refuses
+        # nothing and no quota is necessarily reached.
+        if warm_pool_size < 0:
+            raise ValueError(
+                f"warm_pool_size must be >= 0, got {warm_pool_size} "
+                "(0 disables the warm pool)"
+            )
+        if warm_pool_size > MAX_WARM_POOL_SIZE:
+            raise ValueError(
+                f"warm_pool_size={warm_pool_size} exceeds the maximum of "
+                f"{MAX_WARM_POOL_SIZE}. Warm instances are held Running, not "
+                "Stopped, so each one bills at the full instance rate for up to "
+                "warm_pool_ttl seconds per idle period. If you need more than "
+                f"{MAX_WARM_POOL_SIZE} instances ready, raise init_blocks "
+                "instead so they are actually running work."
+            )
+        if warm_pool_ttl < 0:
+            raise ValueError(f"warm_pool_ttl must be >= 0, got {warm_pool_ttl}")
+
+        # A warm pool is a cost the caller may not have registered from the
+        # kwarg name alone, so state it once at construction with the actual
+        # numbers rather than only in the docstring.
+        if warm_pool_size > 0:
+            logger.warning(
+                f"Warm pool enabled: up to {warm_pool_size} instance(s) will be "
+                f"left RUNNING for {warm_pool_ttl}s after each job completes, "
+                f"billing for that whole window even when idle (up to "
+                f"{warm_pool_size * warm_pool_ttl}s of instance time per idle "
+                "period). Set warm_pool_size=0 to disable."
             )
 
         # Guard: one_shot is incompatible with warm pool (instances are terminated immediately)
