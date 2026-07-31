@@ -8,6 +8,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Security
+- **IMDSv2 is now required on every instance the package launches.** Nothing set
+  `MetadataOptions` anywhere before, so every worker, bastion, spot instance, and
+  fleet instance accepted unauthenticated IMDSv1 requests — the shape that turns
+  any SSRF in user code into instance-credential theft, and the workers run
+  arbitrary submitted commands. `HttpTokens=required` is carried by the launch
+  template, so it applies to the on-demand, spot, and fleet paths at once; the
+  bastion's own `RunInstances` call and the bastion-manager script's worker
+  launches set it directly. `HttpEndpoint` stays `enabled` (SSM reads the instance
+  identity document from IMDS, so disabling it would break dispatch), and the hop
+  limit is deliberately left at EC2's default of 2 rather than tightened to 1 —
+  a request from inside a container spawned by `worker_init` traverses the host
+  network namespace and costs a hop. No IMDSv1 fetch exists anywhere in the
+  package, so nothing internal depended on the old default (closes #85).
 - `ServerlessMode.cleanup_infrastructure()` no longer deletes the caller's
   security group. The code was guarded only by a comment claiming "if we created
   it directly" — nothing verified ownership, and after #69 the ID is always
@@ -27,6 +40,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   live VPC and blackhole egress for unrelated workloads (closes #94).
 
 ### Fixed
+- A spot instance that shut itself down was left `stopped` with a billed EBS
+  volume that the provider had already forgotten about. `InstanceInitiatedShutdownBehavior`
+  is not a member of the `LaunchSpecification` shape `RequestSpotInstances`
+  accepts, so the spot path could not set it and EC2's `stop` default applied to
+  the `shutdown -h now` that `_prepare_init_script` appends — while
+  `EC2_STATUS_MAPPING` maps `stopped` to COMPLETED, so `_cleanup_resources()`
+  dropped the tracking record and the volume was orphaned *and* untracked. This is
+  the same leak Phase 1.3a closed on the on-demand path, still open on spot. The
+  spot path now launches through `RunInstances` with
+  `InstanceMarketOptions={"MarketType": "spot"}`, which does accept both
+  `InstanceInitiatedShutdownBehavior` and `MetadataOptions` — verified against
+  real EC2: the instance reports `InstanceLifecycle=spot` with a spot request ID,
+  shutdown behaviour `terminate`, and `HttpTokens=required` (closes #85).
+- `SpotFleetManager.terminate_block()` leaked the block's launch template whenever
+  no fleet request ID had been recorded for the block. It logged a warning and
+  returned before the template was deleted, so a block whose request failed
+  between creation and bookkeeping held its template until
+  `cleanup_all_resources()` ran — or forever, if the process died first. The
+  template belongs to the block, not to the fleet request, and is now deleted on
+  that path too (refs #85).
+- The `SpotFleetManager` provider stand-in that `StandardMode` builds never
+  carried `iam_instance_profile_arn`, so the manager's `getattr` fell through to
+  `None` and every fleet instance launched with no instance profile — SSM never
+  came online and dispatch silently fell back to UserData. The stand-in is built
+  in `__init__`, before `_resolve_instance_profile()` runs, so the resolved ARN is
+  now also propagated to it once known (refs #85).
 - Spot fleet requests ignored `spot_allocation_strategy` entirely. Both
   `SpotFleetManager._create_spot_fleet_request()` and the fleet request inside
   the generated bastion-manager script hardcoded `lowestPrice`, so the
@@ -387,6 +426,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a first run can proceed with no saved state (closes #122).
 
 ### Added
+- **Launch templates.** `StandardMode.initialize()` now builds one launch template
+  that every launch path shares — on-demand, spot, and spot fleet — carrying the
+  AMI, instance type, network interface, key pair, IMDSv2 settings,
+  `InstanceInitiatedShutdownBehavior`, and the resolved IAM instance profile.
+  Per-job `UserData` and tags stay per-launch overrides. The template is tagged
+  with the provider ID and deleted by `cleanup_infrastructure()`; its ID and
+  version are persisted, and a state document written before this change gets a
+  template on resume. This is the hard prerequisite for the EC2 Fleet/ASG
+  migration in #86: those APIs accept a template reference and nothing resembling
+  `RunInstances` kwargs (closes #85).
+- `build_launch_template_data()`, `create_launch_template()`,
+  `delete_launch_template()`, and `encode_user_data()` in `utils/aws.py`, plus
+  `IMDSV2_METADATA_OPTIONS` and `LAUNCH_TEMPLATE_NAME_PREFIX` in `constants.py`.
+  `create_launch_template()` is idempotent: `initialize()` may run again after a
+  partial failure, and a duplicate name is rejected with
+  `InvalidLaunchTemplateName.AlreadyExistsException`, so an existing template is
+  adopted by adding a *new version* rather than reusing the old one — otherwise a
+  resumed provider whose AMI or instance type had changed would silently keep
+  launching the previous definition.
+- Spot Fleet builds a launch template per block. `SpotFleetLaunchSpecification`
+  has no `MetadataOptions` member, so a template is the only route to IMDSv2 on
+  the fleet path, and `LaunchTemplateConfig.Overrides` carries no `UserData` — the
+  per-block user data has to live in a per-block template rather than in
+  overrides. If template creation fails the manager falls back to
+  `LaunchSpecifications` and logs that IMDSv2 will not be enforced.
+- `tests/aws/test_launch_template_e2e.py` — real-AWS coverage for what only a live
+  launch can show: that the stored template carries IMDSv2 and `terminate`, that
+  an instance launched from it inherits both, that the spot instance really is
+  spot rather than a silent on-demand downgrade, and that `shutdown()` deletes the
+  template.
 - AMIs are resolved at runtime from AWS's public SSM Parameter Store aliases
   (`/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-{arch}`), which
   AWS repoints at every AL2023 release. Any region works, including ones no
@@ -535,6 +604,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   template is caught (refs #112, #113).
 
 ### Changed
+- Plain spot instances are requested with `RunInstances` +
+  `InstanceMarketOptions` instead of `RequestSpotInstances`. The old API cannot
+  express either IMDSv2 or the shutdown behaviour, as above. `RequestSpotInstances`
+  remains the fallback for accounts without `ec2:CreateLaunchTemplate`, where the
+  provider keeps working without IMDSv2 on that one path.
+- Four API asymmetries drove the shape of this work and are recorded here because
+  each is invisible in a mock and expensive to rediscover, all verified against
+  the botocore service model and real EC2:
+  - **botocore base64-encodes `UserData` for `RunInstances` only.** The two
+    built-in handlers are `before-parameter-build.ec2.RunInstances` and
+    `before-parameter-build.autoscaling.CreateLaunchConfiguration`;
+    `CreateLaunchTemplate` is not among them. Plaintext user data in a template is
+    stored verbatim, base64-*decoded* by cloud-init, and fails silently — the
+    instance boots fine and never runs the worker. Encoding twice is the
+    mirror-image trap, which is why `encode_user_data()` exists and is applied to
+    template data only.
+  - **The `InstanceStopped` waiter lists `terminated` as an explicit *failure*
+    acceptor.** The AMI-baking builder instance must therefore keep
+    `InstanceInitiatedShutdownBehavior="stop"`; inheriting the template's
+    `terminate` would fail the bake outright, not merely slow it. The builder
+    deliberately does not use the launch template.
+  - **`RequestSpotFleet` accepts both `LaunchSpecifications` and
+    `LaunchTemplateConfigs` in one request** — a DryRun with both returns
+    `DryRunOperation`. The template would silently lose to the specifications,
+    taking IMDSv2 with it, so exactly one launch form is sent.
+  - **A launch template rejects a `NetworkInterfaces` entry together with
+    top-level `SecurityGroupIds`.** The interface form is required for
+    `AssociatePublicIpAddress`, so it wins whenever a subnet is known.
 - The default spot allocation strategy is now `price-capacity-optimized`, AWS's
   current recommendation, replacing the documented-but-unused
   `capacity-optimized`. It draws from the pools with the deepest spare capacity

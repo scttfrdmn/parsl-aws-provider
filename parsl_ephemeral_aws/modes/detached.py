@@ -20,6 +20,7 @@ import boto3
 from botocore.exceptions import ClientError
 
 from parsl_ephemeral_aws.constants import (
+    IMDSV2_METADATA_OPTIONS,
     RESOURCE_TYPE_EC2,
     RESOURCE_TYPE_BASTION,
     RESOURCE_TYPE_CLOUDFORMATION,
@@ -379,6 +380,12 @@ class DetachedMode(OperatingMode):
                 NetworkInterfaces=[network_interface],
                 InstanceInitiatedShutdownBehavior="terminate",
                 Monitoring={"Enabled": True},
+                # IMDSv2 required (#85). This matters more here than on a
+                # worker: the bastion is long-lived and its instance profile
+                # carries the permissions to launch and terminate instances, so
+                # an SSRF against anything running on it would otherwise hand
+                # over role credentials through an unauthenticated IMDSv1 GET.
+                MetadataOptions=dict(IMDSV2_METADATA_OPTIONS),
             )
 
             instance_id = response["Instances"][0]["InstanceId"]
@@ -741,6 +748,10 @@ RESOURCE_TYPE_SPOT_FLEET = "spot_fleet"
 # mode's spot_allocation_strategy (#84). RequestSpotFleet accepts only the
 # camelCase spelling, so the value substituted here is already normalised.
 ALLOCATION_STRATEGY = 'priceCapacityOptimized'
+# IMDSv2 options for workers this bastion launches, overwritten at script
+# generation time from the package constant (#85). Defined as a literal because
+# the bastion runs this script standalone and cannot import from the package.
+METADATA_OPTIONS = {'HttpTokens': 'required', 'HttpEndpoint': 'enabled'}
 EC2_STATUS_MAPPING = {
     'pending': 'PENDING',
     'running': 'RUNNING',
@@ -1219,6 +1230,7 @@ export PARSL_WORKER_ID=$(hostname)
                 ],
                 'Monitoring': {'Enabled': True},
                 'InstanceInitiatedShutdownBehavior': 'terminate',
+                'MetadataOptions': METADATA_OPTIONS,
             }
 
             # Add key name if provided
@@ -1528,6 +1540,14 @@ if __name__ == '__main__':
             "ALLOCATION_STRATEGY = 'priceCapacityOptimized'",
             "ALLOCATION_STRATEGY = "
             f"'{normalize_spot_fleet_allocation_strategy(self.spot_allocation_strategy)}'"
+            "  # injected at script generation time",
+        )
+        # Same reason as above: injected as a literal so the workers the bastion
+        # launches get IMDSv2 from the one definition in constants.py, rather
+        # than a copy here that drifts the next time it changes (#85).
+        script = script.replace(
+            "METADATA_OPTIONS = {'HttpTokens': 'required', 'HttpEndpoint': 'enabled'}",
+            f"METADATA_OPTIONS = {IMDSV2_METADATA_OPTIONS!r}"
             "  # injected at script generation time",
         )
         return script

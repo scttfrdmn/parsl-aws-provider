@@ -19,6 +19,8 @@ from botocore.exceptions import ClientError
 from parsl_ephemeral_aws.constants import (
     DEFAULT_SPOT_ALLOCATION_STRATEGY,
     EC2_STATUS_MAPPING,
+    IMDSV2_METADATA_OPTIONS,
+    LAUNCH_TEMPLATE_NAME_PREFIX,
     RESOURCE_TYPE_EC2,
     RESOURCE_TYPE_SPOT_FLEET,
     STATUS_CANCELED,
@@ -43,6 +45,9 @@ from parsl_ephemeral_aws.compute.spot_interruption import (
 )
 from parsl_ephemeral_aws.utils.aws import (
     architecture_for_instance_type,
+    build_launch_template_data,
+    create_launch_template,
+    delete_launch_template,
     get_default_ami,
     get_or_create_ssm_instance_profile,
     wait_for_resource,
@@ -213,6 +218,12 @@ class StandardMode(OperatingMode):
         # One-shot mode: each instance runs exactly one command then terminates
         self.one_shot = one_shot
 
+        # Launch template (#85). Built in initialize() so every launch path --
+        # on-demand, spot, and fleet -- shares one definition carrying IMDSv2,
+        # the shutdown behaviour, and the resolved instance profile.
+        self._launch_template_id: Optional[str] = None
+        self._launch_template_version: Optional[str] = None
+
         # Initialize SpotFleetManager if using spot fleet
         self.spot_fleet_manager = None
         self.spot_interruption_monitor = None
@@ -240,6 +251,12 @@ class StandardMode(OperatingMode):
                     "spot_max_price_percentage": self.spot_max_price_percentage,
                     "worker_init": self.worker_init,
                     "tags": self.additional_tags,
+                    # Read by _build_launch_template_config (#85). Without it the
+                    # manager's getattr fell through to None and every fleet
+                    # instance launched with no instance profile, so SSM never
+                    # came online. Still None here on the auto-create path --
+                    # _resolve_instance_profile() overwrites it once resolved.
+                    "iam_instance_profile_arn": self.iam_instance_profile_arn,
                 },
             )
 
@@ -377,6 +394,19 @@ class StandardMode(OperatingMode):
             "MinCount": 1,
             "MaxCount": 1,
             "UserData": user_data,
+            # IMDSv2 on the builder as well: whatever worker_init fetches from
+            # the metadata service must work under the same rules the baked
+            # image will boot under, or a script that works here breaks on
+            # every worker launched from the resulting AMI (#85).
+            "MetadataOptions": dict(IMDSV2_METADATA_OPTIONS),
+            # Explicitly *stop*, not terminate. This is the one launch in the
+            # mode that must not inherit the launch template's terminate
+            # behaviour: the UserData ends in `shutdown -h now`, and create_image
+            # needs the stopped instance to snapshot. The InstanceStopped waiter
+            # names "terminated" as an explicit failure acceptor, so inheriting
+            # terminate here would fail the bake rather than merely slow it --
+            # which is why this path does not use the launch template.
+            "InstanceInitiatedShutdownBehavior": "stop",
             "TagSpecifications": [
                 {
                     "ResourceType": "instance",
@@ -441,6 +471,107 @@ class StandardMode(OperatingMode):
             except Exception as e:
                 logger.warning(f"Failed to delete snapshot {snapshot_id}: {e}")
 
+    # ------------------------------------------------------------------
+    # Launch template helpers (#85)
+    # ------------------------------------------------------------------
+
+    @property
+    def launch_template_name(self) -> str:
+        """Name of this mode's launch template, unique per provider."""
+        return f"{LAUNCH_TEMPLATE_NAME_PREFIX}-{self.provider_id}"
+
+    def _create_launch_template(self) -> None:
+        """Create the launch template every launch path in this mode uses.
+
+        Carries the settings that must not vary per launch: IMDSv2,
+        ``InstanceInitiatedShutdownBehavior``, the network interface, the key
+        pair, and the IAM instance profile resolved by
+        :meth:`_resolve_instance_profile`. ``UserData`` and ``TagSpecifications``
+        are deliberately left out -- they are per-job and are passed as
+        overrides at launch.
+
+        A failure here is not fatal. The launch paths fall back to raw
+        ``RunInstances`` kwargs when no template ID is set, so an account
+        without ``ec2:CreateLaunchTemplate`` keeps working, just without IMDSv2
+        on the plain-spot path (``RequestSpotInstances`` has no
+        ``MetadataOptions`` member at all, so a template is the only way to get
+        IMDSv2 there).
+        """
+        ec2 = self.session.client("ec2")
+        tags = [
+            {"Key": "Name", "Value": self.launch_template_name},
+            {"Key": "CreatedBy", "Value": "ParslEphemeralAWSProvider"},
+            {"Key": "ProviderId", "Value": self.provider_id},
+        ]
+        for key, value in self.additional_tags.items():
+            tags.append({"Key": key, "Value": value})
+
+        try:
+            template_data = build_launch_template_data(
+                image_id=self.image_id,
+                instance_type=self.instance_type,
+                subnet_id=self.subnet_id,
+                security_group_id=self.security_group_id,
+                associate_public_ip=self.use_public_ips,
+                key_name=self.key_name,
+                iam_instance_profile_arn=self.iam_instance_profile_arn,
+                shutdown_behavior="terminate",
+            )
+            (
+                self._launch_template_id,
+                self._launch_template_version,
+            ) = create_launch_template(
+                ec2, self.launch_template_name, template_data, tags
+            )
+            logger.info(
+                f"Created launch template {self._launch_template_id} "
+                f"version {self._launch_template_version} with IMDSv2 required"
+            )
+        except Exception as e:
+            logger.error(
+                f"Failed to create launch template: {e}. Falling back to "
+                "per-launch RunInstances parameters; IMDSv2 will not be "
+                "enforced on spot instance requests."
+            )
+            self._launch_template_id = None
+            self._launch_template_version = None
+
+    def _delete_launch_template(self) -> None:
+        """Delete this mode's launch template if it created one.
+
+        Safe to call while instances launched from the template are still
+        terminating -- deleting a template does not affect running instances.
+        """
+        if not self._launch_template_id:
+            return
+
+        try:
+            delete_launch_template(self.session.client("ec2"), self._launch_template_id)
+            logger.info(f"Deleted launch template {self._launch_template_id}")
+        except Exception as e:
+            logger.error(
+                f"Failed to delete launch template {self._launch_template_id}: {e}"
+            )
+        finally:
+            # Cleared either way: a template that could not be deleted must not
+            # be referenced by a later launch, and cleanup is not retried.
+            self._launch_template_id = None
+            self._launch_template_version = None
+
+    def _launch_template_reference(self) -> Optional[Dict[str, str]]:
+        """Return the ``LaunchTemplate`` kwarg for a launch, or None.
+
+        The version is pinned rather than sent as ``$Latest``: a template
+        adopted from a previous run may carry several versions, and the launch
+        has to use the one this mode built.
+        """
+        if not self._launch_template_id:
+            return None
+        return {
+            "LaunchTemplateId": self._launch_template_id,
+            "Version": self._launch_template_version or "$Latest",
+        }
+
     def save_state(self) -> None:
         """Save the current state to the state store."""
         # Default state
@@ -457,6 +588,8 @@ class StandardMode(OperatingMode):
             "warm_instances": list(self._warm_instances),
             "baked_ami_id": self._baked_ami_id,
             "owns_baked_ami": self._owns_baked_ami,
+            "launch_template_id": self._launch_template_id,
+            "launch_template_version": self._launch_template_version,
         }
 
         # Include spot fleet state if applicable
@@ -507,6 +640,12 @@ class StandardMode(OperatingMode):
                         for rid, r in self.resources.items()
                         if r.get("warm_pool") and r.get("status") == STATUS_WARM
                     ]
+
+                # Restore the launch template so a resumed provider launches
+                # from the same definition instead of leaking it and building a
+                # second one (#85).
+                self._launch_template_id = state.get("launch_template_id")
+                self._launch_template_version = state.get("launch_template_version")
 
                 # Restore baked AMI state
                 saved_baked_ami = state.get("baked_ami_id")
@@ -630,6 +769,12 @@ class StandardMode(OperatingMode):
         # Try to load state first
         if self.load_state():
             logger.debug("Loaded state, resources already verified")
+            # A state document written before #85, or one whose template
+            # creation failed, carries no template ID. Build one now rather
+            # than leaving a resumed provider permanently on the fallback path.
+            if not self._launch_template_id:
+                self._create_launch_template()
+                self.save_state()
             return
 
         logger.debug("Initializing standard mode infrastructure")
@@ -647,6 +792,10 @@ class StandardMode(OperatingMode):
                 self._baked_ami_id = self.baked_ami_id
                 self.image_id = self.baked_ami_id
                 logger.info(f"Using pre-supplied baked AMI {self.baked_ami_id}")
+
+            # After baking, so the template references the baked AMI rather than
+            # the base one -- self.image_id is reassigned above (#85).
+            self._create_launch_template()
 
             # Save state
             self.save_state()
@@ -713,6 +862,14 @@ class StandardMode(OperatingMode):
                 f"Resolved IAM instance profile {self.iam_instance_profile_arn} "
                 "for SSM command dispatch"
             )
+            # The SpotFleetManager's provider stand-in was built in __init__,
+            # before this ran, so its copy of the ARN is still None. Its launch
+            # template reads that copy (#85), so without this every fleet
+            # instance launches with no profile.
+            if self.spot_fleet_manager:
+                self.spot_fleet_manager.provider.iam_instance_profile_arn = (
+                    self.iam_instance_profile_arn
+                )
         except Exception as e:
             logger.error(
                 f"Failed to create IAM instance profile: {e}. SSM command "
@@ -1134,52 +1291,68 @@ class StandardMode(OperatingMode):
         for key, value in self.additional_tags.items():
             tags.append({"Key": key, "Value": value})
 
-        # Prepare network configuration
-        network_interfaces = []
-        if self.subnet_id:
-            network_interface = {
-                "DeviceIndex": 0,
-                "SubnetId": self.subnet_id,
-                "AssociatePublicIpAddress": self.use_public_ips,
+        # Prefer the launch template built in initialize(): it carries IMDSv2,
+        # the shutdown behaviour, the network interface, the key pair, and the
+        # IAM profile, leaving only the per-job UserData and tags here (#85).
+        launch_template = self._launch_template_reference()
+        run_args: Dict[str, Any]
+        if launch_template:
+            run_args = {
+                "LaunchTemplate": launch_template,
+                "MaxCount": 1,
+                "MinCount": 1,
+                "UserData": init_script,
+                "TagSpecifications": [{"ResourceType": "instance", "Tags": tags}],
+            }
+        else:
+            # Fallback for an account that cannot create launch templates.
+            # Every setting the template would have carried has to be repeated
+            # here, which is exactly the duplication #85 removes.
+            network_interfaces = []
+            if self.subnet_id:
+                network_interface = {
+                    "DeviceIndex": 0,
+                    "SubnetId": self.subnet_id,
+                    "AssociatePublicIpAddress": self.use_public_ips,
+                }
+
+                if self.security_group_id:
+                    network_interface["Groups"] = [self.security_group_id]
+
+                network_interfaces.append(network_interface)
+
+            run_args = {
+                "ImageId": self.image_id,
+                "InstanceType": self.instance_type,
+                "MaxCount": 1,
+                "MinCount": 1,
+                "UserData": init_script,
+                "TagSpecifications": [{"ResourceType": "instance", "Tags": tags}],
+                # The init script runs `shutdown -h now` when auto_shutdown or
+                # one_shot is set, and EC2's default for an instance-initiated
+                # shutdown is *stop*, not terminate — leaving a stopped instance
+                # with a billed EBS volume. Worse, EC2_STATUS_MAPPING maps
+                # "stopped" to COMPLETED, so the provider drops the tracking
+                # record and the volume is orphaned as well as billed.
+                # DetachedMode already sets this on all of its launch paths.
+                "InstanceInitiatedShutdownBehavior": "terminate",
+                "MetadataOptions": dict(IMDSV2_METADATA_OPTIONS),
             }
 
-            if self.security_group_id:
-                network_interface["Groups"] = [self.security_group_id]
+            # Add network configuration if available
+            if network_interfaces:
+                run_args["NetworkInterfaces"] = network_interfaces
+            elif self.security_group_id:
+                run_args["SecurityGroupIds"] = [self.security_group_id]
 
-            network_interfaces.append(network_interface)
+            # Add key pair if specified
+            if self.key_name:
+                run_args["KeyName"] = self.key_name
 
-        # Prepare run configuration
-        run_args = {
-            "ImageId": self.image_id,
-            "InstanceType": self.instance_type,
-            "MaxCount": 1,
-            "MinCount": 1,
-            "UserData": init_script,
-            "TagSpecifications": [{"ResourceType": "instance", "Tags": tags}],
-            # The init script runs `shutdown -h now` when auto_shutdown or
-            # one_shot is set, and EC2's default for an instance-initiated
-            # shutdown is *stop*, not terminate — leaving a stopped instance
-            # with a billed EBS volume. Worse, EC2_STATUS_MAPPING maps
-            # "stopped" to COMPLETED, so the provider drops the tracking record
-            # and the volume is orphaned as well as billed. DetachedMode already
-            # sets this on all of its launch paths.
-            "InstanceInitiatedShutdownBehavior": "terminate",
-        }
-
-        # Add network configuration if available
-        if network_interfaces:
-            run_args["NetworkInterfaces"] = network_interfaces
-        elif self.security_group_id:
-            run_args["SecurityGroupIds"] = [self.security_group_id]
-
-        # Add key pair if specified
-        if self.key_name:
-            run_args["KeyName"] = self.key_name
-
-        # Attach the IAM instance profile whenever one is available. SSM
-        # SendCommand needs it, and an unused profile costs nothing.
-        if self.iam_instance_profile_arn:
-            run_args["IamInstanceProfile"] = {"Arn": self.iam_instance_profile_arn}
+            # Attach the IAM instance profile whenever one is available. SSM
+            # SendCommand needs it, and an unused profile costs nothing.
+            if self.iam_instance_profile_arn:
+                run_args["IamInstanceProfile"] = {"Arn": self.iam_instance_profile_arn}
 
         # Use spot instances if requested
         if self.use_spot:
@@ -1225,6 +1398,16 @@ class StandardMode(OperatingMode):
         # Check if using spot fleet
         if self.use_spot_fleet and self.spot_fleet_manager:
             return self._create_spot_fleet_instance(run_args)
+
+        # With a launch template available, request spot through RunInstances
+        # instead of the older RequestSpotInstances (#85). Verified against the
+        # botocore service model: RequestSpotInstances accepts no LaunchTemplate,
+        # and its LaunchSpecification shape has no MetadataOptions member at all,
+        # so IMDSv2 cannot be set on that path by any means. RunInstances with
+        # InstanceMarketOptions accepts both, and DryRun against real EC2
+        # confirms the combination.
+        if "LaunchTemplate" in run_args:
+            return self._create_spot_instance_via_run_instances(run_args)
 
         # Traditional spot instance request
         ec2 = self.session.client("ec2")
@@ -1287,23 +1470,87 @@ class StandardMode(OperatingMode):
             )
 
             # Register with spot interruption monitor if enabled
-            if (
-                self.spot_interruption_handling
-                and self.spot_interruption_monitor
-                and self.spot_interruption_handler
-            ):
-                self.spot_interruption_monitor.register_instance(
-                    instance_id,
-                    self.spot_interruption_handler.handle_instance_interruption,
-                )
-                logger.info(
-                    f"Registered spot instance {instance_id} for interruption handling"
-                )
+            self._register_spot_instance(instance_id)
 
             return instance_id
         except Exception as e:
             logger.error(f"Failed to create spot instance: {e}")
             raise ResourceCreationError(f"Failed to create spot instance: {e}") from e
+
+    def _create_spot_instance_via_run_instances(self, run_args: Dict[str, Any]) -> str:
+        """Request a spot instance through ``RunInstances`` (#85).
+
+        The modern spelling: ``InstanceMarketOptions`` on ``RunInstances``
+        instead of ``RequestSpotInstances``. Preferred whenever a launch
+        template exists, because it is the only route that gets IMDSv2 onto a
+        spot instance -- ``RequestSpotInstances`` has no ``MetadataOptions``
+        member -- and because it returns the instance ID directly, with no
+        intermediate request to poll or tag.
+
+        Parameters
+        ----------
+        run_args : Dict[str, Any]
+            ``RunInstances`` arguments, already carrying ``LaunchTemplate``.
+
+        Returns
+        -------
+        str
+            The EC2 instance ID.
+
+        Raises
+        ------
+        ResourceCreationError
+            If the request fails.
+        """
+        ec2 = self.session.client("ec2")
+        spot_options: Dict[str, Any] = {}
+        if self.spot_max_price:
+            spot_options["MaxPrice"] = self.spot_max_price
+
+        market_options: Dict[str, Any] = {"MarketType": "spot"}
+        if spot_options:
+            market_options["SpotOptions"] = spot_options
+
+        # The template's InstanceInitiatedShutdownBehavior="terminate" is
+        # deliberately left in place. RequestSpotInstances could not express it
+        # -- its LaunchSpecification has no such member -- so the old path left
+        # a self-shutting-down spot instance *stopped*, with a billed EBS volume
+        # that EC2_STATUS_MAPPING then reported as COMPLETED, dropping the
+        # tracking record. Verified against real EC2 that RunInstances accepts
+        # terminate alongside InstanceMarketOptions: a one-time spot instance
+        # launched this way reports InstanceLifecycle=spot and shutdown
+        # behaviour terminate. So this path closes on spot the same leak #66
+        # closed on demand.
+        run_args = dict(run_args)
+        run_args["InstanceMarketOptions"] = market_options
+
+        try:
+            response = ec2.run_instances(**run_args)
+            instance_id = response["Instances"][0]["InstanceId"]
+
+            wait_for_resource(
+                instance_id, "instance_running", ec2, resource_name="EC2 spot instance"
+            )
+            self._register_spot_instance(instance_id)
+            return instance_id
+        except Exception as e:
+            logger.error(f"Failed to create spot instance: {e}")
+            raise ResourceCreationError(f"Failed to create spot instance: {e}") from e
+
+    def _register_spot_instance(self, instance_id: str) -> None:
+        """Register *instance_id* with the interruption monitor, if enabled."""
+        if (
+            self.spot_interruption_handling
+            and self.spot_interruption_monitor
+            and self.spot_interruption_handler
+        ):
+            self.spot_interruption_monitor.register_instance(
+                instance_id,
+                self.spot_interruption_handler.handle_instance_interruption,
+            )
+            logger.info(
+                f"Registered spot instance {instance_id} for interruption handling"
+            )
 
     def _create_spot_fleet_instance(self, run_args: Dict[str, Any]) -> str:
         """Create a spot fleet instance.
@@ -1775,6 +2022,11 @@ class StandardMode(OperatingMode):
                     logger.error(
                         f"Failed to deregister baked AMI {self._baked_ami_id}: {e}"
                     )
+
+            # Delete the launch template (#85). After the AMI deregistration
+            # above and before the state save below, so a failure to delete it
+            # still leaves the ID cleared in the persisted state.
+            self._delete_launch_template()
 
             # Clean up Spot Fleet resources if using spot fleet
             if self.use_spot_fleet and self.spot_fleet_manager:

@@ -5,6 +5,7 @@ SPDX-License-Identifier: Apache-2.0
 SPDX-FileCopyrightText: 2025 Scott Friedman and Project Contributors
 """
 
+import base64
 import json
 import logging
 import os
@@ -30,6 +31,8 @@ from parsl_ephemeral_aws.constants import (
     DEFAULT_AMI_MAPPING,
     DEFAULT_ARCHITECTURE,
     DEFAULT_REGION,
+    IMDSV2_METADATA_OPTIONS,
+    RESOURCE_TYPE_LAUNCH_TEMPLATE,
     SPOT_FLEET_ALLOCATION_STRATEGIES,
 )
 from parsl_ephemeral_aws.exceptions import (
@@ -290,6 +293,228 @@ def normalize_spot_fleet_allocation_strategy(strategy: str) -> str:
         f"{sorted(SPOT_FLEET_ALLOCATION_STRATEGIES)} or their kebab-case "
         f"equivalents."
     )
+
+
+def encode_user_data(user_data: str) -> str:
+    """Base64-encode *user_data* for an API that does not do it for you.
+
+    botocore installs ``base64_encode_user_data`` on
+    ``before-parameter-build.ec2.RunInstances`` only -- verified by inspecting
+    ``botocore.handlers.BUILTIN_HANDLERS``, where that operation and
+    ``autoscaling.CreateLaunchConfiguration`` are the sole entries.
+    ``CreateLaunchTemplate`` is *not* among them, so a plaintext script passed
+    there is stored verbatim, handed to cloud-init base64-decoded, and produces
+    garbage that fails silently -- the instance boots fine and simply never runs
+    the worker.
+
+    Encoding twice is the other half of the trap, so callers must not hand
+    already-encoded data to ``RunInstances``.
+
+    Parameters
+    ----------
+    user_data : str
+        The plaintext user data script.
+
+    Returns
+    -------
+    str
+        The base64-encoded form.
+    """
+    return base64.b64encode(user_data.encode()).decode()
+
+
+def build_launch_template_data(
+    image_id: str,
+    instance_type: str,
+    subnet_id: Optional[str] = None,
+    security_group_id: Optional[str] = None,
+    associate_public_ip: bool = True,
+    key_name: Optional[str] = None,
+    iam_instance_profile_arn: Optional[str] = None,
+    shutdown_behavior: str = "terminate",
+    user_data: Optional[str] = None,
+    monitoring: bool = False,
+) -> Dict[str, Any]:
+    """Build the ``LaunchTemplateData`` shared by every launch path (#85).
+
+    One definition serves the on-demand, spot, and fleet paths, which is what
+    makes the Phase 6 EC2 Fleet/ASG migration possible -- those APIs accept a
+    template reference and nothing resembling ``RunInstances`` kwargs.
+
+    Every field is optional except the image and instance type, because the
+    template is a *baseline*: ``RunInstances`` overrides ``UserData`` and
+    ``TagSpecifications`` per launch, and Spot Fleet overrides ``InstanceType``
+    and ``SubnetId`` per pool.
+
+    Parameters
+    ----------
+    image_id : str
+        AMI to launch.
+    instance_type : str
+        Default instance type; fleet paths override it per pool.
+    subnet_id : Optional[str]
+        Subnet for the primary network interface.
+    security_group_id : Optional[str]
+        Security group for the primary network interface.
+    associate_public_ip : bool
+        Whether the primary interface gets a public IP.
+    key_name : Optional[str]
+        EC2 key pair for SSH access.
+    iam_instance_profile_arn : Optional[str]
+        Instance profile ARN; required for SSM command dispatch.
+    shutdown_behavior : str
+        ``"terminate"`` or ``"stop"`` for an instance-initiated shutdown.
+    user_data : Optional[str]
+        Plaintext user data; base64-encoded here, since
+        ``CreateLaunchTemplate`` does not do it.
+    monitoring : bool
+        Whether to enable detailed CloudWatch monitoring.
+
+    Returns
+    -------
+    Dict[str, Any]
+        A ``LaunchTemplateData`` document.
+    """
+    data: Dict[str, Any] = {
+        "ImageId": image_id,
+        "InstanceType": instance_type,
+        "InstanceInitiatedShutdownBehavior": shutdown_behavior,
+        # Copied, not referenced: the caller must not be able to mutate the
+        # module-level default through the document it gets back.
+        "MetadataOptions": dict(IMDSV2_METADATA_OPTIONS),
+    }
+
+    # A network interface and top-level SecurityGroupIds are mutually exclusive
+    # -- EC2 rejects a template carrying both. The interface form is required
+    # for AssociatePublicIpAddress, so it wins whenever a subnet is known.
+    if subnet_id:
+        interface: Dict[str, Any] = {
+            "DeviceIndex": 0,
+            "SubnetId": subnet_id,
+            "AssociatePublicIpAddress": associate_public_ip,
+        }
+        if security_group_id:
+            interface["Groups"] = [security_group_id]
+        data["NetworkInterfaces"] = [interface]
+    elif security_group_id:
+        data["SecurityGroupIds"] = [security_group_id]
+
+    if key_name:
+        data["KeyName"] = key_name
+    if iam_instance_profile_arn:
+        data["IamInstanceProfile"] = {"Arn": iam_instance_profile_arn}
+    if user_data is not None:
+        data["UserData"] = encode_user_data(user_data)
+    if monitoring:
+        data["Monitoring"] = {"Enabled": True}
+
+    return data
+
+
+def create_launch_template(
+    ec2_client: Any,
+    name: str,
+    launch_template_data: Dict[str, Any],
+    tags: Optional[List[Dict[str, str]]] = None,
+) -> Tuple[str, str]:
+    """Create a launch template, reusing one that already exists under *name*.
+
+    Idempotent because ``initialize()`` may run again after a partial failure,
+    and a second ``CreateLaunchTemplate`` under the same name is rejected with
+    ``InvalidLaunchTemplateName.AlreadyExistsException``. Rather than fail, the
+    existing template is adopted -- its name encodes the provider ID, so it can
+    only be one this provider made.
+
+    Parameters
+    ----------
+    ec2_client : Any
+        A boto3 EC2 client.
+    name : str
+        Launch template name; must be unique within the account and region.
+    launch_template_data : Dict[str, Any]
+        As returned by :func:`build_launch_template_data`.
+    tags : Optional[List[Dict[str, str]]]
+        Tags applied to the template resource itself, for cleanup tracking.
+
+    Returns
+    -------
+    Tuple[str, str]
+        The template ID and version number, the latter as the string
+        ``RunInstances`` expects.
+
+    Raises
+    ------
+    ResourceCreationError
+        If the template can neither be created nor found.
+    """
+    kwargs: Dict[str, Any] = {
+        "LaunchTemplateName": name,
+        "LaunchTemplateData": launch_template_data,
+    }
+    if tags:
+        kwargs["TagSpecifications"] = [
+            {"ResourceType": RESOURCE_TYPE_LAUNCH_TEMPLATE, "Tags": tags}
+        ]
+
+    try:
+        template = ec2_client.create_launch_template(**kwargs)["LaunchTemplate"]
+        logger.debug(
+            f"Created launch template {template['LaunchTemplateId']} ({name}) "
+            f"version {template['LatestVersionNumber']}"
+        )
+        return str(template["LaunchTemplateId"]), str(template["LatestVersionNumber"])
+    except ClientError as e:
+        if (
+            e.response["Error"]["Code"]
+            != "InvalidLaunchTemplateName.AlreadyExistsException"
+        ):
+            raise ResourceCreationError(
+                f"Failed to create launch template {name}: {e}"
+            ) from e
+
+    # Adopt the existing one. A new version is added rather than the old one
+    # reused, so a changed AMI or instance type actually takes effect -- a
+    # resumed provider whose config has moved on must not silently keep
+    # launching the previous definition.
+    try:
+        version = ec2_client.create_launch_template_version(
+            LaunchTemplateName=name,
+            LaunchTemplateData=launch_template_data,
+        )["LaunchTemplateVersion"]
+        logger.debug(
+            f"Launch template {name} already existed; added version "
+            f"{version['VersionNumber']}"
+        )
+        return str(version["LaunchTemplateId"]), str(version["VersionNumber"])
+    except ClientError as e:
+        raise ResourceCreationError(
+            f"Launch template {name} exists but could not be updated: {e}"
+        ) from e
+
+
+def delete_launch_template(ec2_client: Any, template_id: str) -> None:
+    """Delete a launch template, tolerating one that is already gone.
+
+    Deleting the template does not affect instances launched from it, so this is
+    safe to call before those instances have terminated.
+
+    Parameters
+    ----------
+    ec2_client : Any
+        A boto3 EC2 client.
+    template_id : str
+        ID of the template to delete.
+    """
+    try:
+        ec2_client.delete_launch_template(LaunchTemplateId=template_id)
+        logger.debug(f"Deleted launch template {template_id}")
+    except ClientError as e:
+        if e.response["Error"]["Code"] == "InvalidLaunchTemplateId.NotFound":
+            logger.debug(f"Launch template {template_id} already deleted")
+            return
+        raise ResourceDeletionError(
+            f"Failed to delete launch template {template_id}: {e}"
+        ) from e
 
 
 def get_default_ami(
