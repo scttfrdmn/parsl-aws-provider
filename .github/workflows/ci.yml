@@ -80,7 +80,14 @@ jobs:
           enable-cache: true
           python-version: ${{ matrix.python-version }}
       - name: Sync environment
-        run: uv sync --locked --extra dev --extra test
+        # `--extra globus` is here so tests/unit/test_globus_config_loading.py
+        # actually runs: it is the only test that loads a generated endpoint
+        # config through globus-compute-endpoint's own loader, which is the
+        # assertion #87 needed and text-comparison tests cannot make. Without
+        # the extra it importorskips, and the regression could return silently.
+        # The extra resolves alongside `test` since #125 removed localstack and
+        # with it the dill conflict.
+        run: uv sync --locked --extra dev --extra test --extra globus
       - name: Run unit and security tests
         # tests/security is pure-mock and marked `unit`; it belongs to this job
         # rather than a separate one. Selection is by path, not `-m unit`, so a

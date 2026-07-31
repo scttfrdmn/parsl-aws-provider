@@ -72,8 +72,19 @@ test = [
     "requests>=2.25.0",
 ]
 globus = [
-    "globus-compute-sdk>=2.0.0",
-    "globus-compute-endpoint>=2.0.0",
+    # Floor raised from >=2.0.0, which no longer described anything installable
+    # (#87). Two independent reasons:
+    #
+    # 1. globus-compute-endpoint pins parsl *exactly*, and only 4.10.1+ pins
+    #    parsl==2026.4.20 -- which is this project's floor. Every earlier release
+    #    pins an older parsl and cannot resolve alongside it.
+    # 2. The `config.py` shim written by generate_endpoint_config() imports
+    #    `globus_compute_endpoint.endpoint.config.utils.load_config_yaml`. That
+    #    module does not exist before 2.2.0, so a 2.0.x install would produce a
+    #    generated config that fails with ModuleNotFoundError at endpoint start
+    #    rather than at install time.
+    "globus-compute-sdk>=4.10.1",
+    "globus-compute-endpoint>=4.10.1",
 ]
 docs = [
     "sphinx>=4.0.0",

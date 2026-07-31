@@ -1,7 +1,8 @@
 """Unit tests for GlobusComputeProvider.
 
-Verifies config generation for standard, spot, and container variants, as
-well as the minimum_iam_policy() helper.
+Verifies config generation for standard, spot, and container variants, the
+``parsl.providers`` registration and ``config.py`` shim that make a generated
+config loadable (#87), and the minimum_iam_policy() helper.
 
 SPDX-License-Identifier: Apache-2.0
 SPDX-FileCopyrightText: 2025 Scott Friedman and Project Contributors
@@ -12,10 +13,15 @@ import uuid
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import parsl.providers
 import pytest
 
 from parsl_ephemeral_aws import GlobusComputeProvider
-from parsl_ephemeral_aws.globus_compute import _PROVIDER_TYPE
+from parsl_ephemeral_aws.globus_compute import (
+    _CONFIG_PY_SHIM,
+    _PROVIDER_TYPE,
+    _register_with_parsl_providers,
+)
 from parsl_ephemeral_aws.provider import EphemeralAWSProvider
 from parsl_ephemeral_aws.state.file import FileStateStore
 
@@ -68,6 +74,16 @@ def _make_provider(tmp_path, **extra_kwargs) -> GlobusComputeProvider:
     return provider
 
 
+def _all_actions_list(policy) -> list:
+    """Every action in the policy, with duplicates preserved."""
+    return [action for stmt in policy["Statement"] for action in stmt["Action"]]
+
+
+def _all_actions(policy) -> set:
+    """Every action in the policy, flattened across statements."""
+    return set(_all_actions_list(policy))
+
+
 # ---------------------------------------------------------------------------
 # TestGlobusComputeProviderImport
 # ---------------------------------------------------------------------------
@@ -86,6 +102,55 @@ class TestGlobusComputeProviderImport:
     def test_is_subclass_of_ephemeral_aws_provider(self, tmp_path):
         """GlobusComputeProvider is a subclass of EphemeralAWSProvider."""
         assert issubclass(GlobusComputeProvider, EphemeralAWSProvider)
+
+
+# ---------------------------------------------------------------------------
+# TestParslProvidersRegistration
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestParslProvidersRegistration:
+    """Verify the #87 fix: the class is resolvable the way Globus looks it up.
+
+    ``ProviderDispatcher.build_instance`` does
+    ``getattr(parsl.providers, type_name, None)`` and raises when the result is
+    ``None``, so these assertions mirror that call exactly rather than testing
+    a proxy for it.
+    """
+
+    def test_class_is_attribute_of_parsl_providers(self):
+        """Importing the package puts the class on ``parsl.providers``."""
+        # The import at the top of this file has already run the registration.
+        assert getattr(parsl.providers, _PROVIDER_TYPE, None) is GlobusComputeProvider
+
+    def test_provider_type_is_a_bare_name(self):
+        """The type key has no dots -- ``getattr`` cannot walk them (#87)."""
+        assert "." not in _PROVIDER_TYPE
+
+    def test_listed_in_parsl_providers_all(self):
+        """``__all__`` lists it, so ``import *`` and error messages include it."""
+        assert _PROVIDER_TYPE in parsl.providers.__all__
+
+    def test_registration_is_idempotent(self):
+        """Re-registering does not duplicate the ``__all__`` entry."""
+        before = list(parsl.providers.__all__)
+        _register_with_parsl_providers()
+        assert parsl.providers.__all__.count(_PROVIDER_TYPE) == 1
+        assert parsl.providers.__all__ == before
+
+    def test_registration_restores_a_removed_attribute(self):
+        """Calling it again re-assigns the attribute if something removed it."""
+        delattr(parsl.providers, _PROVIDER_TYPE)
+        assert getattr(parsl.providers, _PROVIDER_TYPE, None) is None
+        try:
+            _register_with_parsl_providers()
+            assert (
+                getattr(parsl.providers, _PROVIDER_TYPE, None) is GlobusComputeProvider
+            )
+        finally:
+            # Leave the module as the rest of the suite expects it.
+            _register_with_parsl_providers()
 
 
 # ---------------------------------------------------------------------------
@@ -218,6 +283,52 @@ class TestGenerateEndpointConfig:
         assert ep_id in content
         assert "TODO" not in content
 
+    def test_network_ids_written(self, tmp_path):
+        """The IDs #69 made required appear in the provider block.
+
+        Without these the config parses and then dies in the constructor with
+        ``vpc_id, subnet_id, and security_group_id are required``.
+        """
+        provider = _make_provider(tmp_path)
+        content = Path(
+            provider.generate_endpoint_config(str(tmp_path / "ep"))
+        ).read_text()
+        assert "vpc_id: vpc-test00001" in content
+        assert "subnet_id: subnet-test001" in content
+        assert "security_group_id: sg-test00001" in content
+
+    def test_writes_config_py_shim(self, tmp_path):
+        """``config.py`` is written alongside ``config.yaml`` (#87)."""
+        provider = _make_provider(tmp_path)
+        provider.generate_endpoint_config(str(tmp_path / "ep"))
+        assert (tmp_path / "ep" / "config.py").is_file()
+
+    def test_shim_imports_the_package(self, tmp_path):
+        """The shim's whole purpose is the import that registers the class."""
+        provider = _make_provider(tmp_path)
+        provider.generate_endpoint_config(str(tmp_path / "ep"))
+        shim = (tmp_path / "ep" / "config.py").read_text()
+        assert "import parsl_ephemeral_aws" in shim
+        assert "load_config_yaml" in shim
+
+    def test_shim_defines_module_level_config(self, tmp_path):
+        """``_load_config_py`` reads a module-level ``config``; compile the shim.
+
+        Compiling proves the generated file is syntactically valid without
+        executing it (execution would need globus-compute-endpoint installed).
+        """
+        provider = _make_provider(tmp_path)
+        provider.generate_endpoint_config(str(tmp_path / "ep"))
+        shim_path = tmp_path / "ep" / "config.py"
+        compile(shim_path.read_text(), str(shim_path), "exec")
+        assert "\nconfig = " in _CONFIG_PY_SHIM
+
+    def test_returned_path_is_the_yaml_not_the_shim(self, tmp_path):
+        """The return value stays the file a caller would edit."""
+        provider = _make_provider(tmp_path)
+        result = provider.generate_endpoint_config(str(tmp_path / "ep"))
+        assert result.endswith("config.yaml")
+
 
 # ---------------------------------------------------------------------------
 # TestGenerateEndpointConfigSpot
@@ -345,3 +456,77 @@ class TestMinimumIamPolicy:
         policy = GlobusComputeProvider.minimum_iam_policy(include_ecr=True)
         for stmt in policy["Statement"]:
             assert stmt["Effect"] == "Allow"
+
+    def test_spot_interruption_statement_present(self):
+        """The #86 EventBridge -> SQS warning path needs its own grants."""
+        policy = GlobusComputeProvider.minimum_iam_policy()
+        sids = {s["Sid"] for s in policy["Statement"]}
+        assert "SpotInterruptionWarning" in sids
+
+    def test_network_creation_actions_absent(self):
+        """#69 made the network caller-supplied, so no create/delete grants.
+
+        Granting these would let the provider destroy resources it does not own
+        -- the same hazard class as the serverless SG deletion (#100).
+        """
+        actions = _all_actions(
+            GlobusComputeProvider.minimum_iam_policy(include_ecr=True)
+        )
+        for action in (
+            "ec2:CreateVpc",
+            "ec2:DeleteVpc",
+            "ec2:CreateSubnet",
+            "ec2:DeleteSubnet",
+            "ec2:CreateSecurityGroup",
+            "ec2:DeleteSecurityGroup",
+            "ec2:CreateNatGateway",
+            "ec2:DeleteNatGateway",
+            "ec2:CreateInternetGateway",
+            "ec2:AllocateAddress",
+        ):
+            assert action not in actions
+
+    def test_spot_fleet_actions_absent(self):
+        """Spot Fleet was replaced by EC2 Fleet in #86."""
+        actions = _all_actions(GlobusComputeProvider.minimum_iam_policy())
+        assert "ec2:RequestSpotFleet" not in actions
+        assert "ec2:CancelSpotFleetRequests" not in actions
+        assert "ec2:DescribeSpotFleetRequests" not in actions
+        assert "ec2:CreateFleet" in actions
+
+    def test_iam_delete_actions_absent(self):
+        """No teardown grants while the provider performs no teardown (#132)."""
+        actions = _all_actions(GlobusComputeProvider.minimum_iam_policy())
+        for action in (
+            "iam:DeleteRole",
+            "iam:DeleteInstanceProfile",
+            "iam:RemoveRoleFromInstanceProfile",
+            "iam:DetachRolePolicy",
+        ):
+            assert action not in actions
+
+    def test_launch_template_actions_present(self):
+        """Every launch path goes through a launch template since #85."""
+        actions = _all_actions(GlobusComputeProvider.minimum_iam_policy())
+        assert "ec2:CreateLaunchTemplate" in actions
+        assert "ec2:DeleteLaunchTemplate" in actions
+
+    def test_ssm_get_parameter_present(self):
+        """AMI resolution moved to AWS's public SSM parameters in #82."""
+        actions = _all_actions(GlobusComputeProvider.minimum_iam_policy())
+        assert "ssm:GetParameter" in actions
+
+    def test_no_duplicate_actions(self):
+        """A duplicated action means a list was pasted into two statements."""
+        actions = _all_actions_list(
+            GlobusComputeProvider.minimum_iam_policy(include_ecr=True)
+        )
+        assert len(actions) == len(set(actions))
+
+    def test_every_statement_is_well_formed(self):
+        policy = GlobusComputeProvider.minimum_iam_policy(include_ecr=True)
+        for stmt in policy["Statement"]:
+            assert set(stmt) == {"Sid", "Effect", "Action", "Resource"}
+            assert isinstance(stmt["Action"], list)
+            assert stmt["Action"], f"{stmt['Sid']} has an empty action list"
+            assert all(":" in action for action in stmt["Action"])

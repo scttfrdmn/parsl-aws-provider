@@ -40,6 +40,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   live VPC and blackhole egress for unrelated workloads (closes #94).
 
 ### Fixed
+- **Every generated Globus Compute endpoint config was unloadable.**
+  `generate_endpoint_config()` wrote
+  `type: parsl_ephemeral_aws.globus_compute.GlobusComputeProvider`, but Globus
+  Compute resolves a provider by plain attribute lookup on the `parsl.providers`
+  module — `getattr(parsl.providers, type_name, None)`, raising when the result
+  is `None` — and `getattr` does not walk dots, so a dotted path can never
+  resolve. The type key is now the bare class name, and importing
+  `parsl_ephemeral_aws` assigns the class onto `parsl.providers`.
+  Registering at import is necessary but not sufficient, since the endpoint
+  daemon has no reason to import this package: `generate_endpoint_config()`
+  therefore also writes a small `config.py` shim that imports the package and
+  then hands `config.yaml` to Globus Compute's own loader.
+  `get_config()` prefers `config.py` when both are present, which is what makes
+  the pair work; `config.yaml` remains the single place to edit. Verified against
+  `globus-compute-endpoint` 4.15.0, with a regression test that loads a generated
+  directory through the real loader and a negative control asserting the bare
+  YAML still fails without the shim. Single-user endpoints only — multi-user
+  manager endpoints resolve through a different path and are tracked in #133
+  (closes #87).
+- The generated endpoint config omitted `vpc_id`, `subnet_id`, and
+  `security_group_id`, which #69 made required. A config that resolved its
+  provider type would then have failed in the constructor with
+  `vpc_id, subnet_id, and security_group_id are required` and no indication of
+  where to set them (refs #87).
 - `ServerlessMode`'s spot fleet path could never have launched an instance. Its
   CloudFormation template declared a `RegionMap` of AMIs that no `FindInMap`
   ever read, so the fleet's launch template carried no `ImageId` and EC2 refused
@@ -713,6 +737,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   template is caught (refs #112, #113).
 
 ### Changed
+- **`GlobusComputeProvider.minimum_iam_policy()` is now actually minimum.** It
+  granted `ec2:CreateVpc`, `DeleteVpc`, `CreateSubnet`, `CreateSecurityGroup`,
+  `CreateNatGateway`, and `RequestSpotFleet` — permissions the package no longer
+  uses, and whose delete half would have let it destroy caller-owned network
+  resources it never created. The action lists are now derived from the calls the
+  package actually makes: the network grants are read-only (`DescribeVpcs`,
+  `DescribeSubnets`, `DescribeSecurityGroups`) since #69 made those IDs
+  caller-supplied, Spot Fleet is replaced by `ec2:CreateFleet`/`DescribeFleets`/
+  `DeleteFleets` per #86, and the launch-template actions #85 introduced are
+  added. A new `SpotInterruptionWarning` statement carries the EventBridge and
+  SQS permissions the #86 warning path needs. No IAM delete actions are granted,
+  because the provider performs no instance-profile teardown (#132) — granting
+  them would permit more than it performs. The module docstring's permission list
+  is regenerated from the same source, and both now state what is *not* covered
+  (the S3 and Parameter Store state backends, and detached and serverless modes)
+  rather than implying whole-package coverage (closes #87).
+- The `globus` extra's floor is raised from `globus-compute-{sdk,endpoint}>=2.0.0`
+  to `>=4.10.1`. The old floor described nothing installable: `globus-compute-endpoint`
+  pins parsl *exactly*, and 4.10.1 is the first release pinning
+  `parsl==2026.4.20`, which is this project's floor — every earlier release pins
+  an older parsl and cannot resolve alongside it. Separately, the `config.py`
+  shim imports
+  `globus_compute_endpoint.endpoint.config.utils.load_config_yaml`, and that
+  module does not exist before 2.2.0, so a 2.0.x install would have produced a
+  generated config that failed at endpoint start rather than at install time.
+  The extra now installs alongside `test`, so the config-loading regression test
+  runs in the project environment (refs #87).
 - **Spot Fleet is replaced by EC2 Fleet.** AWS: "Spot Fleet … uses a legacy API
   with no planned investment." Every `request_spot_fleet` call is now
   `create_fleet` — in `SpotFleetManager`, `ServerlessMode`, and the detached
