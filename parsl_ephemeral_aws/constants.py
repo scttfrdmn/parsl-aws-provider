@@ -145,6 +145,28 @@ RESOURCE_TYPE_BASTION = "bastion"
 RESOURCE_TYPE_CLOUDFORMATION = "cloudformation"
 RESOURCE_TYPE_LAMBDA_FUNCTION = "lambda_function"
 RESOURCE_TYPE_ECS_TASK = "ecs_task"
+RESOURCE_TYPE_LAUNCH_TEMPLATE = "launch-template"
+
+# Instance metadata service options applied to every launch (#85).
+#
+# IMDSv2 ("HttpTokens": "required") makes the metadata service reject the
+# unauthenticated IMDSv1 GET, which is the request an SSRF-ed application can be
+# tricked into making on the instance's behalf to read its role credentials.
+# IMDSv2 requires a PUT to obtain a token first, and browsers and most proxies
+# will not issue one.
+#
+# HttpEndpoint stays "enabled" because the SSM agent reads the instance identity
+# document from it; disabling the endpoint outright would break the warm-pool
+# and one-shot dispatch paths, which run over SSM.
+#
+# The hop limit stays at EC2's default of 2 rather than being lowered to 1:
+# worker_init may run containers, and a container's request traverses the
+# host's network namespace, which costs a hop. A limit of 1 would leave
+# metadata unreachable from inside a container.
+IMDSV2_METADATA_OPTIONS = {
+    "HttpTokens": "required",
+    "HttpEndpoint": "enabled",
+}
 
 # Spot fleet constants
 SPOT_FLEET_TARGET_CAPACITY_TYPE = "TargetCapacity"
@@ -213,6 +235,9 @@ DEFAULT_SPOT_MAX_RECOVERY_ATTEMPTS = 3
 DEFAULT_TAG_PREFIX = "parsl-ephemeral"
 TAG_PREFIX = DEFAULT_TAG_PREFIX  # Alias for compatibility
 TAG_NAME = "Name"
+# Launch template naming (#85). The provider ID is appended, keeping the whole
+# name unique per provider instance and well inside EC2's 128-character limit.
+LAUNCH_TEMPLATE_NAME_PREFIX = f"{DEFAULT_TAG_PREFIX}-lt"
 # Marker tag identifying a resource as created by this provider (#109).
 #
 # This used to be TAG_NAME, which is the EC2-reserved "Name" key. Every tag list

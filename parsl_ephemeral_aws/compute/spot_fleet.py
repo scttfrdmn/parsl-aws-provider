@@ -11,7 +11,6 @@ import logging
 import uuid
 import time
 import json
-import base64
 from typing import Dict, List, Optional, Any
 
 from botocore.exceptions import ClientError, NoCredentialsError
@@ -24,6 +23,7 @@ from ..exceptions import (
     SpotFleetThrottlingError,
 )
 from ..constants import (
+    LAUNCH_TEMPLATE_NAME_PREFIX,
     TAG_PREFIX,
     TAG_MANAGED,
     TAG_WORKFLOW_ID,
@@ -40,6 +40,10 @@ from ..constants import (
 )
 from ..config import SecurityConfig
 from ..utils.aws import (
+    build_launch_template_data,
+    create_launch_template,
+    delete_launch_template,
+    encode_user_data,
     normalize_spot_fleet_allocation_strategy,
     resolve_manager_session,
 )
@@ -173,6 +177,9 @@ class SpotFleetManager:
         self.fleet_requests: Dict[str, Any] = {}
         self.instances: Dict[str, Any] = {}
         self.blocks: Dict[str, Any] = {}
+        # block_id -> launch template ID, so each block's template is deleted
+        # when the block is terminated (#85).
+        self.launch_templates: Dict[str, str] = {}
 
     def _setup_security_config(self) -> None:
         """Set up security configuration from provider settings."""
@@ -522,6 +529,112 @@ class SpotFleetManager:
 
             raise ResourceCreationError(f"Failed to create blocks: {e}")
 
+    def _build_launch_template_config(
+        self,
+        block_id: str,
+        network: Dict[str, str],
+        instance_types: List[str],
+        instance_tags: List[Dict[str, str]],
+    ) -> Optional[Dict[str, Any]]:
+        """Build a ``LaunchTemplateConfig`` for this block, or None on failure.
+
+        One template per block, because the user data is per-block and the
+        ``Overrides`` shape cannot carry it -- it accepts only
+        ``InstanceType``/``SubnetId``/price/priority. The instance types become
+        overrides so a single template still covers every pool the fleet may
+        draw from.
+
+        Returns None if the template cannot be created, in which case the caller
+        falls back to ``LaunchSpecifications``. That fallback launches without
+        IMDSv2, which is unavoidable: ``SpotFleetLaunchSpecification`` has no
+        ``MetadataOptions`` member.
+
+        Parameters
+        ----------
+        block_id : str
+            Block this template serves; also names the template.
+        network : Dict[str, str]
+            Resolved ``subnet_id`` and ``security_group_id``.
+        instance_types : List[str]
+            Types to emit as overrides.
+        instance_tags : List[Dict[str, str]]
+            Tags applied to launched instances.
+
+        Returns
+        -------
+        Optional[Dict[str, Any]]
+            A ``LaunchTemplateConfig``, or None to use the legacy form.
+        """
+        name = f"{LAUNCH_TEMPLATE_NAME_PREFIX}-fleet-{block_id}"
+        try:
+            template_data = build_launch_template_data(
+                image_id=self.provider.image_id,
+                instance_type=instance_types[0],
+                subnet_id=network["subnet_id"],
+                security_group_id=network["security_group_id"],
+                associate_public_ip=getattr(self.provider, "use_public_ips", True),
+                key_name=getattr(self.provider, "key_name", None),
+                iam_instance_profile_arn=getattr(
+                    self.provider, "iam_instance_profile_arn", None
+                ),
+                # Fleet instances are reclaimed by cancelling the fleet request
+                # with TerminateInstances=True, so an instance that shuts itself
+                # down should terminate rather than linger as a billed volume.
+                shutdown_behavior="terminate",
+                user_data=self._generate_user_data(),
+            )
+            # Instances launched from the template carry the block tags; the
+            # template resource itself carries them too, so a leaked template is
+            # traceable to the workflow that made it.
+            template_data["TagSpecifications"] = [
+                {"ResourceType": "instance", "Tags": list(instance_tags)}
+            ]
+
+            template_id, version = create_launch_template(
+                self.ec2_client, name, template_data, list(instance_tags)
+            )
+            self.launch_templates[block_id] = template_id
+            logger.debug(
+                f"Created launch template {template_id} for fleet block {block_id}"
+            )
+            return {
+                "LaunchTemplateSpecification": {
+                    "LaunchTemplateId": template_id,
+                    "Version": version,
+                },
+                "Overrides": [
+                    {
+                        "InstanceType": instance_type,
+                        "SubnetId": network["subnet_id"],
+                    }
+                    for instance_type in instance_types
+                ],
+            }
+        except Exception as e:
+            logger.warning(
+                f"Could not create launch template for block {block_id}: {e}. "
+                "Falling back to LaunchSpecifications; IMDSv2 will not be "
+                "enforced on these instances."
+            )
+            return None
+
+    def _delete_launch_template_for_block(self, block_id: str) -> None:
+        """Delete the launch template created for *block_id*, if any.
+
+        Deleting a template does not affect instances already launched from it,
+        so this is safe as soon as the fleet request is cancelled.
+        """
+        template_id = self.launch_templates.pop(block_id, None)
+        if not template_id:
+            return
+        try:
+            delete_launch_template(self.ec2_client, template_id)
+        except Exception as e:
+            logger.warning(
+                f"Failed to delete launch template {template_id} for block "
+                f"{block_id}: {e}"
+            )
+
     def _create_spot_fleet_request(
         self,
         block_id: str,
@@ -564,6 +677,25 @@ class SpotFleetManager:
             else [self.provider.instance_type]
         )
 
+        instance_tags = [
+            {"Key": "Name", "Value": f"{TAG_PREFIX}-node-{block_id[:8]}"},
+            {"Key": TAG_MANAGED, "Value": "true"},
+            {"Key": TAG_WORKFLOW_ID, "Value": self.provider.workflow_id},
+            {"Key": TAG_BLOCK_ID, "Value": block_id},
+        ]
+        for key, value in self.provider.tags.items():
+            instance_tags.append({"Key": key, "Value": value})
+
+        # Prefer a launch template (#85). This is the only way to get IMDSv2 onto
+        # Spot Fleet instances at all: SpotFleetLaunchSpecification has no
+        # MetadataOptions member, and the LaunchTemplateConfig Overrides shape
+        # carries only InstanceType/SubnetId/price/priority -- no UserData or
+        # TagSpecifications -- so the per-block user data has to live in a
+        # per-block template rather than in the overrides.
+        launch_template_config = self._build_launch_template_config(
+            block_id, network, instance_types, instance_tags
+        )
+
         # Generate specs for each instance type
         for instance_type in instance_types:
             try:
@@ -572,33 +704,14 @@ class SpotFleetManager:
                     "InstanceType": instance_type,
                     "SubnetId": network["subnet_id"],
                     "SecurityGroups": [{"GroupId": network["security_group_id"]}],
-                    "UserData": base64.b64encode(
-                        self._generate_user_data().encode()
-                    ).decode(),
+                    "UserData": encode_user_data(self._generate_user_data()),
                     "TagSpecifications": [
                         {
                             "ResourceType": "instance",
-                            "Tags": [
-                                {
-                                    "Key": "Name",
-                                    "Value": f"{TAG_PREFIX}-node-{block_id[:8]}",
-                                },
-                                {"Key": TAG_MANAGED, "Value": "true"},
-                                {
-                                    "Key": TAG_WORKFLOW_ID,
-                                    "Value": self.provider.workflow_id,
-                                },
-                                {"Key": TAG_BLOCK_ID, "Value": block_id},
-                            ],
+                            "Tags": list(instance_tags),
                         }
                     ],
                 }
-
-                # Add provider tags
-                for key, value in self.provider.tags.items():
-                    launch_spec["TagSpecifications"][0]["Tags"].append(
-                        {"Key": key, "Value": value}
-                    )
 
                 # Add key name if provided
                 if self.provider.key_name:
@@ -617,7 +730,6 @@ class SpotFleetManager:
                 "TargetCapacity": target_capacity,
                 "OnDemandTargetCapacity": 0,  # Use only spot instances
                 "IamFleetRole": fleet_role_arn,
-                "LaunchSpecifications": launch_specifications,
                 "TerminateInstancesWithExpiration": True,
                 "Type": "maintain",  # Maintain target capacity
                 # Honour the provider's spot_allocation_strategy instead of
@@ -651,6 +763,18 @@ class SpotFleetManager:
                 ],
             }
         }
+
+        # Exactly one of the two launch forms. EC2 tolerates both keys being
+        # present, but then the template silently loses to the specifications --
+        # and with it IMDSv2 -- so only the preferred one is sent (#85).
+        if launch_template_config:
+            request_params["SpotFleetRequestConfig"]["LaunchTemplateConfigs"] = [
+                launch_template_config
+            ]
+        else:
+            request_params["SpotFleetRequestConfig"]["LaunchSpecifications"] = (
+                launch_specifications
+            )
 
         # Add provider tags to fleet request
         for key, value in self.provider.tags.items():
@@ -1025,6 +1149,10 @@ class SpotFleetManager:
         fleet_request_id = self.blocks[block_id].get("fleet_request_id")
         if not fleet_request_id:
             logger.warning(f"No fleet request ID found for block {block_id}")
+            # Still drop the template: it belongs to the block, not to the fleet
+            # request, and a block whose request never got recorded would
+            # otherwise leak it until cleanup_all_resources runs (#85).
+            self._delete_launch_template_for_block(block_id)
             return
 
         try:
@@ -1050,6 +1178,11 @@ class SpotFleetManager:
             for instance_id in instance_ids:
                 if instance_id in self.instances:
                     self.instances[instance_id]["status"] = "terminated"
+
+            # The block's launch template has no further use once the request is
+            # cancelled, and deleting it does not disturb instances still
+            # shutting down (#85).
+            self._delete_launch_template_for_block(block_id)
 
         except ClientError as e:
             error_code = e.response["Error"]["Code"]
@@ -1125,6 +1258,11 @@ class SpotFleetManager:
                                 )
                 except Exception as e:
                     logger.error(f"Error cancelling Spot Fleet requests: {e}")
+
+            # Delete every per-block launch template (#85). Iterated over a copy
+            # of the keys because the helper pops from the dict as it goes.
+            for block_id in list(self.launch_templates):
+                self._delete_launch_template_for_block(block_id)
 
             # Clean up IAM role if we created one
             if self.iam_fleet_role_arn:

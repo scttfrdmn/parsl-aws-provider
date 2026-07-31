@@ -324,11 +324,17 @@ class TestSpotFleetManager(unittest.TestCase):
         config = mock_ec2_client.request_spot_fleet.call_args.kwargs[
             "SpotFleetRequestConfig"
         ]
-        tag_specs = config["TagSpecifications"] + [
-            spec
-            for launch_spec in config["LaunchSpecifications"]
-            for spec in launch_spec["TagSpecifications"]
-        ]
+        # Instance tags now travel in the launch *template* (#85), so gather them
+        # from CreateLaunchTemplate as well as from any LaunchSpecifications the
+        # fallback path would have emitted. Either form must be duplicate-free.
+        tag_specs = list(config["TagSpecifications"])
+        for launch_spec in config.get("LaunchSpecifications", []):
+            tag_specs.extend(launch_spec["TagSpecifications"])
+        for call in mock_ec2_client.create_launch_template.call_args_list:
+            tag_specs.extend(call.kwargs.get("TagSpecifications", []))
+            tag_specs.extend(
+                call.kwargs["LaunchTemplateData"].get("TagSpecifications", [])
+            )
         self.assertTrue(tag_specs)
         for spec in tag_specs:
             keys = [tag["Key"] for tag in spec["Tags"]]
