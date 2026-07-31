@@ -4,8 +4,8 @@ Exposes ``GlobusComputeProvider``, a thin subclass of ``EphemeralAWSProvider``
 that:
 
 * Carries ``endpoint_id`` and ``container_image`` metadata for Globus Compute.
-* Provides ``generate_endpoint_config(path)`` which writes a valid Globus Compute
-  endpoint ``config.yaml`` to the given directory.
+* Provides ``generate_endpoint_config(path)`` which writes a Globus Compute
+  endpoint configuration the ``globus-compute-endpoint`` daemon can load.
 
 Usage::
 
@@ -16,45 +16,94 @@ Usage::
         region="us-east-1",
         instance_type="t3.medium",
         mode="standard",
+        vpc_id="vpc-...",
+        subnet_id="subnet-...",
+        security_group_id="sg-...",
         use_spot=True,
         auto_create_instance_profile=True,
         display_name="My Ephemeral AWS Endpoint",
     )
     provider.generate_endpoint_config("~/.globus_compute/my_aws_endpoint")
 
+How Globus Compute finds this provider
+--------------------------------------
+Globus Compute resolves the ``provider: type:`` key in ``config.yaml`` by plain
+attribute lookup on the ``parsl.providers`` module -- ``getattr(parsl.providers,
+type_name, None)``, raising if the result is ``None``
+(``globus_compute_endpoint/endpoint/config/dispatch.py``). Two consequences,
+both verified against ``globus-compute-endpoint`` 4.15.0:
+
+1. A dotted path can never resolve, because ``getattr`` does not walk dots. The
+   type key must therefore be the bare class name.
+2. The bare name only resolves if something has already assigned the class onto
+   ``parsl.providers``. Importing this module does that (see
+   :func:`_register_with_parsl_providers`), but the endpoint daemon has no
+   reason to import it -- it reads ``config.yaml`` and nothing else.
+
+So ``generate_endpoint_config()`` writes *two* files: the ``config.yaml`` that
+holds the configuration, and a small ``config.py`` shim that imports this
+package -- registering the class -- and then hands the YAML to Globus Compute's
+own loader. ``get_config()`` prefers ``config.py`` when both are present, which
+is what makes the pair work. ``config.yaml`` stays the single place to edit.
+
+This covers single-user endpoints, which is what ``generate_endpoint_config()``
+produces. **Multi-user (manager) endpoints are not supported** (#133): those
+render ``user_config_template.yaml.j2`` to a string and the forked user-endpoint
+process calls ``load_config_yaml()`` on it directly, never going through
+``get_config()`` -- so there is no ``config.py`` hook and the same "not a valid
+provider" failure returns. Resolving that needs dotted-path support upstream in
+``TypeDispatcher.build_instance``; see #133.
+
 Minimum IAM permissions
 -----------------------
-The role attached to EC2 instances (``auto_create_instance_profile=True`` or a
-manually specified ``iam_instance_profile_arn``) must include:
+:meth:`GlobusComputeProvider.minimum_iam_policy` returns these as a policy
+document. The lists are derived from the AWS API calls the package actually
+makes on the ``mode="standard"`` path, which is what a generated endpoint
+config uses; AWS may require further implicit permissions.
 
 EC2 (always required)
-    ec2:RunInstances, ec2:DescribeInstances, ec2:TerminateInstances,
-    ec2:CreateVpc, ec2:DescribeVpcs, ec2:DeleteVpc,
-    ec2:CreateSubnet, ec2:DescribeSubnets, ec2:DeleteSubnet,
-    ec2:CreateSecurityGroup, ec2:DescribeSecurityGroups,
-    ec2:DeleteSecurityGroup, ec2:AuthorizeSecurityGroupIngress,
-    ec2:CreateInternetGateway, ec2:AttachInternetGateway,
-    ec2:DetachInternetGateway, ec2:DeleteInternetGateway,
-    ec2:CreateRouteTable, ec2:AssociateRouteTable, ec2:CreateRoute,
-    ec2:DescribeRouteTables, ec2:DeleteRouteTable,
-    ec2:CreateTags, ec2:DescribeTags,
-    ec2:DescribeImages, ec2:DescribeInstanceTypes,
-    ec2:DescribeSpotPriceHistory, ec2:RequestSpotFleet,
-    ec2:DescribeSpotFleetRequests, ec2:CancelSpotFleetRequests
+    ec2:RunInstances, ec2:TerminateInstances, ec2:DescribeInstances,
+    ec2:DescribeInstanceTypes, ec2:CreateTags, ec2:DescribeTags,
+    ec2:DescribeImages, ec2:CreateImage, ec2:DeregisterImage,
+    ec2:DeleteSnapshot, ec2:DescribeVpcs, ec2:DescribeSubnets,
+    ec2:DescribeSecurityGroups, ec2:CreateLaunchTemplate,
+    ec2:CreateLaunchTemplateVersion, ec2:DeleteLaunchTemplate,
+    ec2:CreateFleet, ec2:DescribeFleets, ec2:DeleteFleets,
+    ec2:RequestSpotInstances, ec2:DescribeSpotInstanceRequests,
+    ec2:DescribeSpotPriceHistory
 
-SSM (required for Session Manager tunneling)
-    ssm:StartSession, ssm:TerminateSession, ssm:DescribeSessions,
-    ssm:GetConnectionStatus, ssm:ResumeSession,
-    ssm:SendCommand, ssm:ListCommandInvocations
+    The network resources are read-only: ``vpc_id``, ``subnet_id`` and
+    ``security_group_id`` have been caller-supplied since v0.7.0, so no
+    create/delete grant is needed for them.
+
+SSM (required)
+    ssm:GetParameter (resolves the current Amazon Linux 2023 AMI),
+    ssm:SendCommand, ssm:GetCommandInvocation,
+    ssm:DescribeInstanceInformation (warm-pool and one-shot dispatch),
+    ssm:StartSession, ssm:TerminateSession, ssm:ResumeSession,
+    ssm:DescribeSessions, ssm:GetConnectionStatus (Session Manager tunnels)
+
+EventBridge + SQS (required when use_spot and spot_interruption_handling)
+    events:PutRule, events:PutTargets, events:RemoveTargets,
+    events:DeleteRule, events:TagResource, sqs:CreateQueue,
+    sqs:GetQueueAttributes, sqs:SetQueueAttributes, sqs:ReceiveMessage,
+    sqs:DeleteMessage, sqs:DeleteQueue
 
 IAM (required when auto_create_instance_profile=True)
-    iam:CreateRole, iam:AttachRolePolicy, iam:CreateInstanceProfile,
-    iam:AddRoleToInstanceProfile, iam:PassRole,
-    iam:GetRole, iam:GetInstanceProfile
+    iam:CreateRole, iam:GetRole, iam:AttachRolePolicy,
+    iam:CreateInstanceProfile, iam:GetInstanceProfile,
+    iam:AddRoleToInstanceProfile, iam:PassRole
 
 ECR (only when container_image references an ECR repository)
     ecr:GetAuthorizationToken, ecr:BatchGetImage,
-    ecr:GetDownloadUrlForLayer
+    ecr:GetDownloadUrlForLayer, ecr:BatchCheckLayerAvailability
+
+Not covered by ``minimum_iam_policy()``: the non-default state backends
+(``state_store_type="s3"`` needs S3 object access, ``"parameter_store"`` needs
+``ssm:PutParameter``/``GetParameter``/``DeleteParameter``/
+``GetParametersByPath``), ``mode="detached"`` (CloudFormation stack and SSM
+Parameter Store access), and ``mode="serverless"`` (Lambda, ECS, CloudWatch
+Logs, and IAM role lifecycle).
 
 SPDX-License-Identifier: Apache-2.0
 SPDX-FileCopyrightText: 2025 Scott Friedman and Project Contributors
@@ -65,6 +114,8 @@ import os
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+import parsl.providers
+
 from parsl_ephemeral_aws.provider import EphemeralAWSProvider
 
 logger = logging.getLogger(__name__)
@@ -73,7 +124,11 @@ logger = logging.getLogger(__name__)
 # YAML template helpers
 # ---------------------------------------------------------------------------
 
-_PROVIDER_TYPE = "parsl_ephemeral_aws.globus_compute.GlobusComputeProvider"
+# Bare class name, not a dotted path: Globus Compute's ProviderDispatcher does
+# `getattr(parsl.providers, type_name, None)`, and getattr does not walk dots
+# (#87). The name resolves because _register_with_parsl_providers() below puts
+# the class there.
+_PROVIDER_TYPE = "GlobusComputeProvider"
 
 # Indentation helpers for hand-rolled YAML (avoids a PyYAML import at module
 # level and keeps the output human-readable with predictable ordering).
@@ -108,6 +163,51 @@ def _yaml_line(key: str, value: Any, indent: str = "") -> str:
     if isinstance(value, str):
         return f"{indent}{key}: {_yaml_str(value)}"
     return f"{indent}{key}: {value}"
+
+
+# The ``config.py`` shim written alongside ``config.yaml``. Globus Compute
+# imports this file and reads its module-level ``config``; the import of
+# ``parsl_ephemeral_aws`` is what puts ``GlobusComputeProvider`` on
+# ``parsl.providers`` so the YAML's ``type:`` key resolves.
+_CONFIG_PY_SHIM = '''\
+"""Loader shim generated by parsl-ephemeral-aws. Edit config.yaml, not this file.
+
+Globus Compute resolves a provider's ``type:`` by attribute lookup on the
+``parsl.providers`` module, which only knows about providers that ship with
+Parsl. Importing ``parsl_ephemeral_aws`` registers ``GlobusComputeProvider``
+there, so this file exists purely to do that import before the YAML is parsed.
+``globus-compute-endpoint`` prefers ``config.py`` over ``config.yaml`` when both
+are present, which is what gets this executed.
+"""
+
+import pathlib
+
+import parsl_ephemeral_aws  # noqa: F401  registers GlobusComputeProvider
+from globus_compute_endpoint.endpoint.config.utils import load_config_yaml
+
+config = load_config_yaml((pathlib.Path(__file__).parent / "config.yaml").read_text())
+'''
+
+
+def _register_with_parsl_providers() -> None:
+    """Make ``GlobusComputeProvider`` resolvable from a Globus Compute config.
+
+    Globus Compute's ``ProviderDispatcher`` looks a provider up with
+    ``getattr(parsl.providers, type_name, None)`` and raises when that is
+    ``None``, so a class Parsl does not ship is unreachable until it is present
+    as an attribute on that module. ``parsl.providers`` defines no
+    ``__getattr__`` hook to intercept the lookup, so the attribute has to be
+    assigned outright.
+
+    Assigning rather than only extending ``__all__`` is deliberate: ``getattr``
+    consults the module namespace, not ``__all__``. ``__all__`` is extended too
+    so ``from parsl.providers import *`` and the dispatcher's "valid options"
+    error message both list it.
+    """
+    setattr(parsl.providers, "GlobusComputeProvider", GlobusComputeProvider)
+    exported = getattr(parsl.providers, "__all__", None)
+    if isinstance(exported, list) and "GlobusComputeProvider" not in exported:
+        exported.append("GlobusComputeProvider")
 
 
 # ---------------------------------------------------------------------------
@@ -161,14 +261,28 @@ class GlobusComputeProvider(EphemeralAWSProvider):
     # ------------------------------------------------------------------
 
     def generate_endpoint_config(self, path: str) -> str:
-        """Write a Globus Compute endpoint ``config.yaml`` to *path*.
+        """Write a loadable Globus Compute endpoint configuration to *path*.
 
-        Creates the directory at *path* if it does not exist, then writes
-        ``config.yaml`` into it.  Returns the absolute path to the written
-        file.
+        Creates the directory at *path* if it does not exist, then writes two
+        files into it:
 
-        The generated file is suitable for use with the ``globus-compute-endpoint``
-        daemon::
+        ``config.yaml``
+            The configuration itself -- the file to edit.
+        ``config.py``
+            A three-line shim that imports ``parsl_ephemeral_aws`` (registering
+            ``GlobusComputeProvider`` on ``parsl.providers``) and then hands
+            ``config.yaml`` to Globus Compute's own loader.
+
+        Both are needed. Globus Compute looks a provider up by attribute on
+        ``parsl.providers``, so a ``config.yaml`` alone is unloadable: the
+        daemon never imports this package, and the lookup fails with *"'...' is
+        not a valid provider"* (#87). ``get_config()`` prefers ``config.py``
+        when both exist, so the shim runs first and the YAML then resolves.
+
+        Returns the absolute path to ``config.yaml`` -- the file a caller would
+        want to read or edit.
+
+        The result is ready for the ``globus-compute-endpoint`` daemon::
 
             globus-compute-endpoint start my_aws_endpoint
 
@@ -190,7 +304,14 @@ class GlobusComputeProvider(EphemeralAWSProvider):
         yaml_content = self._build_config_yaml()
         config_path.write_text(yaml_content, encoding="utf-8")
 
-        logger.info("Globus Compute endpoint config written to %s", config_path)
+        shim_path = endpoint_dir / "config.py"
+        shim_path.write_text(_CONFIG_PY_SHIM, encoding="utf-8")
+
+        logger.info(
+            "Globus Compute endpoint config written to %s (with loader shim %s)",
+            config_path,
+            shim_path,
+        )
         return str(config_path)
 
     # ------------------------------------------------------------------
@@ -255,6 +376,20 @@ class GlobusComputeProvider(EphemeralAWSProvider):
         lines.append(_yaml_line("region", self.region, indent=_INDENT4))
         lines.append(_yaml_line("instance_type", self.instance_type, indent=_INDENT4))
         lines.append(_yaml_line("mode", self.mode_type.value, indent=_INDENT4))
+
+        # Network. Required since #69, so the constructor has already rejected a
+        # provider that lacks them -- with one exception: serverless mode with
+        # Lambda workers, whose functions run in the Lambda-managed VPC and so
+        # have nothing to pre-provision. That exception is why these are emitted
+        # conditionally rather than unconditionally. Omitting them from the YAML
+        # would produce a config that parses and then fails in the constructor.
+        for key, value in (
+            ("vpc_id", self.vpc_id),
+            ("subnet_id", self.subnet_id),
+            ("security_group_id", self.security_group_id),
+        ):
+            if value:
+                lines.append(_yaml_line(key, value, indent=_INDENT4))
 
         # Block sizing
         lines.append(_yaml_line("min_blocks", self.min_blocks, indent=_INDENT4))
@@ -321,8 +456,20 @@ class GlobusComputeProvider(EphemeralAWSProvider):
     def minimum_iam_policy(include_ecr: bool = False) -> Dict[str, Any]:
         """Return the minimum IAM policy document as a Python dict.
 
-        The returned dict can be serialised to JSON and attached to an IAM
-        role or user to grant the least privileges needed by this provider.
+        The returned dict can be serialised to JSON and attached to the IAM
+        principal that *runs* the provider -- the user, role, or endpoint host
+        that calls ``submit()``. It is not the instance role: workers need only
+        ``AmazonSSMManagedInstanceCore``, which
+        ``auto_create_instance_profile=True`` attaches for them.
+
+        Scope: the ``mode="standard"`` path with file-backed state, which is
+        what a generated endpoint config uses. Actions were derived from the
+        package's actual API calls, so the set is narrower than it was before
+        v0.7.0 -- network resources are caller-supplied since #69, so no
+        VPC/subnet/security-group/NAT/gateway create or delete grant appears,
+        and Spot Fleet was replaced by EC2 Fleet in #86. See the module
+        docstring for what is deliberately *not* covered (the S3 and Parameter
+        Store state backends, and detached and serverless modes).
 
         Parameters
         ----------
@@ -337,71 +484,86 @@ class GlobusComputeProvider(EphemeralAWSProvider):
             IAM policy document compatible with ``json.dumps()``.
         """
         ec2_actions = [
+            # Instance lifecycle
             "ec2:RunInstances",
-            "ec2:DescribeInstances",
             "ec2:TerminateInstances",
-            "ec2:CreateVpc",
-            "ec2:DescribeVpcs",
-            "ec2:DeleteVpc",
-            "ec2:CreateSubnet",
-            "ec2:DescribeSubnets",
-            "ec2:DeleteSubnet",
-            "ec2:CreateSecurityGroup",
-            "ec2:DescribeSecurityGroups",
-            "ec2:DeleteSecurityGroup",
-            "ec2:AuthorizeSecurityGroupIngress",
-            "ec2:RevokeSecurityGroupIngress",
-            "ec2:CreateInternetGateway",
-            "ec2:AttachInternetGateway",
-            "ec2:DetachInternetGateway",
-            "ec2:DeleteInternetGateway",
-            "ec2:CreateRouteTable",
-            "ec2:AssociateRouteTable",
-            "ec2:DisassociateRouteTable",
-            "ec2:CreateRoute",
-            "ec2:DescribeRouteTables",
-            "ec2:DeleteRouteTable",
+            "ec2:DescribeInstances",
+            "ec2:DescribeInstanceTypes",
             "ec2:CreateTags",
             "ec2:DescribeTags",
+            # Read-only on the caller-supplied network, for the existence check
+            # in _verify_resources(). No create or delete: those IDs have been
+            # required rather than provisioned since #69.
+            "ec2:DescribeVpcs",
+            "ec2:DescribeSubnets",
+            "ec2:DescribeSecurityGroups",
+            # AMI resolution, plus bake_ami=True
             "ec2:DescribeImages",
-            "ec2:DescribeInstanceTypes",
+            "ec2:CreateImage",
+            "ec2:DeregisterImage",
+            "ec2:DeleteSnapshot",
+            # Launch templates: every launch path goes through one since #85
+            "ec2:CreateLaunchTemplate",
+            "ec2:CreateLaunchTemplateVersion",
+            "ec2:DeleteLaunchTemplate",
+            # EC2 Fleet, which replaced Spot Fleet in #86
+            "ec2:CreateFleet",
+            "ec2:DescribeFleets",
+            "ec2:DeleteFleets",
+            # Single spot instances (use_spot without use_spot_fleet)
+            "ec2:RequestSpotInstances",
+            "ec2:DescribeSpotInstanceRequests",
             "ec2:DescribeSpotPriceHistory",
-            "ec2:RequestSpotFleet",
-            "ec2:DescribeSpotFleetRequests",
-            "ec2:CancelSpotFleetRequests",
-            "ec2:AllocateAddress",
-            "ec2:ReleaseAddress",
-            "ec2:DescribeAddresses",
-            "ec2:CreateNatGateway",
-            "ec2:DeleteNatGateway",
-            "ec2:DescribeNatGateways",
-            "ec2:DescribeNetworkInterfaces",
-            "ec2:DeleteNetworkInterface",
         ]
 
         ssm_actions = [
+            # Resolves the current AL2023 AMI from AWS's public parameter
+            "ssm:GetParameter",
+            # Command dispatch: warm-pool reuse and one-shot mode
+            "ssm:SendCommand",
+            "ssm:GetCommandInvocation",
+            "ssm:DescribeInstanceInformation",
+            # Session Manager tunnels to reach workers in a private subnet
             "ssm:StartSession",
             "ssm:TerminateSession",
+            "ssm:ResumeSession",
             "ssm:DescribeSessions",
             "ssm:GetConnectionStatus",
-            "ssm:ResumeSession",
-            "ssm:SendCommand",
-            "ssm:ListCommandInvocations",
-            "ssm:DescribeInstanceInformation",
         ]
 
+        # The advance spot-interruption warning (#86) is delivered by an
+        # EventBridge rule into an SQS queue the provider creates and polls.
+        # Only reached when use_spot and spot_interruption_handling are both on,
+        # but included unconditionally: the alternative is a policy that works
+        # until someone enables spot, then fails at initialize().
+        events_actions = [
+            "events:PutRule",
+            "events:PutTargets",
+            "events:RemoveTargets",
+            "events:DeleteRule",
+            "events:TagResource",
+        ]
+
+        sqs_actions = [
+            "sqs:CreateQueue",
+            "sqs:GetQueueAttributes",
+            "sqs:SetQueueAttributes",
+            "sqs:ReceiveMessage",
+            "sqs:DeleteMessage",
+            "sqs:DeleteQueue",
+        ]
+
+        # Only needed for auto_create_instance_profile=True. No delete actions:
+        # the provider does not tear the profile down (#132), so granting them
+        # would permit more than it performs.
         iam_actions = [
             "iam:CreateRole",
-            "iam:AttachRolePolicy",
             "iam:GetRole",
+            "iam:AttachRolePolicy",
             "iam:CreateInstanceProfile",
-            "iam:AddRoleToInstanceProfile",
             "iam:GetInstanceProfile",
+            "iam:AddRoleToInstanceProfile",
             "iam:PassRole",
-            "iam:DeleteRole",
-            "iam:DetachRolePolicy",
-            "iam:DeleteInstanceProfile",
-            "iam:RemoveRoleFromInstanceProfile",
         ]
 
         statements = [
@@ -415,6 +577,12 @@ class GlobusComputeProvider(EphemeralAWSProvider):
                 "Sid": "SSMTunneling",
                 "Effect": "Allow",
                 "Action": ssm_actions,
+                "Resource": "*",
+            },
+            {
+                "Sid": "SpotInterruptionWarning",
+                "Effect": "Allow",
+                "Action": events_actions + sqs_actions,
                 "Resource": "*",
             },
             {
@@ -445,3 +613,10 @@ class GlobusComputeProvider(EphemeralAWSProvider):
             "Version": "2012-10-17",
             "Statement": statements,
         }
+
+
+# Runs on import, which is the only moment that reliably precedes a Globus
+# Compute config load: the generated ``config.py`` shim imports this package
+# before parsing the YAML. Defined above the class, called here, because it
+# references the class by name.
+_register_with_parsl_providers()
