@@ -26,9 +26,13 @@ All work tracking for this project uses GitHub. **Do not create standalone plann
   open until the PR merges. That is intended — don't close them by hand.
 
 ### Milestones
-- **v0.1.0** — Critical bugs and broken functionality; minimum viable provider
-- **v0.2.0** — Stability: race conditions, resource leaks, error handling, core test coverage
-- **v0.3.0** — Feature completeness: production hardening, comprehensive E2E tests
+Every issue needs one. `gh api repos/scttfrdmn/parsl-aws-provider/milestones` is
+authoritative — v0.1.0 through v0.7.0 are closed, so do not assign to them.
+
+- **v0.8.0** — Stabilization: stop the IAM leak, make documented options reachable,
+  turn the integration suite green, first real-AWS warm-pool coverage
+- **v0.9.0** — Deferred refactors and the coverage gaps v0.8.0 recorded rather than
+  closed
 
 ### GitHub Project
 - The project board is at https://github.com/users/scttfrdmn/projects/29
@@ -45,7 +49,10 @@ All work tracking for this project uses GitHub. **Do not create standalone plann
 - **MAJOR** (1.x.x) — breaking changes to the `EphemeralAWSProvider` public interface or config schema
 - **MINOR** (x.1.x) — new features, new operating modes, new state backends (backwards-compatible)
 - **PATCH** (x.x.1) — bug fixes, security patches, documentation (no interface changes)
-- Current version: `0.1.0` (alpha — anything may change)
+- Current version: read it from `pyproject.toml` rather than from here. This line
+  named `0.1.0` through six releases; `make version-check` prints the real value,
+  and `make version-verify` asserts `pyproject.toml` and
+  `parsl_ephemeral_aws/__init__.py` agree.
 
 ---
 
