@@ -68,7 +68,7 @@ dev = [
     "mypy>=0.812",
     "bandit>=1.7.0",
     "pre-commit>=2.15.0",
-    "bump-my-version>=1.0.0",
+    "bump-my-version>=1.5.0",
 ]
 test = [
     # moto 5 replaced the per-service decorators (mock_ec2, mock_s3, ...) with a
