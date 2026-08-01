@@ -31,6 +31,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   these as literals; the new detached-only guard has to compare against the real
   defaults, and a guard repeating the numbers would stop firing the moment one
   changed (refs #136).
+- `ServerlessMode` accepts `lambda_code_bucket`, an existing S3 bucket to stage
+  Lambda deployment packages in. This is the surviving half of `checkpoint_bucket`
+  removed above: alongside gating the interruption monitor, it also overrode the
+  code-staging bucket, and that half was real. A caller-supplied bucket is reused
+  as-is and never deleted (`_owns_lambda_code_bucket` stays `False`, which is what
+  protects it); omit it and a provider-scoped bucket is created on first use and
+  removed by `cleanup_infrastructure()` (refs #137).
+- `GlobusComputeProvider` accepts `encrypted` (default `False`), and defaults
+  `worker_init` to a script that installs `globus-compute-endpoint` rather than
+  inheriting the `parsl`-only default. Both are part of #138 above.
+- An autouse `tests/conftest.py` guard fails any test that leaves a
+  default-named state file in the working directory or the repository root,
+  naming the test and the fix. Gitignoring the path was the alternative and was
+  rejected: it would have silenced the symptom while tests kept writing outside
+  their sandbox. The watched filename is read from the `state_file_path` signature
+  default rather than hardcoded, so renaming the default cannot quietly disable
+  the check (refs #93).
+- **Real-AWS E2E coverage for the warm pool**, `tests/aws/test_warm_pool_e2e.py`,
+  which had none. Every property the pool is sold on is a live-AWS property that
+  a mock asserts by construction: that SSM `SendCommand` actually reached the
+  instance, that no *second* `RunInstances` was issued, that `worker_init` did not
+  run again, and that a WARM instance — a **billed**, running instance — is
+  terminated by TTL expiry, by pool-full eviction, and by `shutdown()`.
+
+  The reuse and eviction tests count instances by the `E2ETestRunId` tag applied
+  in the launch's own `TagSpecifications`, so an instance cannot exist for the run
+  without being counted. `worker_init` is a file append rather than the
+  Parsl-installing default, both to keep the suite's runtime workable and to make
+  "ran once, job ran twice" readable off the instance over SSM.
+  `test_status_follows_the_ssm_command_not_the_instance_state` is the one that
+  cannot be faked another way: on the warm path the instance stays `running`
+  whether the command succeeded or failed, so a FAILED verdict can only have come
+  from the invocation's response code (closes #65).
 
 ### Changed
 - **`DEFAULT_LAMBDA_RUNTIME` is `python3.12`, was `python3.9`** — past end of
@@ -49,6 +82,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   it waits for an invocation event instead of running the task's `Command`, and
   Fargate tasks exited immediately. The CloudFormation template already defaulted
   to a plain Python image; the Python constant overrode it (refs #136).
+- CI actions updated: `actions/checkout` and `actions/upload-artifact` to v7,
+  `astral-sh/setup-uv` to v7, `codecov/codecov-action` to v7, and
+  `aws-actions/configure-aws-credentials` to v6. Swept in one commit rather than
+  merged individually so a dependency bump cannot be mistaken for a functional
+  regression. `configure-aws-credentials` v6 is safe here because the
+  `aws-e2e-tests` job already declares `id-token: write` and assumes a role via
+  OIDC instead of using long-lived keys.
+- **Lint and format now cover the whole repository** rather than
+  `parsl_ephemeral_aws tests`. The 107 pre-existing ruff errors that forced the
+  narrower scope lived entirely in the `tools/` scripts removed above, so
+  `ruff check .` and `ruff format --check .` both pass and nothing outside the
+  package can drift unchecked. Applied in CI, the Makefile, and `make format`
+  (refs #93).
+- Six README links pointed into deleted `tools/` files — the examples table, the
+  documentation list, the quickstart, and the status badge. They now point at
+  `examples/` and `docs/`, which are maintained. While there, the Development
+  Setup block was using `pyenv`, `python -m venv`, and `pip install`, all three
+  forbidden by the project's uv-only rule, and told the reader to clone
+  `your-org/parsl-aws-provider` (refs #93).
+- `scripts/setup_environment.sh` checked for Python 3.9, two releases below the
+  `requires-python = ">=3.10"` that Parsl 2026.x forces. Its bats mock reported
+  3.9 to match, so the pair agreed with each other and with nothing else
+  (refs #93).
+- **Dependabot tracks the `uv` ecosystem instead of `pip`.** Its pip updates read
+  the `requirements.txt` removed above, and that file pinned `black`,
+  `aws-cdk-lib`, `pydantic`, `typeguard`, `types-boto3`, and `tf-ecosystem` —
+  none of which the project depends on or imports. All six open pip pull requests
+  were bumping a dependency set that does not exist. The `uv` ecosystem reads
+  `pyproject.toml` and updates the committed `uv.lock`, which is what every CI
+  job installs from via `uv sync --locked` (refs #93).
+- `examples/serverless_mode.py` told readers the Fargate image was fixed at
+  `public.ecr.aws/lambda/python:3.9` and that Lambda was therefore the better
+  choice — both halves now wrong, since `ecs_container_image` is reachable and
+  the default is `python:3.12-slim`. Its ECS branch passes
+  `ecs_container_image`, `ecs_task_cpu`, and `ecs_task_memory` so the example
+  demonstrates them rather than only naming them (refs #136).
 
 ### Removed
 - **The spot task-recovery API, which could not work at this layer and never
@@ -97,44 +166,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (refs #93).
 - `PHASE1_SUCCESS_PROOF.md` and `README_PHASE1.md` — standalone status documents,
   unreferenced by anything (refs #93).
-
-### Changed
-- CI actions updated: `actions/checkout` and `actions/upload-artifact` to v7,
-  `astral-sh/setup-uv` to v7, `codecov/codecov-action` to v7, and
-  `aws-actions/configure-aws-credentials` to v6. Swept in one commit rather than
-  merged individually so a dependency bump cannot be mistaken for a functional
-  regression. `configure-aws-credentials` v6 is safe here because the
-  `aws-e2e-tests` job already declares `id-token: write` and assumes a role via
-  OIDC instead of using long-lived keys.
-- **Lint and format now cover the whole repository** rather than
-  `parsl_ephemeral_aws tests`. The 107 pre-existing ruff errors that forced the
-  narrower scope lived entirely in the `tools/` scripts removed above, so
-  `ruff check .` and `ruff format --check .` both pass and nothing outside the
-  package can drift unchecked. Applied in CI, the Makefile, and `make format`
-  (refs #93).
-- Six README links pointed into deleted `tools/` files — the examples table, the
-  documentation list, the quickstart, and the status badge. They now point at
-  `examples/` and `docs/`, which are maintained. While there, the Development
-  Setup block was using `pyenv`, `python -m venv`, and `pip install`, all three
-  forbidden by the project's uv-only rule, and told the reader to clone
-  `your-org/parsl-aws-provider` (refs #93).
-- `scripts/setup_environment.sh` checked for Python 3.9, two releases below the
-  `requires-python = ">=3.10"` that Parsl 2026.x forces. Its bats mock reported
-  3.9 to match, so the pair agreed with each other and with nothing else
-  (refs #93).
-- **Dependabot tracks the `uv` ecosystem instead of `pip`.** Its pip updates read
-  the `requirements.txt` removed above, and that file pinned `black`,
-  `aws-cdk-lib`, `pydantic`, `typeguard`, `types-boto3`, and `tf-ecosystem` —
-  none of which the project depends on or imports. All six open pip pull requests
-  were bumping a dependency set that does not exist. The `uv` ecosystem reads
-  `pyproject.toml` and updates the committed `uv.lock`, which is what every CI
-  job installs from via `uv sync --locked` (refs #93).
-- `examples/serverless_mode.py` told readers the Fargate image was fixed at
-  `public.ecr.aws/lambda/python:3.9` and that Lambda was therefore the better
-  choice — both halves now wrong, since `ecs_container_image` is reachable and
-  the default is `python:3.12-slim`. Its ECS branch passes
-  `ecs_container_image`, `ecs_task_cpu`, and `ecs_task_memory` so the example
-  demonstrates them rather than only naming them (refs #136).
 
 ### Fixed
 - **`aws-e2e-tests` went red on every manual dispatch, and its orphan sweep never
@@ -317,41 +348,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   which is what identified a test rather than a real session as the writer. A
   stale state document in the root is also what makes the `load_state()`
   null-restore hazard reachable, so this was not merely untidy (refs #93).
-
-### Added
-- `ServerlessMode` accepts `lambda_code_bucket`, an existing S3 bucket to stage
-  Lambda deployment packages in. This is the surviving half of `checkpoint_bucket`
-  removed above: alongside gating the interruption monitor, it also overrode the
-  code-staging bucket, and that half was real. A caller-supplied bucket is reused
-  as-is and never deleted (`_owns_lambda_code_bucket` stays `False`, which is what
-  protects it); omit it and a provider-scoped bucket is created on first use and
-  removed by `cleanup_infrastructure()` (refs #137).
-- `GlobusComputeProvider` accepts `encrypted` (default `False`), and defaults
-  `worker_init` to a script that installs `globus-compute-endpoint` rather than
-  inheriting the `parsl`-only default. Both are part of #138 above.
-- An autouse `tests/conftest.py` guard fails any test that leaves a
-  default-named state file in the working directory or the repository root,
-  naming the test and the fix. Gitignoring the path was the alternative and was
-  rejected: it would have silenced the symptom while tests kept writing outside
-  their sandbox. The watched filename is read from the `state_file_path` signature
-  default rather than hardcoded, so renaming the default cannot quietly disable
-  the check (refs #93).
-- **Real-AWS E2E coverage for the warm pool**, `tests/aws/test_warm_pool_e2e.py`,
-  which had none. Every property the pool is sold on is a live-AWS property that
-  a mock asserts by construction: that SSM `SendCommand` actually reached the
-  instance, that no *second* `RunInstances` was issued, that `worker_init` did not
-  run again, and that a WARM instance — a **billed**, running instance — is
-  terminated by TTL expiry, by pool-full eviction, and by `shutdown()`.
-
-  The reuse and eviction tests count instances by the `E2ETestRunId` tag applied
-  in the launch's own `TagSpecifications`, so an instance cannot exist for the run
-  without being counted. `worker_init` is a file append rather than the
-  Parsl-installing default, both to keep the suite's runtime workable and to make
-  "ran once, job ran twice" readable off the instance over SSM.
-  `test_status_follows_the_ssm_command_not_the_instance_state` is the one that
-  cannot be faked another way: on the warm path the instance stays `running`
-  whether the command succeeded or failed, so a FAILED verdict can only have come
-  from the invocation's response code (closes #65).
 
 ### Security
 - **The IAM leak fixed above was accumulating standing privileged principals.**
