@@ -24,7 +24,7 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true
@@ -52,7 +52,7 @@ jobs:
   type-check:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true
@@ -74,7 +74,7 @@ jobs:
         # matrix entries could not have installed the package at all.
         python-version: ["3.10", "3.11", "3.12"]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true
@@ -131,7 +131,7 @@ jobs:
         # see into the container's PATH assumptions reliably. The wait step below
         # polls from the runner instead, where curl is guaranteed.
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true
@@ -183,7 +183,7 @@ jobs:
       id-token: write      # OIDC, so no long-lived keys live in secrets
       contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true
@@ -213,7 +213,7 @@ jobs:
   test-bats:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Set up bats
         # `sudo` applied to the npm line only, so `mkdir -p /usr/local/lib/bats`
         # ran unprivileged and the step died on "Permission denied" once the
@@ -236,7 +236,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: [lint, unit-tests]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true
@@ -259,7 +259,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: [lint, unit-tests]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true
