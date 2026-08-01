@@ -244,6 +244,16 @@ class StandardMode(OperatingMode):
                 (),
                 {
                     "workflow_id": self.provider_id,
+                    # The mode's own session, so the manager inherits whatever
+                    # the caller configured -- a profile, role credentials, or an
+                    # endpoint_url. resolve_manager_session() prefers
+                    # provider.session and only falls back to building one from
+                    # ambient environment credentials when there is none, so
+                    # omitting it sent every fleet to the default account for the
+                    # region while the rest of the mode used the caller's (#159).
+                    # #117 fixed this everywhere the provider is passed as self;
+                    # this stand-in was built inline and so was missed.
+                    "session": self.session,
                     "region": self.session.region_name,
                     "aws_profile": None,
                     "vpc_id": self.vpc_id,

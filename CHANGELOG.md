@@ -79,6 +79,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the removed API only, and never exported from the package root (refs #137).
 
 ### Fixed
+- **Every Spot Fleet `StandardMode` created went to the account the environment
+  named, not the one the caller configured.** `StandardMode.__init__` builds a
+  stand-in provider object for `SpotFleetManager`, and that object carried the
+  region, the profile name, the network IDs and every launch parameter — but no
+  `session`. `resolve_manager_session()` prefers `provider.session` and falls back
+  to building one from ambient environment credentials only when there is none, so
+  the fallback fired every time: a caller passing temporary role credentials, a
+  chosen profile, or an `endpoint_url` had their fleet created somewhere else
+  while the rest of the mode used the session they supplied.
+
+  This is the defect #117 fixed for the four `compute/` managers and the state
+  stores. This call site was missed because it constructs the stand-in inline
+  rather than passing `self`, so the audit that found the others did not reach it.
+  The only fleet integration test constructed `SpotFleetManager` directly and then
+  rebound `aws_session` and `ec2_client` by hand, which masked it exactly;
+  the replacement asserts the manager's session **is** the mode's (closes #159).
 - **`error_history` recorded only the fleet errors nobody could classify.**
   `SpotFleetManager._translate_fleet_error()` called
   `RobustErrorHandler.handle_error()` on the unrecognized fallthrough alone, so
