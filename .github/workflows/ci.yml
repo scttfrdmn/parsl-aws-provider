@@ -100,7 +100,7 @@ jobs:
         # letting coverage silently rot.
         run: uv run pytest tests/unit tests/security -v --cov-fail-under=65
       - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v5
+        uses: codecov/codecov-action@v7
         with:
           files: ./coverage.xml
           flags: unittests
@@ -163,7 +163,7 @@ jobs:
           SUBSTRATE_ENDPOINT: http://localhost:4566
         run: uv run pytest tests/test_substrate_emulation.py -v --no-cov
       - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v5
+        uses: codecov/codecov-action@v7
         with:
           files: ./coverage.xml
           flags: integration
