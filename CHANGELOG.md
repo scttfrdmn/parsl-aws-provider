@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-08-01
+
 ### Added
 - **Eight mode options that the provider documented but could not accept.**
   `idle_timeout`, `preserve_bastion`, `bastion_host_type`, and `workflow_id` on
@@ -1818,7 +1820,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - ECS task definitions now create their CloudWatch log group before registration;
   log groups are tracked and deleted on cleanup (closes #22)
 
-[Unreleased]: https://github.com/scttfrdmn/parsl-aws-provider/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/scttfrdmn/parsl-aws-provider/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/scttfrdmn/parsl-aws-provider/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/scttfrdmn/parsl-aws-provider/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/scttfrdmn/parsl-aws-provider/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/scttfrdmn/parsl-aws-provider/compare/v0.4.0...v0.5.0

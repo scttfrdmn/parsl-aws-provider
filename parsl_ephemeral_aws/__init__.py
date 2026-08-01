@@ -7,7 +7,7 @@ SPDX-License-Identifier: Apache-2.0
 SPDX-FileCopyrightText: 2025-2026 Scott Friedman and Project Contributors
 """
 
-__version__ = "0.7.0"
+__version__ = "0.8.0"
 
 from .globus_compute import GlobusComputeProvider
 from .provider import EphemeralAWSProvider
