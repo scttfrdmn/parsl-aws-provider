@@ -167,7 +167,6 @@ source = ["parsl_ephemeral_aws"]
 branch = true
 omit = [
     "tests/*",
-    "setup.py",
     "examples/*",
     "*/__init__.py",
     "*/templates/*",

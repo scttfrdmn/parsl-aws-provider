@@ -50,7 +50,7 @@ Initial release of the Parsl Ephemeral AWS Provider.
 - Python 3.8+
 - Parsl 1.2.0+
 - boto3 1.20.0+
-- Other dependencies as specified in requirements.txt
+- Other dependencies as declared in `pyproject.toml`
 
 SPDX-License-Identifier: Apache-2.0
 SPDX-FileCopyrightText: 2025-2026 Scott Friedman and Project Contributors

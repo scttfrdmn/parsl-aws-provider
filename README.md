@@ -8,7 +8,7 @@
 [![Parsl](https://img.shields.io/badge/Parsl-Compatible-green.svg)](https://parsl.readthedocs.io/)
 [![Globus](https://img.shields.io/badge/Globus%20Compute-Integrated-purple.svg)](https://globus-compute.readthedocs.io/)
 [![Docker](https://img.shields.io/badge/Docker-Container%20Support-blue.svg)](https://www.docker.com/)
-[![Status](https://img.shields.io/badge/Status-Production%20Ready-brightgreen.svg)](tools/real_compute_no_deps.py)
+[![Status](https://img.shields.io/badge/Status-Alpha-yellow.svg)](CHANGELOG.md)
 
 ## 🚀 What This Enables
 
@@ -37,9 +37,10 @@
 
 ```bash
 # Test universal connectivity + real computation
-git clone https://github.com/your-org/parsl-aws-provider
-cd parsl-aws-provider/tools
-python real_compute_no_deps.py
+git clone https://github.com/scttfrdmn/parsl-aws-provider
+cd parsl-aws-provider
+uv sync --extra dev --extra test
+uv run python examples/standard_mode.py
 
 # Expected output:
 # 🎉 REAL COMPUTE TEST SUCCESS
@@ -328,7 +329,7 @@ def analyze_public_dataset(dataset_url):
     }
 ```
 
-See [`DATA_MOVEMENT_GUIDE.md`](tools/DATA_MOVEMENT_GUIDE.md) for comprehensive data flow patterns.
+See [`docs/examples.md`](docs/examples.md) for data flow patterns.
 
 ## 🐳 Container Support
 
@@ -517,10 +518,11 @@ def analyze_public_dataset(dataset_url):
 
 | Example | Description | File |
 |---------|-------------|------|
-| **Basic Parallel** | Simple mathematical computations | [`real_compute_no_deps.py`](tools/real_compute_no_deps.py) |
-| **Container Execution** | Docker containers with SSH tunneling | [`minimal_container_test.py`](tools/minimal_container_test.py) |
-| **S3 Data Flow** | Efficient large dataset processing | [`s3_data_workflow_example.py`](tools/s3_data_workflow_example.py) |
-| **Globus Compute** | FaaS deployment patterns | [`globus_s3_data_patterns.py`](tools/globus_s3_data_patterns.py) |
+| **Standard mode** | EC2 workers, driver stays attached | [`standard_mode.py`](examples/standard_mode.py) |
+| **Parsl integration** | End-to-end HTEX config | [`parsl_aws_integration.py`](examples/parsl_aws_integration.py) |
+| **Detached mode** | Bastion survives the driver | [`detached_mode.py`](examples/detached_mode.py) |
+| **Serverless** | Lambda / Fargate workers | [`serverless_mode.py`](examples/serverless_mode.py) |
+| **Spot fleet** | Mixed instance types, interruption handling | [`spot_fleet_example.py`](examples/spot_fleet_example.py) |
 
 ### Real-World Use Cases
 
@@ -567,10 +569,11 @@ Our provider uses **SSH reverse tunneling over AWS SSM** to solve the fundamenta
 
 ## 📚 Documentation
 
-- **[Usage Examples](tools/)** - Complete working examples
-- **[Data Movement Guide](tools/DATA_MOVEMENT_GUIDE.md)** - Optimal data flow patterns
-- **[Container Success](tools/PHASE2_CONTAINER_SUCCESS.md)** - Container implementation details
-- **[Blog Post](tools/BLOG_POST.md)** - Comprehensive usage guide
+- **[Usage Examples](examples/)** - Complete working examples
+- **[Getting Started](docs/getting_started.md)** - Install, configure, first run
+- **[Operating Modes](docs/operating_modes.md)** - Standard, detached, serverless
+- **[Network Prerequisites](docs/network-prerequisites.md)** - VPC, subnet, and security group requirements
+- **[Troubleshooting](docs/troubleshooting.md)** - Common failures and how to clear them
 
 ## 🎯 When to Use Each Approach
 
@@ -665,7 +668,7 @@ aws sts get-caller-identity
 aws ssm describe-instance-information --region us-east-1
 
 # Validate provider setup
-python tools/real_compute_no_deps.py
+uv run python examples/standard_mode.py
 ```
 
 ## 🤝 Contributing
@@ -684,17 +687,11 @@ We welcome contributions! Areas of focus:
 git clone https://github.com/your-org/parsl-aws-provider
 cd parsl-aws-provider
 
-# Python environment
-pyenv install 3.10.10
-pyenv local 3.10.10
-python -m venv .venv
-source .venv/bin/activate
-
-# Install dependencies
-pip install parsl boto3
+# Environment and dependencies (uv only -- no pip, venv, or pyenv)
+uv sync --extra dev --extra test
 
 # Test installation
-python tools/real_compute_no_deps.py
+uv run pytest tests/unit -m unit --no-cov -q
 ```
 
 ## 📄 License

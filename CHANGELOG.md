@@ -77,6 +77,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `exceptions.py`, plus `DEFAULT_SPOT_CHECKPOINT_INTERVAL` and
   `DEFAULT_SPOT_MAX_RECOVERY_ATTEMPTS` from `constants.py` — raised and read by
   the removed API only, and never exported from the package root (refs #137).
+- **107 of the 109 files in `tools/`**, keeping only `launch_test_driver.py` and
+  `cleanup_aws_resources.py` (the two with referrers — CI's post-E2E sweep runs
+  the latter, and twelve docs pages point at it). The rest were one-off debug and
+  proof scripts (`debug_tunnel.py`, `prove_parsl_works.py`, `instant_test.py`,
+  some eighty more) plus fourteen standalone status documents of the kind
+  CLAUDE.md prohibits. `tools/README.md` documented a `final_bulletproof_phase1.py`
+  that no longer existed, and `tools/awsproviderstate.json` was a committed state
+  file carrying live VPC and security-group IDs — the same hazard #151 cleared
+  from the root. Nothing in the package or the test suite imported any of it
+  (closes #93).
+- `requirements.txt` and `setup.py` from the repository root. `pyproject.toml` is
+  the single source of dependencies and metadata; the former duplicated the list
+  badly enough to have drifted (still naming `black`, which is not a dependency,
+  and a Python floor two releases stale), and the latter was a two-line setuptools
+  shim that `uv build` does not use. Referrers updated: the coverage `omit` lists,
+  the bats environment test that asserted both files exist, and
+  `scripts/setup_environment.sh`, which was pip-installing from the deleted file
+  (refs #93).
+- `PHASE1_SUCCESS_PROOF.md` and `README_PHASE1.md` — standalone status documents,
+  unreferenced by anything (refs #93).
+
+### Changed
+- **Lint and format now cover the whole repository** rather than
+  `parsl_ephemeral_aws tests`. The 107 pre-existing ruff errors that forced the
+  narrower scope lived entirely in the `tools/` scripts removed above, so
+  `ruff check .` and `ruff format --check .` both pass and nothing outside the
+  package can drift unchecked. Applied in CI, the Makefile, and `make format`
+  (refs #93).
+- Six README links pointed into deleted `tools/` files — the examples table, the
+  documentation list, the quickstart, and the status badge. They now point at
+  `examples/` and `docs/`, which are maintained. While there, the Development
+  Setup block was using `pyenv`, `python -m venv`, and `pip install`, all three
+  forbidden by the project's uv-only rule, and told the reader to clone
+  `your-org/parsl-aws-provider` (refs #93).
+- `scripts/setup_environment.sh` checked for Python 3.9, two releases below the
+  `requires-python = ">=3.10"` that Parsl 2026.x forces. Its bats mock reported
+  3.9 to match, so the pair agreed with each other and with nothing else
+  (refs #93).
 
 ### Fixed
 - **A warm instance was forgotten the moment it went warm, and then billed for

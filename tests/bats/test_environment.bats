@@ -75,9 +75,11 @@ teardown() {
   [ -d "$PROJ_ROOT/parsl_ephemeral_aws/state" ]
   [ -d "$PROJ_ROOT/tests" ]
 
-  # Check for essential files
-  [ -f "$PROJ_ROOT/setup.py" ]
-  [ -f "$PROJ_ROOT/requirements.txt" ]
+  # Check for essential files. pyproject.toml is the single source of both
+  # metadata and dependencies (#93): setup.py was a two-line setuptools shim and
+  # requirements.txt duplicated the dependency list badly enough to drift, still
+  # naming black and a Python floor two releases behind.
+  [ -f "$PROJ_ROOT/pyproject.toml" ]
 }
 
 # Test mock functions

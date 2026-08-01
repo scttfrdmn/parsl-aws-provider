@@ -139,14 +139,14 @@ lint: lint-python lint-shell ## Run all linting checks
 # Run Python linting
 lint-python: ## Run Python linting with ruff
 	@echo "$(YELLOW)Running Python linting...$(RESET)"
-	# Scoped to the package and tests, matching CI. `ruff check .` reports 107
-	# pre-existing errors, all in tools/ one-off debug scripts that #93 prunes in
-	# v0.8.0 -- so this target could never pass and was effectively unrunnable.
-	$(RUN) ruff check parsl_ephemeral_aws tests
+	# Whole repo. The 107 pre-existing errors that forced a narrower scope lived
+	# entirely in the tools/ one-off debug scripts #93 removed, so `ruff check .`
+	# now passes and nothing outside the package can drift unchecked.
+	$(RUN) ruff check .
 	# Same scope as `format` below and as the pre-commit hook, which formats
-	# whatever is staged: a narrower check here lets tests/ drift out of format
-	# and only fail on the next commit that happens to stage one of those files.
-	$(RUN) ruff format --check parsl_ephemeral_aws tests
+	# whatever is staged: a narrower check here lets a file drift out of format
+	# and only fail on the next commit that happens to stage it.
+	$(RUN) ruff format --check .
 
 # Run shell script linting
 lint-shell: ## Run shell script linting
@@ -161,8 +161,8 @@ lint-shell: ## Run shell script linting
 # Format code
 format: ## Format code with ruff
 	@echo "$(YELLOW)Formatting code...$(RESET)"
-	$(RUN) ruff format parsl_ephemeral_aws tests
-	$(RUN) ruff check --fix parsl_ephemeral_aws tests
+	$(RUN) ruff format .
+	$(RUN) ruff check --fix .
 
 # Run type checking
 type-check: ## Run type checking with mypy
@@ -183,8 +183,8 @@ docs: ## Generate documentation
 # Build package
 build: clean ## Build package for distribution
 	@echo "$(YELLOW)Building package...$(RESET)"
-	# `uv build`, not setup.py sdist bdist_wheel: setup.py is a legacy shim and
-	# the invocation has been deprecated by setuptools for years.
+	# `uv build` reads pyproject.toml directly. The setup.py shim it used to go
+	# through was removed in #93.
 	$(UV) build
 	@echo "$(GREEN)Package built$(RESET)"
 
