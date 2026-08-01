@@ -105,16 +105,25 @@ long-lived access keys live in secrets. Configure:
 * **Variables** `AWS_TEST_REGION`, `AWS_TEST_VPC_ID`, `AWS_TEST_SUBNET_ID`,
   `AWS_TEST_SG_ID`.
 
-`tests/aws/conftest.py` skips when the three IDs are unset, so a dispatch without
-them configured is a no-op rather than a failure. It also validates the IDs
-against `AWS_TEST_REGION` up front — IDs from another region otherwise surface
-minutes in, from deep inside `RunInstances`, after instances have been billed.
-Pick a subnet in an AZ that offers your instance type (`us-east-1e` does not offer
-`t3.micro`).
+The job is gated on `vars.AWS_TEST_REGION != ''`, so a dispatch on a repository
+without these configured skips rather than failing. The gate is what makes that
+true, not `tests/aws/conftest.py`: conftest does skip when the three IDs are
+unset, but pytest is never reached — `configure-aws-credentials` fails first on
+the empty region, so before
+[#161](https://github.com/scttfrdmn/parsl-aws-provider/issues/161) every dispatch
+was red.
+
+Once it does run, conftest validates the IDs against `AWS_TEST_REGION` up front —
+IDs from another region otherwise surface minutes in, from deep inside
+`RunInstances`, after instances have been billed. Pick a subnet in an AZ that
+offers your instance type (`us-east-1e` does not offer `t3.micro`).
 
 A final `always()` step runs `tools/cleanup_aws_resources.py --dry-run` to report
 orphans, since a failed test is exactly when instances are most likely to be left
-running. It reports without deleting, so CI never mutates a shared account.
+running. It reports without deleting, so CI never mutates a shared account. The
+script takes credentials from the boto3 chain — the OIDC credentials the earlier
+step exported — rather than a named profile; it previously defaulted to the local
+`aws` profile and died here on "The config profile (aws) could not be found".
 
 ### `test-bats`
 
