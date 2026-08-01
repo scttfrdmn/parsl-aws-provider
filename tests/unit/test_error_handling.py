@@ -13,22 +13,22 @@ from unittest.mock import MagicMock, patch
 from botocore.exceptions import ClientError, NoCredentialsError, ProfileNotFound
 from parsl.jobs.states import JobState
 
-from parsl_ephemeral_aws.provider import EphemeralAWSProvider
-from parsl_ephemeral_aws.compute.ec2 import EC2Manager
-from parsl_ephemeral_aws.modes.standard import StandardMode
-from parsl_ephemeral_aws.modes.detached import DetachedMode
-from parsl_ephemeral_aws.modes.serverless import ServerlessMode
-from parsl_ephemeral_aws.compute.spot_fleet import SpotFleetManager
-from parsl_ephemeral_aws.compute.lambda_func import LambdaManager
-from parsl_ephemeral_aws.compute.ecs import ECSManager
-from parsl_ephemeral_aws.constants import (
+from parsl_aws_provider.provider import EphemeralAWSProvider
+from parsl_aws_provider.compute.ec2 import EC2Manager
+from parsl_aws_provider.modes.standard import StandardMode
+from parsl_aws_provider.modes.detached import DetachedMode
+from parsl_aws_provider.modes.serverless import ServerlessMode
+from parsl_aws_provider.compute.spot_fleet import SpotFleetManager
+from parsl_aws_provider.compute.lambda_func import LambdaManager
+from parsl_aws_provider.compute.ecs import ECSManager
+from parsl_aws_provider.constants import (
     STATUS_CANCELLED,
     STATUS_FAILED,
     STATUS_PENDING,
     STATUS_SUCCEEDED,
     STATUS_UNKNOWN,
 )
-from parsl_ephemeral_aws.exceptions import (
+from parsl_aws_provider.exceptions import (
     AWSAuthenticationError,
     AWSConnectionError,
     JobSubmissionError,
@@ -917,7 +917,7 @@ class TestECSManagerErrors:
         session.client.return_value = ecs_client
         session.region_name = "us-east-1"
 
-        with patch("parsl_ephemeral_aws.compute.ecs.CredentialManager") as mock_cm:
+        with patch("parsl_aws_provider.compute.ecs.CredentialManager") as mock_cm:
             mock_cm.return_value.create_boto3_session.return_value = session
             with pytest.raises(ResourceCreationError):
                 ECSManager(provider=provider)
@@ -1425,7 +1425,7 @@ class TestEC2ManagerQuotaErrors:
         mock_session.resource.return_value = MagicMock()
         mock_session.region_name = "us-east-1"
 
-        with patch("parsl_ephemeral_aws.compute.ec2.CredentialManager") as mock_cm:
+        with patch("parsl_aws_provider.compute.ec2.CredentialManager") as mock_cm:
             mock_cm.return_value.create_boto3_session.return_value = mock_session
             manager = EC2Manager(provider=mock_provider)
         manager.ec2_client = mock_ec2

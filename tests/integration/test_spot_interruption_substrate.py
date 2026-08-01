@@ -36,7 +36,7 @@ import uuid
 
 import pytest
 
-from parsl_ephemeral_aws.compute.spot_interruption import SpotInterruptionMonitor
+from parsl_aws_provider.compute.spot_interruption import SpotInterruptionMonitor
 
 pytestmark = [pytest.mark.integration, pytest.mark.substrate]
 

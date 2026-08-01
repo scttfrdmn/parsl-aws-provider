@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **Renamed to `parsl-aws-provider`.** The distribution, the import package, and
+  the repository now agree: `parsl-ephemeral-aws` → `parsl-aws-provider`, and
+  `import parsl_ephemeral_aws` → `import parsl_aws_provider`. **Breaking for
+  imports**, but no released artifact is affected — the package has never been
+  published to PyPI (#180), so there is no installed version anywhere whose
+  imports could break. Doing it before the first publish is what makes it free;
+  afterwards it would have required a deprecation shim (#189).
+
+  Two things deliberately did **not** change. The public class names
+  (`EphemeralAWSProvider`, `GlobusComputeProvider`) are unchanged, so existing
+  code needs only its import line adjusted. And every AWS **resource** name
+  prefix — `parsl-ephemeral-ssm-role-`, `parsl-ephemeral-ssm-profile-`,
+  `parsl-ephemeral-spot-fleet-role-`, `parsl-ephemeral-sg`,
+  `parsl-ephemeral-cluster` — keeps its existing spelling, because
+  `tools/cleanup_aws_resources.py` reaps orphans by prefix and renaming them
+  would strand already-created resources in live accounts.
+
+### Added
+- **Independent-project disclaimer and a `NOTICE` file.** The README badges AWS,
+  Parsl, and Globus Compute, and the repository carried no non-endorsement text
+  at all. `NOTICE` now records that this is unaffiliated community work and
+  attributes the AWS, Parsl, Globus, and Docker marks nominatively. It also states
+  plainly that this is **not** the AWS provider that ships with Parsl — that is
+  `parsl.providers.AWSProvider`, a separate first-party implementation with a
+  different configuration contract.
+
+  `pyproject.toml` declares `license-files = ["LICENSE", "NOTICE"]` so the notice
+  travels with redistributions, as Apache 2.0 section 4(d) requires; setuptools
+  ships only `LICENSE` by default. That also required moving `license` from the
+  legacy `{text = "Apache-2.0"}` table to the PEP 639 SPDX string, since the two
+  forms cannot be mixed (#189).
+
 ### Security
 - **Dependency floors raised past three advisories, one HIGH.** `cryptography`
   `>=3.4.0` → `>=48.0.1` closes GHSA-537c-gmf6-5ccf (HIGH), the vulnerable

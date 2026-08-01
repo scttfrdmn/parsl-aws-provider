@@ -6,9 +6,9 @@ SPDX-FileCopyrightText: 2025-2026 Scott Friedman and Project Contributors
 
 import pytest
 
-from parsl_ephemeral_aws.security import NetworkSecurityPolicy, SecurityEnvironment
-from parsl_ephemeral_aws.security.cidr_manager import CIDRManager, CIDRValidationError
-from parsl_ephemeral_aws.config import SecurityConfig
+from parsl_aws_provider.security import NetworkSecurityPolicy, SecurityEnvironment
+from parsl_aws_provider.security.cidr_manager import CIDRManager, CIDRValidationError
+from parsl_aws_provider.config import SecurityConfig
 
 pytestmark = pytest.mark.unit
 

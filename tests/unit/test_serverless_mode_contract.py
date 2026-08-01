@@ -13,13 +13,13 @@ from unittest.mock import MagicMock
 import boto3
 import pytest
 
-from parsl_ephemeral_aws.constants import (
+from parsl_aws_provider.constants import (
     WORKER_TYPE_AUTO,
     WORKER_TYPE_ECS,
     WORKER_TYPE_LAMBDA,
 )
-from parsl_ephemeral_aws.exceptions import ConfigurationError
-from parsl_ephemeral_aws.modes.serverless import ServerlessMode
+from parsl_aws_provider.exceptions import ConfigurationError
+from parsl_aws_provider.modes.serverless import ServerlessMode
 
 
 pytestmark = pytest.mark.unit
@@ -165,7 +165,7 @@ class TestProviderParameterPlumbing:
         self, mock_session, mock_state_store
     ):
         """It arrives as a ComputeType, whose str() is the qualified name."""
-        from parsl_ephemeral_aws.provider import ComputeType
+        from parsl_aws_provider.provider import ComputeType
 
         mode = _mode(mock_session, mock_state_store, compute_type=ComputeType.LAMBDA)
         assert mode.worker_type == WORKER_TYPE_LAMBDA

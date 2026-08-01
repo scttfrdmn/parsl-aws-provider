@@ -11,7 +11,7 @@ from typing import Optional, Any
 
 
 def configure_logger(
-    logger_name: str = "parsl_ephemeral_aws",
+    logger_name: str = "parsl_aws_provider",
     level: int = logging.INFO,
     log_format: Optional[str] = None,
     file_path: Optional[str] = None,
@@ -23,7 +23,7 @@ def configure_logger(
     Parameters
     ----------
     logger_name : str, optional
-        Name of the logger, by default 'parsl_ephemeral_aws'
+        Name of the logger, by default 'parsl_aws_provider'
     level : int, optional
         Logging level, by default logging.INFO
     log_format : Optional[str], optional
@@ -81,11 +81,11 @@ def set_all_loggers_level(level: int) -> None:
         Logging level to set
     """
     # Main logger
-    logging.getLogger("parsl_ephemeral_aws").setLevel(level)
+    logging.getLogger("parsl_aws_provider").setLevel(level)
 
     # Submodule loggers
     for module in ["modes", "compute", "network", "state", "utils"]:
-        logging.getLogger(f"parsl_ephemeral_aws.{module}").setLevel(level)
+        logging.getLogger(f"parsl_aws_provider.{module}").setLevel(level)
 
 
 def get_boto3_clients_logger() -> logging.Logger:
@@ -141,7 +141,7 @@ def configure_provider_logging(
 
     # Configure main logger
     configure_logger(
-        logger_name="parsl_ephemeral_aws",
+        logger_name="parsl_aws_provider",
         level=level,
         file_path=log_file if isinstance(log_file, str) else None,
     )

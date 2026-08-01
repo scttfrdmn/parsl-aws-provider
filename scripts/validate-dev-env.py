@@ -24,15 +24,15 @@ from typing import List, Tuple
 def check_imports() -> List[Tuple[str, bool, str]]:
     """Test critical imports."""
     imports_to_test = [
-        ("parsl_ephemeral_aws", "Core package"),
-        ("parsl_ephemeral_aws.provider", "Main provider"),
-        ("parsl_ephemeral_aws.modes.standard", "Standard mode"),
-        ("parsl_ephemeral_aws.modes.detached", "Detached mode"),
-        ("parsl_ephemeral_aws.modes.serverless", "Serverless mode"),
-        ("parsl_ephemeral_aws.compute.spot_fleet", "Spot Fleet manager"),
-        ("parsl_ephemeral_aws.compute.lambda_func", "Lambda manager"),
-        ("parsl_ephemeral_aws.constants", "Constants"),
-        ("parsl_ephemeral_aws.exceptions", "Exceptions"),
+        ("parsl_aws_provider", "Core package"),
+        ("parsl_aws_provider.provider", "Main provider"),
+        ("parsl_aws_provider.modes.standard", "Standard mode"),
+        ("parsl_aws_provider.modes.detached", "Detached mode"),
+        ("parsl_aws_provider.modes.serverless", "Serverless mode"),
+        ("parsl_aws_provider.compute.spot_fleet", "Spot Fleet manager"),
+        ("parsl_aws_provider.compute.lambda_func", "Lambda manager"),
+        ("parsl_aws_provider.constants", "Constants"),
+        ("parsl_aws_provider.exceptions", "Exceptions"),
     ]
 
     results = []
@@ -49,7 +49,7 @@ def check_imports() -> List[Tuple[str, bool, str]]:
 def check_constants() -> List[Tuple[str, bool, str]]:
     """Test critical constants availability."""
     try:
-        from parsl_ephemeral_aws.constants import (
+        from parsl_aws_provider.constants import (
             DEFAULT_LAMBDA_RUNTIME,
             DEFAULT_ECS_CPU,
             DEFAULT_ECS_MEMORY,

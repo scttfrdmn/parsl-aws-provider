@@ -6,24 +6,34 @@ requires = ["setuptools>=42", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
-include = ["parsl_ephemeral_aws*"]
+include = ["parsl_aws_provider*"]
 
 # packages.find collects modules, not data files, so without this the
 # CloudFormation and Terraform templates are omitted from the wheel and
 # get_cf_template() cannot find bastion.yml in an installed package (#112).
 [tool.setuptools.package-data]
-parsl_ephemeral_aws = [
+parsl_aws_provider = [
     "templates/cloudformation/*.yml",
     "templates/terraform/*/*.tf",
 ]
 
 [project]
-name = "parsl-ephemeral-aws"
+name = "parsl-aws-provider"
 version = "0.8.0"
 description = "A modern, flexible AWS provider for the Parsl parallel scripting library"
 readme = "README.md"
 requires-python = ">=3.10"
-license = {text = "Apache-2.0"}
+# PEP 639: an SPDX expression string, not the legacy {text = ...} table. The two
+# forms cannot be mixed -- declaring license-files below makes setuptools validate
+# this key against PEP 639, which rejects the table with "project.license must be
+# string".
+license = "Apache-2.0"
+# Apache 2.0 section 4(d) requires the NOTICE text to travel with any
+# redistribution, and setuptools does not include it by default -- only LICENSE is
+# picked up automatically. Naming both here puts them in the wheel's
+# .dist-info/licenses/ and in the sdist. NOTICE carries the independent-project
+# disclaimer and the AWS/Parsl/Globus trademark attribution (#189).
+license-files = ["LICENSE", "NOTICE"]
 authors = [
     {name = "Scott Friedman and Project Contributors", email = "email@example.com"}
 ]
@@ -112,7 +122,7 @@ docs = [
 [project.urls]
 "Homepage" = "https://github.com/scttfrdmn/parsl-aws-provider"
 "Bug Tracker" = "https://github.com/scttfrdmn/parsl-aws-provider/issues"
-"Documentation" = "https://parsl-ephemeral-aws.readthedocs.io"
+"Documentation" = "https://parsl-aws-provider.readthedocs.io"
 
 # [tool.uv] conflicts removed with the localstack dependency (#125). The pin
 # existed because globus-compute-sdk requires dill==0.3.9 while localstack<4.10
@@ -147,7 +157,7 @@ python_functions = "test_*"
 python_classes = "Test*"
 addopts = [
     "--strict-markers",
-    "--cov=parsl_ephemeral_aws",
+    "--cov=parsl_aws_provider",
     "--cov-report=term-missing",
     "--cov-report=html",
     "--cov-report=xml",
@@ -175,7 +185,7 @@ markers = [
 ]
 
 [tool.coverage.run]
-source = ["parsl_ephemeral_aws"]
+source = ["parsl_aws_provider"]
 branch = true
 omit = [
     "tests/*",
@@ -220,7 +230,7 @@ search = 'version = "{current_version}"'
 replace = 'version = "{new_version}"'
 
 [[tool.bumpversion.files]]
-filename = "parsl_ephemeral_aws/__init__.py"
+filename = "parsl_aws_provider/__init__.py"
 search = '__version__ = "{current_version}"'
 replace = '__version__ = "{new_version}"'
 

@@ -19,7 +19,7 @@ from typing import Any, Dict, List, Optional
 import boto3
 from botocore.exceptions import ClientError
 
-from parsl_ephemeral_aws.constants import (
+from parsl_aws_provider.constants import (
     DEFAULT_BASTION_HOST_TYPE,
     DEFAULT_BASTION_IDLE_TIMEOUT,
     DEFAULT_PRESERVE_BASTION,
@@ -34,13 +34,13 @@ from parsl_ephemeral_aws.constants import (
     STATUS_RUNNING,
     STATUS_UNKNOWN,
 )
-from parsl_ephemeral_aws.exceptions import (
+from parsl_aws_provider.exceptions import (
     OperatingModeError,
     ResourceCreationError,
 )
-from parsl_ephemeral_aws.modes.base import OperatingMode
-from parsl_ephemeral_aws.state.base import STATE_KEY_MODE, StateStore
-from parsl_ephemeral_aws.utils.aws import (
+from parsl_aws_provider.modes.base import OperatingMode
+from parsl_aws_provider.state.base import STATE_KEY_MODE, StateStore
+from parsl_aws_provider.utils.aws import (
     architecture_for_instance_type,
     delete_ec2_fleet,
     get_default_ami,
@@ -48,10 +48,10 @@ from parsl_ephemeral_aws.utils.aws import (
     wait_for_resource,
     get_cf_template,
 )
-from parsl_ephemeral_aws.compute.spot_fleet_cleanup import (
+from parsl_aws_provider.compute.spot_fleet_cleanup import (
     cleanup_all_spot_fleet_resources,
 )
-from parsl_ephemeral_aws.compute.spot_interruption import SpotInterruptionMonitor
+from parsl_aws_provider.compute.spot_interruption import SpotInterruptionMonitor
 
 
 logger = logging.getLogger(__name__)

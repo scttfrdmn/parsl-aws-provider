@@ -16,7 +16,7 @@ import pytest
 
 from parsl.jobs.states import JobState
 
-from parsl_ephemeral_aws.constants import (
+from parsl_aws_provider.constants import (
     DEFAULT_BASTION_HOST_TYPE,
     DEFAULT_BASTION_IDLE_TIMEOUT,
     DEFAULT_ECS_CONTAINER_IMAGE,
@@ -28,10 +28,10 @@ from parsl_ephemeral_aws.constants import (
     DEFAULT_WARM_POOL_TTL,
     STATUS_INTERRUPTED,
 )
-from parsl_ephemeral_aws.exceptions import ProviderConfigurationError, ProviderError
-from parsl_ephemeral_aws.provider import EphemeralAWSProvider
-from parsl_ephemeral_aws.state.base import STATE_KEY_MODE, STATE_KEY_PROVIDER
-from parsl_ephemeral_aws.state.file import FileStateStore
+from parsl_aws_provider.exceptions import ProviderConfigurationError, ProviderError
+from parsl_aws_provider.provider import EphemeralAWSProvider
+from parsl_aws_provider.state.base import STATE_KEY_MODE, STATE_KEY_PROVIDER
+from parsl_aws_provider.state.file import FileStateStore
 
 
 # ---------------------------------------------------------------------------
@@ -57,7 +57,7 @@ def _make_provider(tmp_dir, max_blocks=5, **extra_kwargs):
     mode_mock.list_resources.return_value = {}
 
     with (
-        patch("parsl_ephemeral_aws.provider.create_session") as mock_session_factory,
+        patch("parsl_aws_provider.provider.create_session") as mock_session_factory,
         patch.object(
             EphemeralAWSProvider,
             "_initialize_state_store",
@@ -417,8 +417,8 @@ class TestAMIBaking:
         provider_id = f"test-{uuid.uuid4().hex[:8]}"
         state_file = os.path.join(tmp_dir, f"{provider_id}.json")
 
-        from parsl_ephemeral_aws.state.file import FileStateStore
-        from parsl_ephemeral_aws.modes.standard import StandardMode
+        from parsl_aws_provider.state.file import FileStateStore
+        from parsl_aws_provider.modes.standard import StandardMode
 
         state_store = FileStateStore(file_path=state_file, provider_id=provider_id)
 
@@ -460,8 +460,8 @@ class TestAMIBaking:
         provider_id = f"test-{uuid.uuid4().hex[:8]}"
         state_file = os.path.join(tmp_dir, f"{provider_id}.json")
 
-        from parsl_ephemeral_aws.state.file import FileStateStore
-        from parsl_ephemeral_aws.modes.standard import StandardMode
+        from parsl_aws_provider.state.file import FileStateStore
+        from parsl_aws_provider.modes.standard import StandardMode
 
         state_store = FileStateStore(file_path=state_file, provider_id=provider_id)
 
@@ -485,7 +485,7 @@ class TestAMIBaking:
             security_group_id="sg-123",
         )
 
-        with patch("parsl_ephemeral_aws.modes.standard.wait_for_resource") as mock_wait:
+        with patch("parsl_aws_provider.modes.standard.wait_for_resource") as mock_wait:
             ami_id = mode._bake_ami()
 
         assert ami_id == "ami-baked001"
@@ -508,8 +508,8 @@ class TestAMIBaking:
         provider_id = f"test-{uuid.uuid4().hex[:8]}"
         state_file = os.path.join(tmp_dir, f"{provider_id}.json")
 
-        from parsl_ephemeral_aws.state.file import FileStateStore
-        from parsl_ephemeral_aws.modes.standard import StandardMode
+        from parsl_aws_provider.state.file import FileStateStore
+        from parsl_aws_provider.modes.standard import StandardMode
 
         state_store = FileStateStore(file_path=state_file, provider_id=provider_id)
         session_mock = MagicMock()
@@ -551,8 +551,8 @@ class TestAMIBaking:
         provider_id = f"test-{uuid.uuid4().hex[:8]}"
         state_file = os.path.join(tmp_dir, f"{provider_id}.json")
 
-        from parsl_ephemeral_aws.state.file import FileStateStore
-        from parsl_ephemeral_aws.modes.standard import StandardMode
+        from parsl_aws_provider.state.file import FileStateStore
+        from parsl_aws_provider.modes.standard import StandardMode
 
         state_store = FileStateStore(file_path=state_file, provider_id=provider_id)
         session_mock = MagicMock()
@@ -598,8 +598,8 @@ class TestAMIBaking:
         provider_id = f"test-{uuid.uuid4().hex[:8]}"
         state_file = os.path.join(tmp_dir, f"{provider_id}.json")
 
-        from parsl_ephemeral_aws.state.file import FileStateStore
-        from parsl_ephemeral_aws.modes.standard import StandardMode
+        from parsl_aws_provider.state.file import FileStateStore
+        from parsl_aws_provider.modes.standard import StandardMode
 
         state_store = FileStateStore(file_path=state_file, provider_id=provider_id)
 
@@ -690,7 +690,7 @@ class TestOneShotMode:
 
     def _one_shot_mode(self, tmp_dir, **overrides):
         """Build a StandardMode with one_shot=True and a mocked session."""
-        from parsl_ephemeral_aws.modes.standard import StandardMode
+        from parsl_aws_provider.modes.standard import StandardMode
 
         provider_id = f"test-{uuid.uuid4().hex[:8]}"
         state_file = os.path.join(tmp_dir, f"{provider_id}.json")
@@ -797,7 +797,7 @@ class TestOneShotMode:
 
     def test_one_shot_status_comes_from_the_ssm_exit_code(self, tmp_dir):
         """A non-zero exit must report FAILED, not COMPLETED."""
-        from parsl_ephemeral_aws.constants import STATUS_COMPLETED, STATUS_FAILED
+        from parsl_aws_provider.constants import STATUS_COMPLETED, STATUS_FAILED
 
         mode = self._one_shot_mode(tmp_dir)
         mode.resources["i-123"] = {
@@ -861,7 +861,7 @@ class TestStateKeySeparation:
     @staticmethod
     def _mode(provider_id, state_store):
         """Return a StandardMode sharing *state_store* with the provider."""
-        from parsl_ephemeral_aws.modes.standard import StandardMode
+        from parsl_aws_provider.modes.standard import StandardMode
 
         return StandardMode(
             provider_id=provider_id,
@@ -976,9 +976,7 @@ class TestStateKeySeparation:
         the ID default, as a real successor process would.
         """
         with (
-            patch(
-                "parsl_ephemeral_aws.provider.create_session"
-            ) as mock_session_factory,
+            patch("parsl_aws_provider.provider.create_session") as mock_session_factory,
             patch.object(
                 EphemeralAWSProvider,
                 "_initialize_operating_mode",
@@ -1121,7 +1119,7 @@ def _construct(mode, **extra_kwargs):
     built, so nothing here can mask it.
     """
     with (
-        patch("parsl_ephemeral_aws.provider.create_session") as mock_session_factory,
+        patch("parsl_aws_provider.provider.create_session") as mock_session_factory,
         patch.object(
             EphemeralAWSProvider, "_initialize_state_store", return_value=MagicMock()
         ),
@@ -1153,14 +1151,14 @@ def _construct_with_real_mode(mode, **extra_kwargs):
     so the mode is really constructed with whatever the provider passed.
     """
     with (
-        patch("parsl_ephemeral_aws.provider.create_session") as mock_session_factory,
+        patch("parsl_aws_provider.provider.create_session") as mock_session_factory,
         patch.object(
             EphemeralAWSProvider, "_initialize_state_store", return_value=MagicMock()
         ),
         patch.object(EphemeralAWSProvider, "_load_state", return_value=None),
-        patch("parsl_ephemeral_aws.modes.standard.StandardMode.initialize"),
-        patch("parsl_ephemeral_aws.modes.detached.DetachedMode.initialize"),
-        patch("parsl_ephemeral_aws.modes.serverless.ServerlessMode.initialize"),
+        patch("parsl_aws_provider.modes.standard.StandardMode.initialize"),
+        patch("parsl_aws_provider.modes.detached.DetachedMode.initialize"),
+        patch("parsl_aws_provider.modes.serverless.ServerlessMode.initialize"),
     ):
         mock_session_factory.return_value = MagicMock()
         return EphemeralAWSProvider(

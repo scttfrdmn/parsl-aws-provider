@@ -1,4 +1,4 @@
-# Ruff configuration for Parsl Ephemeral AWS Provider
+# Ruff configuration for Parsl AWS Provider
 
 [lint]
 extend-ignore = [
@@ -12,4 +12,4 @@ extend-ignore = [
 # section and warned about on every single invocation.
 [lint.per-file-ignores]
 # Allow F821 errors in compute modules that generate dynamic code templates
-"parsl_ephemeral_aws/compute/*.py" = ["F821", "F841"]
+"parsl_aws_provider/compute/*.py" = ["F821", "F841"]

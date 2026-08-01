@@ -39,7 +39,7 @@ log = logging.getLogger("launch-driver")
 DEFAULT_REGION = os.environ.get("AWS_TEST_REGION", "us-west-2")
 AWS_PROFILE = os.environ.get("AWS_TEST_PROFILE", "aws")
 
-# Amazon Linux 2023 AMIs per region (from parsl_ephemeral_aws/constants.py)
+# Amazon Linux 2023 AMIs per region (from parsl_aws_provider/constants.py)
 AL2023_AMI = {
     "us-east-1": "ami-080e1f13689e07408",
     "us-east-2": "ami-03d21eed81858c120",

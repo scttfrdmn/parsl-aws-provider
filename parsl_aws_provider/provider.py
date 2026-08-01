@@ -1,5 +1,5 @@
 """
-Parsl Ephemeral AWS Provider implementation.
+Parsl AWS Provider implementation.
 
 This module implements the main provider class that conforms to the Parsl
 execution provider interface.
@@ -21,7 +21,7 @@ from parsl.providers.base import ExecutionProvider
 from parsl.utils import RepresentationMixin
 from typeguard import typechecked
 
-from parsl_ephemeral_aws.constants import (
+from parsl_aws_provider.constants import (
     DEFAULT_BAKE_AMI,
     DEFAULT_BASTION_HOST_TYPE,
     DEFAULT_BASTION_IDLE_TIMEOUT,
@@ -45,23 +45,23 @@ from parsl_ephemeral_aws.constants import (
     STATUS_INTERRUPTED,
     STATUS_WARM,
 )
-from parsl_ephemeral_aws.exceptions import (
+from parsl_aws_provider.exceptions import (
     ProviderConfigurationError,
     ProviderError,
 )
-from parsl_ephemeral_aws.modes.base import OperatingMode
-from parsl_ephemeral_aws.modes.detached import DetachedMode
-from parsl_ephemeral_aws.modes.serverless import ServerlessMode
-from parsl_ephemeral_aws.modes.standard import StandardMode
-from parsl_ephemeral_aws.state.base import (
+from parsl_aws_provider.modes.base import OperatingMode
+from parsl_aws_provider.modes.detached import DetachedMode
+from parsl_aws_provider.modes.serverless import ServerlessMode
+from parsl_aws_provider.modes.standard import StandardMode
+from parsl_aws_provider.state.base import (
     STATE_KEY_MODE,
     STATE_KEY_PROVIDER,
     StateStore,
 )
-from parsl_ephemeral_aws.state.file import FileStateStore
-from parsl_ephemeral_aws.state.parameter_store import ParameterStoreStateStore
-from parsl_ephemeral_aws.state.s3 import S3StateStore
-from parsl_ephemeral_aws.utils.aws import (
+from parsl_aws_provider.state.file import FileStateStore
+from parsl_aws_provider.state.parameter_store import ParameterStoreStateStore
+from parsl_aws_provider.state.s3 import S3StateStore
+from parsl_aws_provider.utils.aws import (
     architecture_for_instance_type,
     create_session,
     describe_instance_capacity,

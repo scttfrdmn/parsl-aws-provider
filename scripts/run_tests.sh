@@ -130,7 +130,7 @@ fi
 # Run tests with or without coverage
 if [[ "$COVERAGE" == "true" ]]; then
   echo "Collecting coverage information..."
-  python3 -m pytest "$TEST_PATH" -v --cov=parsl_ephemeral_aws --cov-report=term --cov-report=html --cov-config="$PROJECT_ROOT/.coveragerc"
+  python3 -m pytest "$TEST_PATH" -v --cov=parsl_aws_provider --cov-report=term --cov-report=html --cov-config="$PROJECT_ROOT/.coveragerc"
 
   echo "Coverage report written to $PROJECT_ROOT/coverage_html_report/"
 

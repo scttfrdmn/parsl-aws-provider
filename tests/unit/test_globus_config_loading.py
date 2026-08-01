@@ -22,9 +22,9 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from parsl_ephemeral_aws import GlobusComputeProvider
-from parsl_ephemeral_aws.provider import EphemeralAWSProvider
-from parsl_ephemeral_aws.state.file import FileStateStore
+from parsl_aws_provider import GlobusComputeProvider
+from parsl_aws_provider.provider import EphemeralAWSProvider
+from parsl_aws_provider.state.file import FileStateStore
 
 get_config = pytest.importorskip(
     "globus_compute_endpoint.endpoint.config.utils",
@@ -52,7 +52,7 @@ def _make_provider(tmp_path, **extra_kwargs) -> GlobusComputeProvider:
     )
 
     with (
-        patch("parsl_ephemeral_aws.provider.create_session") as mock_session,
+        patch("parsl_aws_provider.provider.create_session") as mock_session,
         patch.object(
             EphemeralAWSProvider, "_initialize_state_store", return_value=state_store
         ),
@@ -87,7 +87,7 @@ def _load(endpoint_dir: Path):
     the binding of the YAML keys to constructor kwargs.
     """
     with (
-        patch("parsl_ephemeral_aws.provider.create_session") as mock_session,
+        patch("parsl_aws_provider.provider.create_session") as mock_session,
         patch.object(
             EphemeralAWSProvider,
             "_initialize_operating_mode",
@@ -168,7 +168,7 @@ class TestGeneratedConfigLoads:
             with pytest.raises(Exception, match="not a valid provider"):
                 _load(tmp_path / "ep")
         finally:
-            from parsl_ephemeral_aws.globus_compute import (
+            from parsl_aws_provider.globus_compute import (
                 _register_with_parsl_providers,
             )
 
@@ -189,7 +189,7 @@ class TestMultiUserLimitation:
         import parsl.providers
         from globus_compute_endpoint.endpoint.config.utils import load_config_yaml
 
-        from parsl_ephemeral_aws.globus_compute import _register_with_parsl_providers
+        from parsl_aws_provider.globus_compute import _register_with_parsl_providers
 
         rendered = (
             "engine:\n"
@@ -359,7 +359,7 @@ class TestEveryParameterSurvivesTheRoundTrip:
         """
         provider_id = f"test-{uuid.uuid4().hex[:8]}"
         with (
-            patch("parsl_ephemeral_aws.provider.create_session") as mock_session,
+            patch("parsl_aws_provider.provider.create_session") as mock_session,
             patch.object(
                 EphemeralAWSProvider,
                 "_initialize_state_store",
@@ -410,7 +410,7 @@ class TestEveryParameterSurvivesTheRoundTrip:
         import inspect
 
         signature = inspect.signature(EphemeralAWSProvider.__init__)
-        from parsl_ephemeral_aws.globus_compute import _SKIP_PARAMS
+        from parsl_aws_provider.globus_compute import _SKIP_PARAMS
 
         # Values chosen only to be non-default and type-plausible; the assertion
         # is about presence, not about what a sane configuration looks like.

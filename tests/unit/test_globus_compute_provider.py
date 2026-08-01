@@ -16,14 +16,14 @@ from unittest.mock import MagicMock, patch
 import parsl.providers
 import pytest
 
-from parsl_ephemeral_aws import GlobusComputeProvider
-from parsl_ephemeral_aws.globus_compute import (
+from parsl_aws_provider import GlobusComputeProvider
+from parsl_aws_provider.globus_compute import (
     _CONFIG_PY_SHIM,
     _PROVIDER_TYPE,
     _register_with_parsl_providers,
 )
-from parsl_ephemeral_aws.provider import EphemeralAWSProvider
-from parsl_ephemeral_aws.state.file import FileStateStore
+from parsl_aws_provider.provider import EphemeralAWSProvider
+from parsl_aws_provider.state.file import FileStateStore
 
 
 # ---------------------------------------------------------------------------
@@ -46,7 +46,7 @@ def _make_provider(tmp_path, **extra_kwargs) -> GlobusComputeProvider:
     mode_mock.list_resources.return_value = {}
 
     with (
-        patch("parsl_ephemeral_aws.provider.create_session") as mock_session,
+        patch("parsl_aws_provider.provider.create_session") as mock_session,
         patch.object(
             EphemeralAWSProvider,
             "_initialize_state_store",
@@ -94,7 +94,7 @@ class TestGlobusComputeProviderImport:
     """Verify the public import path works."""
 
     def test_importable_from_package(self):
-        """``from parsl_ephemeral_aws import GlobusComputeProvider`` works."""
+        """``from parsl_aws_provider import GlobusComputeProvider`` works."""
         # The import at the top of this file already validates this; an
         # explicit assertion makes the intent clear.
         assert GlobusComputeProvider is not None
@@ -318,7 +318,7 @@ class TestGenerateEndpointConfig:
         provider = _make_provider(tmp_path)
         provider.generate_endpoint_config(str(tmp_path / "ep"))
         shim = (tmp_path / "ep" / "config.py").read_text()
-        assert "import parsl_ephemeral_aws" in shim
+        assert "import parsl_aws_provider" in shim
         assert "load_config_yaml" in shim
 
     def test_shim_defines_module_level_config(self, tmp_path):

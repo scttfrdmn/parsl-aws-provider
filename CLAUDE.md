@@ -1,6 +1,6 @@
-# Using Claude Code for Parsl Ephemeral AWS Provider Development
+# Using Claude Code for Parsl AWS Provider Development
 
-This document provides guidance on effectively using Claude Code to develop the Parsl Ephemeral AWS Provider project. Claude Code's capabilities are particularly well-suited for this type of infrastructure-as-code development.
+This document provides guidance on effectively using Claude Code to develop the Parsl AWS Provider project. Claude Code's capabilities are particularly well-suited for this type of infrastructure-as-code development.
 
 ## Project Management — REQUIRED PRACTICES
 
@@ -52,7 +52,7 @@ authoritative — v0.1.0 through v0.7.0 are closed, so do not assign to them.
 - Current version: read it from `pyproject.toml` rather than from here. This line
   named `0.1.0` through six releases; `make version-check` prints the real value,
   and `make version-verify` asserts `pyproject.toml` and
-  `parsl_ephemeral_aws/__init__.py` agree.
+  `parsl_aws_provider/__init__.py` agree.
 
 ---
 
@@ -92,7 +92,7 @@ Claude Code can assist with:
 When working with Claude, it's helpful to maintain a clear project structure. Here's the recommended structure for this project:
 
 ```
-parsl_ephemeral_aws/
+parsl_aws_provider/
 ├── __init__.py
 ├── provider.py               # Main provider implementation
 ├── constants.py              # AWS-related constants and defaults
@@ -369,12 +369,12 @@ The virtual environment is created at `.venv/` automatically by `uv sync`.
    Do not maintain separate `requirements.txt` or `requirements-dev.txt` files.
 
 3. **Linting and formatting**: `ruff` only — `flake8`, `black`, and `isort` are
-   not dependencies of this project. Scope to `parsl_ephemeral_aws tests`, not
+   not dependencies of this project. Scope to `parsl_aws_provider tests`, not
    `.`: `tools/` carries pre-existing errors that #93 prunes in v0.8.0.
    ```bash
-   uv run ruff check parsl_ephemeral_aws tests
-   uv run ruff format parsl_ephemeral_aws
-   uv run mypy parsl_ephemeral_aws
+   uv run ruff check parsl_aws_provider tests
+   uv run ruff format parsl_aws_provider
+   uv run mypy parsl_aws_provider
    ```
    Or via the Makefile, which is what CI runs: `make lint-python type-check`.
 
@@ -417,7 +417,7 @@ Include comprehensive error handling, logging, and docstrings.
 
 ## Conclusion
 
-Claude Code is a powerful tool for developing the Parsl Ephemeral AWS Provider. By following these guidelines, you can maximize productivity and code quality throughout the development process.
+Claude Code is a powerful tool for developing the Parsl AWS Provider. By following these guidelines, you can maximize productivity and code quality throughout the development process.
 
 Remember to:
 - Provide clear context for code generation

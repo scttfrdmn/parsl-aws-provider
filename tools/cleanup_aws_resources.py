@@ -10,7 +10,7 @@ import sys
 from typing import List, Dict, Optional
 import logging
 
-from parsl_ephemeral_aws.utils.aws import (
+from parsl_aws_provider.utils.aws import (
     delete_ssm_instance_profile,
     ssm_instance_profile_names,
 )

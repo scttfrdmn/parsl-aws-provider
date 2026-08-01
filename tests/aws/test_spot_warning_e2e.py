@@ -53,16 +53,16 @@ import uuid
 
 import pytest
 
-from parsl_ephemeral_aws.compute.spot_interruption import SpotInterruptionMonitor
-from parsl_ephemeral_aws.constants import (
+from parsl_aws_provider.compute.spot_interruption import SpotInterruptionMonitor
+from parsl_aws_provider.constants import (
     SPOT_INTERRUPTION_EVENT_DETAIL_TYPE,
     SPOT_INTERRUPTION_EVENT_SOURCE,
     SPOT_INTERRUPTION_QUEUE_RETENTION_SECONDS,
     SPOT_INTERRUPTION_RULE_NAME_PREFIX,
     TAG_MANAGED,
 )
-from parsl_ephemeral_aws.provider import EphemeralAWSProvider
-from parsl_ephemeral_aws.utils.aws import (
+from parsl_aws_provider.provider import EphemeralAWSProvider
+from parsl_aws_provider.utils.aws import (
     create_spot_interruption_notifier,
     delete_spot_interruption_notifier,
 )
@@ -358,7 +358,7 @@ class TestFISInterruption:
         meaningful rather than a race that happened to be won.
         """
         return fis.create_experiment_template(
-            description="parsl-ephemeral-aws E2E spot interruption warning (#86)",
+            description="parsl-aws-provider E2E spot interruption warning (#86)",
             targets={
                 "workers": {
                     "resourceType": "aws:ec2:spot-instance",
@@ -375,7 +375,7 @@ class TestFISInterruption:
             },
             stopConditions=[{"source": "none"}],
             roleArn=AWS_TEST_FIS_ROLE_ARN,
-            tags={"ManagedBy": "parsl-ephemeral-aws-e2e"},
+            tags={"ManagedBy": "parsl-aws-provider-e2e"},
         )["experimentTemplate"]["id"]
 
     def test_the_warning_arrives_before_the_instance_dies(

@@ -47,8 +47,8 @@ from botocore.awsrequest import AWSResponse
 from botocore.config import Config
 from botocore.exceptions import ClientError
 
-from parsl_ephemeral_aws.constants import RESOURCE_TYPE_EC2
-from parsl_ephemeral_aws.exceptions import (
+from parsl_aws_provider.constants import RESOURCE_TYPE_EC2
+from parsl_aws_provider.exceptions import (
     BastionHostError,
     EC2InstanceError,
     LambdaFunctionError,
@@ -56,10 +56,10 @@ from parsl_ephemeral_aws.exceptions import (
     ResourceCreationError,
     ResourceNotFoundError,
 )
-from parsl_ephemeral_aws.modes.detached import DetachedMode
-from parsl_ephemeral_aws.modes.serverless import ServerlessMode
-from parsl_ephemeral_aws.modes.standard import StandardMode
-from parsl_ephemeral_aws.state.file import FileStateStore
+from parsl_aws_provider.modes.detached import DetachedMode
+from parsl_aws_provider.modes.serverless import ServerlessMode
+from parsl_aws_provider.modes.standard import StandardMode
+from parsl_aws_provider.state.file import FileStateStore
 from tests.substrate_support import is_substrate_available
 
 # A marker only *selects* tests; it never skips them. Every sibling
@@ -559,7 +559,7 @@ class TestPartialCleanup:
             "DeleteLaunchTemplate",
         )
         with patch(
-            "parsl_ephemeral_aws.modes.standard.delete_launch_template",
+            "parsl_aws_provider.modes.standard.delete_launch_template",
             side_effect=denied,
         ):
             with patch("logging.Logger.error") as mock_error:

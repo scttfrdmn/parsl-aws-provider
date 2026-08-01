@@ -11,12 +11,12 @@ from typing import Dict, List, Any, Set
 import boto3
 from botocore.exceptions import ClientError
 
-from parsl_ephemeral_aws.constants import (
+from parsl_aws_provider.constants import (
     TAG_AWS_FLEET_ID,
     TAG_PREFIX,
     TAG_WORKFLOW_ID,
 )
-from parsl_ephemeral_aws.utils.aws import delete_ec2_fleet
+from parsl_aws_provider.utils.aws import delete_ec2_fleet
 
 
 logger = logging.getLogger(__name__)

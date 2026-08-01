@@ -1,4 +1,4 @@
-# Contributing to Parsl Ephemeral AWS Provider
+# Contributing to Parsl AWS Provider
 
 Thank you for your interest in contributing to this project! Here's how you can help.
 
@@ -40,14 +40,14 @@ Thank you for your interest in contributing to this project! Here's how you can 
 2. Make your changes and ensure they follow the project's coding standards
    ```bash
    # Format code and sort imports (ruff covers both)
-   uv run ruff format parsl_ephemeral_aws
-   uv run ruff check --fix parsl_ephemeral_aws tests
+   uv run ruff format parsl_aws_provider
+   uv run ruff check --fix parsl_aws_provider tests
 
    # Run linting
-   uv run ruff check parsl_ephemeral_aws tests
+   uv run ruff check parsl_aws_provider tests
 
    # Run type checking
-   uv run mypy parsl_ephemeral_aws
+   uv run mypy parsl_aws_provider
    ```
    Or all at once, exactly as CI runs them: `make lint-python type-check`.
 

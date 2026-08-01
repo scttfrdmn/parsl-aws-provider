@@ -18,10 +18,10 @@ from unittest.mock import MagicMock, patch
 import pytest
 from parsl.jobs.states import JobState
 
-from parsl_ephemeral_aws.exceptions import ProviderError
-from parsl_ephemeral_aws.provider import EphemeralAWSProvider
-from parsl_ephemeral_aws.state.base import STATE_KEY_PROVIDER
-from parsl_ephemeral_aws.state.file import FileStateStore
+from parsl_aws_provider.exceptions import ProviderError
+from parsl_aws_provider.provider import EphemeralAWSProvider
+from parsl_aws_provider.state.base import STATE_KEY_PROVIDER
+from parsl_aws_provider.state.file import FileStateStore
 from tests.substrate_support import is_substrate_available
 
 
@@ -56,7 +56,7 @@ def _make_provider_with_file_state(tmp_dir, provider_id=None, max_blocks=10):
     mode_mock.list_resources.return_value = {}
 
     with (
-        patch("parsl_ephemeral_aws.provider.create_session") as mock_sf,
+        patch("parsl_aws_provider.provider.create_session") as mock_sf,
         patch.object(
             EphemeralAWSProvider,
             "_initialize_state_store",
@@ -157,7 +157,7 @@ class TestJobLifecycle:
         mode_mock.cleanup_infrastructure.return_value = None
 
         with (
-            patch("parsl_ephemeral_aws.provider.create_session") as mock_sf,
+            patch("parsl_aws_provider.provider.create_session") as mock_sf,
             patch.object(
                 EphemeralAWSProvider,
                 "_initialize_state_store",

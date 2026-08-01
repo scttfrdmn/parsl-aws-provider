@@ -17,7 +17,7 @@ to run it.
 ## Key components
 
 ```
-parsl_ephemeral_aws/
+parsl_aws_provider/
 ├── provider.py                 # EphemeralAWSProvider — the Parsl interface
 ├── globus_compute.py           # GlobusComputeProvider subclass
 ├── constants.py                # AWS constants and defaults

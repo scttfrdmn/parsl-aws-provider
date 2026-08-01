@@ -1,0 +1,56 @@
+Parsl AWS Provider
+Copyright 2025-2026 Scott Friedman and Project Contributors
+
+This product includes software developed by Scott Friedman and Project
+Contributors, licensed under the Apache License, Version 2.0. See the LICENSE
+file for the full license text.
+
+
+INDEPENDENT PROJECT / NO ENDORSEMENT
+------------------------------------
+
+This is an independent, community-maintained project. It is not an official
+product of, nor is it endorsed, sponsored, or approved by, any of the projects
+or organizations named below. Any views expressed in this repository are those
+of the individual contributors and not of their employers.
+
+In particular, this package is NOT the AWS provider that ships with Parsl. Parsl
+includes its own first-party provider, parsl.providers.AWSProvider, maintained by
+the Parsl project. This package is a separate implementation with a different
+design and a different configuration contract, and it is not a drop-in
+replacement for it.
+
+
+TRADEMARK ATTRIBUTION
+---------------------
+
+Amazon Web Services, AWS, Amazon EC2, AWS Lambda, Amazon ECS, AWS Fargate, AWS
+Systems Manager, and Amazon S3 are trademarks of Amazon.com, Inc. or its
+affiliates. Use of these names in this project is nominative -- they identify the
+services this software interoperates with -- and does not imply any affiliation
+with or endorsement by Amazon.com, Inc. or its affiliates.
+
+Parsl is a project of the Parsl developer community. Its name and marks are used
+here nominatively to identify the library this software extends, and do not imply
+affiliation with or endorsement by the Parsl project.
+
+Globus and Globus Compute are trademarks of the University of Chicago. Their use
+here is nominative, identifying the platform this software integrates with, and
+does not imply affiliation with or endorsement by the University of Chicago or
+the Globus organization.
+
+Docker is a trademark of Docker, Inc. Its use here is nominative and does not
+imply affiliation or endorsement.
+
+All other trademarks are the property of their respective owners.
+
+
+THIRD-PARTY DEPENDENCIES
+------------------------
+
+This software depends on third-party packages, each distributed under its own
+license. Their licenses govern their own use and redistribution; see the
+dependency metadata in pyproject.toml and the individual packages for details.
+
+SPDX-License-Identifier: Apache-2.0
+SPDX-FileCopyrightText: 2025-2026 Scott Friedman and Project Contributors

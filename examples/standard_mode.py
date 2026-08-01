@@ -31,7 +31,7 @@ from parsl.app.python import python_app
 from parsl.config import Config
 from parsl.executors import HighThroughputExecutor
 
-from parsl_ephemeral_aws import EphemeralAWSProvider
+from parsl_aws_provider import EphemeralAWSProvider
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("standard-mode")

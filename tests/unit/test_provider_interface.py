@@ -17,9 +17,9 @@ import pytest
 
 from parsl.jobs.states import JobState, JobStatus
 
-from parsl_ephemeral_aws.exceptions import ProviderError
-from parsl_ephemeral_aws.provider import EphemeralAWSProvider
-from parsl_ephemeral_aws.state.file import FileStateStore
+from parsl_aws_provider.exceptions import ProviderError
+from parsl_aws_provider.provider import EphemeralAWSProvider
+from parsl_aws_provider.state.file import FileStateStore
 
 
 # ---------------------------------------------------------------------------
@@ -49,7 +49,7 @@ def _make_provider(tmp_dir, mode_mock=None, max_blocks=5):
         mode_mock.list_resources.return_value = {}
 
     with (
-        patch("parsl_ephemeral_aws.provider.create_session") as mock_session_factory,
+        patch("parsl_aws_provider.provider.create_session") as mock_session_factory,
         patch.object(
             EphemeralAWSProvider,
             "_initialize_state_store",
@@ -455,7 +455,7 @@ class TestExecutionProviderConformance:
     def test_cores_and_mem_per_node_resolved(self, tmp_dir):
         """The base class declares both; EC2 modes populate them from the API."""
         with patch(
-            "parsl_ephemeral_aws.provider.describe_instance_capacity",
+            "parsl_aws_provider.provider.describe_instance_capacity",
             return_value=(2, 1.0),
         ):
             provider, _ = _make_provider(tmp_dir)
@@ -470,9 +470,9 @@ class TestExecutionProviderConformance:
         state_store = FileStateStore(file_path=state_file, provider_id=provider_id)
 
         with (
-            patch("parsl_ephemeral_aws.provider.create_session"),
+            patch("parsl_aws_provider.provider.create_session"),
             patch(
-                "parsl_ephemeral_aws.provider.describe_instance_capacity"
+                "parsl_aws_provider.provider.describe_instance_capacity"
             ) as mock_lookup,
             patch.object(
                 EphemeralAWSProvider,

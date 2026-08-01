@@ -30,7 +30,7 @@ what the provider actually calls:
 ```python
 import json
 
-from parsl_ephemeral_aws import GlobusComputeProvider
+from parsl_aws_provider import GlobusComputeProvider
 
 print(json.dumps(GlobusComputeProvider.minimum_iam_policy(), indent=2))
 print(json.dumps(GlobusComputeProvider.minimum_iam_policy(include_ecr=True), indent=2))
@@ -295,7 +295,7 @@ aws s3api put-bucket-encryption --bucket my-parsl-state-bucket \
 before the first `submit()`:
 
 ```python
-from parsl_ephemeral_aws.state.parameter_store import ParameterStoreState
+from parsl_aws_provider.state.parameter_store import ParameterStoreState
 
 provider.state_store = ParameterStoreState(
     provider=provider,
@@ -351,13 +351,13 @@ work.
 
 ### Audit logging
 
-`parsl_ephemeral_aws.security.audit` provides `AuditLogger` and
+`parsl_aws_provider.security.audit` provides `AuditLogger` and
 `SecurityMonitor`. `ParameterStoreState` emits `STATE_ACCESS` events when the
 provider has an `audit_logger` attribute — but the provider takes no such
 constructor argument and sets no such attribute, so you must attach one yourself:
 
 ```python
-from parsl_ephemeral_aws.security.audit import AuditLogger
+from parsl_aws_provider.security.audit import AuditLogger
 
 provider.audit_logger = AuditLogger(log_file="parsl-audit.jsonl")
 ```

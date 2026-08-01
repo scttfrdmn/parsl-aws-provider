@@ -16,7 +16,7 @@ from typing import Any, Dict, List, Optional
 import boto3
 from botocore.exceptions import ClientError
 
-from parsl_ephemeral_aws.constants import (
+from parsl_aws_provider.constants import (
     DEFAULT_RESOURCE_CREATION_TIMEOUT,
     DEFAULT_SPOT_ALLOCATION_STRATEGY,
     EC2_STATUS_MAPPING,
@@ -33,16 +33,16 @@ from parsl_ephemeral_aws.constants import (
     STATUS_UNKNOWN,
     STATUS_WARM,
 )
-from parsl_ephemeral_aws.exceptions import (
+from parsl_aws_provider.exceptions import (
     OperatingModeError,
     ResourceCreationError,
     SpotFleetError,
 )
-from parsl_ephemeral_aws.modes.base import OperatingMode
-from parsl_ephemeral_aws.state.base import STATE_KEY_MODE
-from parsl_ephemeral_aws.compute.spot_fleet import SpotFleetManager
-from parsl_ephemeral_aws.compute.spot_interruption import SpotInterruptionMonitor
-from parsl_ephemeral_aws.utils.aws import (
+from parsl_aws_provider.modes.base import OperatingMode
+from parsl_aws_provider.state.base import STATE_KEY_MODE
+from parsl_aws_provider.compute.spot_fleet import SpotFleetManager
+from parsl_aws_provider.compute.spot_interruption import SpotInterruptionMonitor
+from parsl_aws_provider.utils.aws import (
     architecture_for_instance_type,
     build_launch_template_data,
     create_launch_template,

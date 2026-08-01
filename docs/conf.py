@@ -12,7 +12,7 @@ import sys
 # Add the project root directory to the Python path
 sys.path.insert(0, os.path.abspath(".."))
 
-project = "Parsl Ephemeral AWS Provider"
+project = "Parsl AWS Provider"
 copyright = "2025-2026, Scott Friedman and Project Contributors"
 author = "Scott Friedman and Project Contributors"
 
@@ -22,7 +22,7 @@ author = "Scott Friedman and Project Contributors"
 try:
     from importlib.metadata import version as _pkg_version
 
-    release = _pkg_version("parsl-ephemeral-aws")
+    release = _pkg_version("parsl-aws-provider")
 except Exception:  # pragma: no cover - docs build without the package installed
     release = "unknown"
 

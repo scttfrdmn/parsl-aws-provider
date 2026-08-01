@@ -20,14 +20,14 @@ import pytest
 from botocore.exceptions import ClientError, NoCredentialsError
 from moto import mock_aws
 
-from parsl_ephemeral_aws.constants import (
+from parsl_aws_provider.constants import (
     AMI_SSM_PARAMETER_TEMPLATE,
     ARCHITECTURE_ARM64,
     ARCHITECTURE_X86_64,
     DEFAULT_AMI_MAPPING,
 )
-from parsl_ephemeral_aws.exceptions import AMINotFoundError
-from parsl_ephemeral_aws.utils.aws import (
+from parsl_aws_provider.exceptions import AMINotFoundError
+from parsl_aws_provider.utils.aws import (
     architecture_for_instance_type,
     get_default_ami,
 )

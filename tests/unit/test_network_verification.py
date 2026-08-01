@@ -23,10 +23,10 @@ import boto3
 import pytest
 from botocore.exceptions import ClientError
 
-from parsl_ephemeral_aws.exceptions import ResourceNotFoundError
-from parsl_ephemeral_aws.modes.detached import DetachedMode
-from parsl_ephemeral_aws.modes.serverless import ServerlessMode
-from parsl_ephemeral_aws.modes.standard import StandardMode
+from parsl_aws_provider.exceptions import ResourceNotFoundError
+from parsl_aws_provider.modes.detached import DetachedMode
+from parsl_aws_provider.modes.serverless import ServerlessMode
+from parsl_aws_provider.modes.standard import StandardMode
 
 
 pytestmark = pytest.mark.unit

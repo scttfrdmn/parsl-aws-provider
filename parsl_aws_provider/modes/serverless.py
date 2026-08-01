@@ -14,7 +14,7 @@ from typing import Any, Dict, List, Optional
 import boto3
 from botocore.exceptions import ClientError
 
-from parsl_ephemeral_aws.constants import (
+from parsl_aws_provider.constants import (
     DEFAULT_INSTANCE_TYPE,
     DEFAULT_REGION,
     LAUNCH_TEMPLATE_NAME_PREFIX,
@@ -40,18 +40,18 @@ from parsl_ephemeral_aws.constants import (
     DEFAULT_ECS_MEMORY,
     DEFAULT_ECS_CONTAINER_IMAGE,
 )
-from parsl_ephemeral_aws.exceptions import (
+from parsl_aws_provider.exceptions import (
     ConfigurationError,
     JobSubmissionError,
     OperatingModeError,
     ResourceCreationError,
 )
-from parsl_ephemeral_aws.modes.base import OperatingMode
-from parsl_ephemeral_aws.state.base import STATE_KEY_MODE
-from parsl_ephemeral_aws.compute.lambda_func import LambdaManager
-from parsl_ephemeral_aws.compute.ecs import ECSManager
-from parsl_ephemeral_aws.compute.spot_interruption import SpotInterruptionMonitor
-from parsl_ephemeral_aws.utils.aws import (
+from parsl_aws_provider.modes.base import OperatingMode
+from parsl_aws_provider.state.base import STATE_KEY_MODE
+from parsl_aws_provider.compute.lambda_func import LambdaManager
+from parsl_aws_provider.compute.ecs import ECSManager
+from parsl_aws_provider.compute.spot_interruption import SpotInterruptionMonitor
+from parsl_aws_provider.utils.aws import (
     architecture_for_instance_type,
     build_fleet_launch_template_configs,
     build_launch_template_data,
@@ -1656,7 +1656,7 @@ class ServerlessMode(OperatingMode):
         # Sweep any fleet resources the per-job stack deletes missed.
         if self.use_spot_fleet:
             try:
-                from parsl_ephemeral_aws.compute.spot_fleet_cleanup import (
+                from parsl_aws_provider.compute.spot_fleet_cleanup import (
                     cleanup_all_spot_fleet_resources,
                 )
 
@@ -1885,7 +1885,7 @@ class ServerlessMode(OperatingMode):
                 # Re-register existing spot fleet resources with interruption monitor if needed
                 if self.spot_interruption_handling and self.spot_interruption_monitor:
                     for resource_id, resource in self.resources.items():
-                        from parsl_ephemeral_aws.constants import (
+                        from parsl_aws_provider.constants import (
                             RESOURCE_TYPE_SPOT_FLEET,
                         )
 

@@ -39,8 +39,8 @@ import time
 import pytest
 from parsl.jobs.states import JobState
 
-from parsl_ephemeral_aws.constants import STATUS_WARM
-from parsl_ephemeral_aws.provider import EphemeralAWSProvider
+from parsl_aws_provider.constants import STATUS_WARM
+from parsl_aws_provider.provider import EphemeralAWSProvider
 
 logger = logging.getLogger(__name__)
 

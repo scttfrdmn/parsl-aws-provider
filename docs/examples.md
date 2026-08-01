@@ -23,7 +23,7 @@ uv run python examples/standard_mode.py
 import parsl
 from parsl.config import Config
 from parsl.executors import HighThroughputExecutor
-from parsl_ephemeral_aws import EphemeralAWSProvider
+from parsl_aws_provider import EphemeralAWSProvider
 
 provider = EphemeralAWSProvider(
     region="us-east-1",
@@ -76,7 +76,7 @@ the provider's AWS ones, and nothing runs at interpreter exit.
 import parsl
 from parsl.config import Config
 from parsl.executors import HighThroughputExecutor
-from parsl_ephemeral_aws import EphemeralAWSProvider
+from parsl_aws_provider import EphemeralAWSProvider
 
 provider = EphemeralAWSProvider(
     region="us-east-1",
@@ -138,7 +138,7 @@ automatically. Call `shutdown()` when the workflow is genuinely finished.
 import parsl
 from parsl.config import Config
 from parsl.executors import HighThroughputExecutor
-from parsl_ephemeral_aws import EphemeralAWSProvider
+from parsl_aws_provider import EphemeralAWSProvider
 
 # Lambda runs in the Lambda-managed VPC, so no network IDs are required.
 provider = EphemeralAWSProvider(
@@ -187,7 +187,7 @@ Dependencies must be in the deployment package or a layer. For ECS/Fargate, use
 import parsl
 from parsl.config import Config
 from parsl.executors import HighThroughputExecutor
-from parsl_ephemeral_aws import EphemeralAWSProvider
+from parsl_aws_provider import EphemeralAWSProvider
 
 provider = EphemeralAWSProvider(
     region="us-east-1",
@@ -311,7 +311,7 @@ code becomes the job status, and the instance terminates.
 ```python
 import time
 
-from parsl_ephemeral_aws import EphemeralAWSProvider
+from parsl_aws_provider import EphemeralAWSProvider
 
 provider = EphemeralAWSProvider(
     region="us-east-1",
@@ -392,7 +392,7 @@ it alone.
 ## State persistence and reconnection
 
 ```python
-from parsl_ephemeral_aws import EphemeralAWSProvider
+from parsl_aws_provider import EphemeralAWSProvider
 
 network = dict(
     region="us-east-1",
@@ -435,10 +435,10 @@ import logging
 import parsl
 from parsl.config import Config
 from parsl.executors import HighThroughputExecutor
-from parsl_ephemeral_aws import EphemeralAWSProvider
+from parsl_aws_provider import EphemeralAWSProvider
 
 parsl.set_stream_logger()
-logging.getLogger("parsl_ephemeral_aws").setLevel(logging.DEBUG)
+logging.getLogger("parsl_aws_provider").setLevel(logging.DEBUG)
 
 provider = EphemeralAWSProvider(
     region="us-east-1",
@@ -527,7 +527,7 @@ provider = AWSProvider(
 
 ```python
 # After
-from parsl_ephemeral_aws import EphemeralAWSProvider
+from parsl_aws_provider import EphemeralAWSProvider
 
 provider = EphemeralAWSProvider(
     # image_id is now optional — omit it to resolve the latest AL2023 AMI

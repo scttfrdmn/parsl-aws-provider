@@ -46,7 +46,7 @@ import logging
 import pytest
 from botocore.exceptions import ClientError
 
-from parsl_ephemeral_aws.constants import LAUNCH_TEMPLATE_NAME_PREFIX
+from parsl_aws_provider.constants import LAUNCH_TEMPLATE_NAME_PREFIX
 
 logger = logging.getLogger(__name__)
 

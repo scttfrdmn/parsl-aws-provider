@@ -10,7 +10,7 @@ SPDX-FileCopyrightText: 2025-2026 Scott Friedman and Project Contributors
 
 from unittest.mock import MagicMock, patch
 
-from parsl_ephemeral_aws.constants import DEFAULT_SPOT_ALLOCATION_STRATEGY
+from parsl_aws_provider.constants import DEFAULT_SPOT_ALLOCATION_STRATEGY
 
 
 def mock_provider(**overrides):
@@ -86,7 +86,7 @@ def make_manager(manager_cls, module, client=None, **provider_overrides):
     manager_cls : type
         The manager to construct, e.g. ``ECSManager``.
     module : str
-        Its module name under ``parsl_ephemeral_aws.compute``, e.g. ``"ecs"`` --
+        Its module name under ``parsl_aws_provider.compute``, e.g. ``"ecs"`` --
         needed because ``CredentialManager`` must be patched where it is *used*.
     client : Optional[MagicMock]
         Pre-configured client to hand back from every ``session.client()`` call.
@@ -102,6 +102,6 @@ def make_manager(manager_cls, module, client=None, **provider_overrides):
     session.resource.return_value = MagicMock()
     session.region_name = "us-east-1"
 
-    with patch(f"parsl_ephemeral_aws.compute.{module}.CredentialManager") as mock_cm:
+    with patch(f"parsl_aws_provider.compute.{module}.CredentialManager") as mock_cm:
         mock_cm.return_value.create_boto3_session.return_value = session
         return manager_cls(provider=provider)

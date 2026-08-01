@@ -9,14 +9,14 @@ from unittest.mock import MagicMock, patch
 import boto3
 import time
 
-from parsl_ephemeral_aws.modes.serverless import ServerlessMode
-from parsl_ephemeral_aws.state.base import STATE_KEY_MODE
-from parsl_ephemeral_aws.utils.aws import get_cf_template
-from parsl_ephemeral_aws.exceptions import (
+from parsl_aws_provider.modes.serverless import ServerlessMode
+from parsl_aws_provider.state.base import STATE_KEY_MODE
+from parsl_aws_provider.utils.aws import get_cf_template
+from parsl_aws_provider.exceptions import (
     JobSubmissionError,
     OperatingModeError,
 )
-from parsl_ephemeral_aws.constants import (
+from parsl_aws_provider.constants import (
     RESOURCE_TYPE_LAMBDA_FUNCTION,
     RESOURCE_TYPE_ECS_TASK,
     WORKER_TYPE_LAMBDA,
@@ -456,7 +456,7 @@ class TestServerlessMode:
         serverless_mode.initialized = True
 
         with patch(
-            "parsl_ephemeral_aws.modes.serverless.get_cf_template",
+            "parsl_aws_provider.modes.serverless.get_cf_template",
             wraps=get_cf_template,
         ) as mock_loader:
             serverless_mode.submit_job("job-1", "echo hello", 1)

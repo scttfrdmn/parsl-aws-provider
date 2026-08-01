@@ -17,12 +17,12 @@ try:
 except ImportError:
     _HAS_FCNTL = False
 
-from parsl_ephemeral_aws.exceptions import (
+from parsl_aws_provider.exceptions import (
     StateDeserializationError,
     StateSerializationError,
     StateStoreError,
 )
-from parsl_ephemeral_aws.state.base import (
+from parsl_aws_provider.state.base import (
     STATE_KEY_MODE,
     STATE_KEY_PROVIDER,
     StateStore,

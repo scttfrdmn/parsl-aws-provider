@@ -62,7 +62,7 @@ policy from the code rather than transcribing one:
 ```python
 import json
 
-from parsl_ephemeral_aws import GlobusComputeProvider
+from parsl_aws_provider import GlobusComputeProvider
 
 print(json.dumps(GlobusComputeProvider.minimum_iam_policy(), indent=2))
 print(json.dumps(GlobusComputeProvider.minimum_iam_policy(include_ecr=True), indent=2))
@@ -94,7 +94,7 @@ Tokens cache in `~/.globus_compute/storage.db` and refresh automatically.
 ### 1. Generate the config
 
 ```python
-from parsl_ephemeral_aws import GlobusComputeProvider
+from parsl_aws_provider import GlobusComputeProvider
 
 provider = GlobusComputeProvider(
     region="us-east-1",
@@ -122,8 +122,8 @@ This writes **two** files:
 Both are needed. Globus Compute resolves a provider's `type:` key by
 `getattr(parsl.providers, type_name, None)` and raises when that is `None`, so a
 class Parsl does not ship is unreachable — and `getattr` cannot walk a dotted
-path, so `type: parsl_ephemeral_aws.globus_compute.GlobusComputeProvider` can
-never resolve either. Importing `parsl_ephemeral_aws` assigns the class onto
+path, so `type: parsl_aws_provider.globus_compute.GlobusComputeProvider` can
+never resolve either. Importing `parsl_aws_provider` assigns the class onto
 `parsl.providers`, but the endpoint daemon has no reason to import this package.
 The `config.py` shim does that import and then hands `config.yaml` to Globus
 Compute's own loader; `get_config()` prefers `config.py` when both are present,
@@ -275,7 +275,7 @@ long-lived `globus-compute-endpoint` worker process the engine expects.
 ### Spot endpoint
 
 ```python
-from parsl_ephemeral_aws import GlobusComputeProvider
+from parsl_aws_provider import GlobusComputeProvider
 
 provider = GlobusComputeProvider(
     region="us-east-1",

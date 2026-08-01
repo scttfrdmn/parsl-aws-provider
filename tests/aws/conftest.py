@@ -16,8 +16,8 @@ import uuid
 import boto3
 import pytest
 
-from parsl_ephemeral_aws import GlobusComputeProvider
-from parsl_ephemeral_aws.provider import EphemeralAWSProvider
+from parsl_aws_provider import GlobusComputeProvider
+from parsl_aws_provider.provider import EphemeralAWSProvider
 
 logger = logging.getLogger(__name__)
 
