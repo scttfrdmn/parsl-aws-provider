@@ -164,6 +164,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The only fleet integration test constructed `SpotFleetManager` directly and then
   rebound `aws_session` and `ec2_client` by hand, which masked it exactly;
   the replacement asserts the manager's session **is** the mode's (closes #159).
+- **Detached mode could not start a bastion without a key pair — the ordinary
+  case.** `DetachedMode._create_bastion_host()` passed `KeyName=None` to
+  `run_instances` whenever no key pair was configured, which fails botocore's own
+  parameter validation before any request leaves the process. Since SSM needs no
+  key pair, `bastion_host_type="direct"` with no `key_name` is the normal
+  configuration, and it could not launch at all. `KeyName` is now sent only when
+  there is one, matching every comparable site in the package, which was already
+  conditional (closes #158).
+- `ECSManager._get_or_create_cluster()` indexed `response["clusters"]`, a key ECS
+  omits entirely rather than returning empty. The resulting `KeyError` was caught
+  and re-reported as "Failed to create ECS cluster" — naming an operation that had
+  not run yet, so the log pointed at the wrong call (refs #92).
 - **`error_history` recorded only the fleet errors nobody could classify.**
   `SpotFleetManager._translate_fleet_error()` called
   `RobustErrorHandler.handle_error()` on the unrecognized fallthrough alone, so
