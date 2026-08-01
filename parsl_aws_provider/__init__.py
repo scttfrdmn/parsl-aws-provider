@@ -1,4 +1,4 @@
-"""Parsl Ephemeral AWS Provider.
+"""Parsl AWS Provider.
 
 A modern, flexible AWS provider for the Parsl parallel scripting library that leverages
 ephemeral resources for cost-effective, scalable scientific computation.

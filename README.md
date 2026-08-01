@@ -10,6 +10,12 @@
 [![Docker](https://img.shields.io/badge/Docker-Container%20Support-blue.svg)](https://www.docker.com/)
 [![Status](https://img.shields.io/badge/Status-Alpha-yellow.svg)](CHANGELOG.md)
 
+> **Independent project.** This is an unaffiliated, community-maintained package. It
+> is **not** an official or endorsed product of Amazon Web Services, the Parsl
+> project, or Globus. It is not the AWS provider that ships with Parsl — that is
+> `parsl.providers.AWSProvider`, maintained by the Parsl project. See
+> [NOTICE](NOTICE) for trademark attribution.
+
 ## 🚀 What This Enables
 
 ✅ **Universal Connectivity**: Deploy from behind any firewall or NAT
@@ -184,7 +190,7 @@ uv run globus-compute-endpoint login
 ```
 
 ```python
-from parsl_ephemeral_aws import GlobusComputeProvider
+from parsl_aws_provider import GlobusComputeProvider
 
 provider = GlobusComputeProvider(
     region="us-east-1",

@@ -9,13 +9,13 @@ from unittest.mock import MagicMock
 import boto3
 from botocore.exceptions import ClientError
 
-from parsl_ephemeral_aws.modes.standard import StandardMode
-from parsl_ephemeral_aws.state.base import STATE_KEY_MODE
-from parsl_ephemeral_aws.exceptions import (
+from parsl_aws_provider.modes.standard import StandardMode
+from parsl_aws_provider.state.base import STATE_KEY_MODE
+from parsl_aws_provider.exceptions import (
     OperatingModeError,
     ResourceNotFoundError,
 )
-from parsl_ephemeral_aws.constants import (
+from parsl_aws_provider.constants import (
     RESOURCE_TYPE_EC2,
     STATUS_INTERRUPTED,
     STATUS_PENDING,

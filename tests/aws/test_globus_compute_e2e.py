@@ -46,7 +46,7 @@ import pytest
 
 from parsl.jobs.states import JobState
 
-from parsl_ephemeral_aws import GlobusComputeProvider
+from parsl_aws_provider import GlobusComputeProvider
 
 logger = logging.getLogger(__name__)
 
@@ -190,15 +190,15 @@ def _offline_provider(tmp_path, provider_id: str, network_ids: dict, **kwargs):
     """
     from unittest.mock import MagicMock, patch
 
-    from parsl_ephemeral_aws.provider import EphemeralAWSProvider
-    from parsl_ephemeral_aws.state.file import FileStateStore
+    from parsl_aws_provider.provider import EphemeralAWSProvider
+    from parsl_aws_provider.state.file import FileStateStore
 
     state_store = FileStateStore(
         file_path=str(tmp_path / f"{provider_id}.json"), provider_id=provider_id
     )
 
     with (
-        patch("parsl_ephemeral_aws.provider.create_session") as mock_sess,
+        patch("parsl_aws_provider.provider.create_session") as mock_sess,
         patch.object(
             EphemeralAWSProvider, "_initialize_state_store", return_value=state_store
         ),
@@ -555,7 +555,7 @@ class TestGlobusComputeEC2Cleanup:
         (not via Globus Compute service) to verify the underlying AWS teardown
         — the Globus Compute layer delegates resource lifecycle to the provider.
         """
-        from parsl_ephemeral_aws.provider import EphemeralAWSProvider
+        from parsl_aws_provider.provider import EphemeralAWSProvider
 
         state_file = str(tmp_path / f"state-{test_run_id}.json")
 

@@ -17,15 +17,15 @@ import pytest
 from unittest.mock import MagicMock, patch
 from botocore.exceptions import ClientError
 
-from parsl_ephemeral_aws.state.base import (
+from parsl_aws_provider.state.base import (
     STATE_KEY_MODE,
     STATE_KEY_PROVIDER,
     StateStore,
 )
-from parsl_ephemeral_aws.state.file import FileStateStore
-from parsl_ephemeral_aws.state.parameter_store import ParameterStoreState
-from parsl_ephemeral_aws.state.s3 import S3State
-from parsl_ephemeral_aws.exceptions import (
+from parsl_aws_provider.state.file import FileStateStore
+from parsl_aws_provider.state.parameter_store import ParameterStoreState
+from parsl_aws_provider.state.s3 import S3State
+from parsl_aws_provider.exceptions import (
     StateDeserializationError,
     StateError,
     StateSerializationError,

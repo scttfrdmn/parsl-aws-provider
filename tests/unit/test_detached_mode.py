@@ -11,13 +11,13 @@ import time
 import json
 from botocore.exceptions import ClientError
 
-from parsl_ephemeral_aws.modes.detached import DetachedMode
-from parsl_ephemeral_aws.state.base import STATE_KEY_MODE
-from parsl_ephemeral_aws.exceptions import (
+from parsl_aws_provider.modes.detached import DetachedMode
+from parsl_aws_provider.state.base import STATE_KEY_MODE
+from parsl_aws_provider.exceptions import (
     OperatingModeError,
     ResourceNotFoundError,
 )
-from parsl_ephemeral_aws.constants import (
+from parsl_aws_provider.constants import (
     RESOURCE_TYPE_BASTION,
     STATUS_INTERRUPTED,
     STATUS_PENDING,
@@ -210,8 +210,8 @@ class TestDetachedMode:
         # to create — that asymmetry is the point of the assertions above.
         assert not hasattr(mode, "create_vpc")
 
-    @patch("parsl_ephemeral_aws.modes.detached.get_default_ami")
-    @patch("parsl_ephemeral_aws.modes.detached.get_cf_template")
+    @patch("parsl_aws_provider.modes.detached.get_default_ami")
+    @patch("parsl_aws_provider.modes.detached.get_cf_template")
     def test_initialize_cloudformation(
         self,
         mock_get_cf_template,
@@ -253,7 +253,7 @@ class TestDetachedMode:
         # Verify state was saved
         detached_mode.state_store.save_state.assert_called()
 
-    @patch("parsl_ephemeral_aws.modes.detached.get_default_ami")
+    @patch("parsl_aws_provider.modes.detached.get_default_ami")
     def test_initialize_direct(
         self, mock_get_default_ami, detached_mode, mock_ec2_client
     ):

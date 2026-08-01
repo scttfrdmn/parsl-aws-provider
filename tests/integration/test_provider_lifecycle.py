@@ -31,12 +31,12 @@ from unittest.mock import MagicMock, patch
 import pytest
 from parsl.jobs.states import JobState
 
-from parsl_ephemeral_aws.exceptions import ProviderConfigurationError
-from parsl_ephemeral_aws.modes.detached import DetachedMode
-from parsl_ephemeral_aws.modes.serverless import ServerlessMode
-from parsl_ephemeral_aws.modes.standard import StandardMode
-from parsl_ephemeral_aws.provider import EphemeralAWSProvider
-from parsl_ephemeral_aws.state.file import FileStateStore
+from parsl_aws_provider.exceptions import ProviderConfigurationError
+from parsl_aws_provider.modes.detached import DetachedMode
+from parsl_aws_provider.modes.serverless import ServerlessMode
+from parsl_aws_provider.modes.standard import StandardMode
+from parsl_aws_provider.provider import EphemeralAWSProvider
+from parsl_aws_provider.state.file import FileStateStore
 from tests.substrate_support import get_substrate_endpoint, is_substrate_available
 
 # Skip all tests if the substrate emulator is not available

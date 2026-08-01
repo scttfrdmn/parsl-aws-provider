@@ -177,7 +177,7 @@ Outputs:
 ## Using the IDs with the Provider
 
 ```python
-from parsl_ephemeral_aws import EphemeralAWSProvider
+from parsl_aws_provider import EphemeralAWSProvider
 
 provider = EphemeralAWSProvider(
     region="us-east-1",

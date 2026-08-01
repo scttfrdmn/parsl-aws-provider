@@ -28,17 +28,17 @@ import uuid
 
 import pytest
 
-from parsl_ephemeral_aws.compute.spot_interruption import SpotInterruptionMonitor
-from parsl_ephemeral_aws.constants import (
+from parsl_aws_provider.compute.spot_interruption import SpotInterruptionMonitor
+from parsl_aws_provider.constants import (
     RESOURCE_TYPE_EC2,
     RESOURCE_TYPE_SPOT_FLEET,
     STATUS_INTERRUPTED,
     STATUS_RUNNING,
 )
-from parsl_ephemeral_aws.modes.detached import DetachedMode
-from parsl_ephemeral_aws.modes.serverless import ServerlessMode
-from parsl_ephemeral_aws.modes.standard import StandardMode
-from parsl_ephemeral_aws.state.file import FileStateStore
+from parsl_aws_provider.modes.detached import DetachedMode
+from parsl_aws_provider.modes.serverless import ServerlessMode
+from parsl_aws_provider.modes.standard import StandardMode
+from parsl_aws_provider.state.file import FileStateStore
 from tests.substrate_support import cleanup_substrate_vpc, setup_substrate_vpc
 
 pytestmark = [pytest.mark.integration, pytest.mark.substrate]

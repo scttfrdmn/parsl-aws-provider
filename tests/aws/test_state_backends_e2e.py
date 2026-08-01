@@ -26,7 +26,7 @@ import time
 
 import pytest
 
-from parsl_ephemeral_aws.provider import EphemeralAWSProvider
+from parsl_aws_provider.provider import EphemeralAWSProvider
 
 logger = logging.getLogger(__name__)
 

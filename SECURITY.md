@@ -2,7 +2,7 @@
 
 ## Supported Versions
 
-The following versions of Parsl Ephemeral AWS Provider are currently being supported with security updates:
+The following versions of Parsl AWS Provider are currently being supported with security updates:
 
 | Version | Supported          |
 | ------- | ------------------ |
@@ -10,7 +10,7 @@ The following versions of Parsl Ephemeral AWS Provider are currently being suppo
 
 ## Reporting a Vulnerability
 
-We take the security of the Parsl Ephemeral AWS Provider seriously. If you believe you've found a security vulnerability, please follow these steps:
+We take the security of the Parsl AWS Provider seriously. If you believe you've found a security vulnerability, please follow these steps:
 
 1. **Do not disclose the vulnerability publicly** on the issue tracker, mailing lists, or social media.
 
@@ -26,7 +26,7 @@ We take the security of the Parsl Ephemeral AWS Provider seriously. If you belie
 
 ## Security Best Practices
 
-When using the Parsl Ephemeral AWS Provider, follow these security best practices:
+When using the Parsl AWS Provider, follow these security best practices:
 
 ### AWS IAM Permissions
 
@@ -73,7 +73,7 @@ Security updates will be announced through:
 
 ## Security-related Configuration
 
-The Parsl Ephemeral AWS Provider includes several security-focused configuration options:
+The Parsl AWS Provider includes several security-focused configuration options:
 
 ```python
 provider = EphemeralAWSProvider(

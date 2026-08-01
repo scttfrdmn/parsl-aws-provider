@@ -2,7 +2,7 @@
 
 This module detects that AWS is reclaiming a spot instance and calls the
 handlers registered for it. It does not decide what to do about it: the
-response lives on :class:`~parsl_ephemeral_aws.modes.base.OperatingMode`, which
+response lives on :class:`~parsl_aws_provider.modes.base.OperatingMode`, which
 marks the doomed block interrupted so Parsl re-runs its tasks.
 
 SPDX-License-Identifier: Apache-2.0
@@ -19,14 +19,14 @@ import boto3
 from typing import Dict, List, Optional, Callable, Any
 from botocore.exceptions import ClientError
 
-from parsl_ephemeral_aws.constants import (
+from parsl_aws_provider.constants import (
     DEFAULT_SPOT_INTERRUPTION_CHECK_INTERVAL,
     DEFAULT_SPOT_INTERRUPTION_LEAD_TIME,
     SPOT_INTERRUPTION_QUEUE_WAIT_SECONDS,
     SPOT_INTERRUPTION_RULE_NAME_PREFIX,
     TAG_MANAGED,
 )
-from parsl_ephemeral_aws.utils.aws import (
+from parsl_aws_provider.utils.aws import (
     create_spot_interruption_notifier,
     delete_spot_interruption_notifier,
     get_ec2_fleet_instance_ids,

@@ -88,7 +88,7 @@ Since #69 the provider creates no network resources, so `vpc_id`, `subnet_id`, a
 
 ```python
 import boto3
-from parsl_ephemeral_aws import EphemeralAWSProvider
+from parsl_aws_provider import EphemeralAWSProvider
 
 ec2 = boto3.client("ec2")
 vpc = ec2.create_vpc(CidrBlock="10.0.0.0/16")["Vpc"]["VpcId"]
@@ -123,7 +123,7 @@ provider.cancel([job_id])
 
 `tests/substrate_support.py` holds the helpers. It lives under `tests/` rather than
 inside the shipped package, because no package code imports it — its predecessor,
-`parsl_ephemeral_aws/utils/localstack.py`, shipped to users who had no use for it.
+`parsl_aws_provider/utils/localstack.py`, shipped to users who had no use for it.
 
 ```python
 from tests.substrate_support import (

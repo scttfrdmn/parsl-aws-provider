@@ -20,7 +20,7 @@ try:
 except ModuleNotFoundError:  # pragma: no cover - 3.10 only
     import tomli as tomllib
 
-from parsl_ephemeral_aws.utils.aws import get_cf_template
+from parsl_aws_provider.utils.aws import get_cf_template
 
 pytestmark = pytest.mark.unit
 
@@ -82,13 +82,13 @@ def test_templates_are_declared_as_package_data():
     with pyproject.open("rb") as handle:
         config = tomllib.load(handle)
 
-    patterns = config["tool"]["setuptools"]["package-data"]["parsl_ephemeral_aws"]
+    patterns = config["tool"]["setuptools"]["package-data"]["parsl_aws_provider"]
 
     assert "templates/cloudformation/*.yml" in patterns
     # Every template the package loads must be matched by some declared pattern.
     template_dir = (
         Path(__file__).resolve().parents[2]
-        / "parsl_ephemeral_aws"
+        / "parsl_aws_provider"
         / "templates"
         / "cloudformation"
     )

@@ -31,7 +31,7 @@ checkout does.
 
 Two details worth knowing:
 
-* **Scope is `parsl_ephemeral_aws tests`, not `.`** — `tools/` carries pre-existing
+* **Scope is `parsl_aws_provider tests`, not `.`** — `tools/` carries pre-existing
   errors (bare excepts, unused imports) in one-off debug scripts that
   [#93](https://github.com/scttfrdmn/parsl-aws-provider/issues/93) prunes in
   v0.8.0. A `.`-scoped check could never pass.
@@ -44,7 +44,7 @@ Two details worth knowing:
 
 ### `type-check`
 
-`mypy parsl_ephemeral_aws`, reported but **not gated** (`continue-on-error: true`)
+`mypy parsl_aws_provider`, reported but **not gated** (`continue-on-error: true`)
 while the pre-existing error count is worked down under
 [#81](https://github.com/scttfrdmn/parsl-aws-provider/issues/81) and
 [#82](https://github.com/scttfrdmn/parsl-aws-provider/issues/82). Remove the
@@ -144,7 +144,7 @@ Builds the Sphinx documentation and uploads it as an artifact.
 ## `release.yml`
 
 Triggered by pushing a `v*` tag. Before anything else it **verifies the tag
-matches `parsl_ephemeral_aws.__version__`** — `bump-my-version` has silently
+matches `parsl_aws_provider.__version__`** — `bump-my-version` has silently
 missed `__init__.py` before (its `[tool.bumpversion]` search string drifted out of
 sync), and v0.6.0 shipped with `__version__ == "0.1.0"`. Catching that here
 matters because a PyPI version can never be reused. `make version-verify` runs the
@@ -181,7 +181,7 @@ on `PATH` rather than `.venv`. Use `uv run` (or the Makefile, which does).
 ```markdown
 [![CI](https://github.com/scttfrdmn/parsl-aws-provider/actions/workflows/ci.yml/badge.svg)](https://github.com/scttfrdmn/parsl-aws-provider/actions/workflows/ci.yml)
 [![codecov](https://codecov.io/gh/scttfrdmn/parsl-aws-provider/branch/main/graph/badge.svg)](https://codecov.io/gh/scttfrdmn/parsl-aws-provider)
-[![PyPI version](https://badge.fury.io/py/parsl-ephemeral-aws.svg)](https://badge.fury.io/py/parsl-ephemeral-aws)
+[![PyPI version](https://badge.fury.io/py/parsl-aws-provider.svg)](https://badge.fury.io/py/parsl-aws-provider)
 ```
 
 SPDX-License-Identifier: Apache-2.0

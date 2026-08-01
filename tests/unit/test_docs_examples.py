@@ -29,7 +29,7 @@ import pytest
 from parsl.config import Config
 from parsl.executors import HighThroughputExecutor
 
-from parsl_ephemeral_aws import EphemeralAWSProvider, GlobusComputeProvider
+from parsl_aws_provider import EphemeralAWSProvider, GlobusComputeProvider
 
 pytestmark = pytest.mark.unit
 
@@ -369,7 +369,7 @@ def test_no_default_pins_an_unsupported_python():
     package requires Python >= 3.10, so a 3.9 default could not run the same code
     as the driver either.
     """
-    from parsl_ephemeral_aws.constants import (
+    from parsl_aws_provider.constants import (
         DEFAULT_ECS_CONTAINER_IMAGE,
         DEFAULT_LAMBDA_RUNTIME,
     )
@@ -389,12 +389,12 @@ def test_the_lambda_runtime_default_is_one_cloudformation_allows():
 
     template = (
         Path(__file__).resolve().parents[2]
-        / "parsl_ephemeral_aws"
+        / "parsl_aws_provider"
         / "templates"
         / "cloudformation"
         / "lambda_worker.yml"
     ).read_text(encoding="utf-8")
-    from parsl_ephemeral_aws.constants import DEFAULT_LAMBDA_RUNTIME
+    from parsl_aws_provider.constants import DEFAULT_LAMBDA_RUNTIME
 
     allowed = re.findall(r"'(python3\.\d+)'", template)
     assert DEFAULT_LAMBDA_RUNTIME in allowed, (
@@ -425,7 +425,7 @@ def test_compute_type_has_no_auto() -> None:
     Several docs make the point that there is no provider-level "auto", which is
     only worth saying while it stays true.
     """
-    from parsl_ephemeral_aws.provider import ComputeType
+    from parsl_aws_provider.provider import ComputeType
 
     assert {c.value for c in ComputeType} == {"ec2", "lambda", "ecs"}
 
@@ -436,7 +436,7 @@ def test_no_atexit_hook_is_registered() -> None:
     If a hook is ever added, docs/troubleshooting.md and every example's `finally`
     rationale need revisiting — so make that a deliberate change, not a silent one.
     """
-    import parsl_ephemeral_aws.provider as provider_module
+    import parsl_aws_provider.provider as provider_module
 
     source = inspect.getsource(provider_module)
     assert "atexit" not in source, (
@@ -451,7 +451,7 @@ def test_default_worker_init_matches_docs() -> None:
     docs/getting_started.md and docs/troubleshooting.md both describe it as
     installing Python 3.11 and Parsl, which is the basis of the slow-startup advice.
     """
-    from parsl_ephemeral_aws.constants import DEFAULT_WORKER_INIT
+    from parsl_aws_provider.constants import DEFAULT_WORKER_INIT
 
     assert "python3.11" in DEFAULT_WORKER_INIT
     assert "parsl" in DEFAULT_WORKER_INIT

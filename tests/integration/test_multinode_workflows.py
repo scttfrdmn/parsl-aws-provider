@@ -11,7 +11,7 @@ There is no MPI support to test. The previous version of this file was written
 against a design that does not exist: it passed ``launcher=MpiExecLauncher()`` to
 modes that accept no such argument, then asserted ``mpirun`` had been spliced
 into the submitted command by launcher wiring the package has never had --
-``grep -rn launcher parsl_ephemeral_aws/`` finds nothing. Since #105 the provider
+``grep -rn launcher parsl_aws_provider/`` finds nothing. Since #105 the provider
 *rejects* unknown kwargs rather than absorbing them, so that construction now
 raises, which is asserted below as the honest answer to "how do I run MPI here".
 
@@ -39,18 +39,18 @@ import uuid
 
 import pytest
 
-from parsl_ephemeral_aws.constants import (
+from parsl_aws_provider.constants import (
     RESOURCE_TYPE_EC2,
     RESOURCE_TYPE_SPOT_FLEET,
     STATUS_CANCELED,
     WORKER_TYPE_ECS,
 )
-from parsl_ephemeral_aws.exceptions import ProviderConfigurationError
-from parsl_ephemeral_aws.modes.detached import DetachedMode
-from parsl_ephemeral_aws.modes.serverless import ServerlessMode
-from parsl_ephemeral_aws.modes.standard import StandardMode
-from parsl_ephemeral_aws.provider import EphemeralAWSProvider
-from parsl_ephemeral_aws.state.file import FileStateStore
+from parsl_aws_provider.exceptions import ProviderConfigurationError
+from parsl_aws_provider.modes.detached import DetachedMode
+from parsl_aws_provider.modes.serverless import ServerlessMode
+from parsl_aws_provider.modes.standard import StandardMode
+from parsl_aws_provider.provider import EphemeralAWSProvider
+from parsl_aws_provider.state.file import FileStateStore
 from tests.substrate_support import get_substrate_endpoint, is_substrate_available
 
 pytestmark = [

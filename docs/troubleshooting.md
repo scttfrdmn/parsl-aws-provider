@@ -21,7 +21,7 @@ implemented; they now fail loudly instead of being ignored.
 import logging
 
 logging.basicConfig(level=logging.INFO)
-logging.getLogger("parsl_ephemeral_aws").setLevel(logging.DEBUG)
+logging.getLogger("parsl_aws_provider").setLevel(logging.DEBUG)
 ```
 
 Or pass `debug=True` to the provider. Add `logging.getLogger("botocore").setLevel(
@@ -253,7 +253,7 @@ Generate the exact policy from the code rather than transcribing one:
 ```python
 import json
 
-from parsl_ephemeral_aws import GlobusComputeProvider
+from parsl_aws_provider import GlobusComputeProvider
 
 print(json.dumps(GlobusComputeProvider.minimum_iam_policy(), indent=2))
 ```
@@ -449,7 +449,7 @@ with:
 
 - What you ran, including the full provider configuration with IDs redacted
 - The full traceback
-- The provider version (`python -c "import parsl_ephemeral_aws; print(parsl_ephemeral_aws.__version__)"`)
+- The provider version (`python -c "import parsl_aws_provider; print(parsl_aws_provider.__version__)"`)
   and the Parsl version
 - `/var/log/cloud-init-output.log` from a worker, if the workers launched
 

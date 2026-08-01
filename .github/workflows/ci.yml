@@ -34,7 +34,7 @@ jobs:
         # Whole repo. The 107 pre-existing errors (bare excepts, unused imports)
         # that forced a narrower scope were all in the tools/ one-off debug
         # scripts #93 removed. flake8 was never a declared dependency, so the old
-        # `flake8 parsl_ephemeral_aws tests` step could only ever have failed.
+        # `flake8 parsl_aws_provider tests` step could only ever have failed.
         run: uv run ruff check .
       - name: Check formatting with ruff
         # ruff-format, not black: .pre-commit-config.yaml formats with ruff-format,
@@ -47,7 +47,7 @@ jobs:
         # do with the change.
         run: uv run ruff format --check .
       - name: Security scan with bandit
-        run: uv run bandit -r parsl_ephemeral_aws -c pyproject.toml
+        run: uv run bandit -r parsl_aws_provider -c pyproject.toml
 
   type-check:
     runs-on: ubuntu-latest
@@ -63,7 +63,7 @@ jobs:
         # #81/#82. Drop continue-on-error once the count reaches zero, so this
         # becomes a real gate rather than a signal.
         continue-on-error: true
-        run: uv run mypy parsl_ephemeral_aws
+        run: uv run mypy parsl_aws_provider
 
   unit-tests:
     runs-on: ubuntu-latest

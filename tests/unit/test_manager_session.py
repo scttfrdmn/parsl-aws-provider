@@ -20,8 +20,8 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from parsl_ephemeral_aws.constants import DEFAULT_REGION
-from parsl_ephemeral_aws.utils.aws import resolve_manager_session
+from parsl_aws_provider.constants import DEFAULT_REGION
+from parsl_aws_provider.utils.aws import resolve_manager_session
 
 pytestmark = pytest.mark.unit
 

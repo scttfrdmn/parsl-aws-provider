@@ -23,7 +23,7 @@ from botocore.exceptions import (
     TokenRetrievalError,
 )
 
-from parsl_ephemeral_aws.constants import (
+from parsl_aws_provider.constants import (
     AMI_SSM_PARAMETER_TEMPLATE,
     ARCHITECTURE_ARM64,
     ARCHITECTURE_X86_64,
@@ -43,7 +43,7 @@ from parsl_ephemeral_aws.constants import (
     SPOT_INTERRUPTION_QUEUE_RETENTION_SECONDS,
     TAG_AWS_FLEET_ID,
 )
-from parsl_ephemeral_aws.exceptions import (
+from parsl_aws_provider.exceptions import (
     AMINotFoundError,
     AWSAuthenticationError,
     AWSConnectionError,
@@ -1739,7 +1739,7 @@ def get_cf_template(template_name: str) -> str:
     from importlib.resources import files
 
     try:
-        resource = files("parsl_ephemeral_aws").joinpath(
+        resource = files("parsl_aws_provider").joinpath(
             "templates", "cloudformation", template_name
         )
         return resource.read_text(encoding="utf-8")
@@ -1756,7 +1756,7 @@ def get_cf_template(template_name: str) -> str:
 
         raise FileNotFoundError(
             f"CloudFormation template {template_name!r} not found in "
-            "parsl_ephemeral_aws/templates/cloudformation. If this is an "
+            "parsl_aws_provider/templates/cloudformation. If this is an "
             "installed package, the templates were not included in the "
             "distribution."
         )

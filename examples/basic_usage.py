@@ -30,7 +30,7 @@ import logging
 import os
 import sys
 
-from parsl_ephemeral_aws import EphemeralAWSProvider
+from parsl_aws_provider import EphemeralAWSProvider
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("basic-usage")

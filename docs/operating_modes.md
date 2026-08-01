@@ -40,7 +40,7 @@ development.
 ### Configuration
 
 ```python
-from parsl_ephemeral_aws import EphemeralAWSProvider
+from parsl_aws_provider import EphemeralAWSProvider
 
 provider = EphemeralAWSProvider(
     mode="standard",

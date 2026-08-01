@@ -19,7 +19,7 @@ the provider builds it, wiring in its own session, region, credentials, and audi
 logger:
 
 ```python
-from parsl_ephemeral_aws import EphemeralAWSProvider
+from parsl_aws_provider import EphemeralAWSProvider
 
 provider = EphemeralAWSProvider(
     region="us-east-1",
@@ -32,7 +32,7 @@ provider = EphemeralAWSProvider(
 ```
 
 `state_store_type` accepts a string or a `StateStoreType` enum member
-(`from parsl_ephemeral_aws.provider import StateStoreType`).
+(`from parsl_aws_provider.provider import StateStoreType`).
 
 ### File store (default)
 
@@ -92,7 +92,7 @@ create it.
 ## The store interface
 
 All three stores implement the same **keyed** interface from
-`parsl_ephemeral_aws.state.base.StateStore`:
+`parsl_aws_provider.state.base.StateStore`:
 
 ```text
 save_state(state_key: str, state_data: Dict[str, Any]) -> None
@@ -198,7 +198,7 @@ Subclass `StateStore` and implement the three keyed methods:
 ```python
 from typing import Any, Dict, Optional
 
-from parsl_ephemeral_aws.state.base import StateStore
+from parsl_aws_provider.state.base import StateStore
 
 
 class MyCustomStateStore(StateStore):

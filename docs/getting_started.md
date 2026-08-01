@@ -14,7 +14,7 @@ Or, working from a clone:
 uv sync --extra dev --extra test
 ```
 
-`uv add parsl-ephemeral-aws` will start working once
+`uv add parsl-aws-provider` will start working once
 [#180](https://github.com/scttfrdmn/parsl-aws-provider/issues/180) is resolved —
 the package name is unregistered, so that command currently fails with "no
 matching distribution found" rather than installing an older version.
@@ -47,7 +47,7 @@ public SSM parameters — x86_64 and arm64 alike, in every region.
 import parsl
 from parsl.config import Config
 from parsl.executors import HighThroughputExecutor
-from parsl_ephemeral_aws import EphemeralAWSProvider
+from parsl_aws_provider import EphemeralAWSProvider
 
 provider = EphemeralAWSProvider(
     region="us-east-1",
@@ -227,13 +227,13 @@ rather than on every launch.
 ## Monitoring
 
 The provider logs through the standard `logging` module under the
-`parsl_ephemeral_aws` hierarchy:
+`parsl_aws_provider` hierarchy:
 
 ```python
 import logging
 
 logging.basicConfig(level=logging.INFO)
-logging.getLogger("parsl_ephemeral_aws").setLevel(logging.DEBUG)
+logging.getLogger("parsl_aws_provider").setLevel(logging.DEBUG)
 ```
 
 Or pass `debug=True` to the provider.

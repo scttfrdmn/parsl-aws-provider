@@ -14,7 +14,7 @@ from pathlib import Path
 from unittest.mock import MagicMock
 from typing import Generator
 
-from parsl_ephemeral_aws.provider import EphemeralAWSProvider
+from parsl_aws_provider.provider import EphemeralAWSProvider
 from tests.substrate_support import (
     cleanup_substrate_vpc,
     create_substrate_session,

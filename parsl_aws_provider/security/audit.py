@@ -328,7 +328,7 @@ class AuditLogger:
         self.monitor = SecurityMonitor()
 
         # Setup audit logger
-        self.audit_logger = logging.getLogger("parsl_ephemeral_aws.security.audit")
+        self.audit_logger = logging.getLogger("parsl_aws_provider.security.audit")
         self.audit_logger.setLevel(logging.INFO)
 
         # Remove existing handlers to avoid duplicates

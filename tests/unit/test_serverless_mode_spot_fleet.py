@@ -10,9 +10,9 @@ from unittest.mock import MagicMock, patch
 import boto3
 import time
 
-from parsl_ephemeral_aws.exceptions import OperatingModeError
-from parsl_ephemeral_aws.modes.serverless import ServerlessMode
-from parsl_ephemeral_aws.constants import (
+from parsl_aws_provider.exceptions import OperatingModeError
+from parsl_aws_provider.modes.serverless import ServerlessMode
+from parsl_aws_provider.constants import (
     RESOURCE_TYPE_SPOT_FLEET,
     WORKER_TYPE_LAMBDA,
     WORKER_TYPE_ECS,
@@ -560,7 +560,7 @@ class TestServerlessModeSpotFleet:
         )
 
     @patch(
-        "parsl_ephemeral_aws.compute.spot_fleet_cleanup.cleanup_all_spot_fleet_resources"
+        "parsl_aws_provider.compute.spot_fleet_cleanup.cleanup_all_spot_fleet_resources"
     )
     def test_cleanup_infrastructure_with_spot_fleet(
         self, mock_cleanup_spot_fleet, serverless_mode_with_spot_fleet

@@ -2,7 +2,7 @@
 
 Renamed from ``tests/test_localstack.py`` in #125.
 
-Nothing here imports ``parsl_ephemeral_aws``: every test drives raw boto3 against
+Nothing here imports ``parsl_aws_provider``: every test drives raw boto3 against
 the emulator. That makes this the suite that answers "does the emulator still
 support what the provider relies on?" -- worth keeping distinct from the
 integration tests, which exercise provider code and would attribute an emulator

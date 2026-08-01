@@ -35,8 +35,8 @@ from unittest.mock import MagicMock, patch
 import pytest
 from botocore.exceptions import ClientError
 
-from parsl_ephemeral_aws.compute.spot_interruption import SpotInterruptionMonitor
-from parsl_ephemeral_aws.constants import (
+from parsl_aws_provider.compute.spot_interruption import SpotInterruptionMonitor
+from parsl_aws_provider.constants import (
     SPOT_INTERRUPTION_EVENT_DETAIL_TYPE,
     SPOT_INTERRUPTION_EVENT_SOURCE,
     SPOT_INTERRUPTION_QUEUE_RETENTION_SECONDS,
@@ -44,8 +44,8 @@ from parsl_ephemeral_aws.constants import (
     SPOT_INTERRUPTION_RULE_NAME_PREFIX,
     TAG_MANAGED,
 )
-from parsl_ephemeral_aws.exceptions import ResourceCreationError
-from parsl_ephemeral_aws.utils.aws import (
+from parsl_aws_provider.exceptions import ResourceCreationError
+from parsl_aws_provider.utils.aws import (
     create_spot_interruption_notifier,
     delete_spot_interruption_notifier,
 )
@@ -407,7 +407,7 @@ class TestMonitorNotifierLifecycle:
         monitor = SpotInterruptionMonitor(session, provider_id="abcdef123456")
 
         with patch(
-            "parsl_ephemeral_aws.compute.spot_interruption."
+            "parsl_aws_provider.compute.spot_interruption."
             "create_spot_interruption_notifier",
             return_value=(monitor._notifier_name, QUEUE_URL, QUEUE_ARN),
         ) as create:
@@ -434,7 +434,7 @@ class TestMonitorNotifierLifecycle:
         monitor = SpotInterruptionMonitor(session, provider_id="abcdef123456")
 
         with patch(
-            "parsl_ephemeral_aws.compute.spot_interruption."
+            "parsl_aws_provider.compute.spot_interruption."
             "create_spot_interruption_notifier",
             side_effect=ResourceCreationError("AccessDenied"),
         ):
@@ -451,7 +451,7 @@ class TestMonitorNotifierLifecycle:
         )
 
         with patch(
-            "parsl_ephemeral_aws.compute.spot_interruption."
+            "parsl_aws_provider.compute.spot_interruption."
             "create_spot_interruption_notifier",
         ) as create:
             monitor.start_monitoring()
@@ -471,7 +471,7 @@ class TestMonitorNotifierLifecycle:
         monitor = SpotInterruptionMonitor(session, provider_id="abcdef123456")
 
         with patch(
-            "parsl_ephemeral_aws.compute.spot_interruption."
+            "parsl_aws_provider.compute.spot_interruption."
             "create_spot_interruption_notifier",
             return_value=(monitor._notifier_name, QUEUE_URL, QUEUE_ARN),
         ) as create:
@@ -487,7 +487,7 @@ class TestMonitorNotifierLifecycle:
         monitor.warning_queue_url = QUEUE_URL
 
         with patch(
-            "parsl_ephemeral_aws.compute.spot_interruption."
+            "parsl_aws_provider.compute.spot_interruption."
             "delete_spot_interruption_notifier",
         ) as delete:
             monitor.stop_monitoring()
@@ -512,7 +512,7 @@ class TestMonitorNotifierLifecycle:
         assert monitor.monitoring_thread is None
 
         with patch(
-            "parsl_ephemeral_aws.compute.spot_interruption."
+            "parsl_aws_provider.compute.spot_interruption."
             "delete_spot_interruption_notifier",
         ) as delete:
             monitor.stop_monitoring()
@@ -523,7 +523,7 @@ class TestMonitorNotifierLifecycle:
         monitor = SpotInterruptionMonitor(session, provider_id="abcdef123456")
 
         with patch(
-            "parsl_ephemeral_aws.compute.spot_interruption."
+            "parsl_aws_provider.compute.spot_interruption."
             "delete_spot_interruption_notifier",
         ) as delete:
             monitor.stop_monitoring()
@@ -687,7 +687,7 @@ class TestPollWarningQueue:
         ec2 = MagicMock()
 
         with patch(
-            "parsl_ephemeral_aws.compute.spot_interruption.get_ec2_fleet_instance_ids",
+            "parsl_aws_provider.compute.spot_interruption.get_ec2_fleet_instance_ids",
             return_value=["i-abc123", "i-other"],
         ) as lookup:
             monitor._poll_warning_queue(sqs, ec2)
@@ -715,7 +715,7 @@ class TestPollWarningQueue:
         monitor.register_fleet("fleet-1", MagicMock())
 
         with patch(
-            "parsl_ephemeral_aws.compute.spot_interruption.get_ec2_fleet_instance_ids",
+            "parsl_aws_provider.compute.spot_interruption.get_ec2_fleet_instance_ids",
         ) as lookup:
             monitor._poll_warning_queue(sqs, MagicMock())
 

@@ -12,7 +12,7 @@ state documents working across the upgrade.
 
 Fleet type ``instant`` is used throughout: it returns the launched instance IDs
 synchronously, so a block knows its instances without polling. See
-:func:`parsl_ephemeral_aws.utils.aws.create_ec2_fleet` for the parameters this
+:func:`parsl_aws_provider.utils.aws.create_ec2_fleet` for the parameters this
 fleet type rejects, and why capacity rebalancing is not among the options.
 
 SPDX-License-Identifier: Apache-2.0

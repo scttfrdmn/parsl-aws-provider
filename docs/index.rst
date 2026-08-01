@@ -48,7 +48,7 @@ Quick example
    import parsl
    from parsl.config import Config
    from parsl.executors import HighThroughputExecutor
-   from parsl_ephemeral_aws import EphemeralAWSProvider
+   from parsl_aws_provider import EphemeralAWSProvider
 
    provider = EphemeralAWSProvider(
        region="us-east-1",

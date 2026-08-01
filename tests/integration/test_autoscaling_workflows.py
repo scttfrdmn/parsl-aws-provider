@@ -10,7 +10,7 @@ methods that do not exist on any mode (``_create_vpc``, ``_create_subnet``,
 ``_delete_vpc``, ``_create_ssm_parameter``, ``_create_tags``) and called two more
 (``mode._init_blocks()``, ``mode.scale_out()``/``mode.scale_in()``) that live on
 the provider, not the mode -- ``grep`` finds none of them in
-``parsl_ephemeral_aws/``. ``unittest.mock.patch.object`` raises
+``parsl_aws_provider/``. ``unittest.mock.patch.object`` raises
 ``AttributeError`` for a missing attribute, so every one of those was a hard
 error rather than a passing test, and the network-creating shape they described
 was removed in #69 anyway.
@@ -38,11 +38,11 @@ import uuid
 import pytest
 from parsl.jobs.states import JobState
 
-from parsl_ephemeral_aws.constants import WORKER_TYPE_ECS, WORKER_TYPE_LAMBDA
-from parsl_ephemeral_aws.exceptions import ProviderError
-from parsl_ephemeral_aws.modes.serverless import ServerlessMode
-from parsl_ephemeral_aws.provider import EphemeralAWSProvider
-from parsl_ephemeral_aws.state.file import FileStateStore
+from parsl_aws_provider.constants import WORKER_TYPE_ECS, WORKER_TYPE_LAMBDA
+from parsl_aws_provider.exceptions import ProviderError
+from parsl_aws_provider.modes.serverless import ServerlessMode
+from parsl_aws_provider.provider import EphemeralAWSProvider
+from parsl_aws_provider.state.file import FileStateStore
 from tests.substrate_support import get_substrate_endpoint, is_substrate_available
 
 pytestmark = [

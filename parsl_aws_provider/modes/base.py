@@ -13,12 +13,12 @@ import boto3
 
 from botocore.exceptions import ClientError
 
-from parsl_ephemeral_aws.constants import (
+from parsl_aws_provider.constants import (
     DEFAULT_SPOT_ALLOCATION_STRATEGY,
     STATUS_INTERRUPTED,
 )
-from parsl_ephemeral_aws.exceptions import OperatingModeError, ResourceNotFoundError
-from parsl_ephemeral_aws.state.base import STATE_KEY_MODE, StateStore
+from parsl_aws_provider.exceptions import OperatingModeError, ResourceNotFoundError
+from parsl_aws_provider.state.base import STATE_KEY_MODE, StateStore
 
 
 logger = logging.getLogger(__name__)
