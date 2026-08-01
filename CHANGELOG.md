@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **The documented install command could not work.** `docs/getting_started.md`
+  opened with `uv add parsl-ephemeral-aws`, but the package has never been
+  published — `pypi.org/pypi/parsl-ephemeral-aws/json` returns 404, because
+  `release.yml`'s PyPI trusted publisher was never registered and every release
+  run since v0.1.0 has failed at or before that step. The command fails outright
+  rather than installing something stale, so anyone following the guide could not
+  get started at all. Now documents installing from the repository, and points at
+  #180 for the publishing fix.
+
 ## [0.8.0] - 2026-08-01
 
 ### Added
