@@ -2,8 +2,10 @@
 
 ## Installation
 
+**Not yet on PyPI**, so install from the repository:
+
 ```bash
-uv add parsl-ephemeral-aws
+uv add git+https://github.com/scttfrdmn/parsl-aws-provider
 ```
 
 Or, working from a clone:
@@ -11,6 +13,11 @@ Or, working from a clone:
 ```bash
 uv sync --extra dev --extra test
 ```
+
+`uv add parsl-ephemeral-aws` will start working once
+[#180](https://github.com/scttfrdmn/parsl-aws-provider/issues/180) is resolved —
+the package name is unregistered, so that command currently fails with "no
+matching distribution found" rather than installing an older version.
 
 Python 3.10 or newer is required (Parsl 2026.x dropped 3.9).
 
