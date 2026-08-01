@@ -7,6 +7,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Eight mode options that the provider documented but could not accept.**
+  `idle_timeout`, `preserve_bastion`, `bastion_host_type`, and `workflow_id` on
+  `mode="detached"`; `lambda_runtime`, `ecs_task_cpu`, `ecs_task_memory`, and
+  `ecs_container_image` on `mode="serverless"`. Each is read by its mode and was
+  reachable only by constructing the mode directly — since #105 the provider
+  *rejects* unknown keyword arguments, so passing one raised
+  `ProviderConfigurationError` rather than being quietly ignored.
+
+  `ecs_container_image` is the consequential one: Fargate ran a fixed image, so
+  serverless mode could not run a workload with its own dependencies, which is
+  the usual reason to choose Fargate over Lambda.
+
+  Each is accepted **only** on the mode that implements it. Setting one elsewhere
+  raises `ProviderConfigurationError` naming every misplaced option at once,
+  because the provider forwards them from one branch only — accepting them
+  silently would leave the caller looking at a configured option that has no
+  effect. `workflow_id` forwards as `None` when unset so `DetachedMode` keeps
+  substituting a fresh UUID (closes #136).
+- `DEFAULT_BASTION_IDLE_TIMEOUT`, `DEFAULT_PRESERVE_BASTION`, and
+  `DEFAULT_BASTION_HOST_TYPE` in `constants.py`. `DetachedMode.__init__` carried
+  these as literals; the new detached-only guard has to compare against the real
+  defaults, and a guard repeating the numbers would stop firing the moment one
+  changed (refs #136).
+
+### Changed
+- **`DEFAULT_LAMBDA_RUNTIME` is `python3.12`, was `python3.9`** — past end of
+  support, and older than the `>=3.10` the package itself requires, so Lambda
+  workers could not run the code the driver did.
+  `scripts/validate-dev-env.py` asserted the literal `"python3.9"`, which is
+  precisely why the constant had never been bumped; it now checks the floor
+  `pyproject`'s `requires-python` declares instead of pinning one value.
+  `templates/cloudformation/lambda_worker.yml` narrows its `Runtime`
+  `AllowedValues` to `python3.10`–`python3.13` and defaults to `python3.12`, so a
+  runtime CloudFormation would reject fails the parameter rather than the stack
+  (refs #136).
+- **`DEFAULT_ECS_CONTAINER_IMAGE` is `python:3.12-slim`, was
+  `public.ecr.aws/lambda/python:3.9`** — a *Lambda* base image being used as a
+  Fargate task image. Its entrypoint is the Lambda runtime interface emulator, so
+  it waits for an invocation event instead of running the task's `Command`, and
+  Fargate tasks exited immediately. The CloudFormation template already defaulted
+  to a plain Python image; the Python constant overrode it (refs #136).
+
 ### Removed
 - **The spot task-recovery API, which could not work at this layer and never
   ran.** `SpotInterruptionHandler`, `ParslSpotInterruptionHandler`, the

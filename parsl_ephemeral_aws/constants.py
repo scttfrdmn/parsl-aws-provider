@@ -431,9 +431,23 @@ MAX_WARM_POOL_SIZE = 20
 DEFAULT_BAKE_AMI = False  # bake worker_init into a custom AMI during initialize()
 DEFAULT_ONE_SHOT = False  # each instance runs one command then terminates
 
+# Detached-mode bastion defaults.
+#
+# Named here rather than left as literals in DetachedMode.__init__ so the
+# provider's detached-only guard can compare against them: a guard that repeated
+# the numbers would silently stop firing the moment a default changed (#136).
+DEFAULT_BASTION_IDLE_TIMEOUT = 30  # minutes of inactivity before self-shutdown
+DEFAULT_PRESERVE_BASTION = True  # bastion survives cleanup_infrastructure()
+DEFAULT_BASTION_HOST_TYPE = "cloudformation"  # or "direct" (RunInstances)
+
 # Lambda defaults (minimal for imports)
 DEFAULT_LAMBDA_TIMEOUT = 300
-DEFAULT_LAMBDA_RUNTIME = "python3.9"
+# python3.9 reached end of support, and this package requires Python >= 3.10
+# anyway, so the old default could not run the same code the driver does. Keep
+# this in step with the Runtime AllowedValues in
+# templates/cloudformation/lambda_worker.yml -- CloudFormation rejects the stack
+# outright if the value is not listed there.
+DEFAULT_LAMBDA_RUNTIME = "python3.12"
 DEFAULT_LAMBDA_HANDLER = "handler.lambda_handler"
 DEFAULT_LAMBDA_MEMORY = 1024
 
@@ -442,7 +456,13 @@ DEFAULT_ECS_TASK_CPU = 1024
 DEFAULT_ECS_TASK_MEMORY = 2048
 DEFAULT_ECS_CPU = 1024  # Alias
 DEFAULT_ECS_MEMORY = 2048  # Alias
-DEFAULT_ECS_CONTAINER_IMAGE = "public.ecr.aws/lambda/python:3.9"
+# A Fargate task image, not a Lambda one. This was
+# "public.ecr.aws/lambda/python:3.9" -- a Lambda base image whose entrypoint is
+# the Lambda runtime interface emulator, so it expects to be invoked with an
+# event rather than to run the task's Command. The CloudFormation template's own
+# default was already "python:3.12-slim"; the Python constant was overriding it
+# with the wrong thing on every call.
+DEFAULT_ECS_CONTAINER_IMAGE = "python:3.12-slim"
 DEFAULT_ECS_CLUSTER_NAME = "parsl-ephemeral-cluster"
 
 # Timeout constants (in seconds)

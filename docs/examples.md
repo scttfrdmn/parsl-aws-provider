@@ -177,9 +177,9 @@ provider.shutdown()
 
 `worker_init` has no effect on Lambda — there is no instance to run it on.
 Dependencies must be in the deployment package or a layer. For ECS/Fargate, use
-`compute_type="ecs"` and supply the three network IDs; note the container image is
-not yet configurable
-([#136](https://github.com/scttfrdmn/parsl-aws-provider/issues/136)).
+`compute_type="ecs"`, supply the three network IDs, and set
+`ecs_container_image` to an image carrying your dependencies (the default,
+`python:3.12-slim`, gives you the standard library only).
 
 ## Spot instances
 

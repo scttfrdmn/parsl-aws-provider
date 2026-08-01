@@ -154,14 +154,23 @@ To reconnect to a running workflow, construct a provider against the **same
 state location**. The persisted `provider_id` is adopted automatically, along
 with the bastion and the tracked jobs — you do not need to pass an ID back in.
 
-### Not configurable through the provider
+### Detached-mode options
 
-`DetachedMode` accepts `idle_timeout` (bastion auto-shutdown, 30 minutes),
-`preserve_bastion` (keep the bastion after shutdown, on), `bastion_host_type`
-(`"cloudformation"`), and `workflow_id`, but `EphemeralAWSProvider` does not
-forward any of them, and passing them raises `ProviderConfigurationError`. The
-defaults apply. Tracked as
-[#136](https://github.com/scttfrdmn/parsl-aws-provider/issues/136).
+| Option | Default | What it controls |
+|---|---|---|
+| `idle_timeout` | `30` | Minutes of inactivity before the bastion shuts itself down |
+| `preserve_bastion` | `True` | Whether the bastion survives `cleanup_infrastructure()` |
+| `bastion_host_type` | `"cloudformation"` | Stack-managed bastion, or `"direct"` for a plain `RunInstances` |
+| `workflow_id` | generated UUID | Identifier used in bastion state paths and tags; pass the same value to reconnect |
+
+`preserve_bastion` defaults to `True`, so **the bastion keeps running and keeps
+billing after shutdown** — that is what makes a later session able to adopt it.
+Pass `preserve_bastion=False` to have it torn down instead.
+
+These are accepted only on `mode="detached"`; setting one on another mode raises
+`ProviderConfigurationError`, because the provider forwards them from the
+detached branch only and they would otherwise appear configured while having no
+effect.
 
 Note `max_idle_time` is a *provider*-level setting and is unrelated: it governs
 when the provider reclaims a resource that has been `RUNNING` longer than the
@@ -243,15 +252,41 @@ provider = EphemeralAWSProvider(
 the mode on its own default of `auto`, which selects Lambda for short single-task
 commands and ECS otherwise.
 
-### Not configurable through the provider
+### Serverless-mode options
 
-`ServerlessMode` accepts `lambda_memory`, `lambda_timeout`, `lambda_runtime`,
-`ecs_task_cpu`, `ecs_task_memory`, and `ecs_container_image`, but the provider
-forwards only `memory_size` and `timeout` (which override the first two). The
-rest keep their defaults — notably `ecs_container_image` is
-`public.ecr.aws/lambda/python:3.9`, so a Fargate task cannot yet run your own
-image. Tracked as
-[#136](https://github.com/scttfrdmn/parsl-aws-provider/issues/136).
+| Option | Default | What it controls |
+|---|---|---|
+| `memory_size` | `1024` | Lambda memory in MB (the provider's alias for `lambda_memory`) |
+| `timeout` | `300` | Lambda timeout in seconds (alias for `lambda_timeout`) |
+| `lambda_runtime` | `"python3.12"` | Lambda runtime identifier |
+| `ecs_task_cpu` | `1024` | Fargate CPU units per task (1024 = 1 vCPU) |
+| `ecs_task_memory` | `2048` | Fargate memory per task in MB |
+| `ecs_container_image` | `"python:3.12-slim"` | Container image for Fargate tasks |
+
+Set `ecs_container_image` to your own image to run a workload with its own
+dependencies — that is usually the reason to choose Fargate over Lambda. The
+stock default gives you the standard library only:
+
+```python
+provider = EphemeralAWSProvider(
+    mode="serverless",
+    compute_type="ecs",
+    ecs_container_image="123456789012.dkr.ecr.us-east-1.amazonaws.com/my-worker:latest",
+    ecs_task_cpu=2048,
+    ecs_task_memory=4096,
+    vpc_id="vpc-...", subnet_id="subnet-...", security_group_id="sg-...",
+)
+```
+
+`ecs_task_cpu` and `ecs_task_memory` must be a combination Fargate accepts; see
+[Fargate task
+sizes](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/AWS_Fargate.html).
+`lambda_runtime` must be one of the `Runtime` values allowed by
+`templates/cloudformation/lambda_worker.yml`, or CloudFormation rejects the
+stack.
+
+These are accepted only on `mode="serverless"`; setting one on another mode
+raises `ProviderConfigurationError`.
 
 ### When to use
 
@@ -338,7 +373,8 @@ image. Tracked as
   which decides on command length and `tasks_per_node`
 - For Lambda, keep tasks short and dependencies minimal
 - Size `memory_size` first: Lambda CPU scales with memory
-- For ECS, be aware the container image is not yet configurable (#136)
+- For ECS, set `ecs_container_image` to an image that already has your
+  dependencies rather than installing them per task
 
 ## Switching between modes
 

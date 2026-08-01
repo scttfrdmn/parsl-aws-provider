@@ -64,15 +64,30 @@ def check_constants() -> List[Tuple[str, bool, str]]:
             ("Status constants", True, ""),
         ]
 
-        # Validate Python version consistency
-        if DEFAULT_LAMBDA_RUNTIME == "python3.9":
+        # Validate Python version consistency.
+        #
+        # Pinned to the literal "python3.9" until #136, which is exactly the
+        # coupling that kept the runtime on an end-of-support version: bumping
+        # the constant failed this check. Assert the floor the package actually
+        # requires instead, so a future bump does not have to touch this file.
+        minimum = (3, 10)  # pyproject requires-python
+        try:
+            runtime_version = tuple(
+                int(part)
+                for part in DEFAULT_LAMBDA_RUNTIME.removeprefix("python").split(".")
+            )
+        except ValueError:
+            runtime_version = ()
+
+        if runtime_version >= minimum:
             results.append(("Python version consistency", True, ""))
         else:
+            expected = ".".join(str(part) for part in minimum)
             results.append(
                 (
                     "Python version consistency",
                     False,
-                    f"Expected python3.9, got {DEFAULT_LAMBDA_RUNTIME}",
+                    f"Expected python{expected} or newer, got {DEFAULT_LAMBDA_RUNTIME}",
                 )
             )
 

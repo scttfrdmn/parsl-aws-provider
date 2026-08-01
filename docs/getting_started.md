@@ -248,9 +248,10 @@ provider.shutdown()
 ```
 
 This cancels tracked jobs, terminates compute, deletes the launch template and
-any AMI the provider baked, and deletes the persisted state. In detached mode the
-bastion is preserved unless you shut down (see #136 for the unreachable
-`preserve_bastion` option).
+any AMI the provider baked, plus the IAM role and instance profile if
+`auto_create_instance_profile` created them, and deletes the persisted state. In
+detached mode the bastion survives shutdown by default so a later session can
+adopt it — pass `preserve_bastion=False` to have it terminated instead.
 
 `parsl.clear()` does not reliably kill the HTEX interchange subprocess; the
 pattern in `examples/parsl_aws_integration.py` handles that.

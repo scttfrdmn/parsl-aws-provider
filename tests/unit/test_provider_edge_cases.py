@@ -17,6 +17,13 @@ import pytest
 from parsl.jobs.states import JobState
 
 from parsl_ephemeral_aws.constants import (
+    DEFAULT_BASTION_HOST_TYPE,
+    DEFAULT_BASTION_IDLE_TIMEOUT,
+    DEFAULT_ECS_CONTAINER_IMAGE,
+    DEFAULT_ECS_CPU,
+    DEFAULT_ECS_MEMORY,
+    DEFAULT_LAMBDA_RUNTIME,
+    DEFAULT_PRESERVE_BASTION,
     DEFAULT_WARM_POOL_SIZE,
     DEFAULT_WARM_POOL_TTL,
     STATUS_INTERRUPTED,
@@ -1094,6 +1101,38 @@ def _construct(mode, **extra_kwargs):
         )
 
 
+def _construct_with_real_mode(mode, **extra_kwargs):
+    """Construct a provider whose operating mode is the real class, not a mock.
+
+    ``_construct`` patches ``_initialize_operating_mode`` wholesale, which is
+    right for testing the guards but useless for testing *forwarding*: a
+    MagicMock accepts any keyword, including ones the real signature would
+    reject, so an assertion against it proves nothing about whether the value
+    arrives. Here only ``initialize()`` is patched -- it is what reaches AWS --
+    so the mode is really constructed with whatever the provider passed.
+    """
+    with (
+        patch("parsl_ephemeral_aws.provider.create_session") as mock_session_factory,
+        patch.object(
+            EphemeralAWSProvider, "_initialize_state_store", return_value=MagicMock()
+        ),
+        patch.object(EphemeralAWSProvider, "_load_state", return_value=None),
+        patch("parsl_ephemeral_aws.modes.standard.StandardMode.initialize"),
+        patch("parsl_ephemeral_aws.modes.detached.DetachedMode.initialize"),
+        patch("parsl_ephemeral_aws.modes.serverless.ServerlessMode.initialize"),
+    ):
+        mock_session_factory.return_value = MagicMock()
+        return EphemeralAWSProvider(
+            region="us-east-1",
+            image_id="ami-12345678",
+            mode=mode,
+            vpc_id="vpc-test00001",
+            subnet_id="subnet-test001",
+            security_group_id="sg-test00001",
+            **extra_kwargs,
+        )
+
+
 @pytest.mark.unit
 class TestStandardOnlyOptionGuard:
     """StandardMode-only options must be refused on other modes (#80)."""
@@ -1210,6 +1249,171 @@ class TestStandardOnlyOptionGuard:
             _construct(
                 "detached", warm_pool_size=1, iam_instance_profile_arn=_FAKE_IAM_ARN
             )
+
+
+# ---------------------------------------------------------------------------
+# TestModeSpecificOptionForwarding (#136)
+# ---------------------------------------------------------------------------
+
+#: Options only DetachedMode implements, with a non-default value for each.
+DETACHED_ONLY_OPTIONS = [
+    ("idle_timeout", 5),
+    ("preserve_bastion", False),
+    ("bastion_host_type", "direct"),
+    ("workflow_id", "wf-136"),
+]
+
+#: Options only ServerlessMode implements, with a non-default value for each.
+SERVERLESS_ONLY_OPTIONS = [
+    ("lambda_runtime", "python3.11"),
+    ("ecs_task_cpu", 256),
+    ("ecs_task_memory", 512),
+    ("ecs_container_image", "myrepo/myimage:latest"),
+]
+
+
+@pytest.mark.unit
+class TestModeSpecificOptionForwarding:
+    """The eight mode options the provider never forwarded (#136).
+
+    Both modes accepted all eight and read them, but
+    ``_initialize_operating_mode()`` passed none of them, so the mode defaults
+    always won. Since #105 rejects unknown kwargs these were not merely ignored
+    but unreachable: there was no way to set them through the public API at all.
+
+    ``ecs_container_image`` is the one with teeth. Every Fargate task ran the
+    same fixed image, so serverless mode could not run a workload with its own
+    dependencies -- the usual reason to pick Fargate over Lambda.
+    """
+
+    @pytest.mark.parametrize("option,value", DETACHED_ONLY_OPTIONS)
+    def test_a_detached_option_is_accepted_and_stored(self, option, value):
+        """The provider must accept it: before #136 this raised."""
+        provider = _construct("detached", **{option: value})
+
+        assert getattr(provider, option) == value
+
+    @pytest.mark.parametrize("option,value", SERVERLESS_ONLY_OPTIONS)
+    def test_a_serverless_option_is_accepted_and_stored(self, option, value):
+        """The provider must accept it: before #136 this raised."""
+        provider = _construct("serverless", **{option: value})
+
+        assert getattr(provider, option) == value
+
+    @pytest.mark.parametrize("option,value", DETACHED_ONLY_OPTIONS)
+    def test_a_detached_option_reaches_the_mode(self, option, value):
+        """Accepting the option is worthless if it stops at the provider.
+
+        This is the assertion that would have failed before the fix even had the
+        parameters existed, because ``_initialize_operating_mode()`` built
+        ``DetachedMode`` without them. Constructing the *real* mode rather than a
+        MagicMock is the point: a mock records any kwarg, including ones the real
+        signature would reject.
+        """
+        provider = _construct_with_real_mode("detached", **{option: value})
+
+        assert getattr(provider.operating_mode, option) == value
+
+    @pytest.mark.parametrize("option,value", SERVERLESS_ONLY_OPTIONS)
+    def test_a_serverless_option_reaches_the_mode(self, option, value):
+        """As above, for the serverless branch."""
+        provider = _construct_with_real_mode(
+            "serverless", compute_type="ecs", **{option: value}
+        )
+
+        assert getattr(provider.operating_mode, option) == value
+
+    @pytest.mark.parametrize("option,value", DETACHED_ONLY_OPTIONS)
+    @pytest.mark.parametrize("mode", ["standard", "serverless"])
+    def test_a_detached_option_is_refused_elsewhere(self, mode, option, value):
+        """Set on a mode that never receives it, it must raise rather than no-op.
+
+        ``preserve_bastion`` and ``idle_timeout`` are the two cost controls in
+        detached mode, so honouring the default while appearing to accept the
+        request is how a caller pays for a bastion they asked to have torn down.
+
+        Matching "supported only by" rather than just the option name is
+        deliberate: the unknown-kwarg check raises the same exception type and
+        also names the option, so a looser assertion passes on an unfixed
+        provider -- for entirely the wrong reason.
+        """
+        with pytest.raises(ProviderConfigurationError, match="supported only by") as e:
+            _construct(mode, **{option: value})
+
+        assert option in str(e.value)
+
+    @pytest.mark.parametrize("option,value", SERVERLESS_ONLY_OPTIONS)
+    @pytest.mark.parametrize("mode", ["standard", "detached"])
+    def test_a_serverless_option_is_refused_elsewhere(self, mode, option, value):
+        """As above, for the serverless-only options."""
+        with pytest.raises(ProviderConfigurationError, match="supported only by") as e:
+            _construct(mode, **{option: value})
+
+        assert option in str(e.value)
+
+    @pytest.mark.parametrize("mode", ["standard", "detached", "serverless"])
+    def test_the_defaults_construct_on_every_mode(self, mode):
+        """Every provider passes through both new guards.
+
+        A wrong comparison in either would break two of the three modes
+        outright, so this is the cheapest way to catch that.
+        """
+        assert _construct(mode).mode_type.value == mode
+
+    @pytest.mark.parametrize("mode", ["standard", "detached", "serverless"])
+    def test_explicitly_passing_a_default_is_not_refused(self, mode):
+        """Passing the documented default asks for nothing, so it must be allowed.
+
+        The values come from the constants rather than literals for the reason
+        the constants exist: ``DEFAULT_LAMBDA_RUNTIME`` and
+        ``DEFAULT_ECS_CONTAINER_IMAGE`` both moved off python3.9 in this same
+        change, and a hardcoded "python3.9" here would have stopped being "the
+        default" without ceasing to look like it.
+        """
+        provider = _construct(
+            mode,
+            idle_timeout=DEFAULT_BASTION_IDLE_TIMEOUT,
+            preserve_bastion=DEFAULT_PRESERVE_BASTION,
+            bastion_host_type=DEFAULT_BASTION_HOST_TYPE,
+            workflow_id=None,
+            lambda_runtime=DEFAULT_LAMBDA_RUNTIME,
+            ecs_task_cpu=DEFAULT_ECS_CPU,
+            ecs_task_memory=DEFAULT_ECS_MEMORY,
+            ecs_container_image=DEFAULT_ECS_CONTAINER_IMAGE,
+        )
+
+        assert provider.mode_type.value == mode
+
+    def test_every_offending_option_is_named_at_once(self):
+        """A caller who set three should not fix them one construction at a time."""
+        with pytest.raises(
+            ProviderConfigurationError, match="supported only by"
+        ) as excinfo:
+            _construct("standard", ecs_task_cpu=256, ecs_task_memory=512)
+
+        message = str(excinfo.value)
+        assert "ecs_task_cpu" in message and "ecs_task_memory" in message
+
+    def test_the_message_names_both_modes(self):
+        """Naming the owning mode and the requested one is what makes it fixable."""
+        with pytest.raises(
+            ProviderConfigurationError, match="supported only by"
+        ) as excinfo:
+            _construct("standard", idle_timeout=5)
+
+        message = str(excinfo.value)
+        assert "detached" in message and "standard" in message
+
+    def test_a_workflow_id_of_none_still_gets_a_generated_id(self):
+        """Forwarding ``None`` must not defeat the mode's own UUID default.
+
+        ``workflow_id`` is the one of the eight whose default is not a constant:
+        ``DetachedMode`` substitutes a fresh UUID. Defaulting it in the provider
+        instead would have pinned every workflow to the literal ``None``.
+        """
+        provider = _construct_with_real_mode("detached")
+
+        assert provider.operating_mode.workflow_id
 
 
 # ---------------------------------------------------------------------------

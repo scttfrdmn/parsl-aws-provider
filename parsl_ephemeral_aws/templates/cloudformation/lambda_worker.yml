@@ -10,13 +10,12 @@ Parameters:
   Runtime:
     Type: String
     Description: Lambda function runtime
-    Default: 'python3.9'
+    Default: 'python3.12'
     AllowedValues:
-      - 'python3.8'
-      - 'python3.9'
       - 'python3.10'
       - 'python3.11'
       - 'python3.12'
+      - 'python3.13'
 
   Handler:
     Type: String
