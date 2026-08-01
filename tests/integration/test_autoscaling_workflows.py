@@ -1,649 +1,324 @@
-"""Integration tests for autoscaling workflows.
+"""Integration tests for scaling behaviour against the substrate emulator.
 
-These tests verify that the provider correctly scales resources up and down
-based on workload demands in various operating modes.
+These drive the *real* provider and the *real* operating modes -- nothing about
+the scaling path is mocked -- so the assertions are about instances that actually
+exist in the emulator, not about calls made to a double.
+
+The previous version of this file could not have tested that. It patched a dozen
+methods that do not exist on any mode (``_create_vpc``, ``_create_subnet``,
+``_create_security_group``, ``_create_ec2_instance``, ``_delete_ec2_instance``,
+``_delete_vpc``, ``_create_ssm_parameter``, ``_create_tags``) and called two more
+(``mode._init_blocks()``, ``mode.scale_out()``/``mode.scale_in()``) that live on
+the provider, not the mode -- ``grep`` finds none of them in
+``parsl_ephemeral_aws/``. ``unittest.mock.patch.object`` raises
+``AttributeError`` for a missing attribute, so every one of those was a hard
+error rather than a passing test, and the network-creating shape they described
+was removed in #69 anyway.
+
+It also shadowed the ``substrate_session`` fixture with a class-scoped one built
+from ``get_substrate_session()``, which binds no endpoint: clients made from it
+reach real AWS and fail on auth. conftest's fixture wraps ``session.client`` to
+inject ``endpoint_url``, which is what makes code under test hit the emulator.
+
+What scaling actually means here:
+
+* ``max_blocks`` is enforced in ``provider.submit()``, which raises
+  ``ProviderError`` rather than silently over-provisioning.
+* ``provider.scale_in(n)`` cancels up to *n* RUNNING blocks and drops them.
+* ``provider.scale_out()`` returns ``[]`` by design -- growing the pool is
+  Parsl's strategy's job, and the provider's docstring says so. A test asserting
+  otherwise would be asserting a feature that does not exist.
 
 SPDX-License-Identifier: Apache-2.0
 SPDX-FileCopyrightText: 2025-2026 Scott Friedman and Project Contributors
 """
 
-import os
 import uuid
+
 import pytest
-import tempfile
-from unittest.mock import MagicMock, patch
+from parsl.jobs.states import JobState
 
-from parsl_ephemeral_aws.provider import EphemeralAWSProvider
-from parsl_ephemeral_aws.modes.standard import StandardMode
-from parsl_ephemeral_aws.modes.detached import DetachedMode
+from parsl_ephemeral_aws.constants import WORKER_TYPE_ECS, WORKER_TYPE_LAMBDA
+from parsl_ephemeral_aws.exceptions import ProviderError
 from parsl_ephemeral_aws.modes.serverless import ServerlessMode
+from parsl_ephemeral_aws.provider import EphemeralAWSProvider
 from parsl_ephemeral_aws.state.file import FileStateStore
-from tests.substrate_support import (
-    get_substrate_session,
-    is_substrate_available,
-)
-
-
-# Skip all tests if the substrate emulator is not available
-pytestmark = pytest.mark.skipif(
-    not is_substrate_available(),
-    reason="substrate not available - start with 'make substrate-up'",
-)
-
-
-@pytest.mark.integration
-class TestAutoscalingWorkflows:
-    """Integration tests for autoscaling workflow scenarios."""
-
-    @pytest.fixture(scope="class")
-    def substrate_session(self):
-        """Create a session connected to substrate."""
-        return get_substrate_session()
-
-    @pytest.fixture
-    def temp_dir(self):
-        """Create a temporary directory for state files."""
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            yield tmp_dir
-
-    @pytest.fixture
-    def state_file_path(self, temp_dir):
-        """Create a path for the state file."""
-        return os.path.join(temp_dir, f"test-state-{uuid.uuid4().hex[:8]}.json")
-
-    @pytest.fixture
-    def file_state_store(self, state_file_path):
-        """Create a FileStateStore instance."""
-        provider_id = f"test-provider-{uuid.uuid4().hex[:8]}"
-        return FileStateStore(file_path=state_file_path, provider_id=provider_id)
-
-    @pytest.mark.substrate
-    def test_standard_mode_scaling(self, substrate_session, file_state_store):
-        """Test autoscaling in StandardMode."""
-        # Create a StandardMode instance with scaling configuration
-        provider_id = f"test-provider-{uuid.uuid4().hex[:8]}"
-
-        # Set up mocks for AWS services using substrate
-        with patch("boto3.Session", return_value=substrate_session):
-            # Create standard mode with scaling configuration
-            mode = StandardMode(
-                provider_id=provider_id,
-                session=substrate_session,
-                state_store=file_state_store,
-                region="us-east-1",
-                instance_type="t2.micro",
-                image_id="ami-12345678",  # Dummy AMI
-                max_blocks=3,
-                min_blocks=0,
-                init_blocks=1,
-            )
-
-            # Initialize mode
-            with patch.object(mode, "_create_vpc", return_value="vpc-12345"):
-                with patch.object(mode, "_create_subnet", return_value="subnet-12345"):
-                    with patch.object(
-                        mode, "_create_security_group", return_value="sg-12345"
-                    ):
-                        mode.initialize()
-
-            # Mock instance creation
-            instance_id_counter = 0
-
-            def create_mock_instance(*args, **kwargs):
-                nonlocal instance_id_counter
-                instance_id_counter += 1
-                return {
-                    "instance_id": f"i-{instance_id_counter:05d}",
-                    "private_ip": f"10.0.0.{instance_id_counter}",
-                    "public_ip": f"54.123.456.{instance_id_counter}",
-                    "dns_name": f"ec2-54-123-456-{instance_id_counter}.compute-1.amazonaws.com",
-                }
-
-            # Test initial block creation
-            with patch.object(
-                mode, "_create_ec2_instance", side_effect=create_mock_instance
-            ):
-                # Should create one instance for init_blocks=1
-                mode._init_blocks()
-
-                # Verify one instance was created
-                assert len(mode.resources) == 1
-
-            # Test scaling out (adding instances)
-            with patch.object(
-                mode, "_create_ec2_instance", side_effect=create_mock_instance
-            ):
-                # Try to scale out by 2 more instances
-                new_blocks = mode.scale_out(2)
-
-                # Verify scaling was successful
-                assert new_blocks == 2
-
-                # Verify we now have 3 instances total
-                assert len(mode.resources) == 3
-
-                # Try to scale beyond max_blocks
-                new_blocks = mode.scale_out(1)
-
-                # Should not scale further since max_blocks=3
-                assert new_blocks == 0
-                assert len(mode.resources) == 3
-
-            # Mock job submission and setting status to running
-            job_ids = []
-            resource_ids = list(mode.resources.keys())
-
-            for i, resource_id in enumerate(resource_ids):
-                job_id = f"job-{i + 1}"
-                # Set resource job mapping
-                mode.resources[resource_id]["job_id"] = job_id
-                # Set to running status
-                mode.resources[resource_id]["status"] = "running"
-                job_ids.append(job_id)
-
-            # Test scaling in (removing instances)
-            with patch.object(mode, "_delete_ec2_instance"):
-                # Mark one job as complete
-                complete_resource_id = resource_ids[0]
-                mode.resources[complete_resource_id]["status"] = "completed"
-
-                # Scale in one block
-                num_released = mode.scale_in(1)
-
-                # Should remove the completed job's instance
-                assert num_released == 1
-                assert complete_resource_id not in mode.resources
-                assert len(mode.resources) == 2
-
-                # Try to scale in more than min_blocks
-                all_resource_ids = list(mode.resources.keys())
-                for resource_id in all_resource_ids:
-                    mode.resources[resource_id]["status"] = "completed"
-
-                # Scale in remaining 2 instances
-                num_released = mode.scale_in(2)
-
-                # Should remove both instances
-                assert num_released == 2
-                assert len(mode.resources) == 0
-
-            # Clean up
-            with patch.object(mode, "_delete_ec2_instance"):
-                with patch.object(mode, "_delete_security_group"):
-                    with patch.object(mode, "_delete_subnet"):
-                        with patch.object(mode, "_delete_vpc"):
-                            mode.cleanup_infrastructure()
-
-    @pytest.mark.substrate
-    def test_detached_mode_scaling(self, substrate_session, file_state_store):
-        """Test autoscaling in DetachedMode."""
-        # Create a DetachedMode instance with scaling configuration
-        provider_id = f"test-provider-{uuid.uuid4().hex[:8]}"
-        workflow_id = f"test-workflow-{uuid.uuid4().hex[:8]}"
-
-        # Set up mocks for AWS services using substrate
-        with patch("boto3.Session", return_value=substrate_session):
-            # Create detached mode with scaling configuration
-            mode = DetachedMode(
-                provider_id=provider_id,
-                session=substrate_session,
-                state_store=file_state_store,
-                region="us-east-1",
-                instance_type="t2.micro",
-                image_id="ami-12345678",  # Dummy AMI
-                workflow_id=workflow_id,
-                bastion_instance_type="t2.micro",
-                bastion_host_type="direct",
-                max_blocks=3,
-                min_blocks=0,
-                init_blocks=1,
-            )
-
-            # Initialize mode
-            with patch.object(mode, "_create_vpc", return_value="vpc-12345"):
-                with patch.object(mode, "_create_subnet", return_value="subnet-12345"):
-                    with patch.object(
-                        mode, "_create_security_group", return_value="sg-12345"
-                    ):
-                        with patch.object(
-                            mode, "_create_bastion_host"
-                        ) as mock_create_bastion:
-                            mock_create_bastion.return_value = {
-                                "instance_id": f"i-bastion-{uuid.uuid4().hex[:8]}",
-                                "private_ip": "10.0.0.2",
-                                "public_ip": "54.123.456.789",
-                                "dns_name": "ec2-54-123-456-789.compute-1.amazonaws.com",
-                            }
-                            with patch.object(mode, "_create_tags"):
-                                mode.initialize()
-
-            # Verify bastion was created
-            assert mode.bastion_id is not None
-
-            # Mock instance creation
-            instance_id_counter = 0
-
-            def create_mock_instance(*args, **kwargs):
-                nonlocal instance_id_counter
-                instance_id_counter += 1
-                return {
-                    "instance_id": f"i-{instance_id_counter:05d}",
-                    "private_ip": f"10.0.0.{instance_id_counter + 10}",
-                    "public_ip": None,  # No public IP in detached mode
-                    "dns_name": None,
-                }
-
-            # Test initial block creation
-            with patch.object(
-                mode, "_create_ec2_instance", side_effect=create_mock_instance
-            ):
-                with patch.object(mode, "_create_ssm_parameter"):
-                    # Should create one instance for init_blocks=1
-                    mode._init_blocks()
-
-                    # Verify one instance was created
-                    assert len(mode.resources) == 1
-
-            # Test scaling out (adding instances)
-            with patch.object(
-                mode, "_create_ec2_instance", side_effect=create_mock_instance
-            ):
-                with patch.object(mode, "_create_ssm_parameter"):
-                    # Try to scale out by 2 more instances
-                    new_blocks = mode.scale_out(2)
-
-                    # Verify scaling was successful
-                    assert new_blocks == 2
-
-                    # Verify we now have 3 instances total
-                    assert len(mode.resources) == 3
-
-                    # Try to scale beyond max_blocks
-                    new_blocks = mode.scale_out(1)
-
-                    # Should not scale further since max_blocks=3
-                    assert new_blocks == 0
-                    assert len(mode.resources) == 3
-
-            # Mock job submission and setting status to running
-            job_ids = []
-            resource_ids = list(mode.resources.keys())
-
-            for i, resource_id in enumerate(resource_ids):
-                job_id = f"job-{i + 1}"
-                # Set resource job mapping
-                mode.resources[resource_id]["job_id"] = job_id
-                # Set to running status
-                mode.resources[resource_id]["status"] = "running"
-                job_ids.append(job_id)
-
-            # Test scaling in (removing instances)
-            with patch.object(mode, "_delete_ec2_instance"):
-                with patch.object(mode, "_delete_ssm_parameter"):
-                    # Mark one job as complete
-                    complete_resource_id = resource_ids[0]
-                    mode.resources[complete_resource_id]["status"] = "completed"
-
-                    # Scale in one block
-                    num_released = mode.scale_in(1)
-
-                    # Should remove the completed job's instance
-                    assert num_released == 1
-                    assert complete_resource_id not in mode.resources
-                    assert len(mode.resources) == 2
-
-                    # Try to scale in more than min_blocks
-                    all_resource_ids = list(mode.resources.keys())
-                    for resource_id in all_resource_ids:
-                        mode.resources[resource_id]["status"] = "completed"
-
-                    # Scale in remaining 2 instances
-                    num_released = mode.scale_in(2)
-
-                    # Should remove both instances
-                    assert num_released == 2
-                    assert len(mode.resources) == 0
-
-            # Clean up
-            with patch.object(mode, "_delete_ec2_instance"):
-                with patch.object(mode, "_delete_ssm_parameter"):
-                    with patch.object(mode, "_delete_security_group"):
-                        with patch.object(mode, "_delete_subnet"):
-                            with patch.object(mode, "_delete_vpc"):
-                                mode.preserve_bastion = (
-                                    False  # Ensure bastion is cleaned up
-                                )
-                                mode.cleanup_infrastructure()
-
-    @pytest.mark.substrate
-    def test_serverless_lambda_scaling(self, substrate_session, file_state_store):
-        """Test autoscaling with Lambda functions in ServerlessMode."""
-        # Create a ServerlessMode instance with Lambda and scaling configuration
-        provider_id = f"test-provider-{uuid.uuid4().hex[:8]}"
-
-        # Set up mocks for AWS services using substrate
-        with patch("boto3.Session", return_value=substrate_session):
-            # Create serverless mode with scaling configuration
-            mode = ServerlessMode(
-                provider_id=provider_id,
-                session=substrate_session,
-                state_store=file_state_store,
-                region="us-east-1",
-                worker_type="lambda",
-                lambda_memory=128,
-                lambda_timeout=30,
-                max_blocks=10,
-                min_blocks=0,
-                init_blocks=0,  # Serverless starts with 0 resources
-            )
-
-            # Initialize mode
-            mode.initialize()
-
-            # Mock Lambda function creation
-            function_counter = 0
-
-            def create_mock_function(*args, **kwargs):
-                nonlocal function_counter
-                function_counter += 1
-                function_name = f"lambda-function-{function_counter}"
-                return {
-                    "FunctionName": function_name,
-                    "FunctionArn": f"arn:aws:lambda:us-east-1:123456789012:function:{function_name}",
-                }
-
-            # Mock Lambda invocation for tasks
-            mock_response = {
-                "StatusCode": 200,
-                "Payload": MagicMock(
-                    read=lambda: b'{"statusCode": 200, "body": "Success"}'
-                ),
-            }
-
-            # Set up Lambda mocking
-            mode.lambda_manager = MagicMock()
-            mode.lambda_manager._create_lambda_function.side_effect = (
-                create_mock_function
-            )
-            mode.lambda_manager.invoke_lambda_function.return_value = mock_response
-
-            # Submit multiple jobs in parallel
-            job_ids = []
-            resource_ids = []
-
-            # Lambda functions are created on demand, no initial blocks
-            assert len(mode.resources) == 0
-
-            # Submit 5 jobs - should create 5 Lambda functions
-            for i in range(5):
-                with patch(
-                    "builtins.open", MagicMock()
-                ):  # Mock writing Lambda code to file
-                    job_id = f"job-{i + 1}"
-                    resource_id = mode.submit_job(job_id, f"echo 'Job {i + 1}'", 1)
-                    job_ids.append(job_id)
-                    resource_ids.append(resource_id)
-
-            # Verify Lambda functions were created
-            assert len(mode.resources) == 5
-            assert mode.lambda_manager._create_lambda_function.call_count == 5
-
-            # Test Lambda function invocation
-            with patch(
-                "builtins.open", MagicMock()
-            ):  # Mock writing Lambda code to file
-                for resource_id in resource_ids:
-                    status = mode.get_job_status([resource_id])
-                    assert resource_id in status
-
-            # Lambda functions are automatically cleaned up after execution
-            # This is a key difference from EC2-based modes
-
-            # Clean up remaining resources
-            mode.lambda_manager.delete_lambda_function.return_value = None
-            mode.cleanup_infrastructure()
-
-    @pytest.mark.substrate
-    def test_auto_worker_type_selection(self, substrate_session, file_state_store):
-        """Test automatic worker type selection in ServerlessMode."""
-        # Create a ServerlessMode instance with auto worker type selection
-        provider_id = f"test-provider-{uuid.uuid4().hex[:8]}"
-
-        # Set up mocks for AWS services using substrate
-        with patch("boto3.Session", return_value=substrate_session):
-            # Create serverless mode with auto worker type
-            mode = ServerlessMode(
-                provider_id=provider_id,
-                session=substrate_session,
-                state_store=file_state_store,
-                region="us-east-1",
-                worker_type="auto",  # Auto selection based on job characteristics
-                lambda_memory=128,
-                lambda_timeout=30,
-                ecs_task_cpu=256,
-                ecs_task_memory=512,
-                ecs_container_image="amazon/amazon-ecs-sample",
-                max_blocks=10,
-                min_blocks=0,
-            )
-
-            # Initialize mode
-            mode.initialize()
-
-            # Mock Lambda function creation
-            mode.lambda_manager = MagicMock()
-            mode.lambda_manager._create_lambda_function.return_value = {
-                "FunctionName": "lambda-function",
-                "FunctionArn": "arn:aws:lambda:us-east-1:123456789012:function:lambda-function",
-            }
-            mode.lambda_manager.invoke_lambda_function.return_value = {
-                "StatusCode": 200,
-                "Payload": MagicMock(
-                    read=lambda: b'{"statusCode": 200, "body": "Success"}'
-                ),
-            }
-
-            # Mock ECS task creation
-            mode.ecs_manager = MagicMock()
-            mode.ecs_manager.create_cluster.return_value = "test-cluster"
-            mode.ecs_manager.register_task_definition.return_value = "test-task:1"
-            mode.ecs_manager.run_task.return_value = {
-                "taskArn": "arn:aws:ecs:us-east-1:123456789012:task/test-cluster/abcdef12345",
-                "clusterArn": "arn:aws:ecs:us-east-1:123456789012:cluster/test-cluster",
-                "taskDefinitionArn": "arn:aws:ecs:us-east-1:123456789012:task-definition/test-task:1",
-            }
-
-            # Patch the worker type selection method
-            with patch.object(mode, "_select_worker_type") as mock_select_worker:
-                # First job is small, should use Lambda
-                mock_select_worker.side_effect = ["lambda", "ecs", "lambda"]
-
-                # Submit jobs with different characteristics
-                with patch(
-                    "builtins.open", MagicMock()
-                ):  # Mock writing Lambda code to file
-                    # First job - small, should use Lambda
-                    job1_id = "small-job"
-                    resource1_id = mode.submit_job(job1_id, "echo 'Small job'", 1)
-
-                    # Lambda function should be created
-                    assert mode.resources[resource1_id]["worker_type"] == "lambda"
-                    assert mode.lambda_manager._create_lambda_function.call_count == 1
-                    assert mode.ecs_manager.run_task.call_count == 0
-
-                    # Second job - larger, should use ECS
-                    job2_id = "large-job"
-                    resource2_id = mode.submit_job(
-                        job2_id, "echo 'Large job'", 4, job_name="cpu-intensive"
-                    )
-
-                    # ECS task should be created
-                    assert mode.resources[resource2_id]["worker_type"] == "ecs"
-                    assert mode.lambda_manager._create_lambda_function.call_count == 1
-                    assert mode.ecs_manager.run_task.call_count == 1
-
-                    # Third job - another small job, back to Lambda
-                    job3_id = "another-small-job"
-                    resource3_id = mode.submit_job(
-                        job3_id, "echo 'Another small job'", 1
-                    )
-
-                    # Lambda function should be created
-                    assert mode.resources[resource3_id]["worker_type"] == "lambda"
-                    assert mode.lambda_manager._create_lambda_function.call_count == 2
-                    assert mode.ecs_manager.run_task.call_count == 1
-
-            # Clean up
-            mode.lambda_manager.delete_lambda_function.return_value = None
-            mode.ecs_manager.stop_task.return_value = None
-            mode.ecs_manager.deregister_task_definition.return_value = None
-            mode.ecs_manager.delete_cluster.return_value = None
-            mode.cleanup_infrastructure()
-
-    @pytest.mark.substrate
-    def test_hybrid_scaling_strategy(self, substrate_session, file_state_store):
-        """Test hybrid scaling strategy using mixed resource types."""
-        # Create a provider that uses a hybrid approach
-        provider_id = f"test-provider-{uuid.uuid4().hex[:8]}"
-
-        # Create a provider to handle both the test and implementation
-        provider = EphemeralAWSProvider(
-            provider_id=provider_id,
-            region="us-east-1",
-            mode="serverless",
-            worker_type="auto",
-            lambda_memory=128,
-            lambda_timeout=30,
-            ecs_task_cpu=256,
-            ecs_task_memory=512,
-            ecs_container_image="amazon/amazon-ecs-sample",
-            max_blocks=10,
-            min_blocks=0,
-            init_blocks=0,
-            # Inject our session and state store for testing
-            _test_session=substrate_session,
-            _test_state_store=file_state_store,
+from tests.substrate_support import get_substrate_endpoint, is_substrate_available
+
+pytestmark = [
+    pytest.mark.integration,
+    pytest.mark.substrate,
+    pytest.mark.skipif(
+        not is_substrate_available(),
+        reason="substrate not available - start with 'make substrate-up'",
+    ),
+]
+
+
+@pytest.fixture
+def state_file(tmp_path):
+    """Path for the provider's state document, inside the test's sandbox."""
+    return tmp_path / f"state-{uuid.uuid4().hex[:8]}.json"
+
+
+def running_instance_ids(session, provider):
+    """Return the live instance IDs this provider owns.
+
+    Scoped by the ``ProviderId`` tag rather than by subnet: every launch here goes
+    through the mode's launch template (#85), and substrate does not apply the
+    template's network interface -- it places the instance in a subnet of its own
+    choosing, so a ``subnet-id`` filter matches nothing even though the launch
+    succeeded. The tag is set per launch in ``_create_instance``, so it survives
+    that gap and also keeps a concurrent test from inflating the count.
+
+    ``terminated`` is excluded because a torn-down instance lingers in
+    ``describe_instances`` for a while.
+    """
+    ec2 = session.client("ec2")
+    reservations = ec2.describe_instances(
+        Filters=[
+            {"Name": "tag:ProviderId", "Values": [provider.provider_id]},
+            {
+                "Name": "instance-state-name",
+                "Values": ["pending", "running", "stopping", "stopped"],
+            },
+        ]
+    )["Reservations"]
+    return [i["InstanceId"] for r in reservations for i in r["Instances"]]
+
+
+def build_provider(session, state_file, network, **config):
+    """Construct a provider with its real operating mode, bound to the emulator.
+
+    ``region`` follows the session rather than being hardcoded. The provider
+    builds its own session from ``region``, and substrate partitions resources by
+    region exactly as AWS does -- so a fixed ``us-east-1`` here against a
+    ``substrate_network`` provisioned in ``AWS_TEST_REGION`` (default
+    ``us-west-2``) makes the caller's own security group report
+    ``InvalidGroup.NotFound``.
+    """
+    return EphemeralAWSProvider(
+        provider_id=f"test-provider-{uuid.uuid4().hex[:8]}",
+        region=session.region_name,
+        endpoint_url=get_substrate_endpoint(),
+        state_file_path=str(state_file),
+        instance_type="t3.micro",
+        image_id="ami-12345678",
+        vpc_id=network["vpc_id"],
+        subnet_id=network["subnet_id"],
+        security_group_id=network["security_group_id"],
+        **config,
+    )
+
+
+class TestStandardModeScaling:
+    """Scaling in standard mode, where each block is an EC2 instance."""
+
+    def test_submit_stops_at_max_blocks(
+        self, substrate_session, substrate_network, state_file
+    ):
+        """The cap is enforced by refusing the submit, not by over-provisioning."""
+        provider = build_provider(
+            substrate_session, state_file, substrate_network, max_blocks=2, min_blocks=0
+        )
+        try:
+            job_ids = [provider.submit(f"echo {i}", tasks_per_node=1) for i in range(2)]
+            assert len(provider.resources) == 2
+            assert len(running_instance_ids(substrate_session, provider)) == 2
+
+            with pytest.raises(ProviderError, match="already at max_blocks = 2"):
+                provider.submit("echo 3", tasks_per_node=1)
+
+            # The refused submit must not have launched anything.
+            assert len(running_instance_ids(substrate_session, provider)) == 2
+            assert [s.state for s in provider.status(job_ids)] == [
+                JobState.RUNNING,
+                JobState.RUNNING,
+            ]
+        finally:
+            provider.shutdown()
+
+    def test_scale_in_releases_running_blocks(
+        self, substrate_session, substrate_network, state_file
+    ):
+        """scale_in cancels the requested number of blocks and forgets them.
+
+        ``status()`` is polled first on purpose: ``scale_in`` selects blocks whose
+        recorded status is RUNNING, and a freshly submitted block is still
+        PENDING until something asks the mode.
+        """
+        provider = build_provider(
+            substrate_session, state_file, substrate_network, max_blocks=3, min_blocks=0
+        )
+        try:
+            job_ids = [provider.submit(f"echo {i}", tasks_per_node=1) for i in range(3)]
+            provider.status(job_ids)
+
+            released = provider.scale_in(2)
+
+            assert len(released) == 2
+            assert set(released) <= set(job_ids)
+            assert len(provider.resources) == 1
+            # The surviving job is the one not released.
+            assert set(provider.job_map) == set(job_ids) - set(released)
+        finally:
+            provider.shutdown()
+
+    def test_scale_in_of_zero_or_fewer_is_a_no_op(
+        self, substrate_session, substrate_network, state_file
+    ):
+        """A non-positive request touches nothing rather than draining the pool."""
+        provider = build_provider(
+            substrate_session, state_file, substrate_network, max_blocks=2, min_blocks=0
+        )
+        try:
+            job_ids = [provider.submit(f"echo {i}", tasks_per_node=1) for i in range(2)]
+            provider.status(job_ids)
+
+            assert provider.scale_in(0) == []
+            assert provider.scale_in(-1) == []
+            assert len(provider.resources) == 2
+        finally:
+            provider.shutdown()
+
+    def test_scale_out_is_delegated_to_parsl(
+        self, substrate_session, substrate_network, state_file
+    ):
+        """scale_out reports nothing and provisions nothing.
+
+        This is the provider's documented contract -- Parsl's strategy decides
+        when to grow -- so the test pins it rather than treating it as a gap. If
+        that ever changes, this failing is the correct signal.
+        """
+        provider = build_provider(
+            substrate_session, state_file, substrate_network, max_blocks=4, min_blocks=0
+        )
+        try:
+            assert provider.scale_out(2) == []
+
+            assert running_instance_ids(substrate_session, provider) == []
+            assert provider.resources == {}
+        finally:
+            provider.shutdown()
+
+
+class TestDetachedModeScaling:
+    """Scaling in detached mode, where a bastion fronts the blocks.
+
+    ``bastion_host_type="direct"`` throughout: the CloudFormation bastion needs
+    an endpoint substrate does not serve. No ``key_name`` is passed, which is the
+    ordinary configuration -- SSM needs none -- and which used to fail botocore's
+    parameter validation before any request was sent (#158).
+    """
+
+    def _provider(self, session, state_file, network, **config):
+        return build_provider(
+            session,
+            state_file,
+            network,
+            mode="detached",
+            bastion_host_type="direct",
+            bastion_instance_type="t3.micro",
+            workflow_id=f"test-workflow-{uuid.uuid4().hex[:8]}",
+            preserve_bastion=False,
+            **config,
         )
 
-        # Initialize the internal operating mode directly
-        with patch.object(provider, "_initialize_operating_mode"):
-            # Mock the operating mode
-            mode = ServerlessMode(
-                provider_id=provider_id,
-                session=substrate_session,
-                state_store=file_state_store,
-                region="us-east-1",
-                worker_type="auto",
-                lambda_memory=128,
-                lambda_timeout=30,
-                ecs_task_cpu=256,
-                ecs_task_memory=512,
-                ecs_container_image="amazon/amazon-ecs-sample",
-                max_blocks=10,
-                min_blocks=0,
-                init_blocks=0,
-            )
+    def test_submit_stops_at_max_blocks(
+        self, substrate_session, substrate_network, state_file
+    ):
+        """The cap applies to worker blocks and leaves the bastion alone."""
+        provider = self._provider(
+            substrate_session, state_file, substrate_network, max_blocks=2, min_blocks=0
+        )
+        try:
+            bastion_id = provider.operating_mode.bastion_id
+            assert bastion_id is not None
 
-            # Initialize mode
+            for i in range(2):
+                provider.submit(f"echo {i}", tasks_per_node=1)
+            assert len(provider.resources) == 2
+
+            with pytest.raises(ProviderError, match="already at max_blocks = 2"):
+                provider.submit("echo 3", tasks_per_node=1)
+
+            # The bastion is infrastructure, not a block, so it is not counted
+            # against max_blocks and must still be running. It carries the same
+            # ProviderId tag as a worker, which is why it shows up here.
+            assert bastion_id in running_instance_ids(substrate_session, provider)
+        finally:
+            provider.shutdown()
+
+    def test_shutdown_removes_the_bastion(
+        self, substrate_session, substrate_network, state_file
+    ):
+        """With preserve_bastion=False the bastion goes with the provider."""
+        provider = self._provider(
+            substrate_session, state_file, substrate_network, max_blocks=1, min_blocks=0
+        )
+        bastion_id = provider.operating_mode.bastion_id
+        assert bastion_id in running_instance_ids(substrate_session, provider)
+
+        provider.shutdown()
+
+        assert provider.operating_mode.bastion_id is None
+        assert bastion_id not in running_instance_ids(substrate_session, provider)
+
+
+class TestServerlessWorkerSelection:
+    """Which backend a serverless block lands on, given its shape.
+
+    Driven through the real ``_select_worker_type`` rather than a patched one. The
+    old test patched it with a fixed ``side_effect`` list and then asserted the
+    resources matched that list, which tested the mock.
+    """
+
+    def _mode(self, substrate_session, network, tmp_path, **config):
+        provider_id = f"test-provider-{uuid.uuid4().hex[:8]}"
+        return ServerlessMode(
+            provider_id=provider_id,
+            session=substrate_session,
+            state_store=FileStateStore(
+                file_path=str(tmp_path / "state.json"), provider_id=provider_id
+            ),
+            region=substrate_session.region_name,
+            vpc_id=network["vpc_id"],
+            subnet_id=network["subnet_id"],
+            security_group_id=network["security_group_id"],
+            **config,
+        )
+
+    def test_auto_routes_by_job_shape(
+        self, substrate_session, substrate_network, tmp_path
+    ):
+        """A single-task, short command goes to Lambda; anything else to ECS."""
+        mode = self._mode(
+            substrate_session, substrate_network, tmp_path, worker_type="auto"
+        )
+        try:
             mode.initialize()
 
-            # Replace provider's operating mode with our mocked one
-            provider._operating_mode = mode
+            assert mode._select_worker_type("echo hello", 1) == WORKER_TYPE_LAMBDA
+            # More than one task per node cannot be a Lambda invocation.
+            assert mode._select_worker_type("echo hello", 4) == WORKER_TYPE_ECS
+            # Nor can a command past Lambda's practical payload size.
+            assert mode._select_worker_type("x" * 6000, 1) == WORKER_TYPE_ECS
+        finally:
+            mode.cleanup_infrastructure()
 
-            # Mock Lambda function and ECS task creation
-            mode.lambda_manager = MagicMock()
-            mode.ecs_manager = MagicMock()
+    @pytest.mark.parametrize("worker_type", [WORKER_TYPE_LAMBDA, WORKER_TYPE_ECS])
+    def test_an_explicit_worker_type_is_never_overridden(
+        self, substrate_session, substrate_network, tmp_path, worker_type
+    ):
+        """Only ``auto`` inspects the job; a named backend is honoured verbatim."""
+        mode = self._mode(
+            substrate_session, substrate_network, tmp_path, worker_type=worker_type
+        )
+        try:
+            mode.initialize()
 
-            # Configure mocks
-            mode.lambda_manager._create_lambda_function.return_value = {
-                "FunctionName": "lambda-function",
-                "FunctionArn": "arn:aws:lambda:us-east-1:123456789012:function:lambda-function",
-            }
-            mode.lambda_manager.invoke_lambda_function.return_value = {
-                "StatusCode": 200,
-                "Payload": MagicMock(
-                    read=lambda: b'{"statusCode": 200, "body": "Success"}'
-                ),
-            }
-
-            mode.ecs_manager.create_cluster.return_value = "test-cluster"
-            mode.ecs_manager.register_task_definition.return_value = "test-task:1"
-            mode.ecs_manager.run_task.return_value = {
-                "taskArn": "arn:aws:ecs:us-east-1:123456789012:task/test-cluster/abcdef12345",
-                "clusterArn": "arn:aws:ecs:us-east-1:123456789012:cluster/test-cluster",
-                "taskDefinitionArn": "arn:aws:ecs:us-east-1:123456789012:task-definition/test-task:1",
-            }
-
-            # Test the provider's submit method with different job types
-            with patch.object(mode, "_select_worker_type") as mock_select_worker:
-                mock_select_worker.side_effect = [
-                    "lambda",
-                    "ecs",
-                    "lambda",
-                    "ecs",
-                    "lambda",
-                ]
-
-                # Submit a mix of jobs with provider interface
-                with patch(
-                    "builtins.open", MagicMock()
-                ):  # Mock writing Lambda code to file
-                    # Submit 5 mixed jobs
-                    job_ids = []
-                    for i in range(5):
-                        job_id = f"job-{i + 1}"
-                        command = f"echo 'Job {i + 1}'"
-
-                        # Submit through provider interface
-                        with patch.object(provider, "status"):  # Mock status calls
-                            resource_id = provider.submit(job_id, command)
-                            job_ids.append(job_id)
-
-                    # Verify jobs were submitted and tracked
-                    assert len(mode.resources) == 5
-
-                    # Should have 3 Lambda functions and 2 ECS tasks based on our mock
-                    lambda_count = sum(
-                        1
-                        for r in mode.resources.values()
-                        if r.get("worker_type") == "lambda"
-                    )
-                    ecs_count = sum(
-                        1
-                        for r in mode.resources.values()
-                        if r.get("worker_type") == "ecs"
-                    )
-
-                    assert lambda_count == 3
-                    assert ecs_count == 2
-
-                    # Check status through provider interface
-                    all_resource_ids = list(mode.resources.keys())
-
-                    # Patch status to return running for all jobs
-                    with patch.object(mode, "get_job_status") as mock_status:
-                        mock_status.return_value = {
-                            rid: "running" for rid in all_resource_ids
-                        }
-                        status = provider.status(job_ids)
-
-                        # All jobs should be running
-                        for job_id in job_ids:
-                            assert status[job_id] == "running"
-
-                    # Test cancellation through provider interface
-                    with patch.object(mode, "cancel_jobs") as mock_cancel:
-                        mock_cancel.return_value = {
-                            rid: "cancelled" for rid in all_resource_ids
-                        }
-                        cancel_status = provider.cancel(job_ids)
-
-                        # All jobs should be cancelled
-                        for job_id in job_ids:
-                            assert cancel_status[job_id] == "cancelled"
-
-            # Clean up - use provider interface
-            with patch.object(mode, "cleanup_infrastructure"):
-                provider.shutdown()
-                # Verify cleanup was called
-                mode.cleanup_infrastructure.assert_called_once()
+            # The same two jobs that ``auto`` routes differently above.
+            assert mode._select_worker_type("echo hello", 1) == worker_type
+            assert mode._select_worker_type("x" * 6000, 8) == worker_type
+        finally:
+            mode.cleanup_infrastructure()
