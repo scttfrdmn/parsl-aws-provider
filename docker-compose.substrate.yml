@@ -18,7 +18,13 @@ services:
   substrate:
     # Pinned, not `latest`: an emulator that silently changes under CI turns an
     # unrelated PR red. Bump deliberately.
-    image: ghcr.io/scttfrdmn/substrate:0.76.0
+    #
+    # 0.82.0 is the first release with an EC2 `CreateFleet` handler (substrate
+    # #387), which is what lets the spot-fleet suite run against an endpoint
+    # instead of moto. `RequestSpotFleet`/`RequestSpotInstances` are still
+    # unimplemented and are not coming back here -- #86 moved this provider onto
+    # CreateFleet, so nothing calls them.
+    image: ghcr.io/scttfrdmn/substrate:0.82.0
     container_name: parsl-substrate
     ports:
       - "4566:4566"

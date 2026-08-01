@@ -42,6 +42,7 @@ from parsl_ephemeral_aws.constants import (
     WORKER_TYPE_ECS,
     WORKER_TYPE_LAMBDA,
     STATUS_CANCELLED,
+    STATUS_COMPLETED,
     STATUS_PENDING,
     STATUS_RUNNING,
 )
@@ -271,38 +272,132 @@ class TestServerlessModeSpotFleetIntegration:
         # remove it again -- otherwise a phantom job would be polled forever.
         assert serverless_mode.resources == {}
 
-    def test_get_spot_fleet_status_reads_the_nested_capacity(
+    def test_an_active_fleet_with_live_instances_reports_running(
         self, serverless_mode, network
     ):
-        """An active, fully fulfilled fleet reports RUNNING.
+        """An active fleet still holding instances reports RUNNING.
 
-        `FulfilledCapacity` lives only inside `SpotFleetRequestConfig`, beside
-        `TargetCapacity`. Reading it from the entry's top level always yielded
-        the 0 default, so `0 >= target` was false and a fully provisioned fleet
-        reported PENDING forever -- never terminal, so Parsl polled it and never
-        freed the block (#114).
+        The status comes from the *instances*, not from capacity counters. An
+        instant fleet does not maintain capacity, so its ``FleetState`` stays
+        ``active`` for the fleet's whole life regardless of what became of the
+        instances, and the counters only ever reflect the original launch.
+
+        This is the site of #114, though not in the way the old test described.
+        That version read `FulfilledCapacity` from the wrong nesting level -- it
+        lives inside `SpotFleetRequestConfig`, beside `TargetCapacity` -- so the
+        0 default made `0 >= target` false and a fully provisioned fleet reported
+        PENDING forever, never terminal, so Parsl polled it and never freed the
+        block. The capacity comparison is gone entirely now; instance state
+        replaced it.
+
+        The old test also created its fleet with ``request_spot_fleet``, the
+        legacy API #86 removed. ``_get_spot_fleet_status`` calls
+        ``describe_fleets``, which knows nothing about an ``sfr-`` request, so it
+        took the "EC2 has forgotten this fleet" branch and returned COMPLETED --
+        the assertion was against an API the code no longer calls.
         """
         serverless_mode.initialize()
         ec2 = serverless_mode.session.client("ec2")
-        fleet_request_id = ec2.request_spot_fleet(
-            SpotFleetRequestConfig={
-                "IamFleetRole": "arn:aws:iam::123456789012:role/parsl-test-fleet",
-                "AllocationStrategy": "priceCapacityOptimized",
-                "TargetCapacity": 2,
-                "LaunchSpecifications": [
-                    {
-                        "ImageId": "ami-12345678",
-                        "InstanceType": "t3.small",
-                        "SubnetId": network["subnet_id"],
-                        "SecurityGroups": [{"GroupId": network["security_group_id"]}],
-                    }
-                ],
-            }
-        )["SpotFleetRequestId"]
+        template = ec2.create_launch_template(
+            LaunchTemplateName="parsl-test-fleet-template",
+            LaunchTemplateData={
+                "ImageId": "ami-12345678",
+                "InstanceType": "t3.small",
+            },
+        )["LaunchTemplate"]
+        fleet = ec2.create_fleet(
+            Type="instant",
+            LaunchTemplateConfigs=[
+                {
+                    "LaunchTemplateSpecification": {
+                        "LaunchTemplateId": template["LaunchTemplateId"],
+                        "Version": str(template["LatestVersionNumber"]),
+                    },
+                    "Overrides": [
+                        {
+                            "InstanceType": "t3.small",
+                            "SubnetId": network["subnet_id"],
+                        }
+                    ],
+                }
+            ],
+            TargetCapacitySpecification={
+                "TotalTargetCapacity": 2,
+                "DefaultTargetCapacityType": "spot",
+            },
+        )
+        fleet_id = fleet["FleetId"]
+
+        # Real EC2 tags every fleet-launched instance with `aws:ec2:fleet-id`,
+        # and that tag is the only supported way to enumerate an instant fleet's
+        # instances: DescribeFleetInstances rejects this fleet type outright, and
+        # DescribeFleets reports the original launch without dropping instances
+        # that have since terminated. Neither moto nor substrate applies it
+        # (substrate#443), so it is set here -- otherwise the lookup comes back
+        # empty and a running fleet reports COMPLETED for want of a tag rather
+        # than for any behaviour of the code under test.
+        instance_ids = [i for g in fleet["Instances"] for i in g["InstanceIds"]]
+        assert instance_ids, "fleet launched nothing; nothing to assert about"
+        ec2.create_tags(
+            Resources=instance_ids,
+            Tags=[{"Key": "aws:ec2:fleet-id", "Value": fleet_id}],
+        )
+
+        assert serverless_mode._get_spot_fleet_status(fleet_id) == STATUS_RUNNING
+
+    def test_a_fleet_whose_instances_are_gone_reports_completed(
+        self, serverless_mode, network
+    ):
+        """A terminal status, so Parsl can free the block.
+
+        The counterpart to the test above, and the reason instance state is what
+        decides: the fleet below stays ``active`` throughout, so anything reading
+        ``FleetState`` alone would report it RUNNING forever.
+        """
+        serverless_mode.initialize()
+        ec2 = serverless_mode.session.client("ec2")
+        template = ec2.create_launch_template(
+            LaunchTemplateName="parsl-test-fleet-template-2",
+            LaunchTemplateData={
+                "ImageId": "ami-12345678",
+                "InstanceType": "t3.small",
+            },
+        )["LaunchTemplate"]
+        fleet = ec2.create_fleet(
+            Type="instant",
+            LaunchTemplateConfigs=[
+                {
+                    "LaunchTemplateSpecification": {
+                        "LaunchTemplateId": template["LaunchTemplateId"],
+                        "Version": str(template["LatestVersionNumber"]),
+                    },
+                    "Overrides": [
+                        {
+                            "InstanceType": "t3.small",
+                            "SubnetId": network["subnet_id"],
+                        }
+                    ],
+                }
+            ],
+            TargetCapacitySpecification={
+                "TotalTargetCapacity": 1,
+                "DefaultTargetCapacityType": "spot",
+            },
+        )
+        fleet_id = fleet["FleetId"]
+        instance_ids = [i for g in fleet["Instances"] for i in g["InstanceIds"]]
+        ec2.create_tags(  # see substrate#443, above
+            Resources=instance_ids,
+            Tags=[{"Key": "aws:ec2:fleet-id", "Value": fleet_id}],
+        )
+
+        ec2.terminate_instances(InstanceIds=instance_ids)
 
         assert (
-            serverless_mode._get_spot_fleet_status(fleet_request_id) == STATUS_RUNNING
+            ec2.describe_fleets(FleetIds=[fleet_id])["Fleets"][0]["FleetState"]
+            == "active"
         )
+        assert serverless_mode._get_spot_fleet_status(fleet_id) == STATUS_COMPLETED
 
     def test_cancel_job_deletes_the_stack(self, serverless_mode):
         """Cancelling a job marks it CANCELLED and deletes its stack."""
