@@ -1,29 +1,43 @@
 """Integration tests for provider lifecycle.
 
-These tests verify the complete lifecycle of the EphemeralAWSProvider, including
-initialization, usage, and cleanup across different operating modes.
+These tests drive ``EphemeralAWSProvider`` through construction, submit, status,
+cancel and shutdown against the substrate emulator, with the operating mode
+replaced by a double so no instances are launched.
+
+Every test here previously passed ``_test_session=``/``_test_state_store=``,
+kwargs that never existed in the package (``git log -S`` finds no commit adding
+them) and which #105 turned from silently-ignored into hard errors. They are
+replaced by the real seams: ``endpoint_url`` binds the session to the emulator,
+and ``_initialize_operating_mode`` is patched the way the unit suite does it.
+
+That mattered more than a kwarg rename. The old tests also assigned
+``provider._operating_mode``, an attribute the provider never reads -- it uses
+``operating_mode`` -- so the doubles were inert and every assertion about them
+was vacuous. Several also asserted an API this provider does not have:
+``initialize_blocks()``, ``save_state()``, ``load_state()``, a dict-returning
+``status()``, and ``submit(job_id, command)``. The real contract is
+``submit(command, tasks_per_node)`` returning a job ID, ``status()`` returning
+``List[JobStatus]`` and ``cancel()`` returning ``List[bool]`` (the Parsl
+compliance fix), so the assertions are rewritten against that.
 
 SPDX-License-Identifier: Apache-2.0
 SPDX-FileCopyrightText: 2025-2026 Scott Friedman and Project Contributors
 """
 
-import os
 import uuid
-import pytest
-import tempfile
-from unittest.mock import MagicMock, PropertyMock
+from contextlib import contextmanager
+from unittest.mock import MagicMock, patch
 
-from parsl_ephemeral_aws.provider import EphemeralAWSProvider
-from parsl_ephemeral_aws.modes.standard import StandardMode
+import pytest
+from parsl.jobs.states import JobState
+
+from parsl_ephemeral_aws.exceptions import ProviderConfigurationError
 from parsl_ephemeral_aws.modes.detached import DetachedMode
 from parsl_ephemeral_aws.modes.serverless import ServerlessMode
+from parsl_ephemeral_aws.modes.standard import StandardMode
+from parsl_ephemeral_aws.provider import EphemeralAWSProvider
 from parsl_ephemeral_aws.state.file import FileStateStore
-from tests.substrate_support import (
-    get_substrate_session,
-    is_substrate_available,
-)
-from parsl_ephemeral_aws.exceptions import ProviderConfigurationError
-
+from tests.substrate_support import get_substrate_endpoint, is_substrate_available
 
 # Skip all tests if the substrate emulator is not available
 pytestmark = pytest.mark.skipif(
@@ -32,525 +46,274 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+@contextmanager
+def build_provider(mode_spec, state_file, network, **config):
+    """Construct a provider whose operating mode is a double, and yield both.
+
+    The mode is substituted through ``_initialize_operating_mode`` rather than by
+    assigning the attribute afterwards, because ``__init__`` itself calls
+    ``operating_mode.initialize()`` -- a post-hoc swap lets the real mode
+    provision infrastructure first, which is what the previous version of these
+    tests did.
+
+    ``spec=`` is deliberate: a bare ``MagicMock`` answers to any attribute, so a
+    test asserting on a method the mode no longer has would keep passing. The
+    state store is real, backed by ``tmp_path``, since the provider round-trips
+    ``provider_id`` through it during construction.
+    """
+    mode = MagicMock(spec=mode_spec)
+    mode.submit_job.return_value = "resource-1"
+    mode.get_job_status.return_value = {}
+    mode.cancel_jobs.return_value = {}
+    mode.list_resources.return_value = {}
+
+    provider_id = config.pop("provider_id", f"test-provider-{uuid.uuid4().hex[:8]}")
+    store = FileStateStore(file_path=str(state_file), provider_id=provider_id)
+
+    with (
+        patch.object(
+            EphemeralAWSProvider, "_initialize_state_store", return_value=store
+        ),
+        patch.object(
+            EphemeralAWSProvider, "_initialize_operating_mode", return_value=mode
+        ),
+    ):
+        provider = EphemeralAWSProvider(
+            provider_id=provider_id,
+            region="us-east-1",
+            endpoint_url=get_substrate_endpoint(),
+            state_file_path=str(state_file),
+            vpc_id=network["vpc_id"],
+            subnet_id=network["subnet_id"],
+            security_group_id=network["security_group_id"],
+            **config,
+        )
+    try:
+        yield provider, mode
+    finally:
+        provider.shutdown()
+
+
 @pytest.mark.integration
+@pytest.mark.substrate
 class TestProviderLifecycle:
     """Integration tests for provider lifecycle."""
 
-    @pytest.fixture(scope="class")
-    def substrate_session(self):
-        """Create a session connected to substrate."""
-        return get_substrate_session()
-
     @pytest.fixture
-    def temp_dir(self):
-        """Create a temporary directory for state files."""
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            yield tmp_dir
+    def state_file(self, tmp_path):
+        """Path for the provider's state document, inside the test's sandbox."""
+        return tmp_path / f"state-{uuid.uuid4().hex[:8]}.json"
 
-    @pytest.fixture
-    def state_file_path(self, temp_dir):
-        """Create a path for the state file."""
-        return os.path.join(temp_dir, f"test-state-{uuid.uuid4().hex[:8]}.json")
-
-    @pytest.fixture
-    def file_state_store(self, state_file_path):
-        """Create a FileStateStore instance."""
-        provider_id = f"test-provider-{uuid.uuid4().hex[:8]}"
-        return FileStateStore(file_path=state_file_path, provider_id=provider_id)
-
-    @pytest.mark.substrate
-    def test_standard_mode_full_lifecycle(self, substrate_session, file_state_store):
-        """Test complete lifecycle of provider in standard mode."""
-        # Configuration for standard mode
-        config = {
-            "provider_id": f"test-provider-{uuid.uuid4().hex[:8]}",
-            "region": "us-east-1",
-            "instance_type": "t2.micro",
-            "image_id": "ami-12345678",  # Dummy AMI
-            "mode": "standard",
-            "max_blocks": 2,
-            "min_blocks": 0,
-            "init_blocks": 1,
-            # Inject test session
-            "_test_session": substrate_session,
-            "_test_state_store": file_state_store,
-        }
-
-        # Create provider
-        provider = EphemeralAWSProvider(**config)
-
-        # Replace provider's operating mode with a mocked StandardMode
-        mock_mode = MagicMock(spec=StandardMode)
-        mock_mode.initialize.return_value = None
-        mock_mode.cleanup_infrastructure.return_value = None
-        provider._operating_mode = mock_mode
-
-        try:
-            # Step a: Initialize provider
-            provider.initialize_blocks()
-            mock_mode.initialize.assert_called_once()
-            mock_mode._init_blocks.assert_called_once()
-
-            # Step b: Submit a job
-            job_id = f"test-job-{uuid.uuid4().hex[:8]}"
-            command = "echo 'hello world'"
-
-            mock_mode.submit_job.return_value = "resource-1"
-            mock_resource_job_mapping = PropertyMock(
-                return_value={"resource-1": job_id}
-            )
-            type(mock_mode).resource_job_mapping = mock_resource_job_mapping
-
-            resource_id = provider.submit(job_id, command)
-            assert resource_id == "resource-1"
-            mock_mode.submit_job.assert_called_with(job_id, command, 1)
-
-            # Step c: Check job status
-            mock_mode.get_job_status.return_value = {"resource-1": "running"}
-            status = provider.status([job_id])
-            assert job_id in status
-            assert status[job_id] == "running"
-
-            # Step d: Scale out
-            mock_mode.scale_out.return_value = 1
-            scaled = provider.scale_out(blocks=1)
-            assert scaled == 1
-            mock_mode.scale_out.assert_called_with(1)
-
-            # Step e: Scale in
-            mock_mode.scale_in.return_value = 1
-            scaled = provider.scale_in(blocks=1)
-            assert scaled == 1
-            mock_mode.scale_in.assert_called_with(1)
-
-            # Step f: Cancel job
-            mock_mode.cancel_jobs.return_value = {"resource-1": "cancelled"}
-            cancel_status = provider.cancel([job_id])
-            assert job_id in cancel_status
-            assert cancel_status[job_id] == "cancelled"
-
-            # Step g: Shutdown provider
-            provider.shutdown()
-            mock_mode.cleanup_infrastructure.assert_called_once()
-
-        finally:
-            # Ensure cleanup even if test fails
-            if (
-                hasattr(provider, "_operating_mode")
-                and provider._operating_mode is not None
-            ):
-                provider.shutdown()
-
-    @pytest.mark.substrate
-    def test_detached_mode_full_lifecycle(self, substrate_session, file_state_store):
-        """Test complete lifecycle of provider in detached mode."""
-        # Configuration for detached mode
-        workflow_id = f"test-workflow-{uuid.uuid4().hex[:8]}"
-        config = {
-            "provider_id": f"test-provider-{uuid.uuid4().hex[:8]}",
-            "region": "us-east-1",
-            "instance_type": "t2.micro",
-            "image_id": "ami-12345678",  # Dummy AMI
-            "mode": "detached",
-            "workflow_id": workflow_id,
-            "bastion_instance_type": "t2.micro",
-            "max_blocks": 2,
-            "min_blocks": 0,
-            "init_blocks": 1,
-            # Inject test session
-            "_test_session": substrate_session,
-            "_test_state_store": file_state_store,
-        }
-
-        # Create provider
-        provider = EphemeralAWSProvider(**config)
-
-        # Replace provider's operating mode with a mocked DetachedMode
-        mock_mode = MagicMock(spec=DetachedMode)
-        mock_mode.initialize.return_value = None
-        mock_mode.cleanup_infrastructure.return_value = None
-        provider._operating_mode = mock_mode
-
-        try:
-            # Step a: Initialize provider
-            provider.initialize_blocks()
-            mock_mode.initialize.assert_called_once()
-            mock_mode._init_blocks.assert_called_once()
-
-            # Step b: Submit a job
-            job_id = f"test-job-{uuid.uuid4().hex[:8]}"
-            command = "echo 'hello world'"
-
-            mock_mode.submit_job.return_value = "resource-1"
-            mock_resource_job_mapping = PropertyMock(
-                return_value={"resource-1": job_id}
-            )
-            type(mock_mode).resource_job_mapping = mock_resource_job_mapping
-
-            resource_id = provider.submit(job_id, command)
-            assert resource_id == "resource-1"
-            mock_mode.submit_job.assert_called_with(job_id, command, 1)
-
-            # Step c: Check job status
-            mock_mode.get_job_status.return_value = {"resource-1": "running"}
-            status = provider.status([job_id])
-            assert job_id in status
-            assert status[job_id] == "running"
-
-            # Step d: Test save_state and load_state specific to detached mode
-            mock_mode.save_state.return_value = None
-            provider.save_state()
-            mock_mode.save_state.assert_called_once()
-
-            mock_mode.load_state.return_value = None
-            provider.load_state()
-            mock_mode.load_state.assert_called_once()
-
-            # Step e: Shutdown provider with preserve_bastion
-            # First set preserve_bastion = True
-            provider.preserve_bastion = True
-            provider.shutdown()
-            # Detached mode should have preserve_bastion set to True
-            mock_mode.preserve_bastion = True
-            mock_mode.cleanup_infrastructure.assert_called_once()
-
-            # Reset for next test
-            mock_mode.cleanup_infrastructure.reset_mock()
-
-            # Now test with preserve_bastion = False
-            provider.preserve_bastion = False
-            provider.shutdown()
-            # Detached mode should have preserve_bastion set to False
-            mock_mode.preserve_bastion = False
-            mock_mode.cleanup_infrastructure.assert_called_once()
-
-        finally:
-            # Ensure cleanup even if test fails
-            if (
-                hasattr(provider, "_operating_mode")
-                and provider._operating_mode is not None
-            ):
-                provider.shutdown()
-
-    @pytest.mark.substrate
-    def test_serverless_mode_full_lifecycle(self, substrate_session, file_state_store):
-        """Test complete lifecycle of provider in serverless mode."""
-        # Configuration for serverless mode
-        config = {
-            "provider_id": f"test-provider-{uuid.uuid4().hex[:8]}",
-            "region": "us-east-1",
-            "mode": "serverless",
-            "worker_type": "lambda",
-            "lambda_memory": 128,
-            "lambda_timeout": 60,
-            "max_blocks": 10,
-            "min_blocks": 0,
-            "init_blocks": 0,  # No initial blocks for serverless
-            # Inject test session
-            "_test_session": substrate_session,
-            "_test_state_store": file_state_store,
-        }
-
-        # Create provider
-        provider = EphemeralAWSProvider(**config)
-
-        # Replace provider's operating mode with a mocked ServerlessMode
-        mock_mode = MagicMock(spec=ServerlessMode)
-        mock_mode.initialize.return_value = None
-        mock_mode.cleanup_infrastructure.return_value = None
-        provider._operating_mode = mock_mode
-
-        try:
-            # Step a: Initialize provider (no blocks for serverless)
-            provider.initialize_blocks()
-            mock_mode.initialize.assert_called_once()
-            # Serverless mode should not call _init_blocks
-            mock_mode._init_blocks.assert_not_called()
-
-            # Step b: Submit a job
-            job_id = f"test-job-{uuid.uuid4().hex[:8]}"
-            command = "echo 'hello world'"
-
-            mock_mode.submit_job.return_value = "resource-1"
-            mock_resource_job_mapping = PropertyMock(
-                return_value={"resource-1": job_id}
-            )
-            type(mock_mode).resource_job_mapping = mock_resource_job_mapping
-
-            resource_id = provider.submit(job_id, command)
-            assert resource_id == "resource-1"
-            mock_mode.submit_job.assert_called_with(job_id, command, 1)
-
-            # Step c: Check job status
-            mock_mode.get_job_status.return_value = {"resource-1": "running"}
-            status = provider.status([job_id])
-            assert job_id in status
-            assert status[job_id] == "running"
-
-            # Step d: Scaling should be a no-op in serverless mode
-            mock_mode.scale_out.return_value = 0
-            scaled = provider.scale_out(blocks=1)
-            assert scaled == 0
-            mock_mode.scale_out.assert_called_with(1)
-
-            mock_mode.scale_in.return_value = 0
-            scaled = provider.scale_in(blocks=1)
-            assert scaled == 0
-            mock_mode.scale_in.assert_called_with(1)
-
-            # Step e: Shutdown provider
-            provider.shutdown()
-            mock_mode.cleanup_infrastructure.assert_called_once()
-
-        finally:
-            # Ensure cleanup even if test fails
-            if (
-                hasattr(provider, "_operating_mode")
-                and provider._operating_mode is not None
-            ):
-                provider.shutdown()
-
-    @pytest.mark.substrate
-    def test_provider_validation(self):
-        """Test validation of provider configuration."""
-        # Test 1: Invalid mode
-        with pytest.raises(ProviderConfigurationError):
-            provider = EphemeralAWSProvider(
-                region="us-east-1",
-                instance_type="t2.micro",
-                image_id="ami-12345678",
-                mode="invalid_mode",
-            )
-
-        # Test 2: Missing required parameter for standard mode
-        with pytest.raises(ProviderConfigurationError):
-            provider = EphemeralAWSProvider(
-                region="us-east-1",
-                mode="standard",
-                # Missing instance_type and image_id
-            )
-
-        # Test 3: Missing required parameter for detached mode
-        with pytest.raises(ProviderConfigurationError):
-            provider = EphemeralAWSProvider(
-                region="us-east-1",
-                instance_type="t2.micro",
-                image_id="ami-12345678",
-                mode="detached",
-                # Missing workflow_id
-            )
-
-        # Test 4: Invalid configuration for serverless mode
-        with pytest.raises(ProviderConfigurationError):
-            provider = EphemeralAWSProvider(
-                region="us-east-1", mode="serverless", worker_type="invalid_worker"
-            )
-
-        # Test 5: Incompatible parameters
-        with pytest.raises(ProviderConfigurationError):
-            provider = EphemeralAWSProvider(
-                region="us-east-1",
-                instance_type="t2.micro",
-                image_id="ami-12345678",
-                mode="standard",
-                use_spot_fleet=True,
-                # Missing instance_types for spot fleet
-            )
-
-    @pytest.mark.substrate
-    def test_configuration_defaults(self, substrate_session, file_state_store):
-        """Test provider default configuration values."""
-        # Create provider with minimal configuration
-        provider = EphemeralAWSProvider(
-            region="us-east-1",
-            instance_type="t2.micro",
+    def test_standard_mode_full_lifecycle(self, substrate_network, state_file):
+        """Submit, poll, cancel and shut down in standard mode."""
+        with build_provider(
+            StandardMode,
+            state_file,
+            substrate_network,
+            instance_type="t3.micro",
             image_id="ami-12345678",
-            # Inject test session
-            _test_session=substrate_session,
-            _test_state_store=file_state_store,
-        )
+            mode="standard",
+            max_blocks=2,
+        ) as (provider, mode):
+            # __init__ initializes the mode; no separate call exists.
+            mode.initialize.assert_called_once()
 
-        # Replace provider's operating mode with a mock
-        mock_mode = MagicMock(spec=StandardMode)
-        provider._operating_mode = mock_mode
+            job_id = provider.submit("echo hello", tasks_per_node=1)
+            assert mode.submit_job.called
+            assert job_id in provider.job_map
 
-        try:
-            # Verify defaults
-            assert provider.mode == "standard"  # Default mode is standard
-            assert provider.max_blocks == 1  # Default max_blocks is 1
-            assert provider.min_blocks == 0  # Default min_blocks is 0
-            assert provider.init_blocks == 0  # Default init_blocks is 0
-            assert not provider.use_spot  # Default use_spot is False
-            assert not provider.use_spot_fleet  # Default use_spot_fleet is False
-            assert (
-                not provider.spot_interruption_handling
-            )  # Default spot_interruption_handling is False
+            mode.get_job_status.return_value = {"resource-1": "RUNNING"}
+            statuses = provider.status([job_id])
+            assert [s.state for s in statuses] == [JobState.RUNNING]
 
-            # Test default label is set
-            assert provider.label.startswith("ephemeral-aws")
+            mode.cancel_jobs.return_value = {"resource-1": "CANCELED"}
+            assert provider.cancel([job_id]) == [True]
 
-        finally:
-            # Ensure cleanup even if test fails
-            if (
-                hasattr(provider, "_operating_mode")
-                and provider._operating_mode is not None
-            ):
-                provider.shutdown()
+        mode.cleanup_infrastructure.assert_called_once()
 
-    @pytest.mark.substrate
-    def test_state_persistence_configuration(self, substrate_session, file_state_store):
-        """Test state persistence configuration options."""
-        # Create provider with file state store
-        provider_id = f"test-provider-{uuid.uuid4().hex[:8]}"
+    def test_detached_mode_full_lifecycle(self, substrate_network, state_file):
+        """Detached mode carries a workflow_id and cleans up on shutdown."""
         workflow_id = f"test-workflow-{uuid.uuid4().hex[:8]}"
-
-        provider = EphemeralAWSProvider(
-            provider_id=provider_id,
-            region="us-east-1",
-            instance_type="t2.micro",
+        with build_provider(
+            DetachedMode,
+            state_file,
+            substrate_network,
+            instance_type="t3.micro",
             image_id="ami-12345678",
             mode="detached",
             workflow_id=workflow_id,
-            bastion_instance_type="t2.micro",
-            state_store="file",
-            state_file_path=file_state_store.file_path,
-            # Inject test session
-            _test_session=substrate_session,
-            _test_state_store=file_state_store,
-        )
+            bastion_instance_type="t3.micro",
+            max_blocks=2,
+        ) as (provider, mode):
+            assert provider.workflow_id == workflow_id
+            mode.initialize.assert_called_once()
 
-        # Replace provider's operating mode with a mock
-        mock_mode = MagicMock(spec=DetachedMode)
-        provider._operating_mode = mock_mode
+            job_id = provider.submit("echo hello", tasks_per_node=1)
+            mode.get_job_status.return_value = {"resource-1": "RUNNING"}
+            assert [s.state for s in provider.status([job_id])] == [JobState.RUNNING]
 
-        try:
-            # Verify state store configuration
-            assert provider.state_store_type == "file"
-            assert provider.state_file_path == file_state_store.file_path
+        mode.cleanup_infrastructure.assert_called_once()
 
-            # Test save_state and load_state
-            provider.save_state()
-            mock_mode.save_state.assert_called_once()
+    def test_serverless_mode_full_lifecycle(self, substrate_network, state_file):
+        """Serverless mode submits without provisioning blocks.
 
-            provider.load_state()
-            mock_mode.load_state.assert_called_once()
+        No network IDs are required for Lambda-only serverless -- functions run in
+        the Lambda-managed VPC -- but passing them is harmless and keeps one
+        construction helper for all three modes.
+        """
+        with build_provider(
+            ServerlessMode,
+            state_file,
+            substrate_network,
+            mode="serverless",
+            max_blocks=10,
+            init_blocks=0,
+        ) as (provider, mode):
+            mode.initialize.assert_called_once()
 
-        finally:
-            # Ensure cleanup even if test fails
-            if (
-                hasattr(provider, "_operating_mode")
-                and provider._operating_mode is not None
-            ):
-                provider.shutdown()
+            job_id = provider.submit("echo hello", tasks_per_node=1)
+            mode.get_job_status.return_value = {"resource-1": "RUNNING"}
+            assert [s.state for s in provider.status([job_id])] == [JobState.RUNNING]
 
-    @pytest.mark.substrate
-    def test_job_status_mapping(self, substrate_session, file_state_store):
-        """Test job status mapping in the provider."""
-        # Create provider
-        provider_id = f"test-provider-{uuid.uuid4().hex[:8]}"
+            # scale_out is Parsl's strategy's job, not the provider's.
+            assert provider.scale_out(blocks=1) == []
 
-        provider = EphemeralAWSProvider(
-            provider_id=provider_id,
-            region="us-east-1",
-            instance_type="t2.micro",
-            image_id="ami-12345678",
-            # Inject test session
-            _test_session=substrate_session,
-            _test_state_store=file_state_store,
-        )
+        mode.cleanup_infrastructure.assert_called_once()
 
-        # Replace provider's operating mode with a mock
-        mock_mode = MagicMock(spec=StandardMode)
-        provider._operating_mode = mock_mode
+    @pytest.mark.parametrize(
+        "config,expected_message",
+        [
+            ({"mode": "invalid_mode"}, "Invalid operating mode"),
+            ({"region": "mars-west-9"}, "Invalid region"),
+            ({"state_store_type": "quantum"}, "Invalid state store type"),
+            ({"state_store_type": "s3"}, "s3_bucket is required"),
+            ({"min_blocks": 5, "max_blocks": 1}, "cannot be less than min_blocks"),
+            # A detached-only option on standard mode: refused rather than
+            # half-honoured, since the mode would ignore it (#136).
+            ({"idle_timeout": 5}, "supported only by mode='detached'"),
+            # #105: an unknown kwarg is an error, not silently dropped. This is
+            # what retired the _test_session injection these tests used to do.
+            ({"nonexistent_option": True}, "Unknown configuration option"),
+        ],
+    )
+    def test_provider_validation(self, substrate_network, config, expected_message):
+        """Invalid configuration is refused at construction, with a reason.
 
-        try:
-            # Set up test data
-            resource_ids = ["resource-1", "resource-2", "resource-3", "resource-4"]
-            job_ids = ["job-1", "job-2", "job-3", "job-4"]
+        The message is asserted, not just the type: every case below raises
+        ``ProviderConfigurationError``, so matching only the class would let a
+        config error pass this test for the wrong reason.
+        """
+        base = {
+            "region": "us-east-1",
+            "instance_type": "t3.micro",
+            "image_id": "ami-12345678",
+            "endpoint_url": get_substrate_endpoint(),
+            "vpc_id": substrate_network["vpc_id"],
+            "subnet_id": substrate_network["subnet_id"],
+            "security_group_id": substrate_network["security_group_id"],
+        }
+        with pytest.raises(ProviderConfigurationError, match=expected_message):
+            EphemeralAWSProvider(**{**base, **config})
 
-            # Map resource IDs to job IDs
-            mock_resource_job_mapping = {}
-            for i, resource_id in enumerate(resource_ids):
-                mock_resource_job_mapping[resource_id] = job_ids[i]
-
-            # Set the mapping in the mock mode
-            type(mock_mode).resource_job_mapping = PropertyMock(
-                return_value=mock_resource_job_mapping
+    def test_network_ids_are_required(self, substrate_network):
+        """Omitting the network IDs is refused (#69 removed VPC creation)."""
+        with pytest.raises(
+            ValueError, match="vpc_id, subnet_id, and security_group_id"
+        ):
+            EphemeralAWSProvider(
+                region="us-east-1",
+                instance_type="t3.micro",
+                image_id="ami-12345678",
+                endpoint_url=get_substrate_endpoint(),
             )
 
-            # Set up status responses with different statuses
-            mock_mode.get_job_status.return_value = {
-                "resource-1": "running",  # Already Parsl status
-                "resource-2": "PENDING",  # AWS-style status (upper case)
-                "resource-3": "terminated",  # AWS status needing translation
-                "resource-4": "nonsense",  # Invalid status
+    def test_configuration_defaults(self, substrate_network, state_file):
+        """Defaults are what the constants declare, not what a docstring claims."""
+        with build_provider(
+            StandardMode,
+            state_file,
+            substrate_network,
+            instance_type="t3.micro",
+            image_id="ami-12345678",
+        ) as (provider, _mode):
+            assert provider.mode_type.value == "standard"
+            assert provider.max_blocks == 10  # DEFAULT_MAX_BLOCKS
+            assert provider.min_blocks == 0
+            assert provider.init_blocks == 0
+            assert not provider.use_spot
+            assert not provider.use_spot_fleet
+            assert not provider.spot_interruption_handling
+            assert provider.label.startswith("ephemeral-aws")
+
+    def test_state_persistence_configuration(self, substrate_network, state_file):
+        """The file state store is wired to the path the caller gave."""
+        with build_provider(
+            DetachedMode,
+            state_file,
+            substrate_network,
+            instance_type="t3.micro",
+            image_id="ami-12345678",
+            mode="detached",
+            workflow_id=f"test-workflow-{uuid.uuid4().hex[:8]}",
+            state_store_type="file",
+        ) as (provider, _mode):
+            assert provider.state_store_type.value == "file"
+            assert provider.state_file_path == str(state_file)
+
+            # submit() persists; the document must land at that path.
+            provider.submit("echo hello", tasks_per_node=1)
+            assert state_file.exists()
+
+    def test_job_status_mapping(self, substrate_network, state_file):
+        """Mode status strings map onto Parsl's JobState enum.
+
+        Asserted through the real ``_STRING_TO_JOB_STATE`` table rather than
+        against strings: ``status()`` returns ``List[JobStatus]`` positionally, so
+        an unknown status must resolve to ``UNKNOWN`` rather than raise.
+        """
+        with build_provider(
+            StandardMode,
+            state_file,
+            substrate_network,
+            instance_type="t3.micro",
+            image_id="ami-12345678",
+            max_blocks=5,
+        ) as (provider, mode):
+            wanted = ["RUNNING", "PENDING", "COMPLETED", "nonsense"]
+            job_ids = []
+            for i, status in enumerate(wanted):
+                mode.submit_job.return_value = f"resource-{i}"
+                job_ids.append(provider.submit(f"echo {i}", tasks_per_node=1))
+
+            mode.get_job_status.return_value = {
+                f"resource-{i}": status for i, status in enumerate(wanted)
             }
 
-            # Test status mapping
-            status = provider.status(job_ids)
+            states = [s.state for s in provider.status(job_ids)]
+            assert states == [
+                JobState.RUNNING,
+                JobState.PENDING,
+                JobState.COMPLETED,
+                JobState.UNKNOWN,
+            ]
 
-            # Verify correct status mapping
-            assert status["job-1"] == "running"
-            # Upper case statuses should be normalized
-            assert status["job-2"] == "pending"
-            # AWS 'terminated' should be mapped to 'failed'
-            assert status["job-3"] == "failed"
-            # Invalid status should be mapped to 'unknown'
-            assert status["job-4"] == "unknown"
+            # An ID this provider never issued resolves to UNKNOWN, not KeyError.
+            assert provider.status(["never-issued"])[0].state == JobState.UNKNOWN
 
-        finally:
-            # Ensure cleanup even if test fails
-            if (
-                hasattr(provider, "_operating_mode")
-                and provider._operating_mode is not None
-            ):
-                provider.shutdown()
-
-    @pytest.mark.substrate
-    def test_provider_tags(self, substrate_session, file_state_store):
-        """Test provider tags configuration."""
-        # Create provider with custom tags
-        provider_id = f"test-provider-{uuid.uuid4().hex[:8]}"
+    def test_provider_tags(self, substrate_network, state_file):
+        """Caller tags survive alongside the provider's own defaults."""
         custom_tags = {
             "Project": "TestProject",
             "Environment": "Testing",
             "CostCenter": "R&D-123",
         }
-
-        provider = EphemeralAWSProvider(
-            provider_id=provider_id,
-            region="us-east-1",
-            instance_type="t2.micro",
+        with build_provider(
+            StandardMode,
+            state_file,
+            substrate_network,
+            instance_type="t3.micro",
             image_id="ami-12345678",
             additional_tags=custom_tags,
-            # Inject test session
-            _test_session=substrate_session,
-            _test_state_store=file_state_store,
-        )
-
-        # Replace provider's operating mode with a StandardMode mock
-        mock_mode = MagicMock(spec=StandardMode)
-        provider._operating_mode = mock_mode
-
-        try:
-            # Initialize provider to verify tags are passed to the mode
-            provider.initialize_blocks()
-
-            # Verify provider tags were set correctly
+        ) as (provider, _mode):
             for key, value in custom_tags.items():
-                assert key in provider.additional_tags
                 assert provider.additional_tags[key] == value
-
-            # Provider should also include default tags
-            assert "CreatedBy" in provider.additional_tags
-            assert provider.additional_tags["CreatedBy"] == "EphemeralAWSProvider"
-            assert "Provider" in provider.additional_tags
-            assert provider.additional_tags["Provider"] == "Parsl"
-
-        finally:
-            # Ensure cleanup even if test fails
-            if (
-                hasattr(provider, "_operating_mode")
-                and provider._operating_mode is not None
-            ):
-                provider.shutdown()

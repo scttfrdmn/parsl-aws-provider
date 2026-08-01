@@ -87,6 +87,42 @@ _CREDENTIAL_EXCEPTIONS = (
 )
 
 
+def _bind_endpoint(session: boto3.Session, endpoint_url: str) -> None:
+    """Make every client built from *session* default to *endpoint_url*.
+
+    Wrapping ``session.client`` is the only approach that reaches all of it.
+    Passing ``endpoint_url`` at each call site would mean touching ~90 client
+    constructions across the modes and compute managers, and would still miss
+    any added later. Setting it on the botocore config store does not work:
+    ``endpoint_url`` is resolved per-service from ``AWS_ENDPOINT_URL`` and
+    ``AWS_ENDPOINT_URL_<SERVICE>``, and a value injected into the store is not
+    consulted by client construction (verified against botocore 1.42).
+
+    ``setdefault`` rather than an override, so a caller that deliberately points
+    one service elsewhere still wins.
+
+    Parameters
+    ----------
+    session : boto3.Session
+        Session to modify in place.
+    endpoint_url : str
+        Endpoint every client should use unless told otherwise.
+    """
+    original_client = session.client
+    original_resource = session.resource
+
+    def client(*args: Any, **kwargs: Any) -> Any:
+        kwargs.setdefault("endpoint_url", endpoint_url)
+        return original_client(*args, **kwargs)
+
+    def resource(*args: Any, **kwargs: Any) -> Any:
+        kwargs.setdefault("endpoint_url", endpoint_url)
+        return original_resource(*args, **kwargs)
+
+    session.client = client
+    session.resource = resource
+
+
 def resolve_manager_session(provider: Any, credential_manager: Any) -> boto3.Session:
     """Return the session a compute manager should use.
 
@@ -149,7 +185,8 @@ def create_session(
     aws_session_token : Optional[str], optional
         AWS session token, by default None
     endpoint_url : Optional[str], optional
-        Custom endpoint URL for AWS services (e.g., for LocalStack), by default None
+        Custom endpoint URL for every AWS service, by default None. Use for VPC
+        or FIPS endpoints, or to point the whole package at an emulator.
 
     Returns
     -------
@@ -171,6 +208,9 @@ def create_session(
             aws_secret_access_key=aws_secret_access_key,
             aws_session_token=aws_session_token,
         )
+
+        if endpoint_url:
+            _bind_endpoint(session, endpoint_url)
 
         # Verify that the session is valid by calling a simple operation
         sts = session.client("sts", endpoint_url=endpoint_url)

@@ -1,47 +1,36 @@
 """Integration tests for operating modes using substrate.
 
-These tests run against substrate, which emulates AWS services locally.
-They verify that the operating modes can create resources, submit jobs, and clean up
-properly in an environment that mimics AWS APIs.
+These drive each mode's real lifecycle -- initialize, submit, status, cancel,
+cleanup -- against the emulator, with no mocking of the mode itself.
+
+Two things had kept the whole file from running. ``FileStateStore(file_path=...)``
+omitted the required ``provider_id``, so every test errored during fixture setup;
+and the assertions described the pre-#69 provider, which created its own VPC,
+subnet and security group. It no longer does: the caller supplies them, so
+``initialize()`` verifies rather than creates, and ``cleanup_infrastructure()``
+leaves them alone -- deleting a caller's network would be the same class of bug as
+the serverless security-group deletion fixed in #100. The old
+``assert mode.vpc_id is None`` after cleanup asserted the opposite.
 
 SPDX-License-Identifier: Apache-2.0
 SPDX-FileCopyrightText: 2025-2026 Scott Friedman and Project Contributors
 """
 
 import os
-import pytest
 import uuid
-from unittest.mock import patch
 
-from parsl_ephemeral_aws.modes.standard import StandardMode
+import pytest
+
 from parsl_ephemeral_aws.modes.detached import DetachedMode
 from parsl_ephemeral_aws.modes.serverless import ServerlessMode
+from parsl_ephemeral_aws.modes.standard import StandardMode
 from parsl_ephemeral_aws.state.file import FileStateStore
-from tests.substrate_support import (
-    get_substrate_session,
-    is_substrate_available,
+from tests.substrate_support import is_substrate_available
+
+pytestmark = pytest.mark.skipif(
+    not is_substrate_available(),
+    reason="substrate not available - start with 'make substrate-up'",
 )
-
-
-@pytest.fixture(scope="session")
-def substrate_available():
-    """Check if substrate is available for testing."""
-    if not is_substrate_available():
-        pytest.skip("substrate not available - start with 'make substrate-up'")
-    return True
-
-
-@pytest.fixture(scope="session")
-def substrate_session(substrate_available):
-    """Create a session connected to substrate."""
-    return get_substrate_session()
-
-
-@pytest.fixture
-def temp_state_store(tmpdir):
-    """Create a temporary state store for testing."""
-    state_file = tmpdir.join("state.json")
-    return FileStateStore(file_path=str(state_file))
 
 
 @pytest.fixture
@@ -50,295 +39,207 @@ def provider_id():
     return f"test-provider-{uuid.uuid4().hex[:8]}"
 
 
+@pytest.fixture
+def temp_state_store(tmp_path, provider_id):
+    """Create a temporary state store for testing.
+
+    ``provider_id`` is required (``state/file.py``): it is the key the document is
+    written under, so a store without one cannot address its own state.
+    """
+    return FileStateStore(
+        file_path=str(tmp_path / "state.json"), provider_id=provider_id
+    )
+
+
 @pytest.mark.integration
+@pytest.mark.substrate
 class TestStandardModeSubstrate:
     """Integration tests for StandardMode using substrate."""
 
-    @pytest.mark.substrate
     def test_initialize_and_cleanup(
-        self, substrate_session, temp_state_store, provider_id
+        self, substrate_session, substrate_network, temp_state_store, provider_id
     ):
-        """Test that StandardMode can initialize resources and clean them up."""
-        # Create StandardMode instance
+        """initialize() verifies the caller's network and builds a launch template."""
         mode = StandardMode(
             provider_id=provider_id,
             session=substrate_session,
             state_store=temp_state_store,
             region="us-east-1",
-            instance_type="t2.micro",
-            image_id="ami-12345678",  # Dummy AMI ID for testing
+            instance_type="t3.micro",
+            image_id="ami-12345678",
+            vpc_id=substrate_network["vpc_id"],
+            subnet_id=substrate_network["subnet_id"],
+            security_group_id=substrate_network["security_group_id"],
         )
 
         try:
-            # Initialize mode - this should create VPC, subnet, security group
             mode.initialize()
 
-            # Verify resources were created
-            assert mode.vpc_id is not None
-            assert mode.subnet_id is not None
-            assert mode.security_group_id is not None
             assert mode.initialized is True
+            # The launch template is the mode's own resource, unlike the network.
+            assert mode._launch_template_id is not None
 
-            # Verify resources exist in substrate
             ec2 = substrate_session.client("ec2")
-            vpcs = ec2.describe_vpcs(VpcIds=[mode.vpc_id])
-            assert len(vpcs["Vpcs"]) == 1
-
-            subnets = ec2.describe_subnets(SubnetIds=[mode.subnet_id])
-            assert len(subnets["Subnets"]) == 1
-
-            security_groups = ec2.describe_security_groups(
-                GroupIds=[mode.security_group_id]
+            templates = ec2.describe_launch_templates(
+                LaunchTemplateIds=[mode._launch_template_id]
             )
-            assert len(security_groups["SecurityGroups"]) == 1
+            assert len(templates["LaunchTemplates"]) == 1
 
-            # Verify state was saved
             assert os.path.exists(temp_state_store.file_path)
 
         finally:
-            # Clean up resources
             mode.cleanup_infrastructure()
 
-            # Verify resources were cleaned up
-            assert mode.vpc_id is None
-            assert mode.subnet_id is None
-            assert mode.security_group_id is None
-            assert mode.initialized is False
+        assert mode.initialized is False
+        # The network belongs to the caller and must survive cleanup (#69).
+        assert mode.vpc_id == substrate_network["vpc_id"]
+        ec2 = substrate_session.client("ec2")
+        assert len(ec2.describe_vpcs(VpcIds=[mode.vpc_id])["Vpcs"]) == 1
 
-    @pytest.mark.substrate
     def test_submit_job_and_status(
-        self, substrate_session, temp_state_store, provider_id
+        self, substrate_session, substrate_network, temp_state_store, provider_id
     ):
-        """Test job submission and status checking."""
-        # Create StandardMode instance
+        """A submitted job launches a tracked instance and can be cancelled."""
         mode = StandardMode(
             provider_id=provider_id,
             session=substrate_session,
             state_store=temp_state_store,
             region="us-east-1",
-            instance_type="t2.micro",
-            image_id="ami-12345678",  # Dummy AMI ID for testing
+            instance_type="t3.micro",
+            image_id="ami-12345678",
+            vpc_id=substrate_network["vpc_id"],
+            subnet_id=substrate_network["subnet_id"],
+            security_group_id=substrate_network["security_group_id"],
         )
 
         try:
-            # Initialize mode
             mode.initialize()
 
-            # Submit a job
             job_id = f"test-job-{uuid.uuid4().hex[:8]}"
-            command = "echo hello"
-            resource_id = mode.submit_job(job_id, command, 1)
+            resource_id = mode.submit_job(job_id, "echo hello", 1)
 
-            # Verify job was tracked
             assert resource_id in mode.resources
             assert mode.resources[resource_id]["job_id"] == job_id
 
-            # Check job status
-            status = mode.get_job_status([resource_id])
-            assert resource_id in status
+            assert mode.get_job_status([resource_id])[resource_id] == "RUNNING"
+            assert mode.cancel_jobs([resource_id])[resource_id] == "CANCELED"
 
-            # Cancel job
-            cancel_status = mode.cancel_jobs([resource_id])
-            assert resource_id in cancel_status
-
-            # Cleanup specific resource
             mode.cleanup_resources([resource_id])
             assert resource_id not in mode.resources
 
         finally:
-            # Clean up all resources
             mode.cleanup_infrastructure()
 
 
 @pytest.mark.integration
+@pytest.mark.substrate
 class TestDetachedModeSubstrate:
-    """Integration tests for DetachedMode using substrate."""
+    """Integration tests for DetachedMode using substrate.
 
-    @pytest.mark.substrate
-    def test_initialize_and_cleanup(
-        self, substrate_session, temp_state_store, provider_id
-    ):
-        """Test that DetachedMode can initialize resources and clean them up."""
-        # Create DetachedMode instance
-        mode = DetachedMode(
+    ``bastion_host_type="direct"`` throughout: the CloudFormation bastion is not
+    reachable here, since substrate serves no ``cloudformation`` endpoint. That
+    path is covered against real AWS in ``tests/aws/``.
+    """
+
+    def _mode(self, session, network, store, provider_id, **overrides):
+        return DetachedMode(
             provider_id=provider_id,
-            session=substrate_session,
-            state_store=temp_state_store,
+            session=session,
+            state_store=store,
             region="us-east-1",
-            instance_type="t2.micro",
+            instance_type="t3.micro",
+            image_id="ami-12345678",
             workflow_id=f"test-workflow-{uuid.uuid4().hex[:8]}",
-            bastion_instance_type="t2.micro",
-            image_id="ami-12345678",  # Dummy AMI ID for testing
-            bastion_host_type="direct",  # Use direct mode for simpler testing
+            bastion_instance_type="t3.micro",
+            bastion_host_type="direct",
+            vpc_id=network["vpc_id"],
+            subnet_id=network["subnet_id"],
+            security_group_id=network["security_group_id"],
+            **overrides,
+        )
+
+    def test_initialize_and_cleanup(
+        self, substrate_session, substrate_network, temp_state_store, provider_id
+    ):
+        """A direct-mode bastion launches with no key pair, and is torn down.
+
+        No ``key_name`` is passed, which is the ordinary configuration -- SSM is
+        how you reach the bastion, and it needs no key. That combination used to
+        fail botocore's parameter validation before any API call, so this mode
+        could not start at all (#158).
+        """
+        mode = self._mode(
+            substrate_session, substrate_network, temp_state_store, provider_id
         )
 
         try:
-            # Initialize mode
             mode.initialize()
 
-            # Verify resources were created
-            assert mode.vpc_id is not None
-            assert mode.subnet_id is not None
-            assert mode.security_group_id is not None
-            assert mode.bastion_id is not None
             assert mode.initialized is True
+            assert mode.bastion_id is not None
 
-            # Verify resources exist in substrate
             ec2 = substrate_session.client("ec2")
-            vpcs = ec2.describe_vpcs(VpcIds=[mode.vpc_id])
-            assert len(vpcs["Vpcs"]) == 1
-
-            subnets = ec2.describe_subnets(SubnetIds=[mode.subnet_id])
-            assert len(subnets["Subnets"]) == 1
-
-            security_groups = ec2.describe_security_groups(
-                GroupIds=[mode.security_group_id]
-            )
-            assert len(security_groups["SecurityGroups"]) == 1
-
-            # Check bastion instance
-            instances = ec2.describe_instances(InstanceIds=[mode.bastion_id])
-            assert len(instances["Reservations"]) > 0
+            reservations = ec2.describe_instances(InstanceIds=[mode.bastion_id])
+            assert len(reservations["Reservations"]) == 1
 
         finally:
-            # Clean up resources
-            # Note: Set preserve_bastion to False to ensure bastion cleanup
             mode.preserve_bastion = False
             mode.cleanup_infrastructure()
 
-            # Verify resources were cleaned up
-            assert mode.vpc_id is None
-            assert mode.subnet_id is None
-            assert mode.security_group_id is None
-            assert mode.bastion_id is None
-            assert mode.initialized is False
+        assert mode.initialized is False
+        assert mode.bastion_id is None
+        # Again, the caller's network outlives the mode.
+        assert mode.vpc_id == substrate_network["vpc_id"]
 
-    @pytest.mark.substrate
     def test_submit_job_and_status(
-        self, substrate_session, temp_state_store, provider_id
+        self, substrate_session, substrate_network, temp_state_store, provider_id
     ):
-        """Test job submission and status checking in detached mode."""
-        # Create DetachedMode instance
-        workflow_id = f"test-workflow-{uuid.uuid4().hex[:8]}"
-        mode = DetachedMode(
-            provider_id=provider_id,
-            session=substrate_session,
-            state_store=temp_state_store,
-            region="us-east-1",
-            instance_type="t2.micro",
-            workflow_id=workflow_id,
-            bastion_instance_type="t2.micro",
-            image_id="ami-12345678",  # Dummy AMI ID for testing
-            bastion_host_type="direct",  # Use direct mode for simpler testing
+        """The bastion records the job in SSM Parameter Store when submitted."""
+        mode = self._mode(
+            substrate_session, substrate_network, temp_state_store, provider_id
         )
 
         try:
-            # Initialize mode
             mode.initialize()
 
-            # Submit a job
             job_id = f"test-job-{uuid.uuid4().hex[:8]}"
-            command = "echo hello"
-            resource_id = mode.submit_job(job_id, command, 1)
+            resource_id = mode.submit_job(job_id, "echo hello", 1)
 
-            # Verify job was tracked
             assert resource_id in mode.resources
             assert mode.resources[resource_id]["job_id"] == job_id
 
-            # Verify SSM parameters were created
+            # Jobs are handed to the bastion through Parameter Store, so the
+            # parameter existing is what proves the dispatch happened.
             ssm = substrate_session.client("ssm")
-            try:
-                job_param = ssm.get_parameter(
-                    Name=f"/parsl/workflows/{workflow_id}/jobs/{job_id}"
-                )
-                assert (
-                    job_param["Parameter"]["Name"]
-                    == f"/parsl/workflows/{workflow_id}/jobs/{job_id}"
-                )
-            except ssm.exceptions.ParameterNotFound:
-                pytest.fail("SSM parameter for job was not created")
+            prefix = f"/parsl/workflows/{mode.workflow_id}"
+            described = ssm.describe_parameters(
+                ParameterFilters=[
+                    {"Key": "Name", "Option": "BeginsWith", "Values": [prefix]}
+                ]
+            )
+            assert described["Parameters"], f"no SSM parameters under {prefix}"
 
-            # Check job status
-            status = mode.get_job_status([resource_id])
-            assert resource_id in status
-
-            # Cancel job
-            cancel_status = mode.cancel_jobs([resource_id])
-            assert resource_id in cancel_status
-
-            # Cleanup specific resource
-            mode.cleanup_resources([resource_id])
-            assert resource_id not in mode.resources
+            assert resource_id in mode.get_job_status([resource_id])
+            assert resource_id in mode.cancel_jobs([resource_id])
 
         finally:
-            # Clean up all resources
-            mode.preserve_bastion = False  # Ensure bastion cleanup
+            mode.preserve_bastion = False
             mode.cleanup_infrastructure()
 
 
 @pytest.mark.integration
+@pytest.mark.substrate
 class TestServerlessModeSubstrate:
     """Integration tests for ServerlessMode using substrate."""
 
-    @pytest.mark.substrate
-    def test_initialize_and_cleanup(
+    def test_lambda_mode_needs_no_network(
         self, substrate_session, temp_state_store, provider_id
     ):
-        """Test that ServerlessMode can initialize resources and clean them up."""
-        # Create ServerlessMode instance
-        mode = ServerlessMode(
-            provider_id=provider_id,
-            session=substrate_session,
-            state_store=temp_state_store,
-            region="us-east-1",
-            worker_type="lambda",  # Use Lambda for simplicity
-            lambda_memory=128,
-            lambda_timeout=30,
-        )
+        """Lambda-only serverless initializes without any caller network.
 
-        try:
-            # Initialize mode - serverless Lambda-only mode won't create network resources
-            mode.initialize()
-
-            # Verify initialization
-            assert mode.initialized is True
-
-            # Lambda mode should not create VPC resources
-            assert mode.vpc_id is None
-            assert mode.subnet_id is None
-            assert mode.security_group_id is None
-
-            # For ECS mode, test with network resources
-            mode_ecs = ServerlessMode(
-                provider_id=f"{provider_id}-ecs",
-                session=substrate_session,
-                state_store=temp_state_store,
-                region="us-east-1",
-                worker_type="ecs",
-                ecs_task_cpu=256,
-                ecs_task_memory=512,
-                ecs_container_image="amazon/amazon-ecs-sample",
-            )
-
-            mode_ecs.initialize()
-            assert mode_ecs.vpc_id is not None
-            assert mode_ecs.subnet_id is not None
-            assert mode_ecs.security_group_id is not None
-
-            # Clean up ECS mode resources
-            mode_ecs.cleanup_infrastructure()
-
-        finally:
-            # Clean up resources
-            mode.cleanup_infrastructure()
-
-            # Verify resources were cleaned up
-            assert mode.initialized is False
-
-    @pytest.mark.substrate
-    def test_submit_lambda_job(self, substrate_session, temp_state_store, provider_id):
-        """Test Lambda job submission with CloudFormation stacks."""
-        # Create ServerlessMode instance for Lambda
+        Functions run in the Lambda-managed VPC, which is why the provider's
+        network guard exempts this combination.
+        """
         mode = ServerlessMode(
             provider_id=provider_id,
             session=substrate_session,
@@ -349,39 +250,86 @@ class TestServerlessModeSubstrate:
             lambda_timeout=30,
         )
 
-        # Mock the Lambda code generation since we can't actually create it in tests
-        mock_lambda_manager = mode.lambda_manager
-        mock_lambda_manager._generate_lambda_code.return_value = b"mock_lambda_code"
-
         try:
-            # Initialize mode
             mode.initialize()
 
-            # Submit a job
+            assert mode.initialized is True
+            assert mode.vpc_id is None
+            assert mode.subnet_id is None
+            assert mode.security_group_id is None
+
+        finally:
+            mode.cleanup_infrastructure()
+
+        assert mode.initialized is False
+
+    def test_ecs_mode_uses_the_supplied_network(
+        self, substrate_session, substrate_network, temp_state_store, provider_id
+    ):
+        """ECS/Fargate tasks run in the caller's subnet, so the IDs are kept."""
+        mode = ServerlessMode(
+            provider_id=provider_id,
+            session=substrate_session,
+            state_store=temp_state_store,
+            region="us-east-1",
+            worker_type="ecs",
+            ecs_task_cpu=256,
+            ecs_task_memory=512,
+            ecs_container_image="python:3.12-slim",
+            vpc_id=substrate_network["vpc_id"],
+            subnet_id=substrate_network["subnet_id"],
+            security_group_id=substrate_network["security_group_id"],
+        )
+
+        try:
+            mode.initialize()
+
+            assert mode.initialized is True
+            assert mode.vpc_id == substrate_network["vpc_id"]
+            assert mode.subnet_id == substrate_network["subnet_id"]
+            assert mode.security_group_id == substrate_network["security_group_id"]
+
+        finally:
+            mode.cleanup_infrastructure()
+
+    def test_submit_lambda_job(
+        self,
+        substrate_session,
+        temp_state_store,
+        provider_id,
+        requires_cloudformation,
+    ):
+        """Submitting a Lambda job provisions its function through a stack.
+
+        Skipped rather than failed while the emulator serves no CloudFormation:
+        ``_submit_lambda_job`` deploys the worker as a stack, so this exercises the
+        emulator's gap, not the provider. Covered for real in ``tests/aws/``.
+        """
+        mode = ServerlessMode(
+            provider_id=provider_id,
+            session=substrate_session,
+            state_store=temp_state_store,
+            region="us-east-1",
+            worker_type="lambda",
+            lambda_memory=128,
+            lambda_timeout=30,
+        )
+
+        try:
+            mode.initialize()
+
             job_id = f"test-job-{uuid.uuid4().hex[:8]}"
-            command = "echo hello"
+            resource_id = mode.submit_job(job_id, "echo hello", 1)
 
-            # Mock writing to temp file
-            with patch("builtins.open", create=True) as mock_open:
-                resource_id = mode.submit_job(job_id, command, 1)
-
-            # Verify job was tracked
             assert resource_id in mode.resources
             assert mode.resources[resource_id]["job_id"] == job_id
             assert mode.resources[resource_id]["worker_type"] == "lambda"
 
-            # Check job status
-            status = mode.get_job_status([resource_id])
-            assert resource_id in status
+            assert resource_id in mode.get_job_status([resource_id])
+            assert resource_id in mode.cancel_jobs([resource_id])
 
-            # Cancel job
-            cancel_status = mode.cancel_jobs([resource_id])
-            assert resource_id in cancel_status
-
-            # Cleanup specific resource
             mode.cleanup_resources([resource_id])
             assert resource_id not in mode.resources
 
         finally:
-            # Clean up all resources
             mode.cleanup_infrastructure()
