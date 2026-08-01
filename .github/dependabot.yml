@@ -17,7 +17,15 @@ updates:
     reviewers:
       - "scttfrdmn"
     commit-message:
-      prefix: "deps"
+      # "build", not "deps". `deps` is not in commitlint.config.js's type-enum,
+      # so every PR dependabot opened carried a subject the repo's own
+      # commit-msg hook rejects (#184). It went unnoticed because commitlint
+      # runs only via pre-commit and dependabot commits server-side, so the hook
+      # never fires on them -- the failure surfaces only when a human rebases or
+      # amends the branch. `build` is the conventional-commits type for
+      # dependency changes and is already allowed; `include: scope` appends
+      # `(deps)`, which scope-enum also allows, giving `build(deps): ...`.
+      prefix: "build"
       include: "scope"
     ignore:
       - dependency-name: "*"

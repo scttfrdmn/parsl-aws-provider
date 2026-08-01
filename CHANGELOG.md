@@ -32,6 +32,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rather than installing something stale, so anyone following the guide could not
   get started at all. Now documents installing from the repository, and points at
   #180 for the publishing fix.
+- **Dependabot generated commit messages the repo's own hook rejects.**
+  `.github/dependabot.yml` set `commit-message.prefix: "deps"` for the `uv`
+  ecosystem, but `deps` is absent from `commitlint.config.js`'s `type-enum`, so
+  every dependabot subject failed the `commit-msg` hook. It stayed invisible
+  because commitlint runs only through pre-commit and dependabot commits
+  server-side — the failure surfaces only once a human rebases or amends the
+  branch. Prefix is now `build`, the conventional-commits type for dependency
+  changes, yielding `build(deps): …` (#184).
 
 ## [0.8.0] - 2026-08-01
 
