@@ -1,415 +1,436 @@
 """Integration tests for state persistence in workflow scenarios.
 
-These tests verify that state persistence works correctly across different
-operating modes and scenarios, including interruptions and resumption.
+Each test runs a real mode against the emulator, saves, builds a *second* mode
+object from the same state store, and asserts the second one knows what the first
+one created. That second object is the whole point: it stands in for a restarted
+driver, and anything it fails to recover is a resource nothing will ever clean up.
+
+The three mode round-trips here used to patch ``_create_vpc``, ``_create_subnet``,
+``_create_security_group``, ``_create_ec2_instance``, ``_create_bastion_host``,
+``_create_ssm_parameter`` and five ``_delete_*`` counterparts. None of those
+methods exists on any mode, so ``patch.object`` raised ``AttributeError`` before
+reaching an assertion -- they described the pre-#69 design, where a mode created
+its own network. The serverless one also called ``mock_open()`` without importing
+it.
+
+Because the mocks never applied, the assertions behind them were never checked,
+and two of them were wrong in a way that matters:
+
+* ``cleanup_infrastructure()`` was expected to leave ``vpc_id``/``subnet_id``/
+  ``security_group_id`` as ``None``. Since #69 those IDs belong to the *caller*;
+  the mode neither creates nor deletes them, and nulling them would make a
+  resumed provider unusable. Verified: they survive cleanup.
+* The state file was expected to be gone or empty after cleanup. Cleanup *saves*
+  -- ``initialized: false`` with an empty ``resources`` map -- because deleting
+  the document is the provider's job at shutdown (``delete_state``), and a
+  cleanup that erased it would strand any resource the pass could not release.
+
+What is asserted instead is what each mode actually persists: the tracking map,
+the launch template (#85), the bastion (#111), and the two ownership flags that
+decide whether cleanup may delete a shared resource (#132, #100).
 
 SPDX-License-Identifier: Apache-2.0
 SPDX-FileCopyrightText: 2025-2026 Scott Friedman and Project Contributors
 """
 
-import os
 import json
+import os
 import time
 import uuid
-import pytest
-import tempfile
 from unittest.mock import patch
 
-from parsl_ephemeral_aws.modes.standard import StandardMode
+import pytest
+
 from parsl_ephemeral_aws.modes.detached import DetachedMode
 from parsl_ephemeral_aws.modes.serverless import ServerlessMode
+from parsl_ephemeral_aws.modes.standard import StandardMode
 from parsl_ephemeral_aws.state.file import FileStateStore
-from tests.substrate_support import (
-    get_substrate_session,
-    is_substrate_available,
-)
+from tests.substrate_support import is_substrate_available
+
+# A marker only *selects* tests; the skipif is what makes a plain
+# `pytest tests/integration` skip rather than error when nothing is listening.
+pytestmark = [
+    pytest.mark.integration,
+    pytest.mark.substrate,
+    pytest.mark.skipif(
+        not is_substrate_available(),
+        reason="substrate not available - start with 'make substrate-up'",
+    ),
+]
 
 
-# Skip all tests if the substrate emulator is not available
-pytestmark = pytest.mark.skipif(
-    not is_substrate_available(),
-    reason="substrate not available - start with 'make substrate-up'",
-)
+@pytest.fixture
+def provider_id():
+    """The identity a resumed provider is recognized by.
+
+    ``load_state`` ignores any document whose ``provider_id`` differs, so both
+    halves of a round-trip must share this and each test must have its own.
+    """
+    return f"test-provider-{uuid.uuid4().hex[:8]}"
 
 
-@pytest.mark.integration
-class TestWorkflowStatePersistence:
-    """Integration tests for workflow state persistence."""
+@pytest.fixture
+def state_store(tmp_path, provider_id):
+    """A real file-backed store in the test's own directory.
 
-    @pytest.fixture(scope="class")
-    def substrate_session(self):
-        """Create a session connected to substrate."""
-        return get_substrate_session()
+    Real, not mocked: the point of these tests is that a document written by one
+    object can be read by another, and a MagicMock store would satisfy every
+    assertion while serializing nothing. ``state/file.py`` also takes an
+    ``fcntl.flock`` on the handle, which a mock cannot provide -- it raises
+    "fileno() returned a non-integer".
+    """
+    return FileStateStore(
+        file_path=str(tmp_path / "state.json"), provider_id=provider_id
+    )
 
-    @pytest.fixture
-    def temp_dir(self):
-        """Create a temporary directory for state files."""
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            yield tmp_dir
 
-    @pytest.fixture
-    def state_file_path(self, temp_dir):
-        """Create a path for the state file."""
-        return os.path.join(temp_dir, f"test-state-{uuid.uuid4().hex[:8]}.json")
+def _saved_mode_state(state_store):
+    """Read the mode's section of the state document straight off disk.
 
-    @pytest.fixture
-    def file_state_store(self, state_file_path):
-        """Create a FileStateStore instance."""
-        provider_id = f"test-provider-{uuid.uuid4().hex[:8]}"
-        return FileStateStore(file_path=state_file_path, provider_id=provider_id)
+    Used where a claim is about the document rather than the restored object --
+    the two can disagree, which is the failure these tests exist to catch.
+    """
+    with open(state_store.file_path) as handle:
+        return json.load(handle)["_states"]["mode"]
 
-    @pytest.fixture
-    def mock_ec2_client(self, substrate_session):
-        """Create a EC2 client connected to substrate."""
-        return substrate_session.client("ec2")
 
-    @pytest.fixture
-    def mock_ssm_client(self, substrate_session):
-        """Create a SSM client connected to substrate."""
-        return substrate_session.client("ssm")
+class TestStandardModeStatePersistence:
+    """StandardMode: what a restarted driver recovers, and what it must not lose."""
 
-    @pytest.fixture
-    def mock_s3_client(self, substrate_session):
-        """Create a S3 client connected to substrate."""
-        return substrate_session.client("s3")
+    def _build(self, session, state_store, provider_id, network, **overrides):
+        kwargs = dict(
+            provider_id=provider_id,
+            session=session,
+            state_store=state_store,
+            region=session.region_name,
+            instance_type="t3.micro",
+            image_id="ami-12345678",
+            vpc_id=network["vpc_id"],
+            subnet_id=network["subnet_id"],
+            security_group_id=network["security_group_id"],
+        )
+        kwargs.update(overrides)
+        return StandardMode(**kwargs)
 
-    @pytest.mark.substrate
-    def test_standard_mode_state_persistence(
-        self, substrate_session, file_state_store, mock_ec2_client
+    def test_resources_and_the_launch_template_survive_a_restart(
+        self, substrate_session, substrate_network, state_store, provider_id
     ):
-        """Test state persistence with StandardMode."""
-        # Create a StandardMode instance
-        provider_id = f"test-provider-{uuid.uuid4().hex[:8]}"
+        """A second mode object recovers the tracking map and the template.
 
-        # Set up mocks for AWS services using substrate
-        with patch("boto3.Session", return_value=substrate_session):
-            # Create a standard mode
-            mode = StandardMode(
-                provider_id=provider_id,
-                session=substrate_session,
-                state_store=file_state_store,
-                region="us-east-1",
-                instance_type="t2.micro",
-                image_id="ami-12345678",  # Dummy AMI
+        The template ID is the load-bearing part: a resumed provider that did not
+        recover it built a second template and leaked the first, since nothing
+        else records it (#85). The instances are real -- ``submit_job`` launches
+        them in the emulator -- so a document that describes them wrongly shows
+        up here rather than in production.
+        """
+        mode = self._build(
+            substrate_session, state_store, provider_id, substrate_network
+        )
+        mode.initialize()
+        resource_ids = [
+            mode.submit_job(f"job-{i}", f"echo 'Job {i}'", 1) for i in range(3)
+        ]
+        assert len(mode.resources) == 3
+        mode.save_state()
+
+        resumed = self._build(
+            substrate_session, state_store, provider_id, substrate_network
+        )
+        try:
+            assert resumed.load_state() is True
+
+            assert resumed.initialized
+            assert set(resumed.resources) == set(resource_ids)
+            for index, resource_id in enumerate(resource_ids):
+                assert resumed.resources[resource_id]["job_id"] == f"job-{index}"
+            # Recovered, not rebuilt: same template, and it still exists.
+            assert resumed._launch_template_id == mode._launch_template_id
+            assert resumed._launch_template_version is not None
+            substrate_session.client("ec2").describe_launch_templates(
+                LaunchTemplateIds=[resumed._launch_template_id]
             )
+        finally:
+            resumed.cleanup_infrastructure()
 
-            # Initialize mode to create basic infrastructure (VPC, etc.)
-            # Mock the actual infrastructure creation
-            with patch.object(mode, "_create_vpc", return_value="vpc-12345"):
-                with patch.object(mode, "_create_subnet", return_value="subnet-12345"):
-                    with patch.object(
-                        mode, "_create_security_group", return_value="sg-12345"
-                    ):
-                        mode.initialize()
+    def test_cleanup_releases_what_the_mode_made_and_keeps_the_rest(
+        self, substrate_session, substrate_network, state_store, provider_id
+    ):
+        """The caller's network outlives the mode; the mode's template does not.
 
-            # Verify mode is initialized
-            assert mode.initialized
-            assert mode.vpc_id == "vpc-12345"
-            assert mode.subnet_id == "subnet-12345"
-            assert mode.security_group_id == "sg-12345"
+        Asserted from the *resumed* object, so ownership is shown to survive
+        persistence: a provider restarted after a crash must still be able to
+        clean up, and must still know which resources are not its to delete.
+        """
+        mode = self._build(
+            substrate_session, state_store, provider_id, substrate_network
+        )
+        mode.initialize()
+        mode.submit_job("job-0", "echo hello", 1)
+        mode.save_state()
+        template_id = mode._launch_template_id
 
-            # Mock job submission
-            with patch.object(mode, "_create_ec2_instance") as mock_create_instance:
-                mock_create_instance.return_value = {
-                    "instance_id": f"i-{uuid.uuid4().hex[:12]}",
-                    "private_ip": "10.0.0.1",
-                    "public_ip": "54.123.456.789",
-                    "dns_name": "ec2-54-123-456-789.compute-1.amazonaws.com",
-                }
+        resumed = self._build(
+            substrate_session, state_store, provider_id, substrate_network
+        )
+        resumed.load_state()
+        resumed.cleanup_infrastructure()
 
-                # Submit some jobs
-                job_ids = []
-                resource_ids = []
-                for i in range(3):
-                    job_id = f"test-job-{i}-{uuid.uuid4().hex[:8]}"
-                    resource_id = mode.submit_job(job_id, f"echo 'Job {i}'", 1)
-                    job_ids.append(job_id)
-                    resource_ids.append(resource_id)
+        assert not resumed.initialized
+        assert resumed.resources == {}
+        assert resumed._launch_template_id is None
 
-            # Verify resources were created
-            assert len(mode.resources) == 3
-            for resource_id in resource_ids:
-                assert resource_id in mode.resources
+        ec2 = substrate_session.client("ec2")
+        templates = ec2.describe_launch_templates()["LaunchTemplates"]
+        assert template_id not in [t["LaunchTemplateId"] for t in templates]
 
-            # Save state
+        # The three IDs were supplied by the caller (#69). The mode did not
+        # create them, so it must not delete them or forget them.
+        assert resumed.vpc_id == substrate_network["vpc_id"]
+        assert resumed.subnet_id == substrate_network["subnet_id"]
+        assert resumed.security_group_id == substrate_network["security_group_id"]
+        ec2.describe_vpcs(VpcIds=[substrate_network["vpc_id"]])
+        ec2.describe_subnets(SubnetIds=[substrate_network["subnet_id"]])
+
+        # Cleanup saves rather than deletes: the document now says "nothing
+        # running", which is what a resumed provider needs to read. Deleting it
+        # is the provider's job at shutdown.
+        saved = _saved_mode_state(state_store)
+        assert saved["initialized"] is False
+        assert saved["resources"] == {}
+        assert saved["launch_template_id"] is None
+
+    def test_another_providers_document_is_not_adopted(
+        self, substrate_session, substrate_network, state_store, provider_id
+    ):
+        """State is keyed by provider ID, so one provider cannot inherit another's.
+
+        Without this guard a second provider sharing a state file would adopt
+        resources it did not create and terminate them on its own shutdown.
+        """
+        mode = self._build(
+            substrate_session, state_store, provider_id, substrate_network
+        )
+        mode.initialize()
+        try:
+            mode.submit_job("job-0", "echo hello", 1)
             mode.save_state()
 
-            # Verify state was saved to file
-            assert os.path.exists(file_state_store.file_path)
-
-            # Create a new mode instance
-            mode2 = StandardMode(
-                provider_id=provider_id,
-                session=substrate_session,
-                state_store=file_state_store,
-                region="us-east-1",
-                instance_type="t2.micro",
-                image_id="ami-12345678",  # Dummy AMI
+            stranger = self._build(
+                substrate_session,
+                state_store,
+                "a-different-provider",
+                substrate_network,
             )
 
-            # Load state
-            mode2.load_state()
+            assert stranger.load_state() is False
+            assert stranger.resources == {}
+            assert not stranger.initialized
+        finally:
+            mode.cleanup_infrastructure()
 
-            # Verify state was loaded correctly
-            assert mode2.initialized
-            assert mode2.vpc_id == "vpc-12345"
-            assert mode2.subnet_id == "subnet-12345"
-            assert mode2.security_group_id == "sg-12345"
-            assert len(mode2.resources) == 3
 
-            # Check that resources were loaded correctly
-            for resource_id in resource_ids:
-                assert resource_id in mode2.resources
-                assert mode2.resources[resource_id]["job_id"] in job_ids
+class TestDetachedModeStatePersistence:
+    """DetachedMode: the bastion and the workflow it serves must both come back."""
 
-            # Clean up - do not actually try to delete AWS resources in the emulator
-            with patch.object(mode2, "_delete_ec2_instance"):
-                with patch.object(mode2, "_delete_security_group"):
-                    with patch.object(mode2, "_delete_subnet"):
-                        with patch.object(mode2, "_delete_vpc"):
-                            mode2.cleanup_infrastructure()
+    def _build(self, session, state_store, provider_id, workflow_id, network):
+        return DetachedMode(
+            provider_id=provider_id,
+            session=session,
+            state_store=state_store,
+            region=session.region_name,
+            instance_type="t3.micro",
+            image_id="ami-12345678",
+            workflow_id=workflow_id,
+            # Not the "cloudformation" default: that path needs an endpoint
+            # substrate does not serve. The direct path uses run_instances, so
+            # the bastion here is a real instance whose fate can be checked.
+            bastion_host_type="direct",
+            bastion_instance_type="t3.micro",
+            preserve_bastion=False,
+            vpc_id=network["vpc_id"],
+            subnet_id=network["subnet_id"],
+            security_group_id=network["security_group_id"],
+        )
 
-            # Verify cleanup logic updated the state
-            assert not mode2.initialized
-            assert mode2.vpc_id is None
-            assert mode2.subnet_id is None
-            assert mode2.security_group_id is None
+    def test_the_bastion_and_workflow_id_survive_a_restart(
+        self, substrate_session, substrate_network, state_store, provider_id
+    ):
+        """Losing either one orphans a running instance.
 
-            # State file should be empty or reflect cleaned state
-            assert (
-                not os.path.exists(file_state_store.file_path)
-                or os.path.getsize(file_state_store.file_path) == 0
-            )
+        The bastion is a long-lived instance the driver does not hold a handle
+        to, and the workflow ID is the SSM prefix its work orders live under -- a
+        resumed provider that recovered neither would launch a second bastion and
+        bill for the first forever.
 
-    @pytest.mark.substrate
-    def test_detached_mode_state_persistence(self, substrate_session, file_state_store):
-        """Test state persistence with DetachedMode."""
-        # Create a DetachedMode instance
-        provider_id = f"test-provider-{uuid.uuid4().hex[:8]}"
+        Both attributes are cleared on the resumed object before loading, so a
+        constructor value cannot masquerade as a restored one.
+        """
         workflow_id = f"test-workflow-{uuid.uuid4().hex[:8]}"
+        mode = self._build(
+            substrate_session, state_store, provider_id, workflow_id, substrate_network
+        )
+        mode.initialize()
+        assert mode.bastion_id is not None
 
-        # Set up mocks for AWS services using substrate
-        with patch("boto3.Session", return_value=substrate_session):
-            # Create a detached mode
-            mode = DetachedMode(
-                provider_id=provider_id,
-                session=substrate_session,
-                state_store=file_state_store,
-                region="us-east-1",
-                instance_type="t2.micro",
-                image_id="ami-12345678",  # Dummy AMI
-                workflow_id=workflow_id,
-                bastion_instance_type="t2.micro",
-                bastion_host_type="direct",
-            )
+        resource_ids = [
+            mode.submit_job(f"job-{i}", f"echo 'Job {i}'", 1) for i in range(3)
+        ]
+        # The bastion is tracked alongside the jobs, so it is cleaned up with them.
+        assert len(mode.resources) == len(resource_ids) + 1
+        mode.save_state()
 
-            # Initialize mode - mock infrastructure creation
-            with patch.object(mode, "_create_vpc", return_value="vpc-12345"):
-                with patch.object(mode, "_create_subnet", return_value="subnet-12345"):
-                    with patch.object(
-                        mode, "_create_security_group", return_value="sg-12345"
-                    ):
-                        with patch.object(
-                            mode, "_create_bastion_host"
-                        ) as mock_create_bastion:
-                            mock_create_bastion.return_value = {
-                                "instance_id": f"i-bastion-{uuid.uuid4().hex[:8]}",
-                                "private_ip": "10.0.0.2",
-                                "public_ip": "54.123.456.789",
-                                "dns_name": "ec2-54-123-456-789.compute-1.amazonaws.com",
-                            }
-                            mode.initialize()
+        # The work orders the bastion polls are in SSM, keyed by workflow ID --
+        # which is why losing that ID is as bad as losing the instance.
+        ssm = substrate_session.client("ssm")
+        job_id = mode.resources[resource_ids[0]]["job_id"]
+        order = json.loads(
+            ssm.get_parameter(Name=f"/parsl/workflows/{workflow_id}/jobs/{job_id}")[
+                "Parameter"
+            ]["Value"]
+        )
+        assert order["command"] == "echo 'Job 0'"
 
-            # Verify mode is initialized with bastion
-            assert mode.initialized
-            assert mode.vpc_id == "vpc-12345"
-            assert mode.subnet_id == "subnet-12345"
-            assert mode.security_group_id == "sg-12345"
-            assert mode.bastion_id is not None
+        resumed = self._build(
+            substrate_session, state_store, provider_id, workflow_id, substrate_network
+        )
+        resumed.bastion_id = None
+        resumed.workflow_id = "never-restored"
 
-            # Mock job submission
-            with patch.object(mode, "_create_ec2_instance") as mock_create_instance:
-                mock_create_instance.return_value = {
-                    "instance_id": f"i-{uuid.uuid4().hex[:12]}",
-                    "private_ip": "10.0.0.5",
-                    "public_ip": None,  # No public IP in detached mode
-                    "dns_name": None,
-                }
+        assert resumed.load_state() is True
+        assert resumed.initialized
+        assert resumed.bastion_id == mode.bastion_id
+        assert resumed.workflow_id == workflow_id
+        assert set(resumed.resources) == set(mode.resources)
 
-                # Mock SSM parameter creation
-                with patch.object(mode, "_create_ssm_parameter"):
-                    # Submit some jobs
-                    job_ids = []
-                    resource_ids = []
-                    for i in range(3):
-                        job_id = f"test-job-{i}-{uuid.uuid4().hex[:8]}"
-                        resource_id = mode.submit_job(job_id, f"echo 'Job {i}'", 1)
-                        job_ids.append(job_id)
-                        resource_ids.append(resource_id)
+        resumed.cleanup_infrastructure()
 
-            # Verify resources were created
-            assert len(mode.resources) == 3
-            for resource_id in resource_ids:
-                assert resource_id in mode.resources
+        assert not resumed.initialized
+        assert resumed.bastion_id is None
+        assert resumed.resources == {}
+        # preserve_bastion=False, so the instance really goes.
+        described = substrate_session.client("ec2").describe_instances(
+            InstanceIds=[mode.bastion_id]
+        )
+        state = described["Reservations"][0]["Instances"][0]["State"]["Name"]
+        assert state in ("shutting-down", "terminated")
+        # And the caller's network is untouched, as in standard mode.
+        assert resumed.vpc_id == substrate_network["vpc_id"]
 
-            # Save state
-            mode.save_state()
 
-            # Verify state was saved to file
-            assert os.path.exists(file_state_store.file_path)
+class TestServerlessModeStatePersistence:
+    """ServerlessMode: the code bucket, and who is allowed to delete it."""
 
-            # Create a new mode instance
-            mode2 = DetachedMode(
-                provider_id=provider_id,
-                session=substrate_session,
-                state_store=file_state_store,
-                region="us-east-1",
-                instance_type="t2.micro",
-                image_id="ami-12345678",  # Dummy AMI
-                workflow_id=workflow_id,
-                bastion_instance_type="t2.micro",
-                bastion_host_type="direct",
-            )
+    def _build(self, session, state_store, provider_id, **overrides):
+        kwargs = dict(
+            provider_id=provider_id,
+            session=session,
+            state_store=state_store,
+            region=session.region_name,
+            # Lambda needs none of the three network IDs, so this is also the one
+            # mode that can be exercised without a VPC.
+            worker_type="lambda",
+            lambda_memory=128,
+            lambda_timeout=30,
+        )
+        kwargs.update(overrides)
+        return ServerlessMode(**kwargs)
 
-            # Load state
-            mode2.load_state()
-
-            # Verify state was loaded correctly
-            assert mode2.initialized
-            assert mode2.vpc_id == "vpc-12345"
-            assert mode2.subnet_id == "subnet-12345"
-            assert mode2.security_group_id == "sg-12345"
-            assert mode2.bastion_id is not None
-            assert len(mode2.resources) == 3
-
-            # Check that resources were loaded correctly
-            for resource_id in resource_ids:
-                assert resource_id in mode2.resources
-                assert mode2.resources[resource_id]["job_id"] in job_ids
-
-            # Clean up
-            with patch.object(mode2, "_delete_ec2_instance"):
-                with patch.object(mode2, "_delete_ssm_parameter"):
-                    with patch.object(mode2, "_delete_security_group"):
-                        with patch.object(mode2, "_delete_subnet"):
-                            with patch.object(mode2, "_delete_vpc"):
-                                mode2.preserve_bastion = (
-                                    False  # Ensure bastion is cleaned up
-                                )
-                                mode2.cleanup_infrastructure()
-
-            # Verify cleanup logic updated the state
-            assert not mode2.initialized
-            assert mode2.vpc_id is None
-            assert mode2.subnet_id is None
-            assert mode2.security_group_id is None
-            assert mode2.bastion_id is None
-
-    @pytest.mark.substrate
-    def test_serverless_mode_state_persistence(
-        self, substrate_session, file_state_store
+    def test_a_bucket_the_mode_created_is_deleted_after_a_restart(
+        self, substrate_session, state_store, provider_id
     ):
-        """Test state persistence with ServerlessMode."""
-        # Create a ServerlessMode instance
-        provider_id = f"test-provider-{uuid.uuid4().hex[:8]}"
+        """Ownership has to survive persistence or the bucket leaks.
 
-        # Set up mocks for AWS services using substrate
-        with patch("boto3.Session", return_value=substrate_session):
-            # Create a serverless mode
-            mode = ServerlessMode(
-                provider_id=provider_id,
-                session=substrate_session,
-                state_store=file_state_store,
-                region="us-east-1",
-                worker_type="lambda",  # Use Lambda for simplicity
-                lambda_memory=128,
-                lambda_timeout=30,
+        ``_owns_lambda_code_bucket`` is set at creation time, in memory. A driver
+        that restarted between the create and the shutdown would clean up with
+        the flag back at its ``False`` default and leave the bucket standing --
+        so the flag is persisted, and this asserts the resumed object acts on it.
+
+        ``_submit_lambda_job`` is patched out because dispatch goes through
+        CloudFormation, which substrate does not serve. The tracking record is
+        written by ``submit_job`` before dispatch (#115), which is the part under
+        test here.
+        """
+        mode = self._build(substrate_session, state_store, provider_id)
+        mode.initialize()
+
+        with patch.object(mode, "_submit_lambda_job"):
+            resource_ids = [
+                mode.submit_job(f"job-{i}", f"echo 'Job {i}'", 1) for i in range(3)
+            ]
+        bucket = mode._ensure_lambda_code_bucket()
+        assert mode._owns_lambda_code_bucket is True
+        mode.save_state()
+
+        resumed = self._build(substrate_session, state_store, provider_id)
+        assert resumed._lambda_code_bucket is None
+        assert resumed._owns_lambda_code_bucket is False
+
+        assert resumed.load_state() is True
+        assert resumed.initialized
+        assert set(resumed.resources) == set(resource_ids)
+        for index, resource_id in enumerate(resource_ids):
+            record = resumed.resources[resource_id]
+            assert record["job_id"] == f"job-{index}"
+            # The routing decision is in the document because it determines
+            # whether the network IDs were required at all (#118).
+            assert record["worker_type"] == "lambda"
+        assert resumed._lambda_code_bucket == bucket
+        assert resumed._owns_lambda_code_bucket is True
+
+        resumed.cleanup_infrastructure()
+
+        assert not resumed.initialized
+        assert resumed.resources == {}
+        buckets = [
+            b["Name"] for b in substrate_session.client("s3").list_buckets()["Buckets"]
+        ]
+        assert bucket not in buckets
+
+    def test_a_bucket_the_caller_supplied_survives_cleanup(
+        self, substrate_session, state_store, provider_id
+    ):
+        """The other side of the gate, and the reason it exists.
+
+        A caller-supplied bucket may hold more than this provider's code, and
+        deleting it would destroy data the provider never owned -- the same
+        hazard class as the shared security group deleted in #100. Checked
+        through a restart, because that is where ownership is easiest to lose.
+        """
+        s3 = substrate_session.client("s3")
+        bucket = f"caller-owned-{uuid.uuid4().hex[:8]}"
+        s3.create_bucket(
+            Bucket=bucket,
+            CreateBucketConfiguration={
+                "LocationConstraint": substrate_session.region_name
+            },
+        )
+        try:
+            mode = self._build(
+                substrate_session, state_store, provider_id, lambda_code_bucket=bucket
             )
-
-            # Initialize mode - Lambda-only mode won't create network resources
             mode.initialize()
-
-            # Verify mode is initialized
-            assert mode.initialized
-
-            # Lambda mode should not create VPC resources
-            assert mode.vpc_id is None
-            assert mode.subnet_id is None
-            assert mode.security_group_id is None
-
-            # Mock Lambda function creation and invocation
-            with patch.object(
-                mode.lambda_manager, "_create_lambda_function"
-            ) as mock_create_lambda:
-                mock_create_lambda.return_value = {
-                    "FunctionName": f"lambda-{uuid.uuid4().hex[:8]}",
-                    "FunctionArn": f"arn:aws:lambda:us-east-1:123456789012:function:lambda-{uuid.uuid4().hex[:8]}",
-                }
-
-                with patch.object(mode.lambda_manager, "_invoke_lambda") as mock_invoke:
-                    mock_invoke.return_value = {
-                        "StatusCode": 200,
-                        "Payload": json.dumps({"statusCode": 200, "body": "Success"}),
-                    }
-
-                    # Submit some jobs
-                    job_ids = []
-                    resource_ids = []
-                    for i in range(3):
-                        job_id = f"test-job-{i}-{uuid.uuid4().hex[:8]}"
-
-                        # Mock writing to temp file for Lambda code
-                        with patch("builtins.open", mock_open()):
-                            resource_id = mode.submit_job(job_id, f"echo 'Job {i}'", 1)
-                            job_ids.append(job_id)
-                            resource_ids.append(resource_id)
-
-            # Verify resources were created
-            assert len(mode.resources) == 3
-            for resource_id in resource_ids:
-                assert resource_id in mode.resources
-
-            # Save state
+            assert mode._ensure_lambda_code_bucket() == bucket
+            assert mode._owns_lambda_code_bucket is False
             mode.save_state()
 
-            # Verify state was saved to file
-            assert os.path.exists(file_state_store.file_path)
-
-            # Create a new mode instance
-            mode2 = ServerlessMode(
-                provider_id=provider_id,
-                session=substrate_session,
-                state_store=file_state_store,
-                region="us-east-1",
-                worker_type="lambda",
-                lambda_memory=128,
-                lambda_timeout=30,
+            resumed = self._build(
+                substrate_session, state_store, provider_id, lambda_code_bucket=bucket
             )
+            assert resumed.load_state() is True
+            assert resumed._owns_lambda_code_bucket is False
 
-            # Load state
-            mode2.load_state()
+            resumed.cleanup_infrastructure()
 
-            # Verify state was loaded correctly
-            assert mode2.initialized
-            assert len(mode2.resources) == 3
+            assert bucket in [b["Name"] for b in s3.list_buckets()["Buckets"]]
+        finally:
+            s3.delete_bucket(Bucket=bucket)
 
-            # Check that resources were loaded correctly
-            for resource_id in resource_ids:
-                assert resource_id in mode2.resources
-                assert mode2.resources[resource_id]["job_id"] in job_ids
-                assert mode2.resources[resource_id]["worker_type"] == "lambda"
 
-            # Clean up
-            with patch.object(mode2.lambda_manager, "_delete_lambda_function"):
-                mode2.cleanup_infrastructure()
+class TestInterruptionPersistence:
+    """A reclaim marker must outlive the driver that recorded it."""
 
-            # Verify cleanup logic updated the state
-            assert not mode2.initialized
-            assert len(mode2.resources) == 0
-
-    @pytest.mark.substrate
     def test_an_interruption_survives_a_restart(
-        self, substrate_session, file_state_store
+        self, substrate_session, substrate_network, state_store, provider_id
     ):
         """An interrupted block must still read as interrupted after a restart.
 
@@ -427,20 +448,19 @@ class TestWorkflowStatePersistence:
         re-run the tasks -- checked across the persistence boundary this file
         exists to cover.
         """
-        provider_id = f"test-provider-{uuid.uuid4().hex[:8]}"
         instance_id = f"i-spot-{uuid.uuid4().hex[:12]}"
 
         def build_mode():
             return StandardMode(
                 provider_id=provider_id,
                 session=substrate_session,
-                state_store=file_state_store,
-                region="us-east-1",
+                state_store=state_store,
+                region=substrate_session.region_name,
                 instance_type="t3.micro",
                 image_id="ami-12345678",
-                vpc_id="vpc-12345",
-                subnet_id="subnet-12345",
-                security_group_id="sg-12345",
+                vpc_id=substrate_network["vpc_id"],
+                subnet_id=substrate_network["subnet_id"],
+                security_group_id=substrate_network["security_group_id"],
                 use_spot=True,
                 spot_interruption_handling=True,
             )
@@ -493,3 +513,15 @@ class TestWorkflowStatePersistence:
         finally:
             if mode2.spot_interruption_monitor:
                 mode2.spot_interruption_monitor.stop_monitoring()
+
+
+def test_the_state_file_lives_where_the_caller_put_it(state_store, tmp_path):
+    """A sanity check on the fixture the whole file depends on.
+
+    If the store wrote somewhere else, every round-trip above would still pass by
+    reading back an object it never persisted.
+    """
+    state_store.save_state("mode", {"provider_id": state_store.provider_id})
+
+    assert os.path.dirname(state_store.file_path) == str(tmp_path)
+    assert os.path.exists(state_store.file_path)
