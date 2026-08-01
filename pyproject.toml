@@ -43,12 +43,21 @@ dependencies = [
     "parsl>=2026.4.20",
     "boto3>=1.20.0",
     "botocore>=1.23.0",
-    "cryptography>=3.4.0",
+    # Floor is the lowest release clearing every advisory that affects the code
+    # this project runs, not the newest release available. GHSA-537c-gmf6-5ccf
+    # (HIGH) is the vulnerable OpenSSL bundled into the wheels -- 46.0.5 ships
+    # OpenSSL 3.5.5 -- fixed in 48.0.1, and this is a *runtime* dependency, so a
+    # consumer installing the provider inherits whatever the floor permits.
+    # 48.0.1 also clears GHSA-m959-cc7f-wv43 (fixed 46.0.6) and
+    # GHSA-p423-j2cm-9vmq (46.0.7).
+    "cryptography>=48.0.1",
 ]
 
 [project.optional-dependencies]
 dev = [
-    "pytest>=6.0.0",
+    # 9.0.3 fixes GHSA-6w46-j5rx-g56g, insecure tmpdir handling. Dev-only, so the
+    # exposure is a developer's own machine rather than a consumer's.
+    "pytest>=9.0.3",
     "pytest-cov>=2.12.0",
     "pytest-mock>=3.0.0",
     "coverage>=6.0",
@@ -69,7 +78,10 @@ test = [
     # imported it, the emulator ran as a container, and LocalStack OSS is now
     # end-of-life. Substrate needs no Python package: it is a single Go binary,
     # pulled as ghcr.io/scttfrdmn/substrate by docker-compose.substrate.yml.
-    "requests>=2.25.0",
+    # 2.33.0 fixes GHSA-gc5v-m9x4-r6x2, insecure temp-file reuse in
+    # extract_zipped_paths(). Nothing here calls it, but requests is a test
+    # dependency only and the bump costs nothing.
+    "requests>=2.33.0",
 ]
 globus = [
     # Floor raised from >=2.0.0, which no longer described anything installable

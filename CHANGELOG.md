@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+- **Dependency floors raised past three advisories, one HIGH.** `cryptography`
+  `>=3.4.0` → `>=48.0.1` closes GHSA-537c-gmf6-5ccf (HIGH), the vulnerable
+  OpenSSL bundled into the wheels — the previously locked 46.0.5 shipped OpenSSL
+  3.5.5 — plus GHSA-m959-cc7f-wv43 and GHSA-p423-j2cm-9vmq. This is the one that
+  matters to consumers: `cryptography` is a *runtime* dependency, so an installed
+  provider inherits whatever the floor permits. `pytest` `>=6.0.0` → `>=9.0.3`
+  (GHSA-6w46-j5rx-g56g, tmpdir handling) and `requests` `>=2.25.0` → `>=2.33.0`
+  (GHSA-gc5v-m9x4-r6x2, temp-file reuse in `extract_zipped_paths()`) are
+  dev/test-only, so their exposure is a developer's machine.
+
+  Each floor is the **lowest** release clearing the advisory rather than the
+  newest available, so compatibility narrows only as far as safety requires;
+  `uv.lock` still resolves to current versions (cryptography 50.0.0, OpenSSL
+  4.0.1).
+
 ### Fixed
 - **The documented install command could not work.** `docs/getting_started.md`
   opened with `uv add parsl-ephemeral-aws`, but the package has never been
