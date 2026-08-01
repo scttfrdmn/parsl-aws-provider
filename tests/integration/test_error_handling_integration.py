@@ -11,10 +11,11 @@ from botocore.exceptions import ClientError
 from parsl_ephemeral_aws.compute.ec2 import EC2Manager
 from parsl_ephemeral_aws.compute.ecs import ECSManager
 from parsl_ephemeral_aws.compute.spot_fleet import SpotFleetManager
-from parsl_ephemeral_aws.error_handling import RobustErrorHandler
+from parsl_ephemeral_aws.error_handling import ErrorContext, RobustErrorHandler
 from parsl_ephemeral_aws.exceptions import (
     ResourceCreationError,
     SpotFleetError,
+    SpotFleetRequestError,
     SpotFleetThrottlingError,
 )
 from tests.support import make_manager, mock_provider
@@ -88,52 +89,96 @@ class TestErrorHandlingIntegration:
         error_record = manager.error_handler.error_history[-1]
         assert "InternalError" in str(error_record.exception)
 
+    @staticmethod
+    def _translate(manager, code, message):
+        """Put *code* through ``_translate_fleet_error`` and return the exception.
+
+        Retargeted from ``_create_spot_fleet_with_retry``, which went away with
+        the legacy ``RequestSpotFleet`` API in #86 -- these two tests had been
+        raising ``AttributeError`` from ``patch.object``'s missing-attribute
+        check ever since, so neither had exercised anything.
+
+        The method *returns* rather than raises, so the caller keeps its
+        ``raise ... from`` chain and the botocore traceback survives.
+        """
+        exc = ClientError(
+            error_response={"Error": {"Code": code, "Message": message}},
+            operation_name="CreateFleet",
+        )
+        context = ErrorContext(
+            operation="create_ec2_fleet",
+            resource_type="ec2_fleet",
+            resource_id="block-1",
+        )
+        return manager._translate_fleet_error(exc, context)
+
     def test_spot_fleet_throttling_becomes_a_typed_error(self):
         """A throttled request is reported as throttling, not a bare ClientError.
 
         The caller can only back off if it can tell throttling apart from a
-        launch-spec mistake, so the specific type is the contract.
-
-        Note the recognized codes are *not* added to ``error_history`` -- only the
-        unrecognized fallthrough is (#120). The original test asserted
-        ``len(error_history) > 0`` here and could never have passed; see
-        ``test_spot_fleet_unrecognized_error_is_recorded`` for the branch that
-        does record.
+        launch-spec mistake, so the specific type is the contract, and
+        ``retry_after`` is what it carries that the base class does not.
         """
-        ec2_client = MagicMock()
-        ec2_client.request_spot_fleet.side_effect = ClientError(
-            error_response={
-                "Error": {"Code": "Throttling", "Message": "Request rate exceeded"}
-            },
-            operation_name="RequestSpotFleet",
-        )
+        manager = make_manager(SpotFleetManager, "spot_fleet", client=MagicMock())
 
-        manager = make_manager(SpotFleetManager, "spot_fleet", client=ec2_client)
+        result = self._translate(manager, "Throttling", "Request rate exceeded")
 
-        with pytest.raises(SpotFleetThrottlingError, match="API throttling error"):
-            manager._create_spot_fleet_with_retry(
-                {"SpotFleetRequestConfig": {}}, MagicMock()
-            )
+        assert isinstance(result, SpotFleetThrottlingError)
+        assert result.retry_after == 60
 
-    def test_spot_fleet_unrecognized_error_is_recorded(self):
-        """An unmapped error code lands in the handler's history for analysis."""
-        ec2_client = MagicMock()
-        ec2_client.request_spot_fleet.side_effect = ClientError(
-            error_response={
-                "Error": {"Code": "InternalError", "Message": "Server error"}
-            },
-            operation_name="RequestSpotFleet",
-        )
+    @pytest.mark.parametrize(
+        "code,expected",
+        [
+            ("InvalidLaunchTemplateId.NotFound", SpotFleetRequestError),
+            ("InsufficientInstanceCapacity", SpotFleetError),
+            ("InvalidFleetConfig", SpotFleetRequestError),
+            ("MaxSpotInstanceCountExceeded", SpotFleetRequestError),
+            ("Throttling", SpotFleetThrottlingError),
+            ("InternalError", SpotFleetError),  # the unrecognized fallthrough
+        ],
+    )
+    def test_every_classified_fleet_error_is_recorded(self, code, expected):
+        """Recognized error families reach ``error_history``, not just unknown ones.
 
-        manager = make_manager(SpotFleetManager, "spot_fleet", client=ec2_client)
+        Recording used to happen on the fallthrough branch alone (#120), which is
+        backwards: an insufficient-capacity or quota rejection is exactly what a
+        caller counts in order to decide whether to diversify instance types or
+        request a limit increase, whereas an error nobody could classify is the
+        least actionable of the set. ``get_error_statistics()`` was therefore
+        blind to every failure the code understood.
+        """
+        manager = make_manager(SpotFleetManager, "spot_fleet", client=MagicMock())
 
-        with pytest.raises(SpotFleetError):
-            manager._create_spot_fleet_with_retry(
-                {"SpotFleetRequestConfig": {}}, MagicMock()
-            )
+        result = self._translate(manager, code, "boom")
 
+        assert isinstance(result, expected)
         assert len(manager.error_handler.error_history) == 1
-        assert "InternalError" in str(manager.error_handler.error_history[-1].exception)
+        record = manager.error_handler.error_history[-1]
+        assert code in str(record.exception)
+        assert record.context.operation == "create_ec2_fleet"
+
+    def test_recording_does_not_swallow_the_error(self):
+        """The handler records; the caller still gets an exception to raise.
+
+        ``handle_error`` runs a recovery attempt for RETRY/FALLBACK actions, and
+        ``InsufficientInstanceCapacity`` maps to FALLBACK -- so this pins that a
+        "successful" recovery cannot silently turn a failed fleet into a
+        pass. No strategy is registered for ``create_ec2_fleet``, but the point
+        is that translation does not depend on that staying true.
+        """
+        manager = make_manager(SpotFleetManager, "spot_fleet", client=MagicMock())
+
+        with patch.object(
+            manager.error_handler.recovery_handler,
+            "attempt_recovery",
+            return_value=True,
+        ):
+            result = self._translate(
+                manager, "InsufficientInstanceCapacity", "no capacity"
+            )
+
+        assert isinstance(result, SpotFleetError)
+        assert len(manager.error_handler.error_history) == 1
 
     def test_error_statistics_collection(self):
         """Test that error statistics are properly collected across modules."""

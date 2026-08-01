@@ -360,13 +360,28 @@ class SpotFleetManager:
         exc : ClientError
             The error EC2 returned.
         context : ErrorContext
-            Error context, recorded for anything unrecognised.
+            Error context. Every error is recorded against it, whichever branch
+            below classifies it.
 
         Returns
         -------
         Exception
             The exception the caller should raise.
         """
+        # Record before classifying, so the recognized families land in
+        # error_history too. Recording only the unrecognized fallthrough had it
+        # backwards (#120): capacity shortages, quota rejections, and throttling
+        # are precisely the failures worth counting, because a caller deciding
+        # whether to back off, diversify instance types, or ask for a limit
+        # increase reads them out of the history. An error nobody classified is
+        # the least actionable of the lot.
+        #
+        # handle_error also attempts recovery for RETRY/FALLBACK actions, but
+        # ErrorRecoveryHandler registers no strategy for "create_ec2_fleet", so
+        # attempt_recovery returns False without doing anything. This stays a
+        # recording call; retries are @retry_with_backoff on create_blocks.
+        self.error_handler.handle_error(exc, context)
+
         error_code = exc.response["Error"]["Code"]
 
         if error_code in (
@@ -406,7 +421,6 @@ class SpotFleetManager:
                 retry_after=retry_after,
             )
 
-        self.error_handler.handle_error(exc, context)
         return SpotFleetError(f"Failed to create EC2 Fleet: {exc}")
 
     @retry_with_backoff()
