@@ -20,6 +20,9 @@ import boto3
 from botocore.exceptions import ClientError
 
 from parsl_ephemeral_aws.constants import (
+    DEFAULT_BASTION_HOST_TYPE,
+    DEFAULT_BASTION_IDLE_TIMEOUT,
+    DEFAULT_PRESERVE_BASTION,
     IMDSV2_METADATA_OPTIONS,
     RESOURCE_TYPE_EC2,
     RESOURCE_TYPE_BASTION,
@@ -86,9 +89,9 @@ class DetachedMode(OperatingMode):
         state_store: StateStore,
         workflow_id: Optional[str] = None,
         bastion_instance_type: str = "t3.micro",
-        idle_timeout: int = 30,
-        preserve_bastion: bool = True,
-        bastion_host_type: str = "cloudformation",
+        idle_timeout: int = DEFAULT_BASTION_IDLE_TIMEOUT,
+        preserve_bastion: bool = DEFAULT_PRESERVE_BASTION,
+        bastion_host_type: str = DEFAULT_BASTION_HOST_TYPE,
         use_spot_fleet: bool = False,
         instance_types: Optional[List[str]] = None,
         nodes_per_block: int = 1,

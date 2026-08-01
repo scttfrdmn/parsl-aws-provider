@@ -57,11 +57,14 @@ The option does not exist. Common renames:
 | `idle_timeout_minutes` | `max_idle_time` (**seconds**) |
 | `create_vpc` / `use_existing_vpc` | removed — the network is always yours (#69) |
 
-Ten further options exist on the mode classes but are not reachable through the
-provider at all — `idle_timeout`, `preserve_bastion`, `bastion_host_type`,
-`workflow_id`, `lambda_runtime`, `lambda_timeout`, `lambda_memory`,
-`ecs_task_cpu`, `ecs_task_memory`, `ecs_container_image`. Passing them raises.
-Tracked as [#136](https://github.com/scttfrdmn/parsl-aws-provider/issues/136).
+Eight options that were unreachable before v0.8.0 are now accepted:
+`idle_timeout`, `preserve_bastion`, `bastion_host_type`, and `workflow_id` on
+`mode="detached"`; `lambda_runtime`, `ecs_task_cpu`, `ecs_task_memory`, and
+`ecs_container_image` on `mode="serverless"` (#136). Each is accepted only on the
+mode that implements it — setting one elsewhere raises
+`ProviderConfigurationError` rather than silently keeping the default.
+`lambda_memory` and `lambda_timeout` remain spelled `memory_size` and `timeout`
+at the provider.
 
 ### `vpc_id, subnet_id, security_group_id are required`
 
@@ -324,10 +327,17 @@ memory.
 
 ### Fargate tasks exit immediately
 
-Read the task's `stoppedReason` and its CloudWatch Logs. The container image is
-`public.ecr.aws/lambda/python:3.9` and is not yet configurable through the
-provider (#136), which makes Fargate much less useful than it should be — the
-usual reason to prefer it over Lambda is running your own image.
+Read the task's `stoppedReason` and its CloudWatch Logs.
+
+If the command fails on a missing import, the default image (`python:3.12-slim`)
+carries the standard library only — set `ecs_container_image` to one with your
+dependencies. Before v0.8.0 the default was `public.ecr.aws/lambda/python:3.9`,
+a *Lambda* base image whose entrypoint is the runtime interface emulator, so it
+expected an invocation event rather than the task's command; if you pinned that
+image deliberately, that is why tasks exit at once (#136).
+
+Also check that `ecs_task_cpu` and `ecs_task_memory` are a combination Fargate
+accepts — an invalid pair fails the task definition, not the task.
 
 ### Spot in serverless mode
 
@@ -357,10 +367,10 @@ for the SSM agent to register — a private subnet requires a NAT gateway or the
 ### The bastion is still running after the workflow finished
 
 That is deliberate: the bastion is preserved so you can reconnect. Call
-`provider.shutdown()` when the workflow is genuinely over. Its own idle-shutdown
-timer (`idle_timeout`, 30 minutes) is not configurable through the provider
-(#136), and `max_idle_time` is unrelated — that governs when the *provider*
-reclaims a long-`RUNNING` resource.
+`provider.shutdown()` when the workflow is genuinely over, or pass
+`preserve_bastion=False` so shutdown terminates it. Its own idle-shutdown timer
+is `idle_timeout` (minutes, default 30); `max_idle_time` is unrelated — that
+governs when the *provider* reclaims a long-`RUNNING` resource.
 
 ## Cost
 

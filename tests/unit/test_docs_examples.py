@@ -334,6 +334,74 @@ def test_documented_renames_do_not_resolve():
     )
 
 
+def test_the_mode_options_docs_promise_are_reachable():
+    """The eight options #136 made reachable are real provider parameters.
+
+    docs/operating_modes.md now documents each in a table as settable, and
+    docs/troubleshooting.md says they stopped being unreachable in v0.8.0. Since
+    #105 an option absent from the signature is rejected outright, so were one
+    dropped the docs would be promising a `ProviderConfigurationError`.
+    """
+    params = inspect.signature(EphemeralAWSProvider.__init__).parameters
+    expected = [
+        "idle_timeout",
+        "preserve_bastion",
+        "bastion_host_type",
+        "workflow_id",
+        "lambda_runtime",
+        "ecs_task_cpu",
+        "ecs_task_memory",
+        "ecs_container_image",
+    ]
+    missing = [name for name in expected if name not in params]
+    assert not missing, (
+        "documented as settable in docs/operating_modes.md but not accepted by "
+        f"the constructor: {missing}"
+    )
+
+
+def test_no_default_pins_an_unsupported_python():
+    """The Lambda runtime and Fargate image defaults must not name python3.9.
+
+    Both did until #136 — and the ECS one was a *Lambda* base image, whose
+    entrypoint is the runtime interface emulator, so Fargate tasks got something
+    that expects an invocation event instead of running their command. The
+    package requires Python >= 3.10, so a 3.9 default could not run the same code
+    as the driver either.
+    """
+    from parsl_ephemeral_aws.constants import (
+        DEFAULT_ECS_CONTAINER_IMAGE,
+        DEFAULT_LAMBDA_RUNTIME,
+    )
+
+    assert DEFAULT_LAMBDA_RUNTIME >= "python3.10"
+    assert "lambda" not in DEFAULT_ECS_CONTAINER_IMAGE
+    assert "3.9" not in DEFAULT_ECS_CONTAINER_IMAGE
+
+
+def test_the_lambda_runtime_default_is_one_cloudformation_allows():
+    """A default the template rejects fails the stack, not the call.
+
+    The constant and the template's ``AllowedValues`` are two lists that have to
+    agree; nothing else checks them against each other.
+    """
+    import re
+
+    template = (
+        Path(__file__).resolve().parents[2]
+        / "parsl_ephemeral_aws"
+        / "templates"
+        / "cloudformation"
+        / "lambda_worker.yml"
+    ).read_text(encoding="utf-8")
+    from parsl_ephemeral_aws.constants import DEFAULT_LAMBDA_RUNTIME
+
+    allowed = re.findall(r"'(python3\.\d+)'", template)
+    assert DEFAULT_LAMBDA_RUNTIME in allowed, (
+        f"{DEFAULT_LAMBDA_RUNTIME} is not in the template's AllowedValues: {allowed}"
+    )
+
+
 def test_globus_only_options_are_globus_only():
     """The Globus-specific options are on the subclass, not the base.
 
