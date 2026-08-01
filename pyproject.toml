@@ -58,7 +58,7 @@ dev = [
     # 9.0.3 fixes GHSA-6w46-j5rx-g56g, insecure tmpdir handling. Dev-only, so the
     # exposure is a developer's own machine rather than a consumer's.
     "pytest>=9.0.3",
-    "pytest-cov>=2.12.0",
+    "pytest-cov>=7.1.0",
     "pytest-mock>=3.0.0",
     "coverage>=6.0",
     # Floor matches the ruff-pre-commit pin so the hook and `uv run ruff` cannot
