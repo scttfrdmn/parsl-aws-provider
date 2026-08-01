@@ -3,6 +3,20 @@
 These tests verify that each state persistence implementation works correctly
 with real storage backends (file system, substrate for AWS services).
 
+Each AWS-backed store is built from conftest's ``substrate_session``, whose
+``client`` is wrapped to bind ``endpoint_url``. The three classes here each used
+to declare a class-scoped ``substrate_session`` of their own from
+``get_substrate_session()``, which binds *no* endpoint -- so ``resolve_session``
+handed the store a session whose clients reach real AWS, and every S3 test
+skipped on ``InvalidAccessKeyId`` from the fixture's ``create_bucket``. That skip
+read as "substrate can't do this" while the cause was the shadowing fixture.
+
+Those same three classes also patched ``boto3.Session`` to inject the session,
+which has never been necessary: ``state/base.resolve_session`` prefers a
+``session`` attribute on the provider object when one is present (#77), so the
+provider stub simply carries it. The patch was also the reason two tests *errored*
+rather than failed -- ``patch`` was used without being imported.
+
 SPDX-License-Identifier: Apache-2.0
 SPDX-FileCopyrightText: 2025-2026 Scott Friedman and Project Contributors
 """
@@ -11,17 +25,15 @@ import os
 import uuid
 import pytest
 import tempfile
-import boto3
+from types import SimpleNamespace
 from botocore.exceptions import ClientError
 
+from parsl_ephemeral_aws.exceptions import StateError
 from parsl_ephemeral_aws.state.base import STATE_KEY_PROVIDER
 from parsl_ephemeral_aws.state.file import FileStateStore
 from parsl_ephemeral_aws.state.parameter_store import ParameterStoreState
 from parsl_ephemeral_aws.state.s3 import S3State
-from tests.substrate_support import (
-    get_substrate_session,
-    is_substrate_available,
-)
+from tests.substrate_support import is_substrate_available
 
 
 # Skip all tests if the substrate emulator is not available
@@ -29,6 +41,29 @@ pytestmark = pytest.mark.skipif(
     not is_substrate_available(),
     reason="substrate not available - start with 'make substrate-up'",
 )
+
+
+def _provider_stub(session, **overrides):
+    """The minimum a state store reads off a provider.
+
+    ``resolve_session`` takes the ``session`` attribute when it is a real
+    ``boto3.Session`` and only falls back to assembling one from the credential
+    attributes otherwise -- so passing the endpoint-bound session here is what
+    keeps the store on the emulator, with no patching.
+
+    A ``SimpleNamespace`` rather than a ``MagicMock``: ``resolve_session`` reads
+    five optional attributes with ``getattr(..., None)`` and treats any truthy
+    value as credentials to build a *new* session from, which a MagicMock would
+    supply -- silently replacing the bound session with an unbound one.
+    """
+    attrs = {
+        "session": session,
+        "provider_id": f"test-provider-{uuid.uuid4().hex[:8]}",
+        "workflow_id": f"test-workflow-{uuid.uuid4().hex[:8]}",
+        "region": session.region_name,
+    }
+    attrs.update(overrides)
+    return SimpleNamespace(**attrs)
 
 
 class TestFileStateStoreIntegration:
@@ -163,64 +198,45 @@ class TestFileStateStoreIntegration:
 class TestParameterStoreStateIntegration:
     """Integration tests for ParameterStoreState using substrate."""
 
-    @pytest.fixture(scope="class")
-    def substrate_session(self):
-        """Create a session connected to substrate."""
-        return get_substrate_session()
-
     @pytest.fixture
-    def mock_provider(self):
-        """Create a provider-like object."""
-
-        class MockProvider:
-            def __init__(self):
-                self.workflow_id = f"test-workflow-{uuid.uuid4().hex[:8]}"
-                self.region = "us-east-1"
-                self.aws_access_key_id = "test"
-                self.aws_secret_access_key = "test"
-                self.aws_session_token = None
-                self.aws_profile = None
-
-        return MockProvider()
+    def mock_provider(self, substrate_session):
+        """A provider stub carrying the endpoint-bound session."""
+        return _provider_stub(substrate_session)
 
     @pytest.fixture
     def parameter_store_state(self, mock_provider, substrate_session):
         """Create a ParameterStoreState instance with substrate."""
         state_prefix = f"/parsl/test/{uuid.uuid4().hex[:8]}"
 
-        # Override session creation to use our substrate session
-        with patch.object(boto3, "Session", return_value=substrate_session):
-            state_store = ParameterStoreState(
-                provider=mock_provider, prefix=state_prefix
+        state_store = ParameterStoreState(provider=mock_provider, prefix=state_prefix)
+        yield state_store
+
+        # Cleanup
+        try:
+            # Find all parameters under our prefix
+            paginator = substrate_session.client("ssm").get_paginator(
+                "get_parameters_by_path"
             )
-            yield state_store
+            page_iterator = paginator.paginate(
+                Path=state_prefix, Recursive=True, WithDecryption=True
+            )
 
-            # Cleanup
-            try:
-                # Find all parameters under our prefix
-                paginator = substrate_session.client("ssm").get_paginator(
-                    "get_parameters_by_path"
-                )
-                page_iterator = paginator.paginate(
-                    Path=state_prefix, Recursive=True, WithDecryption=True
-                )
+            parameters_to_delete = []
+            for page in page_iterator:
+                for param in page.get("Parameters", []):
+                    parameters_to_delete.append(param["Name"])
 
-                parameters_to_delete = []
-                for page in page_iterator:
-                    for param in page.get("Parameters", []):
-                        parameters_to_delete.append(param["Name"])
-
-                # Delete in batches
-                ssm_client = substrate_session.client("ssm")
-                for i in range(0, len(parameters_to_delete), 10):
-                    batch = parameters_to_delete[i : i + 10]
-                    if batch:
-                        try:
-                            ssm_client.delete_parameters(Names=batch)
-                        except Exception as e:
-                            print(f"Error cleaning up parameters: {e}")
-            except Exception as e:
-                print(f"Error during cleanup: {e}")
+            # Delete in batches
+            ssm_client = substrate_session.client("ssm")
+            for i in range(0, len(parameters_to_delete), 10):
+                batch = parameters_to_delete[i : i + 10]
+                if batch:
+                    try:
+                        ssm_client.delete_parameters(Names=batch)
+                    except Exception as e:
+                        print(f"Error cleaning up parameters: {e}")
+        except Exception as e:
+            print(f"Error during cleanup: {e}")
 
     @pytest.fixture
     def complex_state(self):
@@ -325,21 +341,23 @@ class TestParameterStoreStateIntegration:
 class TestS3StateIntegration:
     """Integration tests for S3State using substrate."""
 
-    @pytest.fixture(scope="class")
-    def substrate_session(self):
-        """Create a session connected to substrate."""
-        return get_substrate_session()
-
     @pytest.fixture
     def s3_bucket_name(self, substrate_session):
-        """Create a unique S3 bucket name and ensure it exists."""
+        """Create a unique S3 bucket name and ensure it exists.
+
+        ``CreateBucketConfiguration`` is required outside ``us-east-1`` and
+        rejected inside it, and this session follows ``AWS_TEST_REGION``
+        (default ``us-west-2``) -- so the constraint is passed conditionally
+        rather than omitted, which is what made this fixture fail before.
+        """
         bucket_name = f"test-bucket-{uuid.uuid4().hex[:16]}"
         s3_client = substrate_session.client("s3")
+        region = substrate_session.region_name
 
-        try:
-            s3_client.create_bucket(Bucket=bucket_name)
-        except Exception as e:
-            pytest.skip(f"Failed to create test bucket: {e}")
+        kwargs = {"Bucket": bucket_name}
+        if region and region != "us-east-1":
+            kwargs["CreateBucketConfiguration"] = {"LocationConstraint": region}
+        s3_client.create_bucket(**kwargs)
 
         yield bucket_name
 
@@ -359,32 +377,18 @@ class TestS3StateIntegration:
             print(f"Error cleaning up test bucket: {e}")
 
     @pytest.fixture
-    def mock_provider(self):
-        """Create a provider-like object."""
-
-        class MockProvider:
-            def __init__(self):
-                self.workflow_id = f"test-workflow-{uuid.uuid4().hex[:8]}"
-                self.region = "us-east-1"
-                self.aws_access_key_id = "test"
-                self.aws_secret_access_key = "test"
-                self.aws_session_token = None
-                self.aws_profile = None
-
-        return MockProvider()
+    def mock_provider(self, substrate_session):
+        """A provider stub carrying the endpoint-bound session."""
+        return _provider_stub(substrate_session)
 
     @pytest.fixture
-    def s3_state(self, mock_provider, s3_bucket_name, substrate_session):
+    def s3_state(self, mock_provider, s3_bucket_name):
         """Create an S3State instance with substrate."""
-        key_prefix = f"parsl/test/{uuid.uuid4().hex[:8]}"
-
-        # Override session creation to use our substrate session
-        with patch.object(boto3, "Session", return_value=substrate_session):
-            return S3State(
-                provider=mock_provider,
-                bucket_name=s3_bucket_name,
-                key_prefix=key_prefix,
-            )
+        return S3State(
+            provider=mock_provider,
+            bucket_name=s3_bucket_name,
+            key_prefix=f"parsl/test/{uuid.uuid4().hex[:8]}",
+        )
 
     @pytest.fixture
     def complex_state(self):
@@ -515,46 +519,126 @@ class TestS3StateIntegration:
 
     @pytest.mark.substrate
     def test_create_bucket_if_not_exists(self, mock_provider, substrate_session):
-        """Test creating a bucket if it doesn't exist."""
+        """A missing bucket is created, blocked from public access, and usable.
+
+        Blocking public access is the part worth asserting rather than the
+        creation: the provider writes provider state -- instance IDs, network
+        IDs, and whatever the workflow put in its tags -- into this bucket, and it
+        replaced a deprecated ``ACL="private"`` with the modern equivalent. A
+        bucket created without it would be world-readable if any later policy
+        allowed it.
+
+        ``xfail`` on substrate#446 rather than skip: ``?publicAccessBlock`` is
+        unrouted there, so ``PUT`` falls through to the ``CreateBucket`` handler
+        and answers ``BucketAlreadyExists`` for the bucket that was just made.
+        The provider wraps that as ``StateError: Failed to create S3 bucket``, so
+        the whole constructor fails. xfail keeps the test running -- it will
+        report ``XPASS`` the moment substrate routes the subresource, where a skip
+        would sit silently forever.
+
+        Creation itself is covered under moto in
+        ``tests/unit/test_aws_mocking.py::test_bucket_is_created_when_requested``.
+        Nothing covers it against real S3: ``tests/aws`` pre-creates the bucket in
+        its ``s3_state_bucket`` fixture, so the provider takes the
+        already-exists branch there, and no E2E test passes
+        ``create_bucket_if_not_exists``. The public-access assertions below are
+        therefore unverified against AWS until substrate#446 lands.
+        """
         bucket_name = f"auto-create-bucket-{uuid.uuid4().hex[:16]}"
         s3_client = substrate_session.client("s3")
 
-        # Verify bucket doesn't exist
-        try:
+        with pytest.raises(ClientError) as excinfo:
             s3_client.head_bucket(Bucket=bucket_name)
-            bucket_exists = True
-        except ClientError:
-            bucket_exists = False
+        assert excinfo.value.response["Error"]["Code"] == "404"
 
-        assert not bucket_exists
-
-        # Create S3State with create_bucket_if_not_exists=True
-        with patch.object(boto3, "Session", return_value=substrate_session):
+        try:
             s3_state = S3State(
                 provider=mock_provider,
                 bucket_name=bucket_name,
                 create_bucket_if_not_exists=True,
             )
+        except StateError as exc:
+            if "BucketAlreadyExists" in str(exc):
+                pytest.xfail(
+                    "substrate#446: PUT ?publicAccessBlock is routed to "
+                    "CreateBucket, so the provider cannot lock down a bucket it "
+                    "just created."
+                )
+            raise
 
-        # Verify bucket was created
         try:
+            # Created, and no longer publicly reachable.
             s3_client.head_bucket(Bucket=bucket_name)
-            bucket_exists = True
-        except ClientError:
-            bucket_exists = False
+            blocked = s3_client.get_public_access_block(Bucket=bucket_name)[
+                "PublicAccessBlockConfiguration"
+            ]
+            assert blocked["BlockPublicAcls"] is True
+            assert blocked["IgnorePublicAcls"] is True
+            assert blocked["BlockPublicPolicy"] is True
+            assert blocked["RestrictPublicBuckets"] is True
 
-        assert bucket_exists
+            # Tagged so an operator can tell which workflow owns it.
+            tags = {
+                t["Key"]: t["Value"]
+                for t in s3_client.get_bucket_tagging(Bucket=bucket_name)["TagSet"]
+            }
+            assert tags["ParslManagedBucket"] == "true"
+            assert tags["ParslWorkflowId"] == mock_provider.workflow_id
 
-        # Test saving and loading state in the new bucket
-        test_state = {"created": "auto", "test": True}
-        s3_state.save_state("test_key", test_state)
+            s3_state.save_state("test_key", {"created": "auto", "test": True})
+            assert s3_state.load_state("test_key")["created"] == "auto"
+        finally:
+            s3_state.delete_state("test_key")
+            try:
+                s3_client.delete_bucket(Bucket=bucket_name)
+            except Exception as e:
+                print(f"Error cleaning up bucket: {e}")
 
-        loaded_state = s3_state.load_state("test_key")
-        assert loaded_state["created"] == "auto"
+    @pytest.mark.substrate
+    def test_an_existing_bucket_is_adopted_rather_than_recreated(
+        self, mock_provider, s3_bucket_name
+    ):
+        """``create_bucket_if_not_exists`` must be idempotent.
 
-        # Cleanup
-        s3_state.delete_state("test_key")
-        try:
-            s3_client.delete_bucket(Bucket=bucket_name)
-        except Exception as e:
-            print(f"Error cleaning up bucket: {e}")
+        A provider resumed from a state file constructs its store again, so this
+        runs against a bucket that already exists on every restart. ``CreateBucket``
+        is not reached at all in that case -- which is also why this test passes
+        where the one above cannot.
+        """
+        s3_state = S3State(
+            provider=mock_provider,
+            bucket_name=s3_bucket_name,
+            create_bucket_if_not_exists=True,
+        )
+
+        s3_state.save_state("adopted", {"ok": True})
+        assert s3_state.load_state("adopted") == {"ok": True}
+        s3_state.delete_state("adopted")
+
+    @pytest.mark.substrate
+    def test_an_empty_bucket_is_reclaimed_and_a_used_one_is_not(
+        self, mock_provider, s3_bucket_name
+    ):
+        """``delete_bucket_if_empty`` must not destroy state it still holds.
+
+        Called on shutdown, where the bucket may be shared with another provider
+        or hold state a resumed run still needs. Emptiness is the only signal
+        available, so the check has to be right in both directions.
+        """
+        s3_state = S3State(
+            provider=mock_provider,
+            bucket_name=s3_bucket_name,
+            key_prefix=f"parsl/test/{uuid.uuid4().hex[:8]}",
+        )
+        s3_state.save_state("still-needed", {"ok": True})
+
+        assert s3_state.delete_bucket_if_empty() is False
+        assert s3_state.load_state("still-needed") == {"ok": True}
+
+        s3_state.delete_state("still-needed")
+
+        assert s3_state.delete_bucket_if_empty() is True
+        # The bucket is gone, so the fixture's teardown has nothing to do -- and
+        # the store now fails loudly rather than silently returning None.
+        with pytest.raises(StateError, match="NoSuchBucket"):
+            s3_state.load_state("still-needed")
