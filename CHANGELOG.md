@@ -99,6 +99,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unreferenced by anything (refs #93).
 
 ### Changed
+- CI actions updated: `actions/checkout` and `actions/upload-artifact` to v7,
+  `astral-sh/setup-uv` to v7, `codecov/codecov-action` to v7, and
+  `aws-actions/configure-aws-credentials` to v6. Swept in one commit rather than
+  merged individually so a dependency bump cannot be mistaken for a functional
+  regression. `configure-aws-credentials` v6 is safe here because the
+  `aws-e2e-tests` job already declares `id-token: write` and assumes a role via
+  OIDC instead of using long-lived keys.
 - **Lint and format now cover the whole repository** rather than
   `parsl_ephemeral_aws tests`. The 107 pre-existing ruff errors that forced the
   narrower scope lived entirely in the `tools/` scripts removed above, so
