@@ -11,9 +11,10 @@ Two things to know before using this mode:
 * `worker_init` has no effect on either backend. There is no instance to run it
   on, so dependencies must be in the Lambda deployment package or layer, or in
   the container image.
-* The Fargate container image is not configurable through the provider — it is
-  fixed at `public.ecr.aws/lambda/python:3.9` (issue #136). Since running your own
-  image is the usual reason to prefer Fargate, Lambda is the better choice today.
+* The Fargate container image *is* configurable, as of v0.8.0 — pass
+  `ecs_container_image` (#136). The default, `python:3.12-slim`, carries the
+  standard library only, so set it to an image holding your dependencies. This is
+  the usual reason to prefer Fargate over Lambda.
 
 Usage
 -----
@@ -116,6 +117,16 @@ def _build_provider(compute_type: str) -> EphemeralAWSProvider:
             vpc_id=os.environ["AWS_TEST_VPC_ID"],
             subnet_id=os.environ["AWS_TEST_SUBNET_ID"],
             security_group_id=os.environ["AWS_TEST_SG_ID"],
+            # Reachable since v0.8.0 (#136). The tasks below need only the
+            # standard library, so the default image would do; it is set
+            # explicitly because substituting your own image is the point of
+            # choosing Fargate. cpu/memory must be a pair Fargate accepts --
+            # an invalid combination fails the task definition, not the task.
+            ecs_container_image=os.environ.get(
+                "AWS_TEST_ECS_IMAGE", "python:3.12-slim"
+            ),
+            ecs_task_cpu=512,
+            ecs_task_memory=1024,
         )
 
     return EphemeralAWSProvider(**options)
