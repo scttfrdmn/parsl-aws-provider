@@ -1858,8 +1858,7 @@ def get_or_create_ssm_instance_profile(
         return None
 
     iam = session.client("iam")
-    role_name = f"parsl-ephemeral-ssm-role-{name_suffix}"
-    profile_name = f"parsl-ephemeral-ssm-profile-{name_suffix}"
+    role_name, profile_name = ssm_instance_profile_names(name_suffix)
 
     get_or_create_iam_role(
         iam_client=iam,
@@ -1908,6 +1907,113 @@ def get_or_create_ssm_instance_profile(
         raise ResourceCreationError(
             f"Failed to create instance profile {profile_name}: {e}"
         ) from e
+
+
+def ssm_instance_profile_names(name_suffix: str) -> Tuple[str, str]:
+    """Return the ``(role_name, profile_name)`` pair for *name_suffix*.
+
+    The names are derived, not stored, so the creator and the deleter cannot
+    drift apart. ``get_or_create_ssm_instance_profile`` and
+    ``delete_ssm_instance_profile`` are the two callers.
+    """
+    return (
+        f"parsl-ephemeral-ssm-role-{name_suffix}",
+        f"parsl-ephemeral-ssm-profile-{name_suffix}",
+    )
+
+
+def delete_ssm_instance_profile(session: boto3.Session, name_suffix: str) -> bool:
+    """Delete the SSM role and instance profile named for *name_suffix*.
+
+    The inverse of ``get_or_create_ssm_instance_profile``. **Only call this for a
+    pair this provider created** — see ``StandardMode._owns_instance_profile``. A
+    caller-supplied profile belongs to the caller, and deleting it would break
+    every other workload using it.
+
+    IAM enforces the teardown order: a profile holding a role cannot be deleted,
+    and a role that is still in a profile or has policies attached cannot be
+    deleted either. So it goes role-out-of-profile, profile, policies-off-role,
+    role. Getting this wrong yields ``DeleteConflict`` rather than a partial
+    success, which is why the order is not a matter of taste.
+
+    Every step tolerates ``NoSuchEntity``: cleanup runs on paths that may already
+    have partially completed, and a missing resource is the desired end state
+    rather than an error.
+
+    Parameters
+    ----------
+    session : boto3.Session
+        AWS session used to build the IAM client.
+    name_suffix : str
+        The same discriminator passed to ``get_or_create_ssm_instance_profile``
+        — normally the provider ID.
+
+    Returns
+    -------
+    bool
+        True if the pair is gone (including "was already gone"), False if
+        something could not be deleted. Never raises: a cleanup failure must not
+        mask whatever the caller was originally doing.
+    """
+    role_name, profile_name = ssm_instance_profile_names(name_suffix)
+    iam = session.client("iam")
+    ok = True
+
+    def _tolerate_missing(op: str, fn: Any) -> bool:
+        """Run *fn*, treating an absent resource as success."""
+        try:
+            fn()
+            return True
+        except ClientError as e:
+            if e.response["Error"]["Code"] in ("NoSuchEntity", "NoSuchEntityException"):
+                logger.debug(f"{op}: already gone")
+                return True
+            logger.warning(f"{op} failed: {e}")
+            return False
+        except Exception as e:
+            logger.warning(f"{op} failed: {e}")
+            return False
+
+    ok &= _tolerate_missing(
+        f"Removing role {role_name} from profile {profile_name}",
+        lambda: iam.remove_role_from_instance_profile(
+            InstanceProfileName=profile_name, RoleName=role_name
+        ),
+    )
+    ok &= _tolerate_missing(
+        f"Deleting instance profile {profile_name}",
+        lambda: iam.delete_instance_profile(InstanceProfileName=profile_name),
+    )
+
+    # Detach whatever is actually attached rather than assuming only
+    # AmazonSSMManagedInstanceCore is: delete_role refuses while any policy
+    # remains, so an operator-added policy would otherwise strand the role.
+    try:
+        attached = iam.list_attached_role_policies(RoleName=role_name).get(
+            "AttachedPolicies", []
+        )
+    except ClientError as e:
+        if e.response["Error"]["Code"] not in ("NoSuchEntity", "NoSuchEntityException"):
+            logger.warning(f"Listing policies on role {role_name} failed: {e}")
+            ok = False
+        attached = []
+
+    for policy in attached:
+        ok &= _tolerate_missing(
+            f"Detaching {policy['PolicyArn']} from role {role_name}",
+            lambda p=policy: iam.detach_role_policy(
+                RoleName=role_name, PolicyArn=p["PolicyArn"]
+            ),
+        )
+
+    ok &= _tolerate_missing(
+        f"Deleting role {role_name}",
+        lambda: iam.delete_role(RoleName=role_name),
+    )
+
+    if ok:
+        logger.info(f"Deleted IAM role {role_name} and profile {profile_name}")
+    return ok
 
 
 #: How long to wait for a new instance profile to become visible to EC2.

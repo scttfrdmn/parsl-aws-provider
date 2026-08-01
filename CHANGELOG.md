@@ -36,6 +36,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the removed API only, and never exported from the package root (refs #137).
 
 ### Fixed
+- **Every `auto_create_instance_profile` run leaked an IAM role and an instance
+  profile.** `StandardMode._resolve_instance_profile()` created a
+  `parsl-ephemeral-ssm-{role,profile}-<provider_id>` pair, and `provider_id` is a
+  fresh UUID per run, so each run made a new pair.
+  `cleanup_infrastructure()` deleted the launch template, EventBridge rule, SQS
+  queue, and baked AMI — never the IAM pair, and no
+  `remove_role_from_instance_profile` / `delete_role` call existed anywhere on the
+  path. Cleanup now deletes both, in the only order IAM accepts
+  (`remove_role_from_instance_profile` → `delete_instance_profile` →
+  `detach_role_policy` → `delete_role`), tolerating `NoSuchEntity` at every step
+  so it stays idempotent, and logging rather than raising so a cleanup failure
+  cannot mask the caller's real error.
+
+  **A caller-supplied `iam_instance_profile_arn` is never deleted.** Ownership
+  gates on having taken the auto-create branch and is persisted as
+  `owns_instance_profile`, not recomputed from create-vs-fetch: the names derive
+  from `provider_id`, so a provider resumed from a state file *fetches* the pair
+  it created on its first run, and a create-vs-fetch gate would disown it on
+  every restart and leak it permanently. Deleting shared infrastructure other
+  workloads depend on would be a worse bug than the leak — the hazard class of
+  the serverless security-group deletion fixed in #100 (closes #132).
+- `tools/cleanup_aws_resources.py` reaps orphaned IAM pairs, which it previously
+  ignored entirely. Roles and profiles can be orphaned independently by a partial
+  teardown, so both listings are scanned and the suffixes unioned, and IAM runs
+  after the instance terminations because IAM refuses to delete a profile still
+  attached to an instance. Prefixes derive from the same
+  `ssm_instance_profile_names()` helper the provider creates with, so the creator
+  and the reaper cannot drift apart (refs #132).
 - **A reclaimed spot instance reported its work as successful.** An interrupted
   instance goes to `shutting-down`, which `EC2_STATUS_MAPPING` renders
   `COMPLETED` — so Parsl saw a block that finished normally, and `retries` never
@@ -123,6 +151,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   their sandbox. The watched filename is read from the `state_file_path` signature
   default rather than hardcoded, so renaming the default cannot quietly disable
   the check (refs #93).
+
+### Security
+- **The IAM leak fixed above was accumulating standing privileged principals.**
+  Each orphaned role carried `AmazonSSMManagedInstanceCore` — which grants
+  `ssm:SendCommand`-reachable command execution — and outlived the instances it
+  was made for with nothing to delete it. Verified against a real account: **94
+  orphaned roles and 94 matching instance profiles**, part of 450 roles against
+  IAM's default quota of 1,000, so the drift was also walking toward a hard
+  account-level failure that would have blocked unrelated work. Both halves of the
+  problem are addressed: the provider no longer creates orphans, and the cleanup
+  tool removes existing ones (closes #132).
 
 ## [0.7.0] - 2026-07-31
 

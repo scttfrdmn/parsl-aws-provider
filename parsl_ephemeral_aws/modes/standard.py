@@ -47,6 +47,7 @@ from parsl_ephemeral_aws.utils.aws import (
     build_launch_template_data,
     create_launch_template,
     delete_launch_template,
+    delete_ssm_instance_profile,
     get_default_ami,
     get_or_create_ssm_instance_profile,
     wait_for_resource,
@@ -205,6 +206,10 @@ class StandardMode(OperatingMode):
         self.warm_pool_ttl = warm_pool_ttl
         self.iam_instance_profile_arn = iam_instance_profile_arn
         self.auto_create_instance_profile = auto_create_instance_profile
+        # True when this mode auto-created the IAM role and instance profile, and
+        # so is the one responsible for deleting them (#132). A caller-supplied
+        # iam_instance_profile_arn is never ours to delete.
+        self._owns_instance_profile: bool = False
         # List of instance IDs currently in the warm pool (ready for reuse, FIFO)
         self._warm_instances: List[str] = []
 
@@ -552,6 +557,31 @@ class StandardMode(OperatingMode):
             self._launch_template_id = None
             self._launch_template_version = None
 
+    def _delete_instance_profile(self) -> None:
+        """Delete the IAM role and instance profile, if this mode created them.
+
+        ``_owns_instance_profile`` is the guard, and it is the whole point: a
+        profile the caller supplied through ``iam_instance_profile_arn`` is shared
+        infrastructure that other workloads may depend on, so deleting it would
+        be a far worse bug than the leak this fixes (#132, same hazard class as
+        the serverless security-group deletion in #100).
+
+        Called during cleanup after the instances are confirmed terminated --
+        IAM refuses to delete a profile still attached to a running instance.
+        """
+        if not self._owns_instance_profile:
+            return
+
+        try:
+            delete_ssm_instance_profile(self.session, self.provider_id)
+        except Exception as e:
+            logger.error(f"Failed to delete IAM instance profile: {e}")
+        finally:
+            # Dropped either way: the ARN no longer names something usable, and
+            # cleanup is not retried.
+            self._owns_instance_profile = False
+            self.iam_instance_profile_arn = None
+
     def _launch_template_reference(self) -> Optional[Dict[str, str]]:
         """Return the ``LaunchTemplate`` kwarg for a launch, or None.
 
@@ -584,6 +614,9 @@ class StandardMode(OperatingMode):
             "owns_baked_ami": self._owns_baked_ami,
             "launch_template_id": self._launch_template_id,
             "launch_template_version": self._launch_template_version,
+            # Without this, a provider resumed from state would not know it owns
+            # the IAM pair and would leave it behind on cleanup (#132).
+            "owns_instance_profile": self._owns_instance_profile,
         }
 
         # Include spot fleet state if applicable
@@ -640,6 +673,10 @@ class StandardMode(OperatingMode):
                 # second one (#85).
                 self._launch_template_id = state.get("launch_template_id")
                 self._launch_template_version = state.get("launch_template_version")
+
+                # Reclaim ownership of the IAM pair this provider created on an
+                # earlier run, so cleanup can still delete it (#132).
+                self._owns_instance_profile = state.get("owns_instance_profile", False)
 
                 # Restore baked AMI state
                 saved_baked_ami = state.get("baked_ami_id")
@@ -849,6 +886,12 @@ class StandardMode(OperatingMode):
                 name_suffix=self.provider_id,
                 auto_create=True,
             )
+            # Ownership follows taking this branch, not create-vs-fetch (#132).
+            # The names derive from provider_id, so a provider resumed from a
+            # state file *fetches* the pair it made on its first run -- gating on
+            # "did this call create it" would disown it on every restart and leak
+            # the pair permanently.
+            self._owns_instance_profile = True
             logger.info(
                 f"Resolved IAM instance profile {self.iam_instance_profile_arn} "
                 "for SSM command dispatch"
@@ -2064,6 +2107,12 @@ class StandardMode(OperatingMode):
             # above and before the state save below, so a failure to delete it
             # still leaves the ID cleared in the persisted state.
             self._delete_launch_template()
+
+            # Delete the IAM role and instance profile, but only if we made them
+            # (#132). Before the fix nothing deleted them, so every run left a
+            # standing principal carrying AmazonSSMManagedInstanceCore behind and
+            # the account walked toward IAM's 1,000-role quota.
+            self._delete_instance_profile()
 
             # Clean up Spot Fleet resources if using spot fleet
             if self.use_spot_fleet and self.spot_fleet_manager:
