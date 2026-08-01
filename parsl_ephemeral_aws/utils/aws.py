@@ -674,7 +674,8 @@ def create_spot_interruption_notifier(
 
     This is what supplies the two-minute advance warning. Polling EC2 state
     cannot: an interrupted instance is only observable once it reaches
-    ``shutting-down``, which is after the reclaim, far too late to checkpoint.
+    ``shutting-down``, which is after the reclaim, far too late to stop
+    dispatching into it.
     An ``instant`` fleet also gets no Capacity Rebalance -- ``CreateFleet``
     rejects ``SpotOptions.MaintenanceStrategies`` for the type -- so EventBridge
     is the mechanism, and it has the further advantage of working for instances

@@ -17,6 +17,7 @@ from parsl_ephemeral_aws.exceptions import (
 )
 from parsl_ephemeral_aws.constants import (
     RESOURCE_TYPE_EC2,
+    STATUS_INTERRUPTED,
     STATUS_PENDING,
     STATUS_RUNNING,
     STATUS_CANCELED,
@@ -130,6 +131,95 @@ class TestStandardMode:
         # switch entirely. The old `mode.create_vpc is False` assertion outlived
         # the attribute it read.
         assert not hasattr(mode, "create_vpc")
+
+    @pytest.mark.parametrize(
+        ("use_spot", "use_spot_fleet", "expect_manager"),
+        [
+            (False, False, False),
+            (True, False, False),
+            (False, True, True),
+            (True, True, True),
+        ],
+    )
+    def test_the_fleet_manager_follows_use_spot_fleet_alone(
+        self,
+        mock_session,
+        mock_state_store,
+        mock_ec2_client,
+        use_spot,
+        use_spot_fleet,
+        expect_manager,
+    ):
+        """``use_spot_fleet`` decides, and nothing else (#137).
+
+        The gate was ``use_spot and use_spot_fleet``, but every consumer of the
+        manager tests ``use_spot_fleet`` alone -- so ``use_spot_fleet=True``
+        without ``use_spot`` left the manager ``None``, ``_create_spot_instance``
+        found nothing to dispatch to, and the block launched as a single
+        on-demand instance with no error. The reverse case matters too: a
+        ``use_spot``-only caller never reaches the fleet path, so building a
+        manager for it would be dead weight.
+        """
+        mock_session.client.return_value = mock_ec2_client
+
+        mode = StandardMode(
+            provider_id="test-provider",
+            session=mock_session,
+            state_store=mock_state_store,
+            instance_type="t3.micro",
+            image_id="ami-12345678",
+            region="us-east-1",
+            vpc_id="vpc-12345",
+            subnet_id="subnet-12345",
+            security_group_id="sg-12345",
+            use_spot=use_spot,
+            use_spot_fleet=use_spot_fleet,
+        )
+
+        assert (mode.spot_fleet_manager is not None) is expect_manager
+
+    @pytest.mark.parametrize(
+        ("use_spot", "use_spot_fleet", "expect_monitor"),
+        [
+            (False, False, False),
+            (True, False, True),
+            (False, True, True),
+        ],
+    )
+    def test_the_interruption_monitor_covers_both_spot_paths(
+        self,
+        mock_session,
+        mock_state_store,
+        mock_ec2_client,
+        use_spot,
+        use_spot_fleet,
+        expect_monitor,
+    ):
+        """Unlike the manager, the monitor is wanted on either spot path (#137).
+
+        Its gate was ``use_spot and spot_interruption_handling``, which left a
+        fleet-only caller with no detection at all despite asking for it -- and a
+        fleet is the configuration most exposed to reclaims. On-demand capacity is
+        never reclaimed, so the no-spot case must still build nothing.
+        """
+        mock_session.client.return_value = mock_ec2_client
+
+        mode = StandardMode(
+            provider_id="test-provider",
+            session=mock_session,
+            state_store=mock_state_store,
+            instance_type="t3.micro",
+            image_id="ami-12345678",
+            region="us-east-1",
+            vpc_id="vpc-12345",
+            subnet_id="subnet-12345",
+            security_group_id="sg-12345",
+            use_spot=use_spot,
+            use_spot_fleet=use_spot_fleet,
+            spot_interruption_handling=True,
+        )
+
+        assert (mode.spot_interruption_monitor is not None) is expect_monitor
 
     def test_initialize(self, standard_mode, mock_ec2_client):
         """Initialize verifies the caller's network; it never creates one.
@@ -251,6 +341,40 @@ class TestStandardMode:
 
         # Verify resource was updated
         assert standard_mode.resources[resource_id]["status"] == STATUS_RUNNING
+
+    def test_get_job_status_keeps_an_interruption(self, standard_mode, mock_ec2_client):
+        """A reclaim marked by the monitor survives the next poll (#137).
+
+        This is the half that makes the marker mean anything. EC2 reports a
+        reclaimed instance as "shutting-down", which ``EC2_STATUS_MAPPING``
+        renders COMPLETED, so re-deriving status here would overwrite
+        ``STATUS_INTERRUPTED`` and report the lost block as a success — exactly
+        the silent task loss the marker exists to prevent.
+        """
+        resource_id = "i-12345678"
+        standard_mode.resources = {
+            resource_id: {
+                "type": RESOURCE_TYPE_EC2,
+                "job_id": "job-1",
+                "status": STATUS_INTERRUPTED,
+            }
+        }
+        mock_ec2_client.describe_instances.return_value = {
+            "Reservations": [
+                {
+                    "Instances": [
+                        {"InstanceId": resource_id, "State": {"Name": "shutting-down"}}
+                    ]
+                }
+            ]
+        }
+
+        status = standard_mode.get_job_status([resource_id])
+
+        assert status[resource_id] == STATUS_INTERRUPTED
+        assert standard_mode.resources[resource_id]["status"] == STATUS_INTERRUPTED
+        # Not even asked: the answer could only be wrong.
+        mock_ec2_client.describe_instances.assert_not_called()
 
     def test_cancel_jobs(self, standard_mode, mock_ec2_client):
         """Test canceling jobs."""

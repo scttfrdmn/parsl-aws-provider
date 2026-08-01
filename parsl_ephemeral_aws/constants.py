@@ -292,13 +292,14 @@ EC2_FLEET_ALLOCATION_STRATEGIES = frozenset(
 # (``aws:ec2:send-spot-instance-interruptions``) -- the warning reached the queue
 # 15.2s after the experiment started, with the instance still ``running``. That
 # is the whole point: the EC2-state poll this supplements cannot see anything
-# until ``shutting-down``, by which time checkpointing is already too late.
+# until ``shutting-down``, by which time the executor has already dispatched work
+# to a worker that is gone.
 #
 # ``EC2 Instance Rebalance Recommendation`` is deliberately *not* matched. It is
 # a separate detail-type that signals elevated interruption risk, not an
 # impending reclaim, and confirmed via ``test_event_pattern`` not to match this
-# pattern. Treating it as an interruption would checkpoint and tear down workers
-# that were never going away.
+# pattern. Treating it as an interruption would fail the blocks of healthy
+# workers that were never going away.
 SPOT_INTERRUPTION_EVENT_SOURCE = "aws.ec2"
 SPOT_INTERRUPTION_EVENT_DETAIL_TYPE = "EC2 Spot Instance Interruption Warning"
 
@@ -328,8 +329,6 @@ DEFAULT_SPOT_ALLOCATION_STRATEGY = "price-capacity-optimized"
 DEFAULT_SPOT_INSTANCE_INTERRUPTION_BEHAVIOR = "terminate"
 DEFAULT_SPOT_INTERRUPTION_CHECK_INTERVAL = 30  # seconds
 DEFAULT_SPOT_INTERRUPTION_LEAD_TIME = 120  # seconds
-DEFAULT_SPOT_CHECKPOINT_INTERVAL = 60  # seconds
-DEFAULT_SPOT_MAX_RECOVERY_ATTEMPTS = 3
 
 # Tag defaults
 DEFAULT_TAG_PREFIX = "parsl-ephemeral"
@@ -387,6 +386,18 @@ STATUS_CANCELLED = "CANCELED"  # British spelling alias
 STATUS_UNKNOWN = "UNKNOWN"
 STATUS_SUCCEEDED = "COMPLETED"  # Alias for compatibility
 STATUS_WARM = "WARM"  # instance running, job done, ready for reuse
+
+# A spot instance AWS has issued a two-minute reclaim warning for (#137).
+#
+# Distinct from STATUS_FAILED so logs and state files say why the block died,
+# but it maps to JobState.FAILED in the provider: from Parsl's side a reclaimed
+# block did not finish its work, and FAILED is what makes the executor stop
+# dispatching to it and re-run the lost tasks under its own `retries`.
+#
+# Without this the interruption is invisible. An interrupted instance goes to
+# "shutting-down", which EC2_STATUS_MAPPING renders COMPLETED -- so a reclaimed
+# block reported success and its tasks were silently dropped.
+STATUS_INTERRUPTED = "INTERRUPTED"
 
 # Warm pool defaults.
 #

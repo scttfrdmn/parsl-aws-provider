@@ -11,7 +11,8 @@ Only AWS can prove the three claims that actually matter here:
   no interruptions.
 * **The warning arrives while the instance is still running.** That is the entire
   point: the EC2-state poll it replaces can only see ``shutting-down``, after the
-  reclaim, too late to checkpoint. A previous manual probe measured 15.2s from
+  reclaim and after work has gone to a dead worker. A previous manual probe
+  measured 15.2s from
   the Fault Injection Simulator experiment starting to the message landing in
   SQS, with the instance still ``running``.
 * **The rule and queue are deleted on shutdown.** EventBridge caps rules per
@@ -386,7 +387,7 @@ class TestFISInterruption:
         instance reaches ``shutting-down``. If the warning arrived no earlier
         than that, the EventBridge machinery would be pure cost -- so the
         assertion is not just that a message arrives, but that the instance is
-        still ``running`` when it does, with time left to checkpoint.
+        still ``running`` when it does, leaving time to stop dispatching into it.
 
         Uses its own provider rather than ``spot_provider`` so the E2E run tag
         FIS targets is the only thing selected: ``selectionMode: ALL`` would
@@ -458,8 +459,8 @@ class TestFISInterruption:
             )
             assert state == "running", (
                 f"the warning arrived at {elapsed:.1f}s but {instance_id} was "
-                f"already {state}; there is no lead time to checkpoint in and "
-                "the EventBridge notifier buys nothing over the EC2-state poll"
+                f"already {state}; there is no lead time left and the "
+                "EventBridge notifier buys nothing over the EC2-state poll"
             )
 
             assert warning["detail-type"] == SPOT_INTERRUPTION_EVENT_DETAIL_TYPE
@@ -494,25 +495,18 @@ class TestFISInterruption:
         provider builds for itself carries it the rest of the way: mode
         initialisation creates the notifier, ``_create_spot_instance`` registers
         the instance, the background thread polls, and the registered handler is
-        called with ``Source: eventbridge`` -- the flag telling a checkpointing
-        handler it still has time.
+        called with ``Source: eventbridge`` -- the flag saying the instance is
+        still alive.
 
-        The handler is swapped for a recorder rather than left as the real
-        S3-checkpointing one, so the assertion is about delivery and not about
-        whether a checkpoint happened to succeed. ``checkpoint_bucket`` is still
-        required, because it is what makes the mode build a monitor at all.
+        The handler is swapped for a recorder rather than left as the mode's own
+        ``handle_instance_interruption``, so the assertion is about delivery
+        rather than about what the mode then does with it (covered by the unit
+        and substrate suites). No S3 bucket is involved: the monitor used to be
+        built only when a ``checkpoint_bucket`` was configured, which #137
+        removed along with the unimplementable recovery API behind it.
         """
         fis = aws_session.client("fis", region_name=aws_region)
         ec2 = aws_session.client("ec2", region_name=aws_region)
-        s3 = aws_session.client("s3", region_name=aws_region)
-        bucket = f"parsl-e2e-warn-{test_run_id}"
-        if aws_region == "us-east-1":
-            s3.create_bucket(Bucket=bucket)
-        else:
-            s3.create_bucket(
-                Bucket=bucket,
-                CreateBucketConfiguration={"LocationConstraint": aws_region},
-            )
 
         provider = EphemeralAWSProvider(
             region=aws_region,
@@ -520,7 +514,6 @@ class TestFISInterruption:
             mode="standard",
             use_spot=True,
             spot_interruption_handling=True,
-            checkpoint_bucket=bucket,
             state_store_type="file",
             state_file_path=str(tmp_path / f"state-hdl-{test_run_id}.json"),
             auto_shutdown=True,
@@ -540,7 +533,7 @@ class TestFISInterruption:
             monitor = mode.spot_interruption_monitor
             assert monitor is not None, (
                 "no interruption monitor was built despite "
-                "spot_interruption_handling=True and a checkpoint bucket"
+                "spot_interruption_handling=True"
             )
 
             received = []
@@ -548,7 +541,7 @@ class TestFISInterruption:
             instance_id = provider.job_map[job_id]["resource_id"]
 
             # Registered by _create_spot_instance during submit; replaced here so
-            # the assertion is about delivery rather than about S3.
+            # the assertion is about delivery rather than about the response.
             assert instance_id in monitor.instance_handlers, (
                 f"{instance_id} was never registered with the monitor, so no "
                 "warning for it can ever be routed"
@@ -576,7 +569,7 @@ class TestFISInterruption:
             assert handled_id == instance_id
             assert details["Source"] == "eventbridge", (
                 "the warning was attributed to the post-facto EC2-state poll, "
-                "so a handler would skip checkpointing"
+                "so the block was marked after the reclaim rather than ahead of it"
             )
         finally:
             if job_id:
@@ -593,15 +586,3 @@ class TestFISInterruption:
                     fis.delete_experiment_template(id=template_id)
                 except Exception as exc:
                     logger.warning("FIS template cleanup: %s (ignored)", exc)
-            try:
-                paginator = s3.get_paginator("list_objects_v2")
-                for page in paginator.paginate(Bucket=bucket):
-                    objects = page.get("Contents", [])
-                    if objects:
-                        s3.delete_objects(
-                            Bucket=bucket,
-                            Delete={"Objects": [{"Key": o["Key"]} for o in objects]},
-                        )
-                s3.delete_bucket(Bucket=bucket)
-            except Exception as exc:
-                logger.warning("checkpoint bucket cleanup: %s (ignored)", exc)

@@ -228,14 +228,19 @@ class TestServerlessModeSpotFleetIntegration:
         assert bucket not in [b["Name"] for b in s3.list_buckets()["Buckets"]]
 
     def test_a_caller_supplied_bucket_is_reused_and_kept(self, aws_session):
-        """A configured checkpoint_bucket is staged into, never deleted."""
+        """A configured lambda_code_bucket is staged into, never deleted.
+
+        The parameter used to be ``checkpoint_bucket``, whose checkpointing half
+        #137 removed; the staging override it also carried is real, so it kept the
+        behaviour under a name that describes it.
+        """
         s3 = aws_session.client("s3")
         s3.create_bucket(Bucket="parsl-test-caller-bucket")
 
         mode = self._mode(
             aws_session,
             worker_type=WORKER_TYPE_LAMBDA,
-            checkpoint_bucket="parsl-test-caller-bucket",
+            lambda_code_bucket="parsl-test-caller-bucket",
         )
         mode.initialize()
         resource_id = mode.submit_job("test-job-lambda-3", "echo hi", 1)

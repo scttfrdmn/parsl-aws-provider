@@ -13,7 +13,10 @@ import boto3
 
 from botocore.exceptions import ClientError
 
-from parsl_ephemeral_aws.constants import DEFAULT_SPOT_ALLOCATION_STRATEGY
+from parsl_ephemeral_aws.constants import (
+    DEFAULT_SPOT_ALLOCATION_STRATEGY,
+    STATUS_INTERRUPTED,
+)
 from parsl_ephemeral_aws.exceptions import OperatingModeError, ResourceNotFoundError
 from parsl_ephemeral_aws.state.base import STATE_KEY_MODE, StateStore
 
@@ -57,13 +60,7 @@ class OperatingMode(abc.ABC):
     spot_allocation_strategy : str
         Allocation strategy for spot instances
     spot_interruption_handling : bool
-        Whether to enable spot interruption handling
-    checkpoint_bucket : Optional[str]
-        S3 bucket name for storing task checkpoints
-    checkpoint_prefix : str
-        S3 key prefix for checkpoint data
-    checkpoint_interval : int
-        Interval between checkpoints in seconds
+        Whether to detect spot interruptions and mark the affected block failed
     additional_tags : Dict[str, str]
         Tags to apply to created resources
     auto_shutdown : bool
@@ -94,9 +91,6 @@ class OperatingMode(abc.ABC):
         spot_max_price: Optional[str] = None,
         spot_allocation_strategy: str = DEFAULT_SPOT_ALLOCATION_STRATEGY,
         spot_interruption_handling: bool = False,
-        checkpoint_bucket: Optional[str] = None,
-        checkpoint_prefix: str = "parsl/checkpoints",
-        checkpoint_interval: int = 60,
         additional_tags: Optional[Dict[str, str]] = None,
         auto_shutdown: bool = True,
         max_idle_time: int = 300,
@@ -139,13 +133,9 @@ class OperatingMode(abc.ABC):
             Allocation strategy for spot instances, in kebab-case, by default
             "price-capacity-optimized"
         spot_interruption_handling : bool, optional
-            Whether to enable spot interruption handling, by default False
-        checkpoint_bucket : Optional[str], optional
-            S3 bucket name for storing task checkpoints, by default None
-        checkpoint_prefix : str, optional
-            S3 key prefix for checkpoint data, by default "parsl/checkpoints"
-        checkpoint_interval : int, optional
-            Interval between checkpoints in seconds, by default 60
+            Whether to detect spot interruptions, by default False. Detection
+            marks the affected block STATUS_INTERRUPTED, which the provider
+            reports to Parsl as FAILED so it re-runs the lost tasks.
         additional_tags : Optional[Dict[str, str]], optional
             Tags to apply to created resources, by default None
         auto_shutdown : bool, optional
@@ -177,9 +167,6 @@ class OperatingMode(abc.ABC):
         self.spot_max_price = spot_max_price
         self.spot_allocation_strategy = spot_allocation_strategy
         self.spot_interruption_handling = spot_interruption_handling
-        self.checkpoint_bucket = checkpoint_bucket
-        self.checkpoint_prefix = checkpoint_prefix
-        self.checkpoint_interval = checkpoint_interval
         self.additional_tags = additional_tags or {}
         self.auto_shutdown = auto_shutdown
         self.max_idle_time = max_idle_time
@@ -339,6 +326,106 @@ class OperatingMode(abc.ABC):
             except Exception as e:
                 logger.error(f"Initialization failed: {e}")
                 raise OperatingModeError(f"Initialization failed: {e}") from e
+
+    # ------------------------------------------------------------------
+    # Spot interruption
+    # ------------------------------------------------------------------
+
+    def handle_instance_interruption(
+        self, instance_id: str, event: Dict[str, Any]
+    ) -> None:
+        """Mark *instance_id* interrupted so the block stops being dispatched to.
+
+        Registered with ``SpotInterruptionMonitor`` as the per-instance callback
+        and invoked on the two-minute reclaim warning, roughly 15 s after AWS
+        issues it.
+
+        Marking the resource is the whole response, and it is the useful one:
+        ``get_job_status`` reports ``STATUS_INTERRUPTED``, the provider maps that
+        to ``JobState.FAILED``, and Parsl stops dispatching to the block and
+        re-runs its tasks under the executor's own ``retries``. Nothing here
+        needs S3.
+
+        Without this the interruption was invisible rather than merely
+        unhandled: the instance moves to ``shutting-down``, which
+        ``EC2_STATUS_MAPPING`` renders ``COMPLETED``, so a reclaimed block
+        reported success and its tasks were dropped silently (#137).
+
+        Parameters
+        ----------
+        instance_id : str
+            The instance AWS has warned about.
+        event : Dict[str, Any]
+            The interruption event, logged for diagnosis.
+        """
+        logger.warning(
+            "Spot instance %s is being reclaimed by AWS; marking its block failed "
+            "so Parsl re-runs the affected tasks: %s",
+            instance_id,
+            event,
+        )
+        resource = self.resources.get(instance_id)
+        if resource is None:
+            # Already cleaned up, or belongs to a fleet tracked under its own ID.
+            logger.debug("No tracked resource for interrupted instance %s", instance_id)
+            return
+        resource["status"] = STATUS_INTERRUPTED
+        resource["interruption_event"] = event
+
+    def handle_fleet_interruption(
+        self, fleet_id: str, instance_ids: List[str], event: Dict[str, Any]
+    ) -> None:
+        """Mark a fleet's block, and each warned instance, interrupted.
+
+        Both are marked: the block is what Parsl holds a job ID for, while the
+        instances are what the monitor names, and either may be the tracked
+        resource depending on the launch path.
+
+        A fleet ID is almost never a resource key. ``resources`` is keyed by
+        block ID in StandardMode and by ``serverless-<job_id>`` in the other two,
+        with the fleet recorded as a ``fleet_request_id`` *field* on the record --
+        so a direct ``resources[fleet_id]`` lookup misses every time and the
+        block would keep reporting healthy while AWS took its capacity away. The
+        field is searched instead.
+
+        Parameters
+        ----------
+        fleet_id : str
+            The fleet AWS has warned about.
+        instance_ids : List[str]
+            Instances within the fleet being reclaimed.
+        event : Dict[str, Any]
+            The interruption event, logged for diagnosis.
+        """
+        logger.warning(
+            "Spot fleet %s instances %s are being reclaimed by AWS: %s",
+            fleet_id,
+            instance_ids,
+            event,
+        )
+        for resource_id in self._resource_ids_for_fleet(fleet_id):
+            resource = self.resources[resource_id]
+            resource["status"] = STATUS_INTERRUPTED
+            resource["interruption_event"] = event
+        for instance_id in instance_ids:
+            self.handle_instance_interruption(instance_id, event)
+
+    def _resource_ids_for_fleet(self, fleet_id: str) -> List[str]:
+        """Return the tracked resource IDs backed by *fleet_id*.
+
+        Matches a record keyed by the fleet ID directly, and any record carrying
+        it as ``fleet_request_id`` -- the latter is the shape every mode that
+        launches fleets actually writes.
+        """
+        matches = []
+        if fleet_id in self.resources:
+            matches.append(fleet_id)
+        for resource_id, resource in self.resources.items():
+            if resource_id == fleet_id:
+                continue
+            if resource.get("fleet_request_id") == fleet_id:
+                matches.append(resource_id)
+        return matches
 
     def save_state(self) -> None:
         """Save the current state under the mode's own state key.

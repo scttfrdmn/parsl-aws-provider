@@ -103,11 +103,9 @@ def main() -> int:
         nodes_per_block=2,
         spot_max_price_percentage=80,  # cap at 80% of on-demand
         spot_allocation_strategy="price-capacity-optimized",  # the default
-        # Interruption detection needs a checkpoint bucket today (#137); it gates
-        # whether the monitor is constructed at all. Omit it and you get one
-        # WARNING at startup and no detection.
+        # A detected reclaim marks the fleet's block FAILED, which is what makes
+        # Parsl re-run its tasks under `retries` (#137).
         spot_interruption_handling=True,
-        checkpoint_bucket=os.environ.get("AWS_TEST_CHECKPOINT_BUCKET"),
         min_blocks=0,
         max_blocks=4,
         init_blocks=1,
@@ -132,8 +130,9 @@ def main() -> int:
                 encrypted=False,  # see #62
             )
         ],
-        # What actually protects work from a reclaim: the interruption warning
-        # currently produces a log line, not task recovery (#137).
+        # What actually protects work from a reclaim. The provider marks the block
+        # FAILED; re-running its tasks is Parsl's job, because a provider is never
+        # told which tasks a block is running (#137).
         retries=3,
         run_dir="runinfo_spot_fleet",
     )

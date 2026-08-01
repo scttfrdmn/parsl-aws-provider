@@ -7,7 +7,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+- **The spot task-recovery API, which could not work at this layer and never
+  ran.** `SpotInterruptionHandler`, `ParslSpotInterruptionHandler`, the
+  `checkpointable` decorator, and the `checkpoint_bucket`, `checkpoint_prefix`,
+  and `checkpoint_interval` provider parameters are gone. This is a **breaking
+  config-schema change**: those three keywords now raise
+  `ProviderConfigurationError` rather than being accepted and ignored.
+
+  The entry point was `register_task(task_id, instance_id)`, and a Parsl provider
+  is never told a task ID — `submit(command, tasks_per_node, job_name)` is the
+  whole contract, because providers manage *blocks* while the executor manages
+  tasks. So nothing in the package could populate `task_mapping`; it was always
+  empty, every interruption logged "No registered tasks found", and
+  `save_checkpoint`/`recover_tasks`/`queue_task_for_recovery` were unreachable
+  alongside it. The `checkpointable` decorator's own source said "in a real
+  implementation, we would save to S3 here" and saved nothing.
+
+  Being documented as working made it worse than absent: `checkpoint_bucket` also
+  gated whether the interruption monitor was constructed at all, so a caller who
+  asked for `spot_interruption_handling=True` without a bucket got one startup
+  WARNING and no detection. Detection is unchanged and no longer gated on any
+  bucket. Recovery is Parsl's `retries` (or `max_retries_on_system_failure` on a
+  Globus Compute engine), which is now what the docs say (refs #137).
+- `CheckpointError`, `CheckpointNotFoundError`, and `TaskRecoveryError` from
+  `exceptions.py`, plus `DEFAULT_SPOT_CHECKPOINT_INTERVAL` and
+  `DEFAULT_SPOT_MAX_RECOVERY_ATTEMPTS` from `constants.py` — raised and read by
+  the removed API only, and never exported from the package root (refs #137).
+
 ### Fixed
+- **A reclaimed spot instance reported its work as successful.** An interrupted
+  instance goes to `shutting-down`, which `EC2_STATUS_MAPPING` renders
+  `COMPLETED` — so Parsl saw a block that finished normally, and `retries` never
+  fired for the tasks that died with it. A detected interruption now marks the
+  affected resource `STATUS_INTERRUPTED`, which the provider maps to
+  `JobState.FAILED`. That, not any checkpointing, is what makes the executor stop
+  dispatching into a doomed block and re-run its tasks (refs #137).
+- The interruption marker is now sticky. All three modes' `get_job_status()`
+  re-derive status from live AWS state on every poll, so the mark was overwritten
+  on the next call — an instance AWS is taking back still reports itself
+  `running`. Each mode now short-circuits a resource already marked
+  `STATUS_INTERRUPTED`, and the marker survives a save/load round trip (refs
+  #137).
+- A fleet interruption reached no block. `handle_fleet_interruption()` looked the
+  fleet ID up as a key in `resources`, but the resources dict is keyed by block ID
+  (standard mode) or `serverless-<job_id>`, carrying the fleet as a
+  `fleet_request_id` *field*. Every fleet reclaim therefore found nothing and
+  logged a miss. `OperatingMode._resource_ids_for_fleet()` now searches that
+  field, and `StandardMode` records `fleet_request_id` on the block record so
+  there is something to find (refs #137).
 - **Generated Globus Compute endpoint configs could not start a worker, and
   silently dropped most of the provider's configuration.** Three defects, one
   cause: `_provider_params_yaml()` named the parameters to emit in a hand-written
@@ -58,6 +106,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   null-restore hazard reachable, so this was not merely untidy (refs #93).
 
 ### Added
+- `ServerlessMode` accepts `lambda_code_bucket`, an existing S3 bucket to stage
+  Lambda deployment packages in. This is the surviving half of `checkpoint_bucket`
+  removed above: alongside gating the interruption monitor, it also overrode the
+  code-staging bucket, and that half was real. A caller-supplied bucket is reused
+  as-is and never deleted (`_owns_lambda_code_bucket` stays `False`, which is what
+  protects it); omit it and a provider-scoped bucket is created on first use and
+  removed by `cleanup_infrastructure()` (refs #137).
 - `GlobusComputeProvider` accepts `encrypted` (default `False`), and defaults
   `worker_init` to a script that installs `globus-compute-endpoint` rather than
   inheriting the `parsl`-only default. Both are part of #138 above.

@@ -1,29 +1,25 @@
 #!/usr/bin/env python3
 """Spot interruption handling: seeing a reclaim coming, and surviving it.
 
-Two separate things, and only one of them is implemented today.
+Two separate jobs, split between the provider and Parsl.
 
-**Detection works.** With `spot_interruption_handling=True` the provider creates an
+**The provider detects.** With `spot_interruption_handling=True` it creates an
 EventBridge rule matching the *EC2 Spot Instance Interruption Warning* event with an
 SQS target, and polls it. That gives the full two-minute notice — verified against
 real EC2 with a Fault Injection Simulator experiment, where the warning reached the
 queue 15.2 s in with the instance still `running`. Polling instance state cannot
 see anything until `shutting-down`, far too late to react.
 
-**Recovery does not.** The warning currently produces a log line. There is a
-task-recovery API (`ParslSpotInterruptionHandler.handle_instance_interruption`) but
-nothing in the package feeds it the task mapping it needs, and the `checkpointable`
-decorator's own source says "in a real implementation, we would save to S3 here" —
-it saves nothing. Tracked as
-https://github.com/scttfrdmn/parsl-aws-provider/issues/137.
+A detected reclaim marks the block `FAILED`, and the marker is deliberately sticky:
+an instance AWS is taking back still reports itself `running`, so re-deriving status
+on the next poll would overwrite it.
 
-So what actually re-runs work lost to a reclaim is `retries` on the Parsl `Config`.
-This example sets it, keeps tasks short enough that losing one is cheap, and shows
-how to trigger a real interruption to watch the detection fire.
-
-Note `checkpoint_bucket` is required to get detection at all: without it the monitor
-is never constructed and you get one WARNING at startup, then silence (also #137).
-The bucket is not otherwise written to on this path.
+**Parsl recovers.** `retries` on the `Config` is what re-runs the tasks that were on
+the lost block. The provider cannot do it: a Parsl provider is handed a command and
+returns a block ID, and is never told which tasks a block is running
+(https://github.com/scttfrdmn/parsl-aws-provider/issues/137). So this example sets
+`retries`, keeps chunks small enough that losing one is cheap, and shows how to
+trigger a real interruption to watch the detection fire.
 
 Usage
 -----
@@ -32,7 +28,6 @@ Usage
     export AWS_TEST_VPC_ID=vpc-...
     export AWS_TEST_SUBNET_ID=subnet-...
     export AWS_TEST_SG_ID=sg-...
-    export AWS_TEST_CHECKPOINT_BUCKET=my-parsl-checkpoints
 
     uv run python examples/spot_interruption_example.py
 
@@ -142,8 +137,6 @@ def main() -> int:
             spot_max_price_percentage=70,
             spot_allocation_strategy="price-capacity-optimized",  # the default
             spot_interruption_handling=True,
-            # Required for the monitor to be constructed at all (#137).
-            checkpoint_bucket=os.environ["AWS_TEST_CHECKPOINT_BUCKET"],
             nodes_per_block=2,
             init_blocks=1,
             min_blocks=0,

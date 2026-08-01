@@ -8,7 +8,6 @@ SPDX-FileCopyrightText: 2025-2026 Scott Friedman and Project Contributors
 """
 
 import os
-import time
 import uuid
 import pytest
 import tempfile
@@ -472,87 +471,59 @@ class TestWorkflowErrorScenarios:
             assert mode.security_group_id is None
 
     @pytest.mark.substrate
-    def test_spot_instance_interruption(self, substrate_session, file_state_store):
-        """Test handling of spot instance interruption."""
-        # Create a StandardMode instance with spot instances
+    def test_a_spot_interruption_is_reported_as_a_failure(
+        self, substrate_session, file_state_store
+    ):
+        """A reclaim must surface as a failure, not a success.
+
+        This is the error scenario this file is about: AWS takes the capacity
+        away mid-job. What made it dangerous was not that it went unhandled but
+        that it was reported *wrongly* -- a reclaimed instance reaches
+        ``shutting-down``, which ``EC2_STATUS_MAPPING`` renders COMPLETED, so the
+        block claimed success and its tasks were silently dropped rather than
+        re-run under Parsl's ``retries`` (#137).
+        """
         provider_id = f"test-provider-{uuid.uuid4().hex[:8]}"
+        instance_id = "i-spot-12345"
 
-        # Set up mocks for AWS services using substrate
-        with patch("boto3.Session", return_value=substrate_session):
-            # Create a standard mode with spot instances
-            mode = StandardMode(
-                provider_id=provider_id,
-                session=substrate_session,
-                state_store=file_state_store,
-                region="us-east-1",
-                instance_type="t2.micro",
-                image_id="ami-12345678",  # Dummy AMI
-                use_spot=True,
-                spot_interruption_handling=True,
-            )
+        mode = StandardMode(
+            provider_id=provider_id,
+            session=substrate_session,
+            state_store=file_state_store,
+            region="us-east-1",
+            instance_type="t3.micro",
+            image_id="ami-12345678",
+            vpc_id="vpc-12345",
+            subnet_id="subnet-12345",
+            security_group_id="sg-12345",
+            use_spot=True,
+            spot_interruption_handling=True,
+        )
 
-            # Initialize mode
-            with patch.object(mode, "_create_vpc", return_value="vpc-12345"):
-                with patch.object(mode, "_create_subnet", return_value="subnet-12345"):
-                    with patch.object(
-                        mode, "_create_security_group", return_value="sg-12345"
-                    ):
-                        mode.initialize()
-
-            # Verify spot interruption handler is set up
+        try:
             assert mode.spot_interruption_monitor is not None
-            assert mode.spot_interruption_handler is not None
 
-            # Create a spot instance
-            with patch.object(mode, "_create_ec2_instance") as mock_create_instance:
-                # Return a spot instance
-                instance_id = "i-spot-12345"
-                mock_create_instance.return_value = {
-                    "instance_id": instance_id,
-                    "private_ip": "10.0.0.1",
-                    "public_ip": "54.123.456.789",
-                    "dns_name": "ec2-54-123-456-789.compute-1.amazonaws.com",
-                    "spot_instance": True,
-                }
-
-                # Submit a job
-                job_id = f"test-job-{uuid.uuid4().hex[:8]}"
-                resource_id = mode.submit_job(job_id, "echo 'Test job'", 1)
-
-            # Verify instance was registered with the spot interruption monitor
+            mode.resources[instance_id] = {
+                "type": "ec2",
+                "job_id": f"test-job-{uuid.uuid4().hex[:8]}",
+                "status": "RUNNING",
+                "is_spot": True,
+            }
+            # The registration every spot launch performs.
+            mode._register_spot_instance(instance_id)
             assert instance_id in mode.spot_interruption_monitor.instance_handlers
 
-            # Simulate spot interruption event
-            with patch.object(mode, "_create_ec2_instance") as mock_create_instance:
-                # Return a new spot instance (replacement)
-                new_instance_id = "i-spot-replacement"
-                mock_create_instance.return_value = {
-                    "instance_id": new_instance_id,
-                    "private_ip": "10.0.0.2",
-                    "public_ip": "54.123.456.790",
-                    "dns_name": "ec2-54-123-456-790.compute-1.amazonaws.com",
-                    "spot_instance": True,
-                }
-
-                # Mock resource state to job mapping
-                mode.resource_job_mapping = {resource_id: job_id}
-
-                # Trigger the spot interruption handler
-                handler = mode.spot_interruption_monitor.instance_handlers[instance_id]
-                handler(
+            mode.spot_interruption_monitor.event_queue.put(
+                (
+                    "instance",
                     instance_id,
-                    {
-                        "InstanceAction": "terminate",
-                        "InstanceId": instance_id,
-                        "Time": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                    },
+                    {"InstanceId": instance_id, "InstanceAction": "terminate"},
                 )
+            )
+            mode.spot_interruption_monitor._process_interruption_events()
 
-            # Clean up
-            with patch.object(mode, "_delete_ec2_instance"):
-                with patch.object(mode, "_delete_security_group"):
-                    with patch.object(mode, "_delete_subnet"):
-                        with patch.object(mode, "_delete_vpc"):
-                            if mode.spot_interruption_monitor:
-                                mode.spot_interruption_monitor.stop_monitoring()
-                            mode.cleanup_infrastructure()
+            assert mode.resources[instance_id]["status"] == "INTERRUPTED"
+            assert mode.get_job_status([instance_id])[instance_id] == "INTERRUPTED"
+        finally:
+            if mode.spot_interruption_monitor:
+                mode.spot_interruption_monitor.stop_monitoring()

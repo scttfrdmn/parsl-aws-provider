@@ -14,9 +14,12 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from parsl.jobs.states import JobState
+
 from parsl_ephemeral_aws.constants import (
     DEFAULT_WARM_POOL_SIZE,
     DEFAULT_WARM_POOL_TTL,
+    STATUS_INTERRUPTED,
 )
 from parsl_ephemeral_aws.exceptions import ProviderConfigurationError, ProviderError
 from parsl_ephemeral_aws.provider import EphemeralAWSProvider
@@ -1207,3 +1210,123 @@ class TestStandardOnlyOptionGuard:
             _construct(
                 "detached", warm_pool_size=1, iam_instance_profile_arn=_FAKE_IAM_ARN
             )
+
+
+# ---------------------------------------------------------------------------
+# TestSpotInterruptionStatus
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestSpotInterruptionStatus:
+    """The provider half of the interruption response (#137).
+
+    The mode marks the resource ``STATUS_INTERRUPTED``; these are the three
+    things the provider must then do with it. Before #137 an interrupted
+    instance went to "shutting-down", which ``EC2_STATUS_MAPPING`` renders
+    COMPLETED, so the block reported success and its tasks were dropped.
+    """
+
+    @pytest.fixture
+    def tmp_dir(self):
+        with tempfile.TemporaryDirectory() as d:
+            yield d
+
+    def test_interrupted_reports_failed_to_parsl(self, tmp_dir):
+        """FAILED, not COMPLETED: the block did not finish its work.
+
+        FAILED is what stops the executor dispatching to the block and lets
+        Parsl's own ``retries`` re-run the lost tasks. COMPLETED was the bug.
+        """
+        provider, mode = _make_provider(tmp_dir)
+        provider.resources["i-001"] = {
+            "job_id": "j-001",
+            "status": STATUS_INTERRUPTED,
+            "timestamp": time.time(),
+        }
+        provider.job_map["j-001"] = {
+            "resource_id": "i-001",
+            "status": STATUS_INTERRUPTED,
+        }
+        mode.get_job_status.return_value = {"i-001": STATUS_INTERRUPTED}
+
+        statuses = provider.status(["j-001"])
+
+        assert statuses[0].state == JobState.FAILED
+
+    def test_interrupted_is_terminal(self, tmp_dir):
+        """Once interrupted, a later poll cannot walk the job back.
+
+        ``status()`` short-circuits terminal states, so a reclaimed instance
+        whose EC2 state has since become "terminated" -- which maps to
+        COMPLETED -- must not be re-reported as a success.
+        """
+        provider, mode = _make_provider(tmp_dir)
+        provider.resources["i-001"] = {
+            "job_id": "j-001",
+            "status": STATUS_INTERRUPTED,
+            "timestamp": time.time(),
+        }
+        provider.job_map["j-001"] = {
+            "resource_id": "i-001",
+            "status": STATUS_INTERRUPTED,
+        }
+        mode.get_job_status.return_value = {"i-001": "COMPLETED"}
+
+        statuses = provider.status(["j-001"])
+
+        assert statuses[0].state == JobState.FAILED
+        assert mode.get_job_status.call_count == 0
+
+    def test_interrupted_resource_is_cleaned_up(self, tmp_dir):
+        """It must be terminated like any other terminal state.
+
+        Omitting ``STATUS_INTERRUPTED`` from the cleanup list would trade a
+        silently-successful reclaim for a silent cost leak: an instance the
+        provider has stopped tracking but never terminated.
+        """
+        provider, mode = _make_provider(tmp_dir)
+        provider.resources["i-001"] = {
+            "job_id": "j-001",
+            "status": STATUS_INTERRUPTED,
+            "timestamp": time.time(),
+        }
+        provider.job_map["j-001"] = {
+            "resource_id": "i-001",
+            "status": STATUS_INTERRUPTED,
+        }
+
+        provider._cleanup_resources()
+
+        mode.cleanup_resources.assert_called_once_with(["i-001"])
+        assert "i-001" not in provider.resources
+
+    def test_an_interrupted_warm_instance_is_not_recycled(self, tmp_dir):
+        """AWS is taking the instance, so it must not go back into the pool.
+
+        The warm-pool branch runs before the general one, so this needs its own
+        case: recycling a doomed instance would hand the next job an instance
+        about to vanish.
+        """
+        provider, mode = _make_provider(
+            tmp_dir,
+            warm_pool_size=2,
+            iam_instance_profile_arn=_FAKE_IAM_ARN,
+        )
+        mode._warm_instances = []
+        provider.resources["i-001"] = {
+            "job_id": "j-001",
+            "status": STATUS_INTERRUPTED,
+            "warm_pool": True,
+            "timestamp": time.time(),
+        }
+        provider.job_map["j-001"] = {
+            "resource_id": "i-001",
+            "status": STATUS_INTERRUPTED,
+        }
+
+        provider._cleanup_resources()
+
+        mode.cleanup_resources.assert_called_once_with(["i-001"])
+        assert "i-001" not in mode._warm_instances
+        assert "i-001" not in provider.resources
