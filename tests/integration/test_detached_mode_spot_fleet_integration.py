@@ -125,19 +125,34 @@ class TestDetachedModeSpotFleetIntegration(unittest.TestCase):
         self.workflow_id = "test-workflow-id"
         self.provider_id = "test-provider-id"
 
-        # Create DetachedMode instance with SpotFleet enabled
+        # Create DetachedMode instance with SpotFleet enabled.
+        #
+        # `bastion_host_type="direct"` rather than the "cloudformation" default:
+        # since #86 bastion.yml puts `ImageId` in a launch template and has the
+        # AWS::EC2::Instance reference it, which is what lets one template serve
+        # both the on-demand and the spot bastion. moto's CloudFormation handler
+        # for AWS::EC2::Instance reads `properties["ImageId"]` directly
+        # (moto/ec2/models/instances.py:400) and resolves no launch template, so
+        # it raises `KeyError: 'ImageId'` on a stack real CloudFormation accepts.
+        # The direct path launches with `run_instances`, which moto does model.
+        # The CloudFormation bastion is covered in `tests/aws/` against real AWS.
+        #
+        # `create_vpc=False` used to be passed here. #69 removed the parameter --
+        # every mode now requires the three network IDs, which are supplied
+        # above -- and the mode's `**kwargs` swallowed it silently rather than
+        # rejecting it, so it read as configuration while doing nothing.
         self.detached_mode = DetachedMode(
             provider_id=self.provider_id,
             session=self.session,
             state_store=self.state_store,
             workflow_id=self.workflow_id,
+            bastion_host_type="direct",
             bastion_instance_type="t2.micro",
             instance_type="t2.micro",
             image_id=self.ami_id,
             vpc_id=self.vpc_id,
             subnet_id=self.subnet_id,
             security_group_id=self.security_group_id,
-            create_vpc=False,  # Use existing VPC
             use_spot_fleet=True,
             instance_types=["t2.micro", "t2.small", "m5.small"],
             nodes_per_block=2,

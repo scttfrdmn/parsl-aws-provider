@@ -1,598 +1,530 @@
-"""Integration tests for multi-node execution workflows.
+"""Integration tests for what ``nodes_per_block`` actually does.
 
-These tests verify that the provider correctly handles multi-node jobs like MPI
-workloads across different operating modes.
+The value has exactly one effect in this package: it becomes an EC2 Fleet's
+``TotalTargetCapacity``. Every other launch path ignores it and launches one
+instance per block. ``docs/examples.md:562`` says so under "Not supported", and
+``docs/spot_fleet.md:79`` repeats it -- so these tests pin the contract from both
+sides, asserting that the single-instance paths *ignore* the value rather than
+leaving that half untested.
+
+There is no MPI support to test. The previous version of this file was written
+against a design that does not exist: it passed ``launcher=MpiExecLauncher()`` to
+modes that accept no such argument, then asserted ``mpirun`` had been spliced
+into the submitted command by launcher wiring the package has never had --
+``grep -rn launcher parsl_ephemeral_aws/`` finds nothing. Since #105 the provider
+*rejects* unknown kwargs rather than absorbing them, so that construction now
+raises, which is asserted below as the honest answer to "how do I run MPI here".
+
+It also patched twelve methods that exist on no mode -- ``_create_vpc``,
+``_create_subnet``, ``_create_security_group``, ``_create_ec2_instance``,
+``_create_ec2_instances_as_block``, ``_create_ec2_instances_as_block_impl``,
+``_create_bastion_host``, ``_create_ssm_parameter``, ``_create_tags``,
+``_delete_ec2_instance``, ``_delete_subnet``, ``_delete_vpc`` -- and
+``patch.object`` raises ``AttributeError`` on a missing attribute, so all four
+tests were hard errors and none of their assertions ever ran. Several were also
+wrong on their face: no resource record has an ``instances`` list, there is no
+``provider.initialize_blocks()``, and ``provider.status()`` returns
+``List[JobStatus]`` rather than a job-id-keyed dict.
+
+"Multi-node" here therefore means "a block holding more than one instance", which
+is a fleet. Everything runs against the emulator with nothing on the modes
+stubbed.
 
 SPDX-License-Identifier: Apache-2.0
 SPDX-FileCopyrightText: 2025-2026 Scott Friedman and Project Contributors
 """
 
-import os
+import json
 import uuid
+
 import pytest
-import tempfile
-from unittest.mock import patch
 
-from parsl.launchers import SimpleLauncher, SingleNodeLauncher, MpiExecLauncher
-
-from parsl_ephemeral_aws.provider import EphemeralAWSProvider
-from parsl_ephemeral_aws.modes.standard import StandardMode
+from parsl_ephemeral_aws.constants import (
+    RESOURCE_TYPE_EC2,
+    RESOURCE_TYPE_SPOT_FLEET,
+    STATUS_CANCELED,
+    WORKER_TYPE_ECS,
+)
+from parsl_ephemeral_aws.exceptions import ProviderConfigurationError
 from parsl_ephemeral_aws.modes.detached import DetachedMode
+from parsl_ephemeral_aws.modes.serverless import ServerlessMode
+from parsl_ephemeral_aws.modes.standard import StandardMode
+from parsl_ephemeral_aws.provider import EphemeralAWSProvider
 from parsl_ephemeral_aws.state.file import FileStateStore
-from tests.substrate_support import (
-    get_substrate_session,
-    is_substrate_available,
-)
+from tests.substrate_support import get_substrate_endpoint, is_substrate_available
+
+pytestmark = [
+    pytest.mark.integration,
+    pytest.mark.substrate,
+    pytest.mark.skipif(
+        not is_substrate_available(),
+        reason="substrate not available - start with 'make substrate-up'",
+    ),
+]
+
+#: Large enough that "one per block" and "one per node" cannot be confused, small
+#: enough to stay quick against the emulator.
+NODES = 4
+
+MPI_COMMAND = "mpirun -n 16 -ppn 4 python /path/to/mpi_script.py"
 
 
-# Skip all tests if the substrate emulator is not available
-pytestmark = pytest.mark.skipif(
-    not is_substrate_available(),
-    reason="substrate not available - start with 'make substrate-up'",
-)
+def job_name():
+    """A job name unique to this run.
+
+    Not cosmetic: ``ServerlessMode._create_job_fleet`` derives its launch
+    template name from the job ID, and a name that repeats across runs finds the
+    previous run's template still in the emulator. The mode then tries to add a
+    version to it, and substrate serves no ``CreateLaunchTemplateVersion`` --
+    so a fixed name passes once and fails every time after, which is the worst
+    kind of test.
+    """
+    return f"mpi-job-{uuid.uuid4().hex[:8]}"
 
 
-@pytest.mark.integration
-class TestMultiNodeWorkflows:
-    """Integration tests for multi-node execution workflow scenarios."""
+@pytest.fixture
+def state_store(tmp_path):
+    """A real file-backed state store inside the test's sandbox.
 
-    @pytest.fixture(scope="class")
-    def substrate_session(self):
-        """Create a session connected to substrate."""
-        return get_substrate_session()
+    Real rather than mocked: the fleet paths persist their block map through
+    ``spot_fleet_state``, and a mock hides a serialization error behind a
+    recorded call. It also keeps ``state/file.py``'s ``fcntl.flock`` on a genuine
+    descriptor, which a MagicMock handle cannot supply.
+    """
+    provider_id = f"test-provider-{uuid.uuid4().hex[:8]}"
+    return FileStateStore(
+        file_path=str(tmp_path / f"state-{provider_id}.json"), provider_id=provider_id
+    )
 
-    @pytest.fixture
-    def temp_dir(self):
-        """Create a temporary directory for state files."""
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            yield tmp_dir
 
-    @pytest.fixture
-    def state_file_path(self, temp_dir):
-        """Create a path for the state file."""
-        return os.path.join(temp_dir, f"test-state-{uuid.uuid4().hex[:8]}.json")
+def _standard(session, state_store, network, **overrides):
+    """A StandardMode bound to the emulator, using the caller's network."""
+    kwargs = dict(
+        provider_id=f"test-provider-{uuid.uuid4().hex[:8]}",
+        session=session,
+        state_store=state_store,
+        region=session.region_name,
+        instance_type="t3.micro",
+        image_id="ami-12345678",
+        vpc_id=network["vpc_id"],
+        subnet_id=network["subnet_id"],
+        security_group_id=network["security_group_id"],
+    )
+    kwargs.update(overrides)
+    return StandardMode(**kwargs)
 
-    @pytest.fixture
-    def file_state_store(self, state_file_path):
-        """Create a FileStateStore instance."""
-        provider_id = f"test-provider-{uuid.uuid4().hex[:8]}"
-        return FileStateStore(file_path=state_file_path, provider_id=provider_id)
 
-    @pytest.mark.substrate
-    def test_standard_mode_multinode(self, substrate_session, file_state_store):
-        """Test multi-node execution in StandardMode with MPI."""
-        # Create a StandardMode instance for multi-node execution
-        provider_id = f"test-provider-{uuid.uuid4().hex[:8]}"
+def _fleet_mode(session, state_store, network, **overrides):
+    """A StandardMode whose blocks are EC2 Fleets -- the only multi-node path."""
+    kwargs = dict(
+        use_spot_fleet=True,
+        instance_types=["t3.micro", "t3.small"],
+        nodes_per_block=NODES,
+    )
+    kwargs.update(overrides)
+    return _standard(session, state_store, network, **kwargs)
 
-        # Set up mocks for AWS services using substrate
-        with patch("boto3.Session", return_value=substrate_session):
-            # Create standard mode with multi-node configuration
-            mode = StandardMode(
-                provider_id=provider_id,
-                session=substrate_session,
-                state_store=file_state_store,
-                region="us-east-1",
-                instance_type="c5.large",  # Compute-optimized for MPI
-                image_id="ami-12345678",  # Dummy AMI
-                nodes_per_block=4,  # 4 nodes per block for MPI
-                init_blocks=1,
-                max_blocks=3,
-                launcher=MpiExecLauncher(),  # Use MPI launcher
-            )
 
-            # Initialize mode
-            with patch.object(mode, "_create_vpc", return_value="vpc-12345"):
-                with patch.object(mode, "_create_subnet", return_value="subnet-12345"):
-                    with patch.object(
-                        mode, "_create_security_group", return_value="sg-12345"
-                    ):
-                        mode.initialize()
+def instance_states(session, instance_ids):
+    """Return the set of EC2 state names covering *instance_ids*."""
+    described = session.client("ec2").describe_instances(InstanceIds=list(instance_ids))
+    return {
+        instance["State"]["Name"]
+        for reservation in described["Reservations"]
+        for instance in reservation["Instances"]
+    }
 
-            # Mock instance creation for a multi-node block
-            instance_id_counter = 0
 
-            def create_mock_instance(*args, **kwargs):
-                nonlocal instance_id_counter
-                # For multi-node, we need to return different instances
-                # based on min_count parameter
-                min_count = kwargs.get("min_count", 1)
-                instances = []
+def live_instance_ids(session, tag, value):
+    """Live instance IDs carrying ``tag=value``.
 
-                for i in range(min_count):
-                    instance_id_counter += 1
-                    instances.append(
-                        {
-                            "instance_id": f"i-{instance_id_counter:05d}",
-                            "private_ip": f"10.0.0.{instance_id_counter}",
-                            "public_ip": f"54.123.456.{instance_id_counter}",
-                            "dns_name": f"ec2-54-123-456-{instance_id_counter}.compute-1.amazonaws.com",
-                        }
-                    )
+    Scoped by tag rather than by subnet, as in ``test_autoscaling_workflows.py``:
+    substrate does not apply the launch template's network interface, so a
+    ``subnet-id`` filter matches nothing even for a launch that succeeded.
 
-                if min_count == 1:
-                    return instances[0]
-                return instances
+    Which tag depends on the path, and they do not overlap: ``_create_instance``
+    sets ``ProviderId``, while ``SpotFleetManager`` sets ``WorkflowId`` and
+    ``BlockId`` (``compute/spot_fleet.py``) and ``ServerlessMode``'s own fleet
+    sets ``ParslWorkflowId``. Callers name the one they mean rather than have this
+    helper guess, so a rename on one path cannot silently make the count zero
+    here and still pass.
 
-            # Test multi-node block creation
-            with patch.object(
-                mode, "_create_ec2_instance", side_effect=create_mock_instance
-            ):
-                with patch.object(
-                    mode, "_create_ec2_instances_as_block"
-                ) as mock_create_block:
-                    # Call the actual implementation but with our mock
-                    mock_create_block.side_effect = lambda *args, **kwargs: (
-                        mode._create_ec2_instances_as_block_impl(*args, **kwargs)
-                    )
-
-                    # Should create one block with 4 nodes
-                    mode._init_blocks()
-
-                    # Verify block was created
-                    assert len(mode.resources) == 1
-
-                    # Get the resource ID of the block
-                    block_resource_id = list(mode.resources.keys())[0]
-
-                    # Verify block has 4 nodes
-                    assert (
-                        len(mode.resources[block_resource_id].get("instances", [])) == 4
-                    )
-
-                    # Verify each node has an instance ID
-                    for instance in mode.resources[block_resource_id]["instances"]:
-                        assert "instance_id" in instance
-                        assert instance["instance_id"].startswith("i-")
-
-            # Test MPI job submission to the multi-node block
-            job_id = f"mpi-job-{uuid.uuid4().hex[:8]}"
-            mpi_command = "mpirun -n 16 -ppn 4 python /path/to/mpi_script.py"
-
-            # Submit the MPI job
-            resource_id = mode.submit_job(job_id, mpi_command, 4)  # 4 nodes requested
-
-            # Verify job was assigned to the block
-            assert resource_id == block_resource_id
-            assert mode.resources[resource_id]["job_id"] == job_id
-
-            # Verify the command includes MPI launcher components
-            assert "mpirun" in mode.resources[resource_id]["command"]
-            assert "-n 16" in mode.resources[resource_id]["command"]
-
-            # Test scaling with multi-node blocks
-            with patch.object(
-                mode, "_create_ec2_instance", side_effect=create_mock_instance
-            ):
-                with patch.object(
-                    mode, "_create_ec2_instances_as_block"
-                ) as mock_create_block:
-                    # Call the actual implementation but with our mock
-                    mock_create_block.side_effect = lambda *args, **kwargs: (
-                        mode._create_ec2_instances_as_block_impl(*args, **kwargs)
-                    )
-
-                    # Scale out by adding another block
-                    new_blocks = mode.scale_out(1)
-
-                    # Verify scaling was successful
-                    assert new_blocks == 1
-
-                    # Should now have 2 blocks (each with 4 nodes)
-                    assert len(mode.resources) == 2
-
-                    # Verify the new block also has 4 nodes
-                    new_block_resource_id = [
-                        rid for rid in mode.resources.keys() if rid != block_resource_id
-                    ][0]
-                    assert (
-                        len(mode.resources[new_block_resource_id].get("instances", []))
-                        == 4
-                    )
-
-            # Test job cancellation
-            with patch.object(mode, "_cancel_job"):
-                # Cancel the MPI job
-                result = mode.cancel_jobs([resource_id])
-
-                # Verify cancellation
-                assert resource_id in result
-                assert result[resource_id] == "cancelled"
-
-            # Clean up
-            with patch.object(mode, "_delete_ec2_instance"):
-                with patch.object(mode, "_delete_security_group"):
-                    with patch.object(mode, "_delete_subnet"):
-                        with patch.object(mode, "_delete_vpc"):
-                            mode.cleanup_infrastructure()
-
-    @pytest.mark.substrate
-    def test_detached_mode_multinode(self, substrate_session, file_state_store):
-        """Test multi-node execution in DetachedMode with MPI."""
-        # Create a DetachedMode instance for multi-node execution
-        provider_id = f"test-provider-{uuid.uuid4().hex[:8]}"
-        workflow_id = f"test-workflow-{uuid.uuid4().hex[:8]}"
-
-        # Set up mocks for AWS services using substrate
-        with patch("boto3.Session", return_value=substrate_session):
-            # Create detached mode with multi-node configuration
-            mode = DetachedMode(
-                provider_id=provider_id,
-                session=substrate_session,
-                state_store=file_state_store,
-                region="us-east-1",
-                instance_type="c5.large",  # Compute-optimized for MPI
-                image_id="ami-12345678",  # Dummy AMI
-                workflow_id=workflow_id,
-                bastion_instance_type="t3.micro",
-                bastion_host_type="orchestrator",  # Use orchestrator for MPI coordination
-                nodes_per_block=4,  # 4 nodes per block for MPI
-                init_blocks=1,
-                max_blocks=3,
-                launcher=MpiExecLauncher(),  # Use MPI launcher
-            )
-
-            # Initialize mode
-            with patch.object(mode, "_create_vpc", return_value="vpc-12345"):
-                with patch.object(mode, "_create_subnet", return_value="subnet-12345"):
-                    with patch.object(
-                        mode, "_create_security_group", return_value="sg-12345"
-                    ):
-                        with patch.object(
-                            mode, "_create_bastion_host"
-                        ) as mock_create_bastion:
-                            mock_create_bastion.return_value = {
-                                "instance_id": f"i-bastion-{uuid.uuid4().hex[:8]}",
-                                "private_ip": "10.0.0.2",
-                                "public_ip": "54.123.456.789",
-                                "dns_name": "ec2-54-123-456-789.compute-1.amazonaws.com",
-                            }
-                            with patch.object(mode, "_create_tags"):
-                                mode.initialize()
-
-            # Verify bastion was created with orchestrator role
-            assert mode.bastion_id is not None
-            assert mode.bastion_host_type == "orchestrator"
-
-            # Mock instance creation for a multi-node block
-            instance_id_counter = 0
-
-            def create_mock_instance(*args, **kwargs):
-                nonlocal instance_id_counter
-                # For multi-node, we need to return different instances
-                # based on min_count parameter
-                min_count = kwargs.get("min_count", 1)
-                instances = []
-
-                for i in range(min_count):
-                    instance_id_counter += 1
-                    instances.append(
-                        {
-                            "instance_id": f"i-{instance_id_counter:05d}",
-                            "private_ip": f"10.0.0.{instance_id_counter + 10}",
-                            "public_ip": None,  # No public IP in detached mode
-                            "dns_name": None,
-                        }
-                    )
-
-                if min_count == 1:
-                    return instances[0]
-                return instances
-
-            # Test multi-node block creation
-            with patch.object(
-                mode, "_create_ec2_instance", side_effect=create_mock_instance
-            ):
-                with patch.object(
-                    mode, "_create_ec2_instances_as_block"
-                ) as mock_create_block:
-                    # Call the actual implementation but with our mock
-                    mock_create_block.side_effect = lambda *args, **kwargs: (
-                        mode._create_ec2_instances_as_block_impl(*args, **kwargs)
-                    )
-                    with patch.object(mode, "_create_ssm_parameter"):
-                        # Should create one block with 4 nodes
-                        mode._init_blocks()
-
-                        # Verify block was created
-                        assert len(mode.resources) == 1
-
-                        # Get the resource ID of the block
-                        block_resource_id = list(mode.resources.keys())[0]
-
-                        # Verify block has 4 nodes
-                        assert (
-                            len(mode.resources[block_resource_id].get("instances", []))
-                            == 4
-                        )
-
-                        # Verify each node has an instance ID
-                        for instance in mode.resources[block_resource_id]["instances"]:
-                            assert "instance_id" in instance
-                            assert instance["instance_id"].startswith("i-")
-
-            # Test MPI job submission to the multi-node block
-            job_id = f"mpi-job-{uuid.uuid4().hex[:8]}"
-            mpi_command = "mpirun -n 16 -ppn 4 python /path/to/mpi_script.py"
-
-            # Submit the MPI job with orchestrator parameters
-            with patch.object(mode, "_create_ssm_parameter"):
-                resource_id = mode.submit_job(
-                    job_id, mpi_command, 4
-                )  # 4 nodes requested
-
-            # Verify job was assigned to the block
-            assert resource_id == block_resource_id
-            assert mode.resources[resource_id]["job_id"] == job_id
-
-            # Verify the job has SSM parameters for orchestration
-            assert mode.resources[resource_id].get("ssm_parameter_name") is not None
-
-            # Clean up
-            with patch.object(mode, "_delete_ec2_instance"):
-                with patch.object(mode, "_delete_ssm_parameter"):
-                    with patch.object(mode, "_delete_security_group"):
-                        with patch.object(mode, "_delete_subnet"):
-                            with patch.object(mode, "_delete_vpc"):
-                                mode.preserve_bastion = (
-                                    False  # Ensure bastion is cleaned up
-                                )
-                                mode.cleanup_infrastructure()
-
-    @pytest.mark.substrate
-    def test_standard_mode_with_different_launchers(
-        self, substrate_session, file_state_store
-    ):
-        """Test different launchers in StandardMode."""
-        # Create a StandardMode instance
-        provider_id = f"test-provider-{uuid.uuid4().hex[:8]}"
-
-        # Test different launchers
-        launchers = [
-            (SimpleLauncher(), "simple"),
-            (SingleNodeLauncher(), "single-node"),
-            (MpiExecLauncher(), "mpi"),
+    ``terminated`` and ``shutting-down`` are excluded: a torn-down instance
+    lingers in ``describe_instances`` for a while.
+    """
+    reservations = session.client("ec2").describe_instances(
+        Filters=[
+            {"Name": f"tag:{tag}", "Values": [value]},
+            {
+                "Name": "instance-state-name",
+                "Values": ["pending", "running", "stopping", "stopped"],
+            },
         ]
+    )["Reservations"]
+    return [
+        instance["InstanceId"]
+        for reservation in reservations
+        for instance in reservation["Instances"]
+    ]
 
-        for launcher, launcher_type in launchers:
-            # Set up mocks for AWS services using substrate
-            with patch("boto3.Session", return_value=substrate_session):
-                # Create standard mode with specific launcher
-                mode = StandardMode(
-                    provider_id=f"{provider_id}-{launcher_type}",
-                    session=substrate_session,
-                    state_store=file_state_store,
-                    region="us-east-1",
-                    instance_type="c5.large",
-                    image_id="ami-12345678",  # Dummy AMI
-                    nodes_per_block=2
-                    if launcher_type == "mpi"
-                    else 1,  # Multi-node only for MPI
-                    init_blocks=1,
-                    max_blocks=2,
-                    launcher=launcher,
-                )
 
-                # Initialize mode
-                with patch.object(mode, "_create_vpc", return_value="vpc-12345"):
-                    with patch.object(
-                        mode, "_create_subnet", return_value="subnet-12345"
-                    ):
-                        with patch.object(
-                            mode, "_create_security_group", return_value="sg-12345"
-                        ):
-                            mode.initialize()
+class TestFleetTargetCapacity:
+    """The one path where ``nodes_per_block`` is honoured."""
 
-                # Mock instance creation
-                instance_id_counter = 0
+    def test_nodes_per_block_becomes_the_fleets_target_capacity(
+        self, substrate_session, substrate_network, state_store
+    ):
+        """One block is one fleet holding ``nodes_per_block`` instances.
 
-                def create_mock_instance(*args, **kwargs):
-                    nonlocal instance_id_counter
-                    # For multi-node, handle multiple instances
-                    min_count = kwargs.get("min_count", 1)
-                    instances = []
+        Asserted against EC2 as well as against the block map, because the two
+        can disagree: substrate honours ``TotalTargetCapacity`` (substrate#387),
+        whereas moto launches exactly one instance no matter what is requested,
+        which is why this cannot be covered there at all.
+        """
+        mode = _fleet_mode(substrate_session, state_store, substrate_network)
+        try:
+            mode.initialize()
+            block_id = mode.submit_job(job_name(), MPI_COMMAND, NODES)
 
-                    for i in range(min_count):
-                        instance_id_counter += 1
-                        instances.append(
-                            {
-                                "instance_id": f"i-{instance_id_counter:05d}",
-                                "private_ip": f"10.0.0.{instance_id_counter}",
-                                "public_ip": f"54.123.456.{instance_id_counter}",
-                                "dns_name": f"ec2-54-123-456-{instance_id_counter}.compute-1.amazonaws.com",
-                            }
-                        )
+            block = mode.spot_fleet_manager.blocks[block_id]
+            assert len(block["instance_ids"]) == NODES
 
-                    if min_count == 1:
-                        return instances[0]
-                    return instances
+            capacity = substrate_session.client("ec2").describe_fleets(
+                FleetIds=[block["fleet_request_id"]]
+            )["Fleets"][0]["TargetCapacitySpecification"]
+            assert capacity["TotalTargetCapacity"] == NODES
+            assert capacity["DefaultTargetCapacityType"] == "spot"
 
-                # Test block creation
-                with patch.object(
-                    mode, "_create_ec2_instance", side_effect=create_mock_instance
-                ):
-                    with patch.object(
-                        mode, "_create_ec2_instances_as_block"
-                    ) as mock_create_block:
-                        mock_create_block.side_effect = lambda *args, **kwargs: (
-                            mode._create_ec2_instances_as_block_impl(*args, **kwargs)
-                        )
+            # Every node exists, not just every ID: a fleet that only partially
+            # filled would still report the capacity that was requested.
+            live = live_instance_ids(substrate_session, "BlockId", block_id)
+            assert sorted(live) == sorted(block["instance_ids"])
+        finally:
+            mode.cleanup_infrastructure()
 
-                        # Create initial blocks
-                        mode._init_blocks()
+    def test_a_multi_node_block_is_tracked_as_one_resource(
+        self, substrate_session, substrate_network, state_store
+    ):
+        """One resource per block, keyed by block ID -- not one per node.
 
-                        # Verify block creation
-                        assert len(mode.resources) == 1
+        This is the shape the old tests got wrong: they expected
+        ``resources[block]["instances"]`` to hold a list of per-node dicts. The
+        node IDs live on the manager's block map instead, and reach the state
+        document through ``spot_fleet_state`` rather than through ``resources``.
+        A provider resumed from state needs them from there, so the round-trip is
+        asserted too.
+        """
+        mode = _fleet_mode(substrate_session, state_store, substrate_network)
+        try:
+            mode.initialize()
+            block_id = mode.submit_job(job_name(), MPI_COMMAND, NODES)
 
-                # Test job submission with the specific launcher
-                job_id = f"{launcher_type}-job-{uuid.uuid4().hex[:8]}"
+            assert list(mode.resources) == [block_id]
+            record = mode.resources[block_id]
+            assert record["type"] == RESOURCE_TYPE_SPOT_FLEET
+            assert record["fleet_request_id"].startswith("fleet-")
+            assert "instances" not in record
 
-                # Different commands based on launcher type
-                if launcher_type == "mpi":
-                    command = "mpirun -n 8 -ppn 4 python /path/to/mpi_script.py"
-                else:
-                    command = "python /path/to/script.py"
+            with open(state_store.file_path) as handle:
+                saved = json.load(handle)["_states"]["mode"]
+            saved_block = saved["spot_fleet_state"]["blocks"][block_id]
+            assert len(saved_block["instance_ids"]) == NODES
+        finally:
+            mode.cleanup_infrastructure()
 
-                # Submit the job
-                resource_id = mode.submit_job(job_id, command, 1)
+    def test_the_fleet_manager_inherits_the_modes_session(
+        self, substrate_session, substrate_network, state_store
+    ):
+        """The manager must not build its own session from the environment.
 
-                # Verify submission
-                assert resource_id in mode.resources
-                assert mode.resources[resource_id]["job_id"] == job_id
+        ``resolve_manager_session()`` prefers ``provider.session`` and falls back
+        to ambient environment credentials only when there is none (#117). The
+        stand-in ``StandardMode`` builds for the manager carried no ``session``,
+        so the fallback always fired: every fleet went to the default account for
+        the region while the rest of the mode used the session the caller
+        configured. The endpoint is the visible symptom here; against real AWS it
+        would be the account, which is why this is asserted rather than left to
+        the fleet tests above -- they would keep passing while the fleet was
+        created somewhere else entirely.
+        """
+        mode = _fleet_mode(substrate_session, state_store, substrate_network)
 
-                # Verify launcher was applied to command
-                submitted_command = mode.resources[resource_id]["command"]
-
-                if launcher_type == "mpi":
-                    assert "mpirun" in submitted_command
-                elif launcher_type == "single-node":
-                    # SingleNodeLauncher may add node-specific prefixes
-                    assert command in submitted_command
-                else:  # SimpleLauncher
-                    # SimpleLauncher doesn't modify the command
-                    assert command == submitted_command
-
-                # Clean up
-                with patch.object(mode, "_delete_ec2_instance"):
-                    with patch.object(mode, "_delete_security_group"):
-                        with patch.object(mode, "_delete_subnet"):
-                            with patch.object(mode, "_delete_vpc"):
-                                mode.cleanup_infrastructure()
-
-    @pytest.mark.substrate
-    def test_provider_multinode_integration(self, substrate_session, file_state_store):
-        """Test multi-node integration through provider interface."""
-        # Create a provider for multi-node execution
-        provider_id = f"test-provider-{uuid.uuid4().hex[:8]}"
-
-        # Create a provider to handle both the test and implementation
-        provider = EphemeralAWSProvider(
-            provider_id=provider_id,
-            region="us-east-1",
-            mode="standard",
-            instance_type="c5.xlarge",
-            image_id="ami-12345678",  # Dummy AMI
-            nodes_per_block=4,
-            init_blocks=1,
-            max_blocks=2,
-            launcher=MpiExecLauncher(),
-            # Inject our session and state store for testing
-            _test_session=substrate_session,
-            _test_state_store=file_state_store,
+        assert mode.spot_fleet_manager.aws_session is substrate_session
+        assert (
+            mode.spot_fleet_manager.ec2_client.meta.endpoint_url
+            == get_substrate_endpoint()
         )
 
-        # Initialize the internal operating mode directly
-        with patch.object(provider, "_initialize_operating_mode"):
-            # Mock the operating mode
-            mode = StandardMode(
-                provider_id=provider_id,
-                session=substrate_session,
-                state_store=file_state_store,
-                region="us-east-1",
-                instance_type="c5.xlarge",
-                image_id="ami-12345678",  # Dummy AMI
-                nodes_per_block=4,
-                init_blocks=1,
-                max_blocks=2,
-                launcher=MpiExecLauncher(),
+    def test_the_price_cap_is_fleet_wide_so_it_scales_with_capacity(
+        self, substrate_session, substrate_network, state_store
+    ):
+        """``MaxTotalPrice`` covers the whole fleet, unlike the legacy ``SpotPrice``.
+
+        The legacy per-instance-hour ``SpotPrice`` needed no scaling; sending that
+        same number as a fleet-wide maximum would cap a 4-node fleet at one node's
+        budget and it would never fill. Asserted as a ratio rather than an
+        absolute because the figure derives from live spot-price history.
+
+        Read off the manager rather than off the created fleet: substrate accepts
+        ``SpotOptions`` but omits it from ``describe_fleets``, so the value is not
+        observable on the fleet itself.
+        """
+        mode = _fleet_mode(
+            substrate_session,
+            state_store,
+            substrate_network,
+            spot_max_price_percentage=50,
+        )
+        resolve = mode.spot_fleet_manager._resolve_max_total_price
+
+        single = float(resolve(1))
+        assert single > 0
+        assert float(resolve(NODES)) == pytest.approx(single * NODES)
+
+    def test_no_cap_is_sent_when_none_was_asked_for(
+        self, substrate_session, substrate_network, state_store
+    ):
+        """The default, and the configuration AWS recommends: no maximum at all."""
+        mode = _fleet_mode(substrate_session, state_store, substrate_network)
+
+        assert mode.spot_fleet_manager._resolve_max_total_price(NODES) is None
+
+
+class TestSingleInstancePathsIgnoreNodesPerBlock:
+    """The other half of the contract, and the half that surprises people."""
+
+    def test_standard_mode_launches_one_instance_per_block(
+        self, substrate_session, substrate_network, state_store
+    ):
+        """``nodes_per_block=4`` on the on-demand path still launches one.
+
+        Not a defect to fix here -- ``_create_instance`` hardcodes
+        ``MinCount=1, MaxCount=1`` and ``docs/examples.md`` documents the
+        limitation -- but worth a test that fails the day someone wires the value
+        into those counts without also teaching ``get_job_status`` and
+        ``cleanup_resources`` about a multi-instance record.
+        """
+        mode = _standard(
+            substrate_session, state_store, substrate_network, nodes_per_block=NODES
+        )
+        try:
+            mode.initialize()
+            instance_id = mode.submit_job(job_name(), MPI_COMMAND, NODES)
+
+            assert list(mode.resources) == [instance_id]
+            assert mode.resources[instance_id]["type"] == RESOURCE_TYPE_EC2
+            assert live_instance_ids(
+                substrate_session, "ProviderId", mode.provider_id
+            ) == [instance_id]
+        finally:
+            mode.cleanup_infrastructure()
+
+    def test_detached_mode_delegates_the_value_rather_than_acting_on_it(
+        self, substrate_session, substrate_network, state_store
+    ):
+        """The value is written into the work order; the bastion acts on it.
+
+        ``DetachedMode.submit_job`` launches no workers -- it writes a JSON work
+        order to Parameter Store and returns. The bastion manager script polls
+        that path and calls ``launch_spot_fleet()``, which reads
+        ``nodes_per_block`` as the fleet's target capacity
+        (``modes/detached.py:965``). So the mode's whole obligation is to *carry*
+        the value, and the only instance in the account after a submit is the
+        bastion -- both halves asserted, since a driver that quietly launched
+        workers too would double the bill.
+
+        ``bastion_host_type="direct"``: the default CloudFormation path needs a
+        service substrate does not emulate, and the real stack is covered in
+        ``tests/aws/``.
+        """
+        workflow_id = f"test-workflow-{uuid.uuid4().hex[:8]}"
+        mode = DetachedMode(
+            provider_id=f"test-provider-{uuid.uuid4().hex[:8]}",
+            session=substrate_session,
+            state_store=state_store,
+            region=substrate_session.region_name,
+            workflow_id=workflow_id,
+            bastion_host_type="direct",
+            bastion_instance_type="t3.micro",
+            preserve_bastion=False,
+            image_id="ami-12345678",
+            instance_type="c5.large",
+            nodes_per_block=NODES,
+            use_spot_fleet=True,
+            instance_types=["c5.large", "c5.xlarge"],
+            vpc_id=substrate_network["vpc_id"],
+            subnet_id=substrate_network["subnet_id"],
+            security_group_id=substrate_network["security_group_id"],
+        )
+        try:
+            mode.initialize()
+            job_id = job_name()
+            resource_id = mode.submit_job(job_id, MPI_COMMAND, NODES)
+
+            work_order = json.loads(
+                substrate_session.client("ssm").get_parameter(
+                    Name=f"/parsl/workflows/{workflow_id}/jobs/{job_id}"
+                )["Parameter"]["Value"]
+            )
+            assert work_order["nodes_per_block"] == NODES
+            assert work_order["use_spot_fleet"] is True
+            assert work_order["instance_types"] == ["c5.large", "c5.xlarge"]
+
+            assert mode.resources[resource_id]["type"] == RESOURCE_TYPE_EC2
+            assert live_instance_ids(
+                substrate_session, "ProviderId", mode.provider_id
+            ) == [mode.bastion_id]
+        finally:
+            mode.cleanup_infrastructure()
+
+
+class TestServerlessFleetCapacity:
+    """The serverless mode carries its own copy of the capacity semantics."""
+
+    def test_the_ecs_fleet_path_honours_nodes_per_block(
+        self, substrate_session, substrate_network, state_store
+    ):
+        """``use_spot_fleet`` on the ECS worker type trades Fargate for a fleet.
+
+        A second, independent implementation of the same behaviour --
+        ``ServerlessMode._create_job_fleet`` builds its own launch template and
+        calls ``create_ec2_fleet`` directly instead of going through
+        ``SpotFleetManager`` -- so it needs its own coverage. The instance IDs
+        land on the resource record here, not on a block map, and there is no
+        stack: ``get_job_status`` and ``cleanup_resources`` both branch on
+        ``stack_name``, so recording one would send them down the CloudFormation
+        path for a fleet that has none.
+        """
+        mode = ServerlessMode(
+            provider_id=f"test-provider-{uuid.uuid4().hex[:8]}",
+            session=substrate_session,
+            state_store=state_store,
+            region=substrate_session.region_name,
+            worker_type=WORKER_TYPE_ECS,
+            image_id="ami-12345678",
+            instance_types=["t3.micro", "t3.small"],
+            nodes_per_block=NODES,
+            use_spot_fleet=True,
+            vpc_id=substrate_network["vpc_id"],
+            subnet_id=substrate_network["subnet_id"],
+            security_group_id=substrate_network["security_group_id"],
+        )
+        try:
+            mode.initialize()
+            resource_id = mode.submit_job(job_name(), MPI_COMMAND, NODES)
+
+            record = mode.resources[resource_id]
+            assert record["resource_type"] == RESOURCE_TYPE_SPOT_FLEET
+            assert len(record["instance_ids"]) == NODES
+            assert record["use_spot_fleet"] is True
+            assert "stack_name" not in record
+
+            capacity = substrate_session.client("ec2").describe_fleets(
+                FleetIds=[record["fleet_request_id"]]
+            )["Fleets"][0]["TargetCapacitySpecification"]
+            assert capacity["TotalTargetCapacity"] == NODES
+        finally:
+            mode.cleanup_infrastructure()
+
+
+class TestThroughTheProvider:
+    """The same behaviour, reached the way a Parsl config reaches it."""
+
+    def test_nodes_per_block_reaches_the_fleet_through_the_provider(
+        self, substrate_session, substrate_network, tmp_path
+    ):
+        """Three hops, each of which has been broken before.
+
+        The provider's ``common_params`` (the fleet path was unreachable through
+        the provider at all until #105), the mode's constructor, and the stand-in
+        the mode builds for the manager. Only the last hop is what the fleet
+        actually reads, so the assertion follows the value all the way to the
+        instances rather than stopping at ``provider.nodes_per_block``.
+        """
+        provider = EphemeralAWSProvider(
+            provider_id=f"test-provider-{uuid.uuid4().hex[:8]}",
+            region=substrate_session.region_name,
+            endpoint_url=get_substrate_endpoint(),
+            state_file_path=str(tmp_path / "state.json"),
+            mode="standard",
+            image_id="ami-12345678",
+            instance_type="c5.large",
+            nodes_per_block=NODES,
+            use_spot_fleet=True,
+            instance_types=["c5.large", "c5.xlarge"],
+            max_blocks=2,
+            vpc_id=substrate_network["vpc_id"],
+            subnet_id=substrate_network["subnet_id"],
+            security_group_id=substrate_network["security_group_id"],
+        )
+        try:
+            job_id = provider.submit(MPI_COMMAND, tasks_per_node=NODES)
+
+            mode = provider.operating_mode
+            assert mode.nodes_per_block == NODES
+            assert mode.spot_fleet_manager.provider.nodes_per_block == NODES
+
+            block_id = provider.job_map[job_id]["resource_id"]
+            block = mode.spot_fleet_manager.blocks[block_id]
+            assert len(block["instance_ids"]) == NODES
+
+            # One block, not NODES of them: max_blocks counts blocks, so a
+            # provider that conflated the two would refuse the first submit.
+            assert len(provider.resources) == 1
+        finally:
+            provider.shutdown()
+
+    def test_a_launcher_is_not_a_provider_option(self, substrate_network, tmp_path):
+        """``launcher`` is a Parsl executor concept this provider does not take.
+
+        The old tests passed ``MpiExecLauncher()`` to both the provider and the
+        modes, then asserted the launcher had rewritten the submitted command. No
+        launcher wiring exists -- the command goes into UserData or over SSM
+        verbatim -- and since #105 an unrecognised kwarg is refused rather than
+        dropped. That refusal is the behaviour worth pinning: a config that looks
+        like it requests MPI fails loudly instead of running single-node and
+        reporting success.
+        """
+        with pytest.raises(ProviderConfigurationError, match="launcher"):
+            EphemeralAWSProvider(
+                region="us-west-2",
+                endpoint_url=get_substrate_endpoint(),
+                state_file_path=str(tmp_path / "state.json"),
+                image_id="ami-12345678",
+                launcher="MpiExecLauncher",
+                vpc_id=substrate_network["vpc_id"],
+                subnet_id=substrate_network["subnet_id"],
+                security_group_id=substrate_network["security_group_id"],
             )
 
-            # Initialize infrastructure
-            with patch.object(mode, "_create_vpc", return_value="vpc-12345"):
-                with patch.object(mode, "_create_subnet", return_value="subnet-12345"):
-                    with patch.object(
-                        mode, "_create_security_group", return_value="sg-12345"
-                    ):
-                        mode.initialize()
 
-            # Replace provider's operating mode with our mocked one
-            provider._operating_mode = mode
+class TestMultiNodeTeardown:
+    """Cancelling one block must reclaim all of its nodes."""
 
-            # Mock instance creation for a multi-node block
-            instance_id_counter = 0
+    def test_cancelling_a_block_terminates_every_node(
+        self, substrate_session, substrate_network, state_store
+    ):
+        """A partial teardown leaves billed instances nothing points at.
 
-            def create_mock_instance(*args, **kwargs):
-                nonlocal instance_id_counter
-                # For multi-node, handle multiple instances
-                min_count = kwargs.get("min_count", 1)
-                instances = []
+        Deleting the fleet is what terminates the instances; ``cancel_jobs`` does
+        no per-node bookkeeping. So this asserts that the block-level operation
+        really covers all ``nodes_per_block`` of them, which is the failure that
+        would otherwise show up only on an AWS bill.
+        """
+        mode = _fleet_mode(substrate_session, state_store, substrate_network)
+        try:
+            mode.initialize()
+            block_id = mode.submit_job("mpi-job", MPI_COMMAND, NODES)
+            instance_ids = list(
+                mode.spot_fleet_manager.blocks[block_id]["instance_ids"]
+            )
+            assert len(instance_ids) == NODES
 
-                for i in range(min_count):
-                    instance_id_counter += 1
-                    instances.append(
-                        {
-                            "instance_id": f"i-{instance_id_counter:05d}",
-                            "private_ip": f"10.0.0.{instance_id_counter}",
-                            "public_ip": f"54.123.456.{instance_id_counter}",
-                            "dns_name": f"ec2-54-123-456-{instance_id_counter}.compute-1.amazonaws.com",
-                        }
-                    )
+            assert mode.cancel_jobs([block_id]) == {block_id: STATUS_CANCELED}
 
-                if min_count == 1:
-                    return instances[0]
-                return instances
-
-            # Test block creation
-            with patch.object(
-                mode, "_create_ec2_instance", side_effect=create_mock_instance
-            ):
-                with patch.object(
-                    mode, "_create_ec2_instances_as_block"
-                ) as mock_create_block:
-                    mock_create_block.side_effect = lambda *args, **kwargs: (
-                        mode._create_ec2_instances_as_block_impl(*args, **kwargs)
-                    )
-
-                    # Initialize through provider interface
-                    provider.initialize_blocks()
-
-                    # Verify block creation
-                    assert len(mode.resources) == 1
-
-                    # Get the resource ID of the block
-                    block_resource_id = list(mode.resources.keys())[0]
-
-                    # Verify block has 4 nodes
-                    assert (
-                        len(mode.resources[block_resource_id].get("instances", [])) == 4
-                    )
-
-            # Test job submission through provider interface
-            job_id = f"mpi-job-{uuid.uuid4().hex[:8]}"
-            mpi_command = "mpirun -n 16 -ppn 4 python /path/to/mpi_script.py"
-
-            # Submit job through provider interface
-            with patch.object(provider, "status"):  # Mock status calls
-                resource_id = provider.submit(job_id, mpi_command)
-
-            # Verify submission through provider interface
-            assert resource_id in mode.resources
-            assert mode.resources[resource_id]["job_id"] == job_id
-
-            # Test status check through provider interface
-            with patch.object(mode, "get_job_status") as mock_status:
-                mock_status.return_value = {resource_id: "running"}
-
-                # Check status
-                status = provider.status([job_id])
-
-                # Verify status
-                assert job_id in status
-                assert status[job_id] == "running"
-
-            # Test scaling through provider interface
-            with patch.object(mode, "scale_out") as mock_scale_out:
-                mock_scale_out.return_value = 1
-
-                # Scale out
-                scaled = provider.scale_out(blocks=1)
-
-                # Verify scaling
-                assert scaled == 1
-                mock_scale_out.assert_called_with(1)
-
-            # Clean up through provider interface
-            with patch.object(mode, "cleanup_infrastructure"):
-                provider.shutdown()
-
-                # Verify cleanup was called
-                mode.cleanup_infrastructure.assert_called_once()
+            assert instance_states(substrate_session, instance_ids) <= {
+                "shutting-down",
+                "terminated",
+            }
+        finally:
+            mode.cleanup_infrastructure()

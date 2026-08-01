@@ -361,25 +361,37 @@ class DetachedMode(OperatingMode):
                 "Groups": [self.security_group_id],
             }
 
-            # Create the bastion host
-            response = ec2.run_instances(
-                ImageId=self.image_id,
-                InstanceType=self.bastion_instance_type,
-                MaxCount=1,
-                MinCount=1,
-                UserData=init_script,
-                KeyName=self.key_name,
-                TagSpecifications=[{"ResourceType": "instance", "Tags": tags}],
-                NetworkInterfaces=[network_interface],
-                InstanceInitiatedShutdownBehavior="terminate",
-                Monitoring={"Enabled": True},
+            run_args: Dict[str, Any] = {
+                "ImageId": self.image_id,
+                "InstanceType": self.bastion_instance_type,
+                "MaxCount": 1,
+                "MinCount": 1,
+                "UserData": init_script,
+                "TagSpecifications": [{"ResourceType": "instance", "Tags": tags}],
+                "NetworkInterfaces": [network_interface],
+                "InstanceInitiatedShutdownBehavior": "terminate",
+                "Monitoring": {"Enabled": True},
                 # IMDSv2 required (#85). This matters more here than on a
                 # worker: the bastion is long-lived and its instance profile
                 # carries the permissions to launch and terminate instances, so
                 # an SSRF against anything running on it would otherwise hand
                 # over role credentials through an unauthenticated IMDSv1 GET.
-                MetadataOptions=dict(IMDSV2_METADATA_OPTIONS),
-            )
+                "MetadataOptions": dict(IMDSV2_METADATA_OPTIONS),
+            }
+
+            # Only send KeyName when there is one. Passing ``KeyName=None``
+            # failed botocore's own parameter validation before any request was
+            # made, so a direct-mode bastion could never launch without a key
+            # pair -- and SSM is the documented way in, which needs no key at
+            # all. Both the standard-mode launch path and the bastion agent's
+            # own run_instances call already add it conditionally; this one did
+            # not. The CloudFormation path was unaffected, which is why the gap
+            # survived: it maps an empty key to AWS::NoValue (bastion.yml).
+            if self.key_name:
+                run_args["KeyName"] = self.key_name
+
+            # Create the bastion host
+            response = ec2.run_instances(**run_args)
 
             instance_id = response["Instances"][0]["InstanceId"]
             logger.debug(f"Created bastion host instance {instance_id}")
