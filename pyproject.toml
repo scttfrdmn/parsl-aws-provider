@@ -69,7 +69,7 @@ test = [
     # imported it, the emulator ran as a container, and LocalStack OSS is now
     # end-of-life. Substrate needs no Python package: it is a single Go binary,
     # pulled as ghcr.io/scttfrdmn/substrate by docker-compose.substrate.yml.
-    "requests>=2.25.0",
+    "requests>=2.34.2",
 ]
 globus = [
     # Floor raised from >=2.0.0, which no longer described anything installable
