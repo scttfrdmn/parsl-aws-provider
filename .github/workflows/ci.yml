@@ -250,7 +250,7 @@ jobs:
         run: |
           python -m zipfile -l dist/*.whl | grep -q 'templates/cloudformation/' \
             || { echo "::error::CloudFormation templates missing from wheel"; exit 1; }
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: dist
           path: dist/
@@ -270,7 +270,7 @@ jobs:
         # #124, which hid ~65 toctree entries pointing at pages nobody had
         # written. Zero now, so keep it that way.
         run: uv run make -C docs html SPHINXOPTS="-W"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: documentation
           path: docs/_build/html/
