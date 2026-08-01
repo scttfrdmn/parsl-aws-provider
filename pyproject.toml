@@ -65,7 +65,7 @@ dev = [
     # disagree on formatting; at 0.2.x they differed on comprehension-conditional
     # parenthesization and each would undo the other's output.
     "ruff>=0.15.4",
-    "mypy>=0.812",
+    "mypy>=2.3.0",
     "bandit>=1.7.0",
     "pre-commit>=2.15.0",
     "bump-my-version>=1.0.0",
