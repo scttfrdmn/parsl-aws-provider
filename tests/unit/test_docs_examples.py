@@ -335,14 +335,20 @@ def test_documented_renames_do_not_resolve():
 
 
 def test_globus_only_options_are_globus_only():
-    """The three Globus-specific options are on the subclass, not the base.
+    """The Globus-specific options are on the subclass, not the base.
 
     docs/globus_compute.md documents them as the whole of what GlobusComputeProvider
-    adds.
+    adds. ``encrypted`` joined them in #138: it configures the engine rather than
+    the provider, which is why it does not belong on the base.
     """
     base = _accepted_kwargs(EphemeralAWSProvider)
     globus = _own_kwargs(GlobusComputeProvider)
-    assert globus - base == {"endpoint_id", "container_image", "display_name"}
+    assert globus - base == {
+        "endpoint_id",
+        "container_image",
+        "display_name",
+        "encrypted",
+    }
 
 
 def test_compute_type_has_no_auto() -> None:

@@ -8,6 +8,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **Generated Globus Compute endpoint configs could not start a worker, and
+  silently dropped most of the provider's configuration.** Three defects, one
+  cause: `_provider_params_yaml()` named the parameters to emit in a hand-written
+  list that covered 15 of 52.
+  - `worker_init` was not in the list, so the reconstructed provider fell back to
+    `EphemeralAWSProvider`'s default — which installs `parsl` and not
+    `globus-compute-endpoint`. A Globus worker's launch command is rewritten to
+    `globus-compute-endpoint python-exec parsl.executors.high_throughput.process_worker_pool`,
+    so every worker failed "command not found". `GlobusComputeProvider` now
+    defaults `worker_init` to a script installing both, and emits it
+    unconditionally so it travels with the config rather than being re-resolved on
+    load.
+  - `encrypted: true` was hardcoded and unreachable from the constructor.
+    `HighThroughputExecutor` writes CurveZMQ certificates under its own `run_dir`
+    on the endpoint host and hands that path to workers as `--cert_dir`, so an EC2
+    worker died `FileNotFoundError` before registering. It is now an `encrypted`
+    constructor parameter defaulting to `False`; `True` still needs certificate
+    distribution (#62), and High-Assurance endpoints — which reject `False` — need
+    that resolved rather than this default.
+  - The other 37 parameters, including `additional_tags`, the state-backend
+    selection, and every fleet, warm-pool, and AMI-baking option, never reached
+    the file. The emitted set is now derived from `inspect.signature`, so a
+    newly added parameter is covered without anyone updating the generator.
+
+  The emitter keys on what the caller passed rather than on what differs from the
+  default, which matters for `image_id`: it is resolved from SSM to the current
+  AL2023 AMI at construction (#84), and a differs-from-default rule would write
+  that day's AMI into the file and freeze it there. An `image_id` the caller chose
+  is still emitted. `provider_id` is never emitted, so an endpoint restart adopts
+  the persisted ID instead of the generating process's.
+
+  Every other test of this generator asserted on the *text* it produced, which is
+  how a config no worker could load kept passing — including one that asserted
+  `encrypted: true`. The new tests load the generated directory through
+  `globus_compute_endpoint`'s own `get_config()` and assert on the reconstructed
+  objects; that round-trip caught two bugs in the fix itself. It is possible now
+  because #125 removed the `globus`/`test` extra conflict along with LocalStack
+  (closes #138).
 - Two fixtures in `tests/unit/test_error_handling.py` wrote
   `ephemeral_aws_state.json` into the repository root on every run.
   `state_file_path` defaults to that *relative* filename, and both fixtures mock
@@ -20,6 +58,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   null-restore hazard reachable, so this was not merely untidy (refs #93).
 
 ### Added
+- `GlobusComputeProvider` accepts `encrypted` (default `False`), and defaults
+  `worker_init` to a script that installs `globus-compute-endpoint` rather than
+  inheriting the `parsl`-only default. Both are part of #138 above.
 - An autouse `tests/conftest.py` guard fails any test that leaves a
   default-named state file in the working directory or the repository root,
   naming the test and the fix. Gitignoring the path was the alternative and was
