@@ -109,8 +109,10 @@ SPDX-License-Identifier: Apache-2.0
 SPDX-FileCopyrightText: 2025-2026 Scott Friedman and Project Contributors
 """
 
+import inspect
 import logging
 import os
+from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -136,6 +138,67 @@ _INDENT2 = "  "
 _INDENT4 = "    "
 _INDENT6 = "      "
 
+# Constructor parameters deliberately left out of the generated config.
+#
+# ``provider_id`` identifies one provider's state document. Emitting it would
+# pin every endpoint restart to the *generating* process's ID; leaving it out
+# lets the constructor adopt whatever is already persisted at the state location,
+# which is what _adopt_persisted_provider_id() exists to do.
+#
+# ``nodes_per_block``, ``cores_per_node`` and ``mem_per_node`` belong to Parsl's
+# own ExecutionProvider surface. GlobusComputeEngine sets them from its own
+# config keys, so emitting them here would put two writers on one value.
+#
+# ``debug`` is a local troubleshooting flag, not endpoint configuration.
+_SKIP_PARAMS = frozenset(
+    {
+        "provider_id",
+        "nodes_per_block",
+        "cores_per_node",
+        "mem_per_node",
+        "debug",
+    }
+)
+
+# Parameters whose name differs from the attribute holding the resolved value.
+# ``mode`` is the only one: the constructor normalises it into ``mode_type`` (an
+# OperatingModeType) and keeps no ``self.mode``.
+_ATTRIBUTE_OVERRIDES = {"mode": "mode_type"}
+
+# Emitted even when the caller did not pass them. The first four are what someone
+# reads the file to find out, and a config that states them is easier to trust
+# than one where their absence has to be interpreted.
+#
+# ``worker_init`` is here for a stronger reason: it is the only thing that puts
+# ``globus-compute-endpoint`` on a worker's PATH (see
+# DEFAULT_GLOBUS_WORKER_INIT). Leaving it out when unset would mean the
+# reconstructed provider falls back to EphemeralAWSProvider's parsl-only
+# DEFAULT_WORKER_INIT -- the #138 failure, reintroduced one level down. It is
+# always emitted, so the subclass default travels with the config.
+_ALWAYS_EMIT = frozenset(
+    {"region", "instance_type", "mode", "max_blocks", "worker_init"}
+)
+
+# A Globus Compute worker is not launched with Parsl's process_worker_pool.py.
+# GlobusComputeEngine._get_compute_launch_cmd() rewrites the template to
+#
+#     globus-compute-endpoint python-exec \
+#         parsl.executors.high_throughput.process_worker_pool ...
+#
+# so ``globus-compute-endpoint`` must be on the worker's PATH. Nothing but
+# worker_init puts it there, and EphemeralAWSProvider's DEFAULT_WORKER_INIT
+# installs ``parsl`` alone -- every worker launched with it fails "command not
+# found" (#138). This default installs both.
+#
+# The pip install carries no --upgrade: globus-compute-endpoint pins parsl
+# exactly, so letting pip take a newer parsl would break the pin it just
+# resolved.
+DEFAULT_GLOBUS_WORKER_INIT = (
+    "dnf install -y python3.11 python3.11-pip\n"
+    "ln -sf /usr/bin/python3.11 /usr/bin/python3\n"
+    "pip3.11 install --quiet globus-compute-endpoint\n"
+)
+
 
 def _yaml_str(value: str) -> str:
     """Quote a string value if it contains YAML-special characters.
@@ -143,7 +206,19 @@ def _yaml_str(value: str) -> str:
     A bare colon is only a YAML mapping indicator when followed by a space or
     at end of line (e.g. ``"key: value"`` or trailing ``":"``).  Simple values
     such as Docker image tags (``python:3.11-slim``) do not need quoting.
+
+    Strings holding a newline are emitted as a double-quoted scalar with the
+    escape left intact -- ``worker_init`` is multi-line shell script, and a raw
+    newline inside a plain scalar would end the line and corrupt the document.
     """
+    if "\n" in value or "\t" in value:
+        escaped = (
+            value.replace("\\", "\\\\")
+            .replace('"', '\\"')
+            .replace("\n", "\\n")
+            .replace("\t", "\\t")
+        )
+        return f'"{escaped}"'
     needs_quoting = (
         ": " in value
         or value.endswith(":")
@@ -160,8 +235,21 @@ def _yaml_line(key: str, value: Any, indent: str = "") -> str:
         return f"{indent}{key}: null"
     if isinstance(value, bool):
         return f"{indent}{key}: {str(value).lower()}"
+    # Before the str branch, not after: OperatingModeType and friends are
+    # ``(str, Enum)``, so an isinstance(value, str) test matches them and
+    # ``str(value)`` renders "OperatingModeType.STANDARD" -- which the provider
+    # constructor then rejects as an invalid mode. ``.value`` is what it accepts.
+    if isinstance(value, Enum):
+        return f"{indent}{key}: {_yaml_str(str(value.value))}"
     if isinstance(value, str):
         return f"{indent}{key}: {_yaml_str(value)}"
+    if isinstance(value, dict):
+        inner = ", ".join(
+            f"{_yaml_str(str(k))}: {_yaml_str(str(v))}" for k, v in value.items()
+        )
+        return f"{indent}{key}: {{{inner}}}"
+    if isinstance(value, (list, tuple)):
+        return f"{indent}{key}: [{', '.join(_yaml_str(str(v)) for v in value)}]"
     return f"{indent}{key}: {value}"
 
 
@@ -238,6 +326,20 @@ class GlobusComputeProvider(EphemeralAWSProvider):
     display_name : str, optional
         Human-readable name for the Globus Compute endpoint.
         Default is ``"Ephemeral AWS Endpoint"``.
+    encrypted : bool, optional
+        Whether the engine encrypts worker traffic with CurveZMQ. Default is
+        ``False``, and that default is deliberate: ``HighThroughputExecutor``
+        generates the certificates under its own ``run_dir`` on the *endpoint
+        host* and passes that path to workers as ``--cert_dir``, so an EC2
+        worker is handed a directory that does not exist on it and dies with
+        ``FileNotFoundError``. Until certificate distribution is implemented
+        (#62), ``True`` cannot work for remote workers and rely on VPC isolation
+        instead. This was hardcoded ``true`` before #138, which made every
+        generated config unusable.
+
+        High-Assurance endpoints are the exception -- ``assert_ha_compliant()``
+        rejects ``encrypted=False``, so those need #62 resolved rather than this
+        default.
     \\*\\*kwargs
         All keyword arguments accepted by ``EphemeralAWSProvider``.
     """
@@ -249,12 +351,26 @@ class GlobusComputeProvider(EphemeralAWSProvider):
         endpoint_id: Optional[str] = None,
         container_image: Optional[str] = None,
         display_name: str = "Ephemeral AWS Endpoint",
+        encrypted: bool = False,
         **kwargs: Any,
     ) -> None:
+        # A Globus worker needs globus-compute-endpoint on its PATH, which the
+        # inherited DEFAULT_WORKER_INIT does not install (#138). Only defaulted,
+        # never overridden: an explicit worker_init is the caller's business.
+        kwargs.setdefault("worker_init", DEFAULT_GLOBUS_WORKER_INIT)
+
+        # Recorded before super().__init__ because the parent normalises and
+        # resolves several of these in place. _provider_params_yaml() emits this
+        # set, so it is the caller's stated intent that reaches the config rather
+        # than whatever the attributes hold afterwards -- see that method for why
+        # the difference matters for image_id.
+        self._explicit_params: frozenset = frozenset(kwargs)
+
         super().__init__(**kwargs)
         self.endpoint_id: Optional[str] = endpoint_id
         self.container_image: Optional[str] = container_image
         self.display_name: str = display_name
+        self.encrypted: bool = encrypted
 
     # ------------------------------------------------------------------
     # Config generation
@@ -337,7 +453,16 @@ class GlobusComputeProvider(EphemeralAWSProvider):
         lines.append("")
         lines.append("engine:")
         lines.append(f"{_INDENT2}type: GlobusComputeEngine")
-        lines.append(f"{_INDENT2}encrypted: true")
+        if not self.encrypted:
+            lines.append(
+                f"{_INDENT2}# CurveZMQ certificates live in the endpoint host's run_dir,"
+                " which an EC2"
+            )
+            lines.append(
+                f"{_INDENT2}# worker cannot read -- see #62. Set true once that is"
+                " distributed."
+            )
+        lines.append(_yaml_line("encrypted", self.encrypted, indent=_INDENT2))
         lines.append(f"{_INDENT2}max_retries_on_system_failure: 3")
 
         # ---- container (optional) ----
@@ -369,82 +494,62 @@ class GlobusComputeProvider(EphemeralAWSProvider):
         return "\n".join(lines)
 
     def _provider_params_yaml(self) -> list[str]:
-        """Return YAML lines (with 4-space indent) for provider parameters."""
+        """Return YAML lines (with 4-space indent) for provider parameters.
+
+        The emitted set is every parameter the caller passed explicitly, plus
+        those in :data:`_ALWAYS_EMIT`, minus :data:`_SKIP_PARAMS`. Parameter
+        names come from ``inspect.signature`` rather than a hand-written list,
+        because the hand-written version covered 15 of 52 and silently dropped
+        the rest (#138) -- ``worker_init`` among them, without which the
+        reconstructed provider installs ``parsl`` but not
+        ``globus-compute-endpoint`` and every worker command is "command not
+        found". A signature-derived set cannot fall behind a new option.
+
+        Keyed on what the caller *passed*, not on what differs from the default,
+        because two attributes are resolved at runtime and would otherwise be
+        frozen into the config:
+
+        * ``image_id`` defaults to ``None`` and is then filled in from SSM with
+          the current Amazon Linux 2023 AMI (#84). Emitting the resolved value
+          would pin the endpoint to whatever AMI was current on the day the
+          config was generated, which is the staleness #84 removed.
+        * ``provider_id`` defaults to a fresh UUID; see :data:`_SKIP_PARAMS`.
+
+        A caller who passes a value equal to the default still gets it emitted.
+        That is intended -- it was a deliberate choice, and a default can change
+        between releases.
+        """
         lines: list[str] = []
+        signature = inspect.signature(EphemeralAWSProvider.__init__)
 
-        # Core compute parameters
-        lines.append(_yaml_line("region", self.region, indent=_INDENT4))
-        lines.append(_yaml_line("instance_type", self.instance_type, indent=_INDENT4))
-        lines.append(_yaml_line("mode", self.mode_type.value, indent=_INDENT4))
+        for name, parameter in signature.parameters.items():
+            if name in _SKIP_PARAMS or parameter.kind is parameter.VAR_KEYWORD:
+                continue
+            if name not in _ALWAYS_EMIT and name not in self._explicit_params:
+                continue
 
-        # Network. Required since #69, so the constructor has already rejected a
-        # provider that lacks them -- with one exception: serverless mode with
-        # Lambda workers, whose functions run in the Lambda-managed VPC and so
-        # have nothing to pre-provision. That exception is why these are emitted
-        # conditionally rather than unconditionally. Omitting them from the YAML
-        # would produce a config that parses and then fails in the constructor.
-        for key, value in (
-            ("vpc_id", self.vpc_id),
-            ("subnet_id", self.subnet_id),
-            ("security_group_id", self.security_group_id),
-        ):
-            if value:
-                lines.append(_yaml_line(key, value, indent=_INDENT4))
+            attribute = _ATTRIBUTE_OVERRIDES.get(name, name)
+            if not hasattr(self, attribute):  # pragma: no cover - defensive
+                continue
 
-        # Block sizing
-        lines.append(_yaml_line("min_blocks", self.min_blocks, indent=_INDENT4))
-        lines.append(_yaml_line("max_blocks", self.max_blocks, indent=_INDENT4))
+            lines.append(_yaml_line(name, getattr(self, attribute), indent=_INDENT4))
 
-        # Spot
-        lines.append(_yaml_line("use_spot", self.use_spot, indent=_INDENT4))
-        if self.use_spot:
-            lines.append(
-                _yaml_line(
-                    "spot_interruption_handling",
-                    self.spot_interruption_handling,
-                    indent=_INDENT4,
-                )
-            )
-
-        # IAM / connectivity
-        lines.append(
-            _yaml_line(
-                "auto_create_instance_profile",
-                self.auto_create_instance_profile,
-                indent=_INDENT4,
-            )
-        )
-        if self.iam_instance_profile_arn:
-            lines.append(
-                _yaml_line(
-                    "iam_instance_profile_arn",
-                    self.iam_instance_profile_arn,
-                    indent=_INDENT4,
-                )
-            )
-
-        # Container image forwarded to provider so workers can pull it
+        # These two are GlobusComputeProvider's own, so the signature loop above
+        # cannot see them -- it reads EphemeralAWSProvider.__init__. Both are real
+        # kwargs of this subclass, so they bind on the way back in.
+        #
+        # container_image is emitted here as well as as engine.container_uri: the
+        # engine key is what actually containerises the worker, while this one
+        # keeps the value on the reconstructed provider, so regenerating a config
+        # from a loaded one does not silently drop it. The other two subclass
+        # params live elsewhere in the document -- display_name is a top-level
+        # Globus key and encrypted belongs to the engine.
+        if self.endpoint_id:
+            lines.append(_yaml_line("endpoint_id", self.endpoint_id, indent=_INDENT4))
         if self.container_image:
             lines.append(
                 _yaml_line("container_image", self.container_image, indent=_INDENT4)
             )
-
-        # Tuning
-        lines.append(
-            _yaml_line(
-                "status_polling_interval",
-                self.status_polling_interval,
-                indent=_INDENT4,
-            )
-        )
-        lines.append(_yaml_line("waiter_delay", self.waiter_delay, indent=_INDENT4))
-        lines.append(
-            _yaml_line("waiter_max_attempts", self.waiter_max_attempts, indent=_INDENT4)
-        )
-
-        # Optional endpoint_id metadata
-        if self.endpoint_id:
-            lines.append(_yaml_line("endpoint_id", self.endpoint_id, indent=_INDENT4))
 
         return lines
 

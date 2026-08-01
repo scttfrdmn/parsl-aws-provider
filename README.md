@@ -169,35 +169,45 @@ parsl.clear()
 > **Full guide**: [docs/globus_compute.md](docs/globus_compute.md) — architecture,
 > IAM setup, spot/container examples, multi-region deployment, and troubleshooting.
 
-Deploy enterprise Function-as-a-Service endpoints using our AWS Provider:
+Run functions on ephemeral EC2 from any network — including behind a NAT, which
+standard mode cannot do.
 
 ### Endpoint Configuration
 
+Generate the endpoint directory from the provider rather than hand-writing YAML.
+It writes both files Globus Compute needs, and needs no edits to start:
+
 ```bash
-# Install Globus Compute
-pip install globus-compute-endpoint globus-compute-sdk
-
-# Configure endpoint
-globus-compute-endpoint configure aws_research_endpoint
+uv sync --extra globus
+uv run globus-compute-endpoint login
 ```
 
-Edit `~/.globus_compute/aws_research_endpoint/config.yaml`:
+```python
+from parsl_ephemeral_aws import GlobusComputeProvider
 
-```yaml
-display_name: "AWS Research Endpoint"
-engine:
-  type: GlobusComputeEngine
+provider = GlobusComputeProvider(
+    region="us-east-1",
+    vpc_id="vpc-0123456789abcdef0",
+    subnet_id="subnet-0123456789abcdef0",
+    security_group_id="sg-0123456789abcdef0",
+    instance_type="c5.large",
+    mode="standard",
+    auto_create_instance_profile=True,
+    min_blocks=0,
+    max_blocks=20,
+    display_name="AWS Research Endpoint",
+)
 
-  provider:
-    type: AWSProvider
-    region: us-east-1
-    instance_type: c5.large
-    enable_ssm_tunneling: true
-    init_blocks: 1
-    max_blocks: 20
-
-  max_workers_per_node: 1
+provider.generate_endpoint_config("~/.globus_compute/aws_research_endpoint")
 ```
+
+```bash
+uv run globus-compute-endpoint start aws_research_endpoint
+```
+
+The `config.py` shim written alongside `config.yaml` is what makes the config
+loadable at all — Globus Compute resolves a provider by attribute lookup on
+`parsl.providers`, which does not know this class until something imports it.
 
 ### Function Execution
 

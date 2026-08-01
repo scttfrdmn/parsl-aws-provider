@@ -5,12 +5,13 @@ Run Python functions on ephemeral AWS EC2 instances through
 environment — including behind corporate firewalls, university networks, and home
 routers.
 
-```{warning}
-Read [Known limitations](#known-limitations) before deploying. The generated
-`config.yaml` currently drops `worker_init` and hardcodes `encrypted: true`, and
-both defects prevent workers from starting
-([#138](https://github.com/scttfrdmn/parsl-aws-provider/issues/138)). Two manual
-edits work around them, and are given below.
+```{note}
+Before v0.8.0 the generated `config.yaml` dropped `worker_init`, hardcoded
+`encrypted: true`, and omitted 37 of 52 provider parameters — so every endpoint
+needed two manual edits before a worker could start
+([#138](https://github.com/scttfrdmn/parsl-aws-provider/issues/138)). Generated
+configs are now complete and start unedited. Read
+[Known limitations](#known-limitations) before deploying.
 ```
 
 ## Why it is worth the trouble
@@ -129,54 +130,54 @@ Compute's own loader; `get_config()` prefers `config.py` when both are present,
 which is what makes the pair work
 ([#87](https://github.com/scttfrdmn/parsl-aws-provider/issues/87)).
 
-### 2. Apply the two required edits
+### 2. Read the two keys that are set for you
 
-Open `config.yaml` and make both changes. Without them the endpoint starts, EC2
-instances launch, and no worker ever registers
-([#138](https://github.com/scttfrdmn/parsl-aws-provider/issues/138)).
+No edits are required. Two generated keys are worth understanding, because both
+are the difference between a worker that registers and one that dies silently:
 
 ```yaml
 engine:
   type: GlobusComputeEngine
-  encrypted: false          # ← change from true; see below
+  # CurveZMQ certificates live in the endpoint host's run_dir, which an EC2
+  # worker cannot read -- see #62. Set true once that is distributed.
+  encrypted: false
   provider:
     type: GlobusComputeProvider
     region: us-east-1
-    # ... generated keys ...
-    # ← add this, replacing the default worker_init entirely:
-    worker_init: "dnf install -y python3.11 python3.11-pip\nln -sf /usr/bin/python3.11 /usr/bin/python3\npip3.11 install --quiet --upgrade globus-compute-endpoint\n"
+    worker_init: "dnf install -y python3.11 python3.11-pip\nln -sf /usr/bin/python3.11 /usr/bin/python3\npip3.11 install --quiet globus-compute-endpoint\n"
+    # ... every parameter you passed to the constructor ...
 ```
 
-**Why `worker_init`.** A Globus Compute worker is not launched with Parsl's
+**`worker_init`.** A Globus Compute worker is not launched with Parsl's
 `process_worker_pool.py`. The engine rewrites the command to:
 
 ```
 globus-compute-endpoint python-exec parsl.executors.high_throughput.process_worker_pool -a ...
 ```
 
-so `globus-compute-endpoint` must be on the worker's `PATH`. The provider's
-default `worker_init` installs `parsl` and not `globus-compute-endpoint`, and the
-generator drops any value you passed to the constructor — so the reconstructed
-provider always gets the default. The worker command is then `command not found`.
+so `globus-compute-endpoint` must be on the worker's `PATH`, and nothing but
+`worker_init` puts it there. `GlobusComputeProvider` therefore overrides the
+inherited default — which installs `parsl` alone — with one that installs both,
+and emits it unconditionally so it travels with the config. Pass your own
+`worker_init` to replace it; it must still install `globus-compute-endpoint`.
 
-**Why `encrypted: false`.** `GlobusComputeEngine` forwards `encrypted` to the
-wrapped `HighThroughputExecutor`, which generates CurveZMQ certificates in its
-`run_dir` **on the endpoint host** and passes that path to workers as
-`--cert_dir`. An EC2 worker has no such path and dies with `FileNotFoundError`
-before registering. Same-VPC deployments rely on VPC isolation instead;
-certificate distribution is
-[#62](https://github.com/scttfrdmn/parsl-aws-provider/issues/62).
+The install deliberately omits `--upgrade`: `globus-compute-endpoint` pins
+`parsl` exactly, so letting pip take a newer `parsl` breaks the pin it just
+resolved.
+
+**`encrypted: false`.** `GlobusComputeEngine` forwards `encrypted` to the wrapped
+`HighThroughputExecutor`, which generates CurveZMQ certificates in its `run_dir`
+**on the endpoint host** and passes that path to workers as `--cert_dir`. An EC2
+worker has no such path and dies with `FileNotFoundError` before registering.
+Same-VPC deployments rely on VPC isolation instead; certificate distribution is
+[#62](https://github.com/scttfrdmn/parsl-aws-provider/issues/62). Pass
+`encrypted=True` to override, once you have a way to distribute the certificates.
 
 ```{note}
 High-Assurance endpoints reject `encrypted: false`
-(`GlobusComputeEngine.assert_ha_compliant()`), so they need #62 resolved rather
-than this workaround.
+(`GlobusComputeEngine.assert_ha_compliant()`), so they need #62 resolved before
+they can use this provider at all.
 ```
-
-Anything else the generator dropped goes in the same place — `additional_tags`,
-`state_store_type`, `use_spot_fleet`, `warm_pool_size`, `image_id`, and 32 more.
-A hand-edited `config.yaml` accepts every `EphemeralAWSProvider` option; only the
-*generator* is selective.
 
 ### 3. Start the endpoint
 
@@ -221,7 +222,7 @@ uv run python tools/cleanup_aws_resources.py --dry-run --region us-east-1
 
 ## Configuration reference
 
-`GlobusComputeProvider` accepts every `EphemeralAWSProvider` parameter plus three
+`GlobusComputeProvider` accepts every `EphemeralAWSProvider` parameter plus four
 of its own:
 
 | Parameter | Type | Default | Description |
@@ -229,13 +230,30 @@ of its own:
 | `endpoint_id` | `str \| None` | `None` | Endpoint UUID. Emitted into `config.yaml` as a provider key and a trailing comment. |
 | `container_image` | `str \| None` | `None` | Image URI. Sets `container_type: docker` and `container_uri` under `engine`. |
 | `display_name` | `str` | `"Ephemeral AWS Endpoint"` | Label shown in the Globus Compute web console. |
+| `encrypted` | `bool` | `False` | CurveZMQ encryption on the engine. `True` needs [#62](https://github.com/scttfrdmn/parsl-aws-provider/issues/62) — see step 2. |
 
-Parameters that reach `config.yaml` today: `region`, `instance_type`, `mode`,
-`vpc_id`, `subnet_id`, `security_group_id`, `min_blocks`, `max_blocks`,
-`use_spot`, `spot_interruption_handling`, `auto_create_instance_profile`,
-`iam_instance_profile_arn`, `container_image`, `status_polling_interval`,
-`waiter_delay`, `waiter_max_attempts`, and `endpoint_id`. Everything else must be
-added to the YAML by hand until #138 lands.
+`worker_init` also differs from the base class: `GlobusComputeProvider` defaults
+it to a script that installs `globus-compute-endpoint`, not just `parsl`.
+
+**Which parameters reach `config.yaml`.** Every parameter you pass, plus
+`region`, `instance_type`, `mode`, `max_blocks`, and `worker_init` whether you
+pass them or not. The list comes from `inspect.signature`, so a parameter added to
+`EphemeralAWSProvider` is emitted without anyone updating the generator — the
+hand-maintained list that preceded it covered 15 of 52 (#138).
+
+Two parameters are deliberately never emitted:
+
+- **`provider_id`** — pinning it would tie every endpoint restart to the ID of the
+  process that generated the config, instead of adopting whatever is already
+  persisted at the state location.
+- **`image_id`, unless you passed it** — it is resolved from SSM to the current
+  Amazon Linux 2023 AMI at construction ([#84](https://github.com/scttfrdmn/parsl-aws-provider/issues/84)),
+  and writing that resolved value in would freeze the endpoint on whichever AMI
+  was current the day you generated the file. An `image_id` you chose is emitted.
+
+`nodes_per_block`, `cores_per_node`, `mem_per_node`, and `debug` are also left
+out: the first three are set by `GlobusComputeEngine` from its own config keys, so
+emitting them would put two writers on one value.
 
 Recommended values for a Globus Compute deployment:
 
@@ -253,8 +271,6 @@ Recommended values for a Globus Compute deployment:
 long-lived `globus-compute-endpoint` worker process the engine expects.
 
 ## Examples
-
-Each of these still needs the two edits from step 2.
 
 ### Spot endpoint
 
@@ -281,7 +297,7 @@ provider.generate_endpoint_config("~/.globus_compute/spot_aws")
 ```
 
 What actually protects your work is a retry policy on the engine, not the
-interruption handler:
+interruption handler. The generator already writes it:
 
 ```yaml
 engine:
@@ -296,9 +312,6 @@ Two limitations, both
 being constructed *at all* — without it you get one WARNING at startup and no
 detection — and what the warning triggers today is a log line, not task
 recovery. Treat it as observability.
-
-`checkpoint_bucket` is also one of the dropped parameters (#138), so add it to
-the YAML by hand.
 
 ### Container endpoint
 
@@ -315,6 +328,9 @@ provider = GlobusComputeProvider(
     max_blocks=5,
     auto_create_instance_profile=True,
     display_name="Python 3.11 Container Endpoint",
+    # Overriding the default is correct here: the host runs Docker, and the
+    # image is what needs globus-compute-endpoint.
+    worker_init="dnf install -y docker\nsystemctl start docker\n",
 )
 
 provider.generate_endpoint_config("~/.globus_compute/python311_aws")
@@ -322,14 +338,10 @@ provider.generate_endpoint_config("~/.globus_compute/python311_aws")
 
 `container_type: docker` means the engine wraps the worker command in
 `docker run`, so `worker_init` must install and start Docker *and* the image must
-contain `globus-compute-endpoint`:
+contain `globus-compute-endpoint`.
 
-```yaml
-    worker_init: "dnf install -y docker\nsystemctl start docker\n"
-```
-
-`python:3.11-slim` does not contain it, so build your own image or pass one that
-does. For a private ECR image, add the permissions from
+`python:3.11-slim` does not contain `globus-compute-endpoint`, so build your own
+image or pass one that does. For a private ECR image, add the permissions from
 `minimum_iam_policy(include_ecr=True)`.
 
 ### One endpoint per region
@@ -372,13 +384,10 @@ start`.
 
 ## Known limitations
 
-- **`worker_init` is dropped and `encrypted: true` is hardcoded** in the
-  generated config; both prevent workers from registering, and both need the
-  manual edits from step 2
-  ([#138](https://github.com/scttfrdmn/parsl-aws-provider/issues/138)).
-- **37 of 52 provider parameters are dropped** by the generator, including
-  `additional_tags`, the state-backend selection, and every fleet, warm-pool, and
-  AMI-baking option (#138). Add them to `config.yaml` by hand.
+- **CurveZMQ encryption cannot be enabled** for EC2 workers until certificate
+  distribution exists ([#62](https://github.com/scttfrdmn/parsl-aws-provider/issues/62)),
+  so `encrypted` defaults to `False` and High-Assurance endpoints — which reject
+  that — cannot use this provider.
 - **Multi-user (manager) endpoints are unsupported**
   ([#133](https://github.com/scttfrdmn/parsl-aws-provider/issues/133)). Those
   render `user_config_template.yaml.j2` to a string and the forked user-endpoint
@@ -413,13 +422,16 @@ uv run pytest tests/unit/test_globus_compute_provider.py --no-cov -v
 
 ### The endpoint starts, instances launch, no worker registers
 
-The two step-2 edits. In order of likelihood:
+In order of likelihood:
 
 1. **`globus-compute-endpoint` is not installed on the worker.** Reach the
    instance with `aws ssm start-session --target i-...` and read
-   `/var/log/cloud-init-output.log`; then run `which globus-compute-endpoint`.
-2. **`encrypted: true` is still set.** The worker dies with `FileNotFoundError`
-   on the `--cert_dir` path before it can log anything useful.
+   `/var/log/cloud-init-output.log`; then run `which globus-compute-endpoint`. If
+   you passed your own `worker_init`, this is usually it — the default installs
+   the binary and a custom one may not.
+2. **`encrypted: true`.** The worker dies with `FileNotFoundError` on the
+   `--cert_dir` path before it can log anything useful. Generated configs set
+   `false`; check whether the file was hand-edited or predates v0.8.0.
 3. **The daemon host is not reachable from the subnet.** Workers connect back to
    it over ZMQ. Check the daemon host's own security group, not the workers'.
 
@@ -438,9 +450,9 @@ It is waiting for a worker. Beyond the above:
 - **Egress**: a private subnet needs a NAT gateway or the `ssm`, `ssmmessages`,
   and `ec2messages` VPC endpoints, plus a route to whatever package index
   `worker_init` uses.
-- **AMI**: resolved from SSM for the region and architecture. A custom `image_id`
-  must exist in the target region — and note `image_id` is a dropped parameter
-  (#138), so confirm it actually reached the YAML.
+- **AMI**: resolved from SSM for the region and architecture, and only emitted
+  into `config.yaml` when you passed it explicitly. A custom `image_id` must exist
+  in the target region.
 
 ### `ResourceNotFoundException` on start
 

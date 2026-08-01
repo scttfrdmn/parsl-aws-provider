@@ -254,10 +254,20 @@ class TestGenerateEndpointConfig:
         assert "mode: standard" in content
 
     def test_config_encrypted_flag(self, tmp_path):
+        """False by default, and reflects the constructor argument (#138).
+
+        This asserted ``true`` while the value was hardcoded, which is how a
+        config no EC2 worker could load kept passing its own test: the worker is
+        handed a ``--cert_dir`` under the endpoint host's ``run_dir`` and dies
+        ``FileNotFoundError`` before registering (#62).
+        """
         provider = _make_provider(tmp_path)
         config_path = provider.generate_endpoint_config(str(tmp_path / "ep"))
-        content = Path(config_path).read_text()
-        assert "encrypted: true" in content
+        assert "encrypted: false" in Path(config_path).read_text()
+
+        explicit = _make_provider(tmp_path, encrypted=True)
+        config_path = explicit.generate_endpoint_config(str(tmp_path / "ep2"))
+        assert "encrypted: true" in Path(config_path).read_text()
 
     def test_existing_directory_is_ok(self, tmp_path):
         """Calling generate_endpoint_config twice does not raise."""
