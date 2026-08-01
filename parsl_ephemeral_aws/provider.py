@@ -160,6 +160,12 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
         EC2 key pair name for SSH access. If not provided, instances will be created without a key pair.
     profile_name : str, optional
         AWS profile name to use. If not provided, the default profile will be used.
+    endpoint_url : str, optional
+        Override the endpoint every AWS client uses. Set this for VPC interface
+        endpoints, FIPS endpoints, or to point the provider at an emulator such
+        as substrate. Applies to clients the operating modes and compute managers
+        build from the session too, not just the provider's own. A caller that
+        needs one service elsewhere can still override it per client.
     state_store_type : str, optional
         Type of state store to use ('file', 'parameter_store', or 's3'). Default is 'file'.
     state_file_path : str, optional
@@ -325,6 +331,7 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
         security_group_id: Optional[str] = None,
         key_name: Optional[str] = None,
         profile_name: Optional[str] = None,
+        endpoint_url: Optional[str] = None,
         state_store_type: str = StateStoreType.FILE,
         state_file_path: str = "ephemeral_aws_state.json",
         s3_bucket: Optional[str] = None,
@@ -429,6 +436,7 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
         self.security_group_id = security_group_id
         self.key_name = key_name
         self.profile_name = profile_name
+        self.endpoint_url = endpoint_url
         self.state_store_type = StateStoreType(state_store_type.lower())
         self.state_file_path = state_file_path
         self.s3_bucket = s3_bucket
@@ -607,7 +615,9 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
 
         # Initialize state
         self.session = create_session(
-            region=self.region, profile_name=self.profile_name
+            region=self.region,
+            profile_name=self.profile_name,
+            endpoint_url=self.endpoint_url,
         )
 
         # Resolve the AMI now that a credentialed session exists. Deferred from

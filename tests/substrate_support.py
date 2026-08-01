@@ -173,19 +173,25 @@ def get_substrate_resource(
     return session.resource(service_name, endpoint_url=endpoint)
 
 
-def setup_substrate_vpc() -> Dict[str, str]:
+def setup_substrate_vpc(session: Optional[boto3.Session] = None) -> Dict[str, str]:
     """Provision a VPC, subnet, gateway, route table and security group.
 
     Since #69 the provider creates no network resources, so every mode requires
     ``vpc_id``/``subnet_id``/``security_group_id`` to exist beforehand. This is
     what supplies them in the emulator.
 
+    Pass ``session`` when the caller has one, so the resources land in the region
+    that session uses. Substrate partitions by region, and the default here is
+    ``us-east-1`` while the suite's ``AWS_TEST_REGION`` defaults to ``us-west-2``
+    -- creating in one and describing from the other reports the resource as
+    missing immediately after it was created successfully.
+
     The subnet's availability zone is read from ``describe_availability_zones``
     rather than built as ``f"{region}a"``: that string is a guess about zone
     naming, and a wrong guess is how the real-AWS suite ended up pinned to a zone
     that does not offer ``t3.micro``.
     """
-    ec2 = get_substrate_client("ec2")
+    ec2 = get_substrate_client("ec2", session=session)
 
     def tag(resource_id: str, name: str) -> None:
         ec2.create_tags(
@@ -269,17 +275,20 @@ def setup_substrate_vpc() -> Dict[str, str]:
     }
 
 
-def cleanup_substrate_vpc(vpc_id: str) -> None:
+def cleanup_substrate_vpc(vpc_id: str, session: Optional[boto3.Session] = None) -> None:
     """Delete a VPC and everything attached to it, best-effort.
 
     Every step is individually guarded: this runs in teardown, where raising
     would mask the actual test result. Order matters — dependents before
     dependencies, or the VPC delete fails with ``DependencyViolation``.
 
+    Pass the same ``session`` used to create the VPC — see
+    :func:`setup_substrate_vpc` on why the region has to match.
+
     Prefer :func:`reset_substrate_state` where the whole emulator can be wiped;
     this exists for tests that share a server with others.
     """
-    ec2 = get_substrate_client("ec2")
+    ec2 = get_substrate_client("ec2", session=session)
 
     try:
         vpcs = ec2.describe_vpcs(VpcIds=[vpc_id]).get("Vpcs")

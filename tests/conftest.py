@@ -16,9 +16,11 @@ from typing import Generator
 
 from parsl_ephemeral_aws.provider import EphemeralAWSProvider
 from tests.substrate_support import (
+    cleanup_substrate_vpc,
     create_substrate_session,
     get_substrate_endpoint,
     is_substrate_running,
+    setup_substrate_vpc,
 )
 
 # Configure logging for tests
@@ -433,6 +435,71 @@ def substrate_available() -> bool:
     except Exception as exc:
         logging.warning("substrate health check failed: %s", exc)
     return False
+
+
+@pytest.fixture(scope="session")
+def cloudformation_available() -> bool:
+    """Return whether the emulator serves CloudFormation.
+
+    Substrate has a Go ``StackDeployer`` but exposes no ``cloudformation`` plugin
+    over HTTP, so ``create_stack`` answers ``ServiceNotAvailable``. ``DetachedMode``
+    provisions its bastion through a stack, so tests that reach it must *skip*
+    rather than fail -- an emulator gap is not a defect in the provider, and a red
+    suite that stays red teaches everyone to ignore it (same treatment as the
+    un-emulated EventBridge in #137).
+
+    Probed rather than hardcoded to ``False``: substrate may grow the plugin, and
+    a skip that outlives its reason is how coverage quietly disappears. The real
+    bastion path is covered against live CloudFormation in ``tests/aws/``.
+    """
+    endpoint = get_substrate_endpoint()
+    try:
+        response = requests.get(f"{endpoint}/_localstack/health", timeout=5)
+        if response.status_code == 200:
+            services = response.json().get("services", {})
+            return services.get("cloudformation") == "available"
+    except Exception as exc:
+        logging.warning("cloudformation availability check failed: %s", exc)
+    return False
+
+
+@pytest.fixture
+def requires_cloudformation(cloudformation_available) -> None:
+    """Skip the requesting test unless the emulator serves CloudFormation."""
+    if not cloudformation_available:
+        pytest.skip(
+            "substrate does not emulate cloudformation; DetachedMode's bastion "
+            "stack is covered against real AWS in tests/aws/"
+        )
+
+
+@pytest.fixture
+def substrate_network(substrate_session) -> Generator[dict, None, None]:
+    """Provision a real VPC, subnet and security group in the emulator.
+
+    Since #69 every mode requires ``vpc_id``/``subnet_id``/``security_group_id``
+    to exist beforehand, and ``modes/base.py`` *verifies* each one with a
+    ``describe_*`` call. So the unit suite's ``vpc-12345`` placeholders do not
+    work here: they are only sufficient where the session itself is mocked, and
+    against a live endpoint they raise ``ResourceNotFoundError``. These IDs are
+    real, emulator-side resources.
+
+    Provisioned through ``substrate_session`` rather than
+    ``setup_substrate_vpc()``'s own client, because that helper hardcodes
+    ``us-east-1`` while this session follows ``AWS_TEST_REGION`` (default
+    ``us-west-2``). Substrate partitions resources by region, so the mismatch
+    created the network in one region and then looked for it in another --
+    surfacing as ``InvalidGroup.NotFound`` for a group that had just been created
+    successfully.
+
+    Torn down per test rather than shared: a leftover VPC makes the next test's
+    failure depend on execution order, which is the hardest kind to read.
+    """
+    network = setup_substrate_vpc(session=substrate_session)
+    try:
+        yield network
+    finally:
+        cleanup_substrate_vpc(network["vpc_id"], session=substrate_session)
 
 
 @pytest.fixture

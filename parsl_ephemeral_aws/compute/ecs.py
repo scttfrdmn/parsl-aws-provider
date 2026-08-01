@@ -226,10 +226,16 @@ class ECSManager:
         cluster_name = f"{TAG_PREFIX}-cluster-{self.provider.workflow_id}"
 
         try:
-            # Check if cluster already exists
+            # Check if cluster already exists. ``clusters`` is optional in the
+            # response shape -- ECS omits it rather than returning an empty list
+            # when nothing matched, and the name goes into ``failures`` instead.
+            # Indexing it raised ``KeyError: 'clusters'``, which the handler below
+            # then reported as "Failed to create ECS cluster": the wrong
+            # operation, since the create had not been attempted yet.
             response = self.ecs_client.describe_clusters(clusters=[cluster_name])
+            existing = response.get("clusters") or []
 
-            if response["clusters"] and response["clusters"][0]["status"] == "ACTIVE":
+            if existing and existing[0]["status"] == "ACTIVE":
                 logger.info(f"Using existing ECS cluster: {cluster_name}")
                 self.clusters.add(cluster_name)
 
