@@ -115,6 +115,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `requires-python = ">=3.10"` that Parsl 2026.x forces. Its bats mock reported
   3.9 to match, so the pair agreed with each other and with nothing else
   (refs #93).
+- `examples/serverless_mode.py` told readers the Fargate image was fixed at
+  `public.ecr.aws/lambda/python:3.9` and that Lambda was therefore the better
+  choice — both halves now wrong, since `ecs_container_image` is reachable and
+  the default is `python:3.12-slim`. Its ECS branch passes
+  `ecs_container_image`, `ecs_task_cpu`, and `ecs_task_memory` so the example
+  demonstrates them rather than only naming them (refs #136).
 
 ### Fixed
 - **A warm instance was forgotten the moment it went warm, and then billed for
