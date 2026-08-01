@@ -54,7 +54,7 @@ class TestAWSConnectionErrors:
     """Tests for AWS connection and authentication errors."""
 
     @pytest.fixture
-    def provider_config(self):
+    def provider_config(self, tmp_path):
         """Create a basic provider configuration."""
         return {
             "region": "us-east-1",
@@ -65,6 +65,11 @@ class TestAWSConnectionErrors:
             "vpc_id": "vpc-12345",
             "subnet_id": "subnet-12345",
             "security_group_id": "sg-12345",
+            # Only boto3.Session is mocked here, so the state store is a real
+            # FileStateStore. Without this it defaults to the relative
+            # 'ephemeral_aws_state.json' and every construction that *succeeds*
+            # drops one in the repository root (#93).
+            "state_file_path": str(tmp_path / "state.json"),
         }
 
     def _provider_with_failing_sts(self, provider_config, error_code):
@@ -987,7 +992,7 @@ class TestProviderConfigurationErrors:
     """
 
     @pytest.fixture
-    def provider_config(self):
+    def provider_config(self, tmp_path):
         """Minimum config that constructs, for tests to perturb one field of."""
         return {
             "region": "us-east-1",
@@ -997,6 +1002,9 @@ class TestProviderConfigurationErrors:
             "vpc_id": "vpc-12345",
             "subnet_id": "subnet-12345",
             "security_group_id": "sg-12345",
+            # Keeps the real FileStateStore inside the sandbox -- see the note on
+            # TestAWSConnectionErrors.provider_config.
+            "state_file_path": str(tmp_path / "state.json"),
         }
 
     @staticmethod
