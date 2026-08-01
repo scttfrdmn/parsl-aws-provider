@@ -115,6 +115,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `requires-python = ">=3.10"` that Parsl 2026.x forces. Its bats mock reported
   3.9 to match, so the pair agreed with each other and with nothing else
   (refs #93).
+- **Dependabot tracks the `uv` ecosystem instead of `pip`.** Its pip updates read
+  the `requirements.txt` removed above, and that file pinned `black`,
+  `aws-cdk-lib`, `pydantic`, `typeguard`, `types-boto3`, and `tf-ecosystem` —
+  none of which the project depends on or imports. All six open pip pull requests
+  were bumping a dependency set that does not exist. The `uv` ecosystem reads
+  `pyproject.toml` and updates the committed `uv.lock`, which is what every CI
+  job installs from via `uv sync --locked` (refs #93).
 - `examples/serverless_mode.py` told readers the Fargate image was fixed at
   `public.ecr.aws/lambda/python:3.9` and that Lambda was therefore the better
   choice — both halves now wrong, since `ecs_container_image` is reachable and
