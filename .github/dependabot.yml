@@ -1,13 +1,19 @@
 version: 2
 updates:
-  - package-ecosystem: "pip"
+  # "uv", not "pip". The pip ecosystem read requirements.txt, which #93 deleted
+  # for duplicating pyproject.toml and drifting: it pinned black, aws-cdk-lib,
+  # pydantic, typeguard, types-boto3, and tf-ecosystem, none of which this
+  # project depends on or imports. Every pip PR dependabot opened was therefore
+  # maintaining a dependency set that did not exist. The uv ecosystem reads
+  # pyproject.toml and updates the committed uv.lock, which is what CI installs
+  # from (`uv sync --locked`).
+  - package-ecosystem: "uv"
     directory: "/"
     schedule:
       interval: "weekly"
     open-pull-requests-limit: 10
     labels:
       - "dependencies"
-      - "pip"
     reviewers:
       - "scttfrdmn"
     commit-message:
