@@ -29,9 +29,6 @@ setup() {
   cp "$SCRIPT_PATH" "${TEST_TEMP_DIR}/setup_environment.sh"
   chmod +x "${TEST_TEMP_DIR}/setup_environment.sh"
 
-  # Create a mock requirements.txt file
-  echo "boto3>=1.28.0" > "${TEST_TEMP_DIR}/requirements.txt"
-
   # Create a mock Python virtual environment
   mkdir -p "${TEST_TEMP_DIR}/.venv/bin"
   echo "#!/bin/bash" > "${TEST_TEMP_DIR}/.venv/bin/activate"
@@ -46,11 +43,14 @@ exit 0
 EOF
   chmod +x "${TEST_TEMP_DIR}/bin/pip"
 
-  # Create a mock python3 that reports version 3.9
+  # Create a mock python3 reporting the project's floor. Must track
+  # PYTHON_MIN_VERSION in the script under test and requires-python in
+  # pyproject.toml (>=3.10 since Parsl 2026.x dropped 3.9); a mock below the
+  # floor makes the script exit 1 and every test here fail on the version gate.
   cat > "${TEST_TEMP_DIR}/bin/python3" <<EOF
 #!/usr/bin/env bash
 if [[ "\$*" == *"version_info"* ]]; then
-  echo "3.9"
+  echo "3.10"
 elif [[ "\$*" == *"-m venv"* ]]; then
   mkdir -p "\${@: -1}/bin"
   echo "#!/bin/bash" > "\${@: -1}/bin/activate"
@@ -58,7 +58,7 @@ elif [[ "\$*" == *"-m venv"* ]]; then
 elif [[ "\$*" == *"-m pip"* ]]; then
   echo "MOCK PIP CALLED WITH: \$@" >&2
 else
-  echo "Mock Python 3.9.0"
+  echo "Mock Python 3.10.0"
 fi
 exit 0
 EOF

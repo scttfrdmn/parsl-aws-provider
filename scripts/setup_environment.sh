@@ -6,8 +6,7 @@ set -e
 
 # Default values
 DEFAULT_REGION="us-east-1"
-PYTHON_MIN_VERSION="3.9"
-REQUIREMENTS_FILE="requirements.txt"
+PYTHON_MIN_VERSION="3.10"
 ENV_FILE=".env"
 
 # Parse command line arguments
@@ -87,15 +86,9 @@ else
   exit 1
 fi
 
-# Install requirements
-if [[ -f "$REQUIREMENTS_FILE" ]]; then
-  echo "Installing requirements..."
-  pip install -r "$REQUIREMENTS_FILE"
-else
-  echo "Warning: Requirements file not found"
-fi
-
-# Install the package in development mode
+# Install the package in development mode. Dependencies come with it: they are
+# declared in pyproject.toml, and requirements.txt was removed in #93 for
+# duplicating that list badly enough to drift out of date.
 echo "Installing package in development mode..."
 pip install -e .
 

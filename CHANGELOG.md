@@ -77,6 +77,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `exceptions.py`, plus `DEFAULT_SPOT_CHECKPOINT_INTERVAL` and
   `DEFAULT_SPOT_MAX_RECOVERY_ATTEMPTS` from `constants.py` — raised and read by
   the removed API only, and never exported from the package root (refs #137).
+- **107 of the 109 files in `tools/`**, keeping only `launch_test_driver.py` and
+  `cleanup_aws_resources.py` (the two with referrers — CI's post-E2E sweep runs
+  the latter, and twelve docs pages point at it). The rest were one-off debug and
+  proof scripts (`debug_tunnel.py`, `prove_parsl_works.py`, `instant_test.py`,
+  some eighty more) plus fourteen standalone status documents of the kind
+  CLAUDE.md prohibits. `tools/README.md` documented a `final_bulletproof_phase1.py`
+  that no longer existed, and `tools/awsproviderstate.json` was a committed state
+  file carrying live VPC and security-group IDs — the same hazard #151 cleared
+  from the root. Nothing in the package or the test suite imported any of it
+  (closes #93).
+- `requirements.txt` and `setup.py` from the repository root. `pyproject.toml` is
+  the single source of dependencies and metadata; the former duplicated the list
+  badly enough to have drifted (still naming `black`, which is not a dependency,
+  and a Python floor two releases stale), and the latter was a two-line setuptools
+  shim that `uv build` does not use. Referrers updated: the coverage `omit` lists,
+  the bats environment test that asserted both files exist, and
+  `scripts/setup_environment.sh`, which was pip-installing from the deleted file
+  (refs #93).
+- `PHASE1_SUCCESS_PROOF.md` and `README_PHASE1.md` — standalone status documents,
+  unreferenced by anything (refs #93).
+
+### Changed
+- **Lint and format now cover the whole repository** rather than
+  `parsl_ephemeral_aws tests`. The 107 pre-existing ruff errors that forced the
+  narrower scope lived entirely in the `tools/` scripts removed above, so
+  `ruff check .` and `ruff format --check .` both pass and nothing outside the
+  package can drift unchecked. Applied in CI, the Makefile, and `make format`
+  (refs #93).
+- Six README links pointed into deleted `tools/` files — the examples table, the
+  documentation list, the quickstart, and the status badge. They now point at
+  `examples/` and `docs/`, which are maintained. While there, the Development
+  Setup block was using `pyenv`, `python -m venv`, and `pip install`, all three
+  forbidden by the project's uv-only rule, and told the reader to clone
+  `your-org/parsl-aws-provider` (refs #93).
+- `scripts/setup_environment.sh` checked for Python 3.9, two releases below the
+  `requires-python = ">=3.10"` that Parsl 2026.x forces. Its bats mock reported
+  3.9 to match, so the pair agreed with each other and with nothing else
+  (refs #93).
+- **Dependabot tracks the `uv` ecosystem instead of `pip`.** Its pip updates read
+  the `requirements.txt` removed above, and that file pinned `black`,
+  `aws-cdk-lib`, `pydantic`, `typeguard`, `types-boto3`, and `tf-ecosystem` —
+  none of which the project depends on or imports. All six open pip pull requests
+  were bumping a dependency set that does not exist. The `uv` ecosystem reads
+  `pyproject.toml` and updates the committed `uv.lock`, which is what every CI
+  job installs from via `uv sync --locked` (refs #93).
+- `examples/serverless_mode.py` told readers the Fargate image was fixed at
+  `public.ecr.aws/lambda/python:3.9` and that Lambda was therefore the better
+  choice — both halves now wrong, since `ecs_container_image` is reachable and
+  the default is `python:3.12-slim`. Its ECS branch passes
+  `ecs_container_image`, `ecs_task_cpu`, and `ecs_task_memory` so the example
+  demonstrates them rather than only naming them (refs #136).
 
 ### Fixed
 - **A warm instance was forgotten the moment it went warm, and then billed for
@@ -113,6 +164,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The only fleet integration test constructed `SpotFleetManager` directly and then
   rebound `aws_session` and `ec2_client` by hand, which masked it exactly;
   the replacement asserts the manager's session **is** the mode's (closes #159).
+- **Detached mode could not start a bastion without a key pair — the ordinary
+  case.** `DetachedMode._create_bastion_host()` passed `KeyName=None` to
+  `run_instances` whenever no key pair was configured, which fails botocore's own
+  parameter validation before any request leaves the process. Since SSM needs no
+  key pair, `bastion_host_type="direct"` with no `key_name` is the normal
+  configuration, and it could not launch at all. `KeyName` is now sent only when
+  there is one, matching every comparable site in the package, which was already
+  conditional (closes #158).
+- `ECSManager._get_or_create_cluster()` indexed `response["clusters"]`, a key ECS
+  omits entirely rather than returning empty. The resulting `KeyError` was caught
+  and re-reported as "Failed to create ECS cluster" — naming an operation that had
+  not run yet, so the log pointed at the wrong call (refs #92).
 - **`error_history` recorded only the fleet errors nobody could classify.**
   `SpotFleetManager._translate_fleet_error()` called
   `RobustErrorHandler.handle_error()` on the unrecognized fallthrough alone, so

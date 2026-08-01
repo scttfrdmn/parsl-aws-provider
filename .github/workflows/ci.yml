@@ -31,21 +31,21 @@ jobs:
       - name: Sync environment
         run: uv sync --locked --extra dev --extra test
       - name: Lint with ruff
-        # Scoped to the package and tests, not `.`: tools/ carries 107 pre-existing
-        # errors (bare excepts, unused imports) in one-off debug scripts that #93
-        # prunes in v0.8.0. flake8 was never a declared dependency, so the old
+        # Whole repo. The 107 pre-existing errors (bare excepts, unused imports)
+        # that forced a narrower scope were all in the tools/ one-off debug
+        # scripts #93 removed. flake8 was never a declared dependency, so the old
         # `flake8 parsl_ephemeral_aws tests` step could only ever have failed.
-        run: uv run ruff check parsl_ephemeral_aws tests
+        run: uv run ruff check .
       - name: Check formatting with ruff
         # ruff-format, not black: .pre-commit-config.yaml formats with ruff-format,
         # while [tool.black] line-length = 100 is stale config that disagrees with
         # how the tree is actually formatted. Running black churns unrelated lines.
         #
-        # tests/ is in scope because the pre-commit hook formats whatever is
-        # staged. Checking only the package here lets tests/ drift out of format
-        # until some later commit stages one of those files and the hook rewrites
-        # it, failing a commit that had nothing to do with the change.
-        run: uv run ruff format --check parsl_ephemeral_aws tests
+        # Whole repo, because the pre-commit hook formats whatever is staged.
+        # A narrower check lets a file drift out of format until some later commit
+        # stages it and the hook rewrites it, failing a commit that had nothing to
+        # do with the change.
+        run: uv run ruff format --check .
       - name: Security scan with bandit
         run: uv run bandit -r parsl_ephemeral_aws -c pyproject.toml
 
