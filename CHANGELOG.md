@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Two fixtures in `tests/unit/test_error_handling.py` wrote
+  `ephemeral_aws_state.json` into the repository root on every run.
+  `state_file_path` defaults to that *relative* filename, and both fixtures mock
+  only `boto3.Session` — so the state store is a real `FileStateStore` pointed at
+  the working directory, and each construction that succeeded left a file behind.
+  The 11 affected tests now pass a `tmp_path` path. The file had been mistaken for
+  a leftover from a manual run; its `launch_template_id` was a `MagicMock` repr,
+  which is what identified a test rather than a real session as the writer. A
+  stale state document in the root is also what makes the `load_state()`
+  null-restore hazard reachable, so this was not merely untidy (refs #93).
+
+### Added
+- An autouse `tests/conftest.py` guard fails any test that leaves a
+  default-named state file in the working directory or the repository root,
+  naming the test and the fix. Gitignoring the path was the alternative and was
+  rejected: it would have silenced the symptom while tests kept writing outside
+  their sandbox. The watched filename is read from the `state_file_path` signature
+  default rather than hardcoded, so renaming the default cannot quietly disable
+  the check (refs #93).
+
 ## [0.7.0] - 2026-07-31
 
 ### Security

@@ -4,14 +4,17 @@ SPDX-License-Identifier: Apache-2.0
 SPDX-FileCopyrightText: 2025-2026 Scott Friedman and Project Contributors
 """
 
+import inspect
 import os
 import pytest
 import boto3
 import logging
 import requests
+from pathlib import Path
 from unittest.mock import MagicMock
 from typing import Generator
 
+from parsl_ephemeral_aws.provider import EphemeralAWSProvider
 from tests.substrate_support import (
     create_substrate_session,
     get_substrate_endpoint,
@@ -24,6 +27,16 @@ logging.basicConfig(level=logging.INFO)
 # Test configuration
 AWS_TEST_REGION = os.environ.get("AWS_TEST_REGION", "us-west-2")
 AWS_TEST_PROFILE = os.environ.get("AWS_TEST_PROFILE", "aws")
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
+# Read from the signature rather than hardcoded, so the guard below keeps working
+# if the default is ever renamed. Kept out of the fixture to pay the import once.
+DEFAULT_STATE_FILENAME = (
+    inspect.signature(EphemeralAWSProvider.__init__)
+    .parameters["state_file_path"]
+    .default
+)
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -89,6 +102,43 @@ def _neutralize_aws_credentials(request, monkeypatch):
         monkeypatch.setenv(*marker.args)
     monkeypatch.delenv("AWS_PROFILE", raising=False)
     monkeypatch.delenv("AWS_DEFAULT_PROFILE", raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _no_default_state_file_left_behind(request):
+    """Fail the test that drops a default-path state file outside its sandbox.
+
+    ``state_file_path`` defaults to the *relative* ``ephemeral_aws_state.json``
+    (provider.py), so any test that constructs a provider successfully without
+    overriding it writes into whatever the working directory happens to be --
+    normally the checkout. Two fixtures in ``test_error_handling.py`` did exactly
+    that for several releases; the file went unnoticed because it is not
+    gitignored and reads as a leftover from a manual run (#93).
+
+    Ignoring the path would have hidden it. Failing here instead names the
+    offending test, and the fix is a one-line ``state_file_path`` pointing at
+    ``tmp_path``. That matters beyond tidiness: a stale state document in the
+    repo root is what makes the ``load_state()`` null-restore hazard reachable,
+    so a test leaving one behind is not harmless.
+
+    Both the working directory and the repo root are checked, because the write
+    lands in the former while the latter is what gets committed by accident, and
+    a test is free to ``chdir`` between the two. Scoped to the default filename:
+    a state file at an explicit path is the caller's business.
+    """
+    watched = {Path.cwd() / DEFAULT_STATE_FILENAME, REPO_ROOT / DEFAULT_STATE_FILENAME}
+    preexisting = {p for p in watched if p.exists()}
+    yield
+    leaked = sorted(p for p in watched if p.exists() and p not in preexisting)
+    if leaked:
+        for path in leaked:
+            path.unlink()
+        pytest.fail(
+            f"{request.node.nodeid} wrote {DEFAULT_STATE_FILENAME} outside its "
+            f"sandbox ({', '.join(str(p) for p in leaked)}). Pass "
+            "state_file_path=str(tmp_path / 'state.json') when constructing the "
+            "provider, or patch _initialize_state_store."
+        )
 
 
 @pytest.fixture
