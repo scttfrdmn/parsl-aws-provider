@@ -17,5 +17,5 @@ types-boto3>=1.0.0
 # `localstack` dropped in #125: LocalStack OSS is end-of-life and the emulator is
 # now substrate, a Go binary pulled as a container image rather than a Python
 # package. See docs/substrate_testing.md.
-tf-ecosystem>=0.0.1
+tf-ecosystem>=1.0.7
 tf-python>=0.0.1
