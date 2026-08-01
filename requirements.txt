@@ -11,7 +11,7 @@ ruff>=0.0.267
 mypy>=1.0.0
 black>=23.0.0
 bandit>=1.7.0
-types-boto3>=1.0.0
+types-boto3>=1.43.58
 
 # Optional dependencies
 # `localstack` dropped in #125: LocalStack OSS is end-of-life and the emulator is
