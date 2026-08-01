@@ -137,6 +137,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   demonstrates them rather than only naming them (refs #136).
 
 ### Fixed
+- **`aws-e2e-tests` went red on every manual dispatch, and its orphan sweep never
+  ran.** The job's comment claimed a dispatch without the repository variables
+  configured was "a no-op, not a failure" on the strength of
+  `tests/aws/conftest.py`'s skip — but pytest was never reached:
+  `configure-aws-credentials` fails first on the empty region with `Input
+  required and not supplied: aws-region`. The job is now gated on
+  `vars.AWS_TEST_REGION != ''`, so it skips as documented. That mattered beyond
+  tidiness: `ci.yml` triggers on `pull_request` into `main`, so a stacked PR based
+  on another feature branch reports no checks at all, and manual dispatch is the
+  only way to get evidence before the parent merges.
+
+  The `always()` orphan sweep then died on `The config profile (aws) could not be
+  found` — `tools/cleanup_aws_resources.py` defaulted `--profile` to `aws`, the
+  name this project's developers use locally but one no runner has. It now
+  defaults to the boto3 credential chain, which honours `AWS_PROFILE` locally and
+  picks up the OIDC credentials in CI. The step that reports leaked instances was
+  failing at exactly the moment instances are most likely to be leaked
+  (closes #161).
 - **A warm instance was forgotten the moment it went warm, and then billed for
   indefinitely.** `_cleanup_resources()` moved a finished warm-pool instance to
   `STATUS_WARM` in memory, but reached `_save_state()` only inside its

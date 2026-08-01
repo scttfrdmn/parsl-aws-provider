@@ -173,9 +173,17 @@ jobs:
   aws-e2e-tests:
     # Real AWS: bills money and needs a pre-provisioned VPC/subnet/SG, so it is
     # manual-only. #60 closed with 51 tests under tests/aws that no workflow ever
-    # referenced. tests/aws/conftest.py skips when the three IDs are unset, so a
-    # run without the repository variables configured is a no-op, not a failure.
-    if: github.event_name == 'workflow_dispatch'
+    # referenced.
+    #
+    # The `vars.AWS_TEST_REGION != ''` half of the gate is what makes an
+    # unconfigured run a no-op (#161). Relying on conftest.py's skip was not
+    # enough: pytest is never reached, because configure-aws-credentials fails
+    # first on the empty region with "Input required and not supplied:
+    # aws-region". So the job went red on every dispatch, which made manual
+    # dispatch useless as a green signal -- and dispatch is the only way to get
+    # CI evidence for a stacked PR, since the workflow triggers on pull_request
+    # into main and a PR based on a feature branch reports no checks at all.
+    if: github.event_name == 'workflow_dispatch' && vars.AWS_TEST_REGION != ''
     runs-on: ubuntu-latest
     needs: unit-tests
     environment: aws-e2e
@@ -205,6 +213,10 @@ jobs:
         # always(): a failed test is exactly when instances are most likely to be
         # left running. --dry-run reports without deleting, so a shared account is
         # never touched by CI.
+        #
+        # No --profile: the script now defaults to the boto3 credential chain,
+        # which picks up the OIDC credentials configure-aws-credentials exported
+        # (#161). It used to default to the local "aws" profile and die here.
         if: always()
         env:
           AWS_TEST_REGION: ${{ vars.AWS_TEST_REGION }}

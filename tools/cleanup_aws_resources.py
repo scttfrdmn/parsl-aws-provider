@@ -7,7 +7,7 @@ Safely removes all test instances, security groups, and other resources.
 import boto3
 import time
 import sys
-from typing import List, Dict
+from typing import List, Dict, Optional
 import logging
 
 from parsl_ephemeral_aws.utils.aws import (
@@ -29,15 +29,30 @@ _ROLE_PREFIX, _PROFILE_PREFIX = (
 class AWSResourceCleaner:
     """Cleans up AWS resources created during testing."""
 
-    def __init__(self, profile_name: str = "aws", region: str = "us-east-1"):
-        """Initialize the cleaner with AWS session."""
+    def __init__(self, profile_name: Optional[str] = None, region: str = "us-east-1"):
+        """Initialize the cleaner with AWS session.
+
+        A None profile_name means the standard boto3 credential chain, which
+        honours AWS_PROFILE. The default used to be the literal "aws" -- the
+        profile name this project's developers use locally, per CLAUDE.md, but
+        one that exists on no CI runner. CI's post-E2E sweep therefore died on
+        "The config profile (aws) could not be found" instead of reporting
+        orphans, which is the one moment orphans are most likely (#161). The
+        runner authenticates via OIDC, so it has credentials but no profile.
+        """
         try:
-            self.session = boto3.Session(profile_name=profile_name, region_name=region)
+            if profile_name:
+                self.session = boto3.Session(
+                    profile_name=profile_name, region_name=region
+                )
+            else:
+                self.session = boto3.Session(region_name=region)
             self.ec2_client = self.session.client("ec2")
             self.iam_client = self.session.client("iam")
             self.region = region
             logger.info(
-                f"Initialized AWS session for region {region} with profile {profile_name}"
+                f"Initialized AWS session for region {region} with profile "
+                f"{profile_name or 'default credential chain'}"
             )
         except Exception as e:
             logger.error(f"Failed to initialize AWS session: {e}")
@@ -368,7 +383,10 @@ def main():
         description="Clean up AWS resources created by Parsl testing"
     )
     parser.add_argument(
-        "--profile", default="aws", help="AWS profile to use (default: aws)"
+        "--profile",
+        default=None,
+        help="AWS profile to use (default: the standard credential chain, "
+        "which honours AWS_PROFILE)",
     )
     parser.add_argument(
         "--region", default="us-east-1", help="AWS region (default: us-east-1)"
