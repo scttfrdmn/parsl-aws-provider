@@ -1,97 +1,163 @@
-"""Example of using Spot Fleet with Parsl AWS Provider.
+#!/usr/bin/env python3
+"""EC2 Fleet: several instance types per block.
 
-This example demonstrates how to configure and use Spot Fleet with the Parsl AWS Provider,
-which provides improved reliability and cost-effectiveness for spot instance provisioning.
+Requesting multiple instance types is the single most effective way to reduce
+spot interruptions — EC2 draws from whichever pool has capacity. As of v0.7.0
+this uses the EC2 Fleet API (`CreateFleet` with `Type="instant"`), not the legacy
+Spot Fleet API; the option keeps the name `use_spot_fleet` for compatibility.
+
+Both `use_spot` and `use_spot_fleet` must be set. `use_spot_fleet` alone builds
+no fleet manager and the block silently falls through to a single on-demand
+instance (issue #137).
+
+Usage
+-----
+    export AWS_PROFILE=aws
+    export AWS_TEST_REGION=us-east-1
+    export AWS_TEST_VPC_ID=vpc-...
+    export AWS_TEST_SUBNET_ID=subnet-...
+    export AWS_TEST_SG_ID=sg-...
+
+    uv run python examples/spot_fleet_example.py
 
 SPDX-License-Identifier: Apache-2.0
-SPDX-FileCopyrightText: 2025 Scott Friedman and Project Contributors
+SPDX-FileCopyrightText: 2025-2026 Scott Friedman and Project Contributors
 """
 
+import logging
+import os
+import sys
+
 import parsl
+from parsl.addresses import address_by_route
 from parsl.app.app import python_app
 from parsl.config import Config
 from parsl.executors import HighThroughputExecutor
-from parsl.providers import EphemeralAWSProvider
-from parsl.addresses import address_by_hostname
 
-# Import StateStore implementation from the provider package
-from parsl_ephemeral_aws.state import S3StateStore
+from parsl_ephemeral_aws import EphemeralAWSProvider
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger("spot-fleet")
 
 
 @python_app
 def hello(name):
-    """Simple app that returns a hello message."""
+    """Report which fleet instance ran this task."""
     import platform
-    import socket
+    import urllib.request
 
-    return f"Hello, {name}! Running on {platform.node()} ({socket.gethostbyname(socket.gethostname())})"
+    try:
+        # IMDSv2 is required, so fetch a token first.
+        token = (
+            urllib.request.urlopen(  # nosec B310
+                urllib.request.Request(
+                    "http://169.254.169.254/latest/api/token",
+                    headers={"X-aws-ec2-metadata-token-ttl-seconds": "60"},
+                    method="PUT",
+                ),
+                timeout=5,
+            )
+            .read()
+            .decode()
+        )
+        instance_type = (
+            urllib.request.urlopen(  # nosec B310
+                urllib.request.Request(
+                    "http://169.254.169.254/latest/meta-data/instance-type",
+                    headers={"X-aws-ec2-metadata-token": token},
+                ),
+                timeout=5,
+            )
+            .read()
+            .decode()
+        )
+    except Exception:
+        instance_type = "unknown"
+
+    return f"Hello, {name}! Ran on {platform.node()} ({instance_type})"
 
 
-if __name__ == "__main__":
-    # Configure a SpotFleet-enabled provider
+def main() -> int:
+    """Run a batch of tasks across a diversified spot fleet."""
+    try:
+        network = {
+            "region": os.environ.get("AWS_TEST_REGION", "us-east-1"),
+            "vpc_id": os.environ["AWS_TEST_VPC_ID"],
+            "subnet_id": os.environ["AWS_TEST_SUBNET_ID"],
+            "security_group_id": os.environ["AWS_TEST_SG_ID"],
+        }
+    except KeyError as exc:
+        logger.error("Missing required environment variable: %s", exc)
+        return 2
+
     provider = EphemeralAWSProvider(
-        # Basic AWS configuration
-        region="us-east-1",  # Specify your preferred region
-        # Operating mode
-        operating_mode="detached",  # Detached mode is required for spot fleet to work well
-        preserve_bastion=True,  # Keep the bastion host alive across runs
-        workflow_id="spot-fleet-demo",  # Unique identifier for this workflow
-        # Spot Fleet configuration
-        use_spot_fleet=True,  # Enable Spot Fleet (instead of individual spot instances)
-        instance_types=[  # Multiple instance types for better availability
-            "t3.small",
-            "t3.medium",
-            "m5.small",
-            "m5a.small",
-        ],
-        nodes_per_block=2,  # Launch 2 instances per block
-        spot_max_price_percentage=80,  # Maximum 80% of on-demand price
-        # Standard configuration
-        instance_type="t3.small",  # Primary instance type (used as default if needed)
+        mode="standard",
+        # Both flags are required for the fleet path (#137).
+        use_spot=True,
+        use_spot_fleet=True,
+        # A list of instance type NAMES — not weighted dicts. Keep vCPU and
+        # memory comparable; mix families and generations, not sizes.
+        instance_types=["m5.large", "m5a.large", "m6i.large", "c5.large"],
+        # nodes_per_block is the fleet's target capacity. This is the only launch
+        # path where it has any effect.
+        nodes_per_block=2,
+        spot_max_price_percentage=80,  # cap at 80% of on-demand
+        spot_allocation_strategy="price-capacity-optimized",  # the default
+        # Interruption detection needs a checkpoint bucket today (#137); it gates
+        # whether the monitor is constructed at all. Omit it and you get one
+        # WARNING at startup and no detection.
+        spot_interruption_handling=True,
+        checkpoint_bucket=os.environ.get("AWS_TEST_CHECKPOINT_BUCKET"),
         min_blocks=0,
         max_blocks=4,
         init_blocks=1,
-        use_spot=True,  # Must be True to use spot fleet
-        # State tracking (required for detached mode)
-        state_store=S3StateStore(
-            bucket_name="your-state-bucket",  # Replace with your S3 bucket
-            key_prefix="parsl-states",
-            auto_create_bucket=True,
-        ),
-        # AWS tags
-        tags={"Project": "ParslSpotFleetDemo", "Department": "Research"},
+        auto_create_instance_profile=True,
+        state_store_type="file",
+        state_file_path="spot_fleet_state.json",
+        additional_tags={"Project": "ParslSpotFleetDemo"},
+        waiter_delay=15,
+        waiter_max_attempts=40,
+        **network,
     )
 
-    # Create a HighThroughputExecutor with the provider
-    executor = HighThroughputExecutor(
-        label="spot_fleet_executor",
-        address=address_by_hostname(),
-        provider=provider,
-    )
-
-    # Create Parsl configuration
     config = Config(
-        executors=[executor],
-        strategy=None,
+        executors=[
+            HighThroughputExecutor(
+                label="spot_fleet_executor",
+                provider=provider,
+                address=address_by_route(),
+                worker_port_range=(54000, 55000),
+                heartbeat_threshold=600,
+                heartbeat_period=30,
+                encrypted=False,  # see #62
+            )
+        ],
+        # What actually protects work from a reclaim: the interruption warning
+        # currently produces a log line, not task recovery (#137).
+        retries=3,
+        run_dir="runinfo_spot_fleet",
     )
 
-    # Load the configuration
-    parsl.load(config)
+    try:
+        parsl.load(config)
+        logger.info("Submitting 10 tasks to the fleet ...")
 
-    # Submit a bunch of hello apps
-    futures = []
-    for i in range(10):
-        futures.append(hello(f"Task {i}"))
+        for future in [hello(f"Task {i}") for i in range(10)]:
+            try:
+                logger.info(future.result(timeout=900))
+            except Exception as exc:
+                logger.error("Task failed: %s", exc)
+        return 0
 
-    # Wait for results and print them
-    for future in futures:
-        try:
-            result = future.result()
-            print(result)
-        except Exception as e:
-            print(f"Task failed: {e}")
+    except Exception:
+        logger.exception("Workflow failed")
+        return 1
 
-    # Cleanup
-    print("Waiting for AWS resources to be cleaned up...")
-    parsl.dfk().cleanup()
-    print("Done!")
+    finally:
+        parsl.clear()
+        provider.shutdown()
+        logger.info("Fleet and instances terminated.")
+
+
+if __name__ == "__main__":
+    sys.exit(main())

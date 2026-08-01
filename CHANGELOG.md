@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-07-31
+
 ### Security
 - **IMDSv2 is now required on every instance the package launches.** Nothing set
   `MetadataOptions` anywhere before, so every worker, bastion, spot instance, and
@@ -735,6 +737,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   invisible in development and failed only from an installed wheel. Both stack
   parameter tests also now assert `TemplateBody`, so deploying the other
   template is caught (refs #112, #113).
+- `tests/unit/test_docs_examples.py` — the check `docs/README.md` and
+  `docs/examples.md` had both been promising. Every fenced Python block in the
+  documentation and every file in `examples/` is parsed, and each keyword argument
+  passed to `EphemeralAWSProvider`, `GlobusComputeProvider`,
+  `HighThroughputExecutor`, or `Config` is checked against the real signature.
+  The accepted set is the union over `inspect.getmro()`: `**kwargs` is *not*
+  treated as "accepts anything", because on this provider it means the opposite —
+  it exists only to reject unknown options (#105) — while
+  `GlobusComputeProvider` does forward through it. Also asserts the 15 renamed or
+  removed option names no longer resolve, that every example disables HTEX
+  encryption (#62) and shuts its provider down, and that each example is listed
+  in `examples/README.md`. It found two unparseable blocks on its first run.
+- `tests/unit/test_license_headers.py` — enumerates tracked files via
+  `git ls-files` and asserts no stale copyright year, one canonical copyright
+  form, and both SPDX tags on every Python and shell source. The year was wrong
+  for seven months before anyone read a header (#119); a grep is cheaper than
+  rediscovering it next January. `tools/` is exempt from the *missing*-header
+  check only — 90 files there have never carried one and #93 prunes the
+  directory in v0.8.0 — but the stale-year checks stay tree-wide, matching how
+  ruff and bandit are scoped.
+- The CI docs job now builds with `SPHINXOPTS="-W"`, so a documentation warning
+  fails the build. The tree carried 398 of them, which is how ~65 toctree entries
+  pointing at pages nobody had written stayed invisible (closes #124).
 
 ### Changed
 - **`GlobusComputeProvider.minimum_iam_policy()` is now actually minimum.** It
@@ -1054,6 +1079,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   subnet, and security group are now the caller's responsibility.
 - E2E tests read `AWS_TEST_VPC_ID`, `AWS_TEST_SUBNET_ID`, and `AWS_TEST_SG_ID`
   from the environment; tests are skipped (not failed) when these are unset.
+- **All eight examples run.** Six raised `ValueError` on the first line of the
+  constructor because they predate #69 and pass no network IDs; every one also
+  used options that no longer exist. `mode=StandardMode(...)` and
+  `state_store=FileStateStore(...)` — objects where the provider takes strings —
+  `worker_type`, `state_prefix`, and HTEX's `max_workers` (the parameter is
+  `max_workers_per_node`) are all gone. Each example now reads its VPC, subnet,
+  and security group from `AWS_TEST_VPC_ID`/`AWS_TEST_SUBNET_ID`/`AWS_TEST_SG_ID`
+  and exits `2` with the missing name when one is unset, rather than failing
+  inside boto3 minutes later. `examples/README.md` lists all eight, where it had
+  listed six.
+- The `.md` documentation is rewritten against the real 52-parameter signature.
+  `docs/state_persistence.md` documented three state-store constructors that
+  exist in no form; `docs/operating_modes.md` still showed `create_vpc=True`.
+  `docs/examples.md`, `docs/security.md`, and `docs/getting_started.md` all
+  configured the provider with removed or renamed options (closes #124).
+- `docs/localstack_testing.md` → `docs/substrate_testing.md`, following the
+  emulator swap in #125.
+- `DetachedMode.cleanup_infrastructure()`'s docstring said it "cleans up the VPC,
+  subnet, and security group if they were created by the provider." It has not
+  done that since #69 — the caller supplies them and this mode never created
+  them. The inline comment claiming the same has been corrected too; it gates
+  monitor teardown, not networking.
+- The `SPDX-FileCopyrightText` range is now `2025-2026` across 153 tracked files,
+  including `LICENSE`'s Apache appendix. `docs/conf.py` and
+  `scripts/setup_environment.sh` had no header at all (closes #119).
+- The four `GlobusComputeProvider` constructions in
+  `tests/aws/test_globus_compute_e2e.py` now supply network IDs. All four raised
+  `ValueError`, including the three config-generation tests that touch no AWS
+  resources: the guard runs before the operating mode is built, so the existing
+  `patch.object(..., "_initialize_operating_mode")` does not bypass it. Those
+  three now pass. The module docstring's `pip install` instructions are `uv sync`.
 
 ### Removed
 - `SpotFleetManager._get_iam_fleet_role()` and `_create_spot_fleet_request()`,
@@ -1098,6 +1154,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `_create_security_group()` (182 LOC). These built the VPC through
   CloudFormation rather than direct EC2 calls, which is why #69's pass missed
   them; `create_vpc` is gone from `ServerlessMode` as well (closes #73).
+- The parallel reStructuredText documentation tree — 26 `.rst` files, ~7,800 lines,
+  under `docs/source/`, `docs/advanced_topics/`, `docs/user_guide/`,
+  `docs/getting_started/`, and `docs/operating_modes/`. Nine were index stubs whose
+  `toctree` directives named ~65 pages nobody ever wrote, which is where most of
+  the 398 build warnings came from. The other sixteen had real content, and that is
+  the reason to delete rather than repair them: they documented a provider that
+  does not exist. `worker_type`, `use_spot_instances`, `create_vpc`, `state_store=`,
+  and `FileState` appear 60 times across them, and `configuration.rst` presented
+  `vpc_id` as optional — the opposite of the truth since #69. Two files
+  (`gpu_computing.rst`, 1,422 lines, and `mpi_workflows.rst`, 1,068) documented
+  GPU-aware scheduling and multi-node MPI at length; the provider has no parameter
+  for either, and never had. `docs/examples.md` now names both as unimplemented
+  instead. `docs/source/conf.py` was a second, divergent Sphinx config for a
+  `SOURCEDIR` that is `.`, and `docs/advanced_usage.md` had the same
+  removed-options problem. `docs/api_reference.rst` replaces `api.rst` and
+  `api/index.rst`, autodocumenting the modules that are actually reachable
+  (closes #124).
+- The three mode-diagram SVGs under `docs/images/`. They drew the VPC, subnet, and
+  NAT gateway the provider created before #69 and no page referenced them.
 
 ## [0.6.0] - 2026-03-02
 
@@ -1390,7 +1465,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - ECS task definitions now create their CloudWatch log group before registration;
   log groups are tracked and deleted on cleanup (closes #22)
 
-[Unreleased]: https://github.com/scttfrdmn/parsl-aws-provider/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/scttfrdmn/parsl-aws-provider/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/scttfrdmn/parsl-aws-provider/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/scttfrdmn/parsl-aws-provider/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/scttfrdmn/parsl-aws-provider/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/scttfrdmn/parsl-aws-provider/compare/v0.3.0...v0.4.0

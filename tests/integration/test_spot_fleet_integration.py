@@ -5,7 +5,7 @@ testing: moto intercepts the HTTP layer, so the manager builds its own boto3
 session and issues real API calls against a simulated AWS.
 
 SPDX-License-Identifier: Apache-2.0
-SPDX-FileCopyrightText: 2025 Scott Friedman and Project Contributors
+SPDX-FileCopyrightText: 2025-2026 Scott Friedman and Project Contributors
 """
 
 import unittest

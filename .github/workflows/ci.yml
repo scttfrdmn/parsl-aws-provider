@@ -266,7 +266,10 @@ jobs:
       - name: Sync environment
         run: uv sync --locked --extra dev --extra docs
       - name: Build documentation
-        run: uv run make -C docs html
+        # -W turns warnings into errors. The tree carried 398 of them before
+        # #124, which hid ~65 toctree entries pointing at pages nobody had
+        # written. Zero now, so keep it that way.
+        run: uv run make -C docs html SPHINXOPTS="-W"
       - uses: actions/upload-artifact@v4
         with:
           name: documentation

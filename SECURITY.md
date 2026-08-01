@@ -110,4 +110,4 @@ Our typical vulnerability disclosure timeline is:
 This timeline may vary based on the severity and complexity of the issue.
 
 SPDX-License-Identifier: Apache-2.0
-SPDX-FileCopyrightText: 2025 Scott Friedman and Project Contributors
+SPDX-FileCopyrightText: 2025-2026 Scott Friedman and Project Contributors

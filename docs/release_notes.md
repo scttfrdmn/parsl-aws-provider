@@ -53,4 +53,4 @@ Initial release of the Parsl Ephemeral AWS Provider.
 - Other dependencies as specified in requirements.txt
 
 SPDX-License-Identifier: Apache-2.0
-SPDX-FileCopyrightText: 2025 Scott Friedman and Project Contributors
+SPDX-FileCopyrightText: 2025-2026 Scott Friedman and Project Contributors

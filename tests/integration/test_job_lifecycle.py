@@ -6,7 +6,7 @@ The operating mode is mocked to avoid EC2/Lambda API calls, letting us focus
 on the provider's state management and concurrency guarantees.
 
 SPDX-License-Identifier: Apache-2.0
-SPDX-FileCopyrightText: 2025 Scott Friedman and Project Contributors
+SPDX-FileCopyrightText: 2025-2026 Scott Friedman and Project Contributors
 """
 
 import os

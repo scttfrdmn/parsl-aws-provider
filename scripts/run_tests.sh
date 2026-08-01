@@ -8,7 +8,7 @@
 # #125 only so it does not point at a dead LocalStack endpoint.
 #
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: 2025 Scott Friedman and Project Contributors
+# SPDX-FileCopyrightText: 2025-2026 Scott Friedman and Project Contributors
 
 set -e
 

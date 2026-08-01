@@ -4,7 +4,7 @@ This module provides utilities for validating and managing CIDR blocks
 to ensure secure network configurations.
 
 SPDX-License-Identifier: Apache-2.0
-SPDX-FileCopyrightText: 2025 Scott Friedman and Project Contributors
+SPDX-FileCopyrightText: 2025-2026 Scott Friedman and Project Contributors
 """
 
 import ipaddress

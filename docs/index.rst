@@ -1,220 +1,127 @@
 Parsl Ephemeral AWS Provider
-==========================
+============================
 
-A modern, flexible AWS provider for the `Parsl <https://parsl-project.org/>`_ parallel scripting library
-that leverages ephemeral resources for cost-effective, scalable scientific computation.
-
-.. image:: https://badge.fury.io/py/parsl-ephemeral-aws.svg
-   :target: https://badge.fury.io/py/parsl-ephemeral-aws
-   :alt: PyPI version
+A provider for the `Parsl <https://parsl-project.org/>`_ parallel scripting library
+that runs workflows on ephemeral AWS resources: instances are created when work
+arrives and destroyed when it finishes.
 
 .. image:: https://img.shields.io/badge/License-Apache%202.0-blue.svg
    :target: https://opensource.org/licenses/Apache-2.0
    :alt: License
 
-.. image:: https://img.shields.io/pypi/pyversions/parsl-ephemeral-aws.svg
-   :target: https://pypi.org/project/parsl-ephemeral-aws/
-   :alt: Python Versions
-
-.. image:: https://readthedocs.org/projects/parsl-ephemeral-aws/badge/?version=latest
-   :target: https://parsl-ephemeral-aws.readthedocs.io/en/latest/?badge=latest
-   :alt: Documentation Status
-
 .. image:: https://github.com/scttfrdmn/parsl-aws-provider/actions/workflows/ci.yml/badge.svg
    :target: https://github.com/scttfrdmn/parsl-aws-provider/actions/workflows/ci.yml
    :alt: Build Status
 
-.. image:: https://codecov.io/gh/scttfrdmn/parsl-aws-provider/branch/main/graph/badge.svg
-   :target: https://codecov.io/gh/scttfrdmn/parsl-aws-provider
-   :alt: codecov
+.. warning::
 
-.. note::
+   This package is **alpha**. The public interface and configuration schema may
+   change in any release before 1.0.0.
 
-   The Parsl Ephemeral AWS Provider enables seamless execution of Parsl workflows on dynamically provisioned
-   AWS resources with true ephemerality - resources are created when needed and destroyed when not,
-   minimizing costs while maximizing scalability.
+Key features
+------------
 
-Key Features
------------
+* **Three operating modes** -- standard (direct client-to-worker), detached
+  (a bastion orchestrates jobs so the client can disconnect), and serverless
+  (Lambda or ECS/Fargate workers).
+* **Spot support** -- on-demand or spot, single instances or EC2 Fleet, with
+  ``price-capacity-optimized`` allocation and two-minute interruption warnings
+  delivered through EventBridge and SQS.
+* **State persistence** -- file, S3, or SSM Parameter Store, so a provider can be
+  reconstructed after a restart.
+* **Pre-provisioned networking** -- you supply the VPC, subnet, and security
+  group; the provider never creates or deletes them. See
+  :doc:`network-prerequisites`.
 
-* **Truly Ephemeral**: All resources (including VPC, security groups, etc.) are cleaned up automatically
-* **Flexible Compute Options**: Supports EC2, Spot instances, Lambda, and ECS/Fargate
-* **Modern AWS Integration**: Uses EC2 Fleet, Spot Fleet, auto-scaling groups, and other advanced AWS features
-* **Resilient Execution**: Intelligently handles spot interruptions with state persistence
-* **Multi-mode Operation**: Choose between standard, detached, or serverless execution modes
+Networking is a prerequisite, not an option
+-------------------------------------------
 
-Documentation Overview
---------------------
+Since v0.7.0 ``vpc_id``, ``subnet_id``, and ``security_group_id`` are **required**
+for every mode except serverless-with-Lambda workers. Read
+:doc:`network-prerequisites` before your first run.
 
-.. grid:: 3
-
-   .. grid-item-card:: Getting Started
-      :link: getting_started/index
-      :link-type: doc
-
-      Learn how to install and get up and running quickly with basic examples.
-
-   .. grid-item-card:: User Guide
-      :link: user_guide/index
-      :link-type: doc
-
-      Comprehensive documentation for core features and configurations.
-
-   .. grid-item-card:: Operating Modes
-      :link: operating_modes/index
-      :link-type: doc
-
-      Explore the different operating modes: Standard, Detached, and Serverless.
-
-   .. grid-item-card:: Advanced Topics
-      :link: advanced_topics/index
-      :link-type: doc
-
-      Dive into advanced features like spot interruption handling, MPI, and more.
-
-   .. grid-item-card:: Developer Guide
-      :link: developer/index
-      :link-type: doc
-
-      Contributing, architecture, testing, and extending the provider.
-
-   .. grid-item-card:: Examples & Tutorials
-      :link: examples/index
-      :link-type: doc
-
-      Complete working examples and tutorials for common use cases.
-
-Quick Example
------------
+Quick example
+-------------
 
 .. code-block:: python
 
+   import parsl
    from parsl.config import Config
    from parsl.executors import HighThroughputExecutor
    from parsl_ephemeral_aws import EphemeralAWSProvider
 
-   # Configure the ephemeral AWS provider
    provider = EphemeralAWSProvider(
-       image_id='ami-12345678',  # Amazon Linux 2 AMI
-       instance_type='t3.medium',
-       region='us-west-2',
-
+       region="us-east-1",
+       instance_type="t3.medium",
+       # Pre-provisioned network resources. Required -- see network-prerequisites.
+       vpc_id="vpc-0123456789abcdef0",
+       subnet_id="subnet-0123456789abcdef0",
+       security_group_id="sg-0123456789abcdef0",
        # Block parameters
        init_blocks=1,
        min_blocks=0,
        max_blocks=10,
-
-       # Ephemeral settings
-       use_spot_instances=True,
-       spot_max_price_percentage=80,  # 80% of on-demand price
-
-       # State persistence
-       state_store='parameter_store',  # 'parameter_store', 's3', 'file', 'none'
+       # Spot instances at up to 80% of the on-demand price
+       use_spot=True,
+       spot_max_price_percentage=80,
+       # State persistence: "file", "s3", or "parameter_store"
+       state_store_type="file",
    )
 
-   # Create Parsl configuration
    config = Config(
        executors=[
            HighThroughputExecutor(
-               label='aws_executor',
+               label="aws_executor",
                provider=provider,
+               # See network-prerequisites: CurveZMQ certificates live in the
+               # driver's run_dir and workers cannot read them (#62).
+               encrypted=False,
            )
        ]
    )
 
-   # Load the configuration
-   import parsl
-   parsl.load(config)
+   with parsl.load(config):
 
-   # Define and run your Parsl workflows
-   @parsl.python_app
-   def hello_world():
-       return "Hello, World!"
+       @parsl.python_app
+       def hello():
+           return "Hello from AWS"
 
-   result = hello_world()
-   print(result.result())
+       print(hello().result())
 
-.. toctree::
-   :maxdepth: 1
-   :hidden:
-   :caption: Getting Started
-
-   getting_started/index
-   getting_started/installation
-   getting_started/quickstart
-   getting_started/basic_concepts
+``image_id`` is optional: an Amazon Linux 2023 AMI is resolved from AWS's public
+SSM parameters for the region and architecture in use.
 
 .. toctree::
-   :maxdepth: 1
-   :hidden:
-   :caption: User Guide
+   :maxdepth: 2
+   :caption: Using the provider
 
-   user_guide/index
-   user_guide/configuration
-   user_guide/state_persistence
-   user_guide/resource_management
-   user_guide/spot_handling
-
-.. toctree::
-   :maxdepth: 1
-   :hidden:
-   :caption: Operating Modes
-
-   operating_modes/index
-   operating_modes/standard_mode
-   operating_modes/detached_mode
-   operating_modes/serverless_mode
+   getting_started
+   network-prerequisites
+   operating_modes
+   state_persistence
+   spot_fleet
+   examples
+   troubleshooting
 
 .. toctree::
-   :maxdepth: 1
-   :hidden:
-   :caption: Advanced Topics
+   :maxdepth: 2
+   :caption: Integrations
 
-   advanced_topics/index
-   advanced_topics/cost_optimization
-   advanced_topics/mpi_workflows
-   advanced_topics/gpu_computing
-   advanced_topics/security
+   globus_compute
 
 .. toctree::
-   :maxdepth: 1
-   :hidden:
-   :caption: Developer Guide
+   :maxdepth: 2
+   :caption: Reference
 
-   developer/index
-   developer/architecture
-   developer/contributing
-   developer/testing
-   developer/extending
+   api_reference
+   security
+   architecture
 
 .. toctree::
-   :maxdepth: 1
-   :hidden:
-   :caption: Examples & Tutorials
+   :maxdepth: 2
+   :caption: Development
 
-   examples/index
-   examples/data_analysis
-   examples/machine_learning
-   examples/scientific_computing
-   examples/hybrid_workflows
-
-.. toctree::
-   :maxdepth: 1
-   :hidden:
-   :caption: API Reference
-
-   api/index
-   api/provider
-   api/modes
-   api/compute
-   api/network
-   api/state
-
-.. toctree::
-   :maxdepth: 1
-   :hidden:
-   :caption: Project
-
-   project/roadmap
-   project/changelog
-   project/license
+   substrate_testing
+   ci_cd
+   roadmap
+   release_notes

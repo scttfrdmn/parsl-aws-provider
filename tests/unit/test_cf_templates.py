@@ -5,7 +5,7 @@ sites patch it out with a string literal, so the fact that it raised
 ``ModuleNotFoundError`` on every call went unnoticed (#112).
 
 SPDX-License-Identifier: Apache-2.0
-SPDX-FileCopyrightText: 2025 Scott Friedman and Project Contributors
+SPDX-FileCopyrightText: 2025-2026 Scott Friedman and Project Contributors
 """
 
 from pathlib import Path

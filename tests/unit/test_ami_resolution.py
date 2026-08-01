@@ -10,7 +10,7 @@ Architecture matters just as much: an x86_64 AMI on a Graviton instance type
 fails to launch, and nothing in this package distinguished the two before #84.
 
 SPDX-License-Identifier: Apache-2.0
-SPDX-FileCopyrightText: 2025 Scott Friedman and Project Contributors
+SPDX-FileCopyrightText: 2025-2026 Scott Friedman and Project Contributors
 """
 
 from unittest.mock import MagicMock

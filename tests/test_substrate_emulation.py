@@ -9,7 +9,7 @@ integration tests, which exercise provider code and would attribute an emulator
 regression to the provider.
 
 SPDX-License-Identifier: Apache-2.0
-SPDX-FileCopyrightText: 2025 Scott Friedman and Project Contributors
+SPDX-FileCopyrightText: 2025-2026 Scott Friedman and Project Contributors
 """
 
 import pytest

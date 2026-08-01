@@ -1,179 +1,276 @@
-# Globus Compute Integration Guide
+# Globus Compute integration
 
-Run Python functions on ephemeral AWS EC2 instances through the **Globus Compute**
-platform — from any network environment, including corporate firewalls, university
-networks, and home routers.
+Run Python functions on ephemeral AWS EC2 instances through
+[Globus Compute](https://globus-compute.readthedocs.io/), from any network
+environment — including behind corporate firewalls, university networks, and home
+routers.
 
----
-
-## Architecture
-
-```
-Your Machine (any network)          Globus Compute Service           AWS EC2
-┌──────────────────────┐            ┌──────────────────┐         ┌──────────────────┐
-│ globus_compute_sdk   │            │ Globus Compute   │         │ GlobusCompute-   │
-│ Executor.submit(fn)  │◄──AMQP────►│ Message Router   │◄──SSM──►│ Engine worker    │
-│                      │            │ (globusid.org)   │  tunnel │ + Parsl HTEX     │
-└──────────────────────┘            └──────────────────┘         └──────────────────┘
-                                                                       ▲
-                                                              GlobusComputeProvider
-                                                              (creates VPC / EC2)
+```{warning}
+Read [Known limitations](#known-limitations) before deploying. The generated
+`config.yaml` currently drops `worker_init` and hardcodes `encrypted: true`, and
+both defects prevent workers from starting
+([#138](https://github.com/scttfrdmn/parsl-aws-provider/issues/138)). Two manual
+edits work around them, and are given below.
 ```
 
-Key points:
+## Why it is worth the trouble
 
-* **No inbound ports required.** The EC2 instance connects *outward* to the Globus
-  message router via AMQP (port 443). AWS Session Manager tunneling handles all
-  management traffic.
-* **Ephemeral infrastructure.** EC2 instances are created when the endpoint starts
-  workers and terminated when they idle out or the endpoint is stopped.
-* **Globus auth.** Functions are submitted to an endpoint UUID. Auth uses the Globus
-  identity platform — no AWS credentials required on the client machine.
+Standard mode needs the client to accept **inbound** TCP on the interchange
+ports, which a NAT'd laptop cannot. Globus Compute inverts that: the endpoint
+runs somewhere reachable, and both your client and the EC2 workers connect
+*outward*.
 
----
+```
+Your machine (any network)        Globus Compute service        AWS EC2
+┌──────────────────────┐          ┌──────────────────┐      ┌──────────────────┐
+│ globus_compute_sdk   │          │ Globus Compute   │      │ GlobusCompute-   │
+│ Executor.submit(fn)  │◄──AMQP──►│ message router   │◄────►│ Engine worker    │
+│                      │   :443   │ (globus.org)     │ ZMQ  │ + Parsl HTEX     │
+└──────────────────────┘          └──────────────────┘      └──────────────────┘
+                                            ▲
+                                   globus-compute-endpoint
+                                   daemon + GlobusComputeProvider
+                                   (launches and terminates EC2)
+```
+
+The endpoint daemon holds the provider, so **the daemon host is what workers
+connect back to** — the same reachability requirement standard mode has, just
+moved. Run the endpoint on an EC2 instance in the same VPC as the workers, or in
+a subnet they can route to. Running it on a NAT'd laptop does not work, which is
+the single most common misreading of this diagram.
+
+What Globus Compute does buy you: your *client* can be anywhere, functions are
+addressed by endpoint UUID rather than network location, and authentication is
+Globus identity rather than AWS credentials on the client machine.
 
 ## Prerequisites
 
-### 1. AWS account and credentials
+**1. Pre-provisioned network.** Since v0.7.0 `vpc_id`, `subnet_id`, and
+`security_group_id` are required — the provider never creates them. See
+[network-prerequisites.md](network-prerequisites.md). Every example below passes
+all three; omitting them raises at construction:
 
-```bash
-aws configure --profile aws   # Access Key ID, Secret, region
+```
+ValueError: vpc_id, subnet_id, and security_group_id are required.
+Pre-provision network resources outside the provider.
 ```
 
-The IAM user / role must have EC2, SSM, and IAM permissions.
-Generate the minimum policy document with:
+**2. AWS credentials** for the endpoint daemon host. Generate the minimum IAM
+policy from the code rather than transcribing one:
 
 ```python
-from parsl_ephemeral_aws import GlobusComputeProvider
 import json
+
+from parsl_ephemeral_aws import GlobusComputeProvider
+
 print(json.dumps(GlobusComputeProvider.minimum_iam_policy(), indent=2))
-# For private ECR images add: minimum_iam_policy(include_ecr=True)
+print(json.dumps(GlobusComputeProvider.minimum_iam_policy(include_ecr=True), indent=2))
 ```
 
-### 2. Python package
+It grants no network-creation actions, which is deliberate — see
+[security.md](security.md).
+
+**3. The `globus` extra.**
 
 ```bash
-# Core install + Globus Compute extras
-pip install "parsl-ephemeral-aws[globus]"
-
-# Or install the Globus packages separately
-pip install parsl-ephemeral-aws globus-compute-sdk globus-compute-endpoint
+uv sync --extra globus
 ```
 
-> **Note on Python version**: `globus-compute-endpoint` requires Python ≥ 3.10.
+`globus-compute-endpoint` requires Python ≥ 3.10, which this project already
+does. It pins `parsl` exactly, so the floor is `>=4.10.1` — the first release
+pinning a `parsl` version compatible with this package.
 
-### 3. Globus account and authentication
+**4. Globus authentication**, once, on the daemon host:
 
 ```bash
-# Log in once (opens a browser for OAuth)
-globus-compute-endpoint login
+uv run globus-compute-endpoint login
 ```
 
-Tokens are cached at `~/.globus_compute/storage.db` and refreshed automatically.
+Tokens cache in `~/.globus_compute/storage.db` and refresh automatically.
 
----
+## Quick start
 
-## Quick Start
-
-### Step 1 — Generate an endpoint config
+### 1. Generate the config
 
 ```python
 from parsl_ephemeral_aws import GlobusComputeProvider
 
 provider = GlobusComputeProvider(
     region="us-east-1",
+    vpc_id="vpc-0123456789abcdef0",
+    subnet_id="subnet-0123456789abcdef0",
+    security_group_id="sg-0123456789abcdef0",
     instance_type="t3.medium",
     mode="standard",
-    auto_create_instance_profile=True,   # creates SSM role automatically
+    auto_create_instance_profile=True,
+    min_blocks=0,
     max_blocks=4,
     display_name="My Ephemeral AWS Endpoint",
 )
 
-# Writes ~/.globus_compute/my_aws_endpoint/config.yaml
 provider.generate_endpoint_config("~/.globus_compute/my_aws_endpoint")
 ```
 
-### Step 2 — Start the endpoint daemon
+This writes **two** files:
 
-```bash
-globus-compute-endpoint start my_aws_endpoint
+| File | Purpose |
+|---|---|
+| `config.yaml` | the configuration — the file to edit |
+| `config.py` | a loader shim; do not edit |
+
+Both are needed. Globus Compute resolves a provider's `type:` key by
+`getattr(parsl.providers, type_name, None)` and raises when that is `None`, so a
+class Parsl does not ship is unreachable — and `getattr` cannot walk a dotted
+path, so `type: parsl_ephemeral_aws.globus_compute.GlobusComputeProvider` can
+never resolve either. Importing `parsl_ephemeral_aws` assigns the class onto
+`parsl.providers`, but the endpoint daemon has no reason to import this package.
+The `config.py` shim does that import and then hands `config.yaml` to Globus
+Compute's own loader; `get_config()` prefers `config.py` when both are present,
+which is what makes the pair work
+([#87](https://github.com/scttfrdmn/parsl-aws-provider/issues/87)).
+
+### 2. Apply the two required edits
+
+Open `config.yaml` and make both changes. Without them the endpoint starts, EC2
+instances launch, and no worker ever registers
+([#138](https://github.com/scttfrdmn/parsl-aws-provider/issues/138)).
+
+```yaml
+engine:
+  type: GlobusComputeEngine
+  encrypted: false          # ← change from true; see below
+  provider:
+    type: GlobusComputeProvider
+    region: us-east-1
+    # ... generated keys ...
+    # ← add this, replacing the default worker_init entirely:
+    worker_init: "dnf install -y python3.11 python3.11-pip\nln -sf /usr/bin/python3.11 /usr/bin/python3\npip3.11 install --quiet --upgrade globus-compute-endpoint\n"
 ```
 
-The endpoint registers with the Globus Compute service and prints its UUID:
+**Why `worker_init`.** A Globus Compute worker is not launched with Parsl's
+`process_worker_pool.py`. The engine rewrites the command to:
+
+```
+globus-compute-endpoint python-exec parsl.executors.high_throughput.process_worker_pool -a ...
+```
+
+so `globus-compute-endpoint` must be on the worker's `PATH`. The provider's
+default `worker_init` installs `parsl` and not `globus-compute-endpoint`, and the
+generator drops any value you passed to the constructor — so the reconstructed
+provider always gets the default. The worker command is then `command not found`.
+
+**Why `encrypted: false`.** `GlobusComputeEngine` forwards `encrypted` to the
+wrapped `HighThroughputExecutor`, which generates CurveZMQ certificates in its
+`run_dir` **on the endpoint host** and passes that path to workers as
+`--cert_dir`. An EC2 worker has no such path and dies with `FileNotFoundError`
+before registering. Same-VPC deployments rely on VPC isolation instead;
+certificate distribution is
+[#62](https://github.com/scttfrdmn/parsl-aws-provider/issues/62).
+
+```{note}
+High-Assurance endpoints reject `encrypted: false`
+(`GlobusComputeEngine.assert_ha_compliant()`), so they need #62 resolved rather
+than this workaround.
+```
+
+Anything else the generator dropped goes in the same place — `additional_tags`,
+`state_store_type`, `use_spot_fleet`, `warm_pool_size`, `image_id`, and 32 more.
+A hand-edited `config.yaml` accepts every `EphemeralAWSProvider` option; only the
+*generator* is selective.
+
+### 3. Start the endpoint
+
+```bash
+uv run globus-compute-endpoint start my_aws_endpoint
+```
+
+It registers and prints its UUID:
 
 ```
 Starting endpoint; registered endpoint ID: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
 ```
 
-Copy the UUID — you need it to submit functions.
-
-### Step 3 — Submit functions from your client machine
+### 4. Submit from anywhere
 
 ```python
 from globus_compute_sdk import Executor
 
-ENDPOINT_ID = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"   # from step 2
+ENDPOINT_ID = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+
 
 def square(x):
     return x * x
 
+
 with Executor(endpoint_id=ENDPOINT_ID) as ex:
-    future = ex.submit(square, 7)
-    print(future.result())   # → 49
+    print(ex.submit(square, 7).result())   # → 49
 ```
 
-### Step 4 — Stop the endpoint
+### 5. Stop it
 
 ```bash
-globus-compute-endpoint stop my_aws_endpoint
+uv run globus-compute-endpoint stop my_aws_endpoint
 ```
 
-This gracefully drains pending functions and terminates all EC2 worker instances.
+This drains pending functions and scales the provider's blocks in. It does not
+call `provider.shutdown()`, so sweep for leftovers if the daemon died uncleanly:
 
----
+```bash
+uv run python tools/cleanup_aws_resources.py --dry-run --region us-east-1
+```
 
-## Configuration Reference
+## Configuration reference
 
-`GlobusComputeProvider` accepts all `EphemeralAWSProvider` parameters plus three
-additional ones:
+`GlobusComputeProvider` accepts every `EphemeralAWSProvider` parameter plus three
+of its own:
 
 | Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `endpoint_id` | `str \| None` | `None` | Globus Compute endpoint UUID. Written as a comment into the generated `config.yaml`. |
-| `container_image` | `str \| None` | `None` | Docker image URI for containerised workers. Sets `container_type: docker` and `container_uri` in the config. Supports Docker Hub, ECR, and any registry reachable from EC2. |
-| `display_name` | `str` | `"Ephemeral AWS Endpoint"` | Human-readable label shown in the Globus Compute web console. |
+|---|---|---|---|
+| `endpoint_id` | `str \| None` | `None` | Endpoint UUID. Emitted into `config.yaml` as a provider key and a trailing comment. |
+| `container_image` | `str \| None` | `None` | Image URI. Sets `container_type: docker` and `container_uri` under `engine`. |
+| `display_name` | `str` | `"Ephemeral AWS Endpoint"` | Label shown in the Globus Compute web console. |
 
-All `EphemeralAWSProvider` parameters are forwarded unchanged. The most relevant
-ones for Globus Compute deployments:
+Parameters that reach `config.yaml` today: `region`, `instance_type`, `mode`,
+`vpc_id`, `subnet_id`, `security_group_id`, `min_blocks`, `max_blocks`,
+`use_spot`, `spot_interruption_handling`, `auto_create_instance_profile`,
+`iam_instance_profile_arn`, `container_image`, `status_polling_interval`,
+`waiter_delay`, `waiter_max_attempts`, and `endpoint_id`. Everything else must be
+added to the YAML by hand until #138 lands.
 
-| Parameter | Recommended value | Notes |
-|-----------|-------------------|-------|
-| `region` | Your nearest AWS region | |
-| `instance_type` | `"t3.medium"` — `"c5.2xlarge"` | Match to function workload |
-| `mode` | `"standard"` | Most Globus Compute use-cases |
+Recommended values for a Globus Compute deployment:
+
+| Parameter | Suggested | Why |
+|---|---|---|
+| `mode` | `"standard"` | Detached mode's bastion duplicates what the endpoint daemon already does |
 | `min_blocks` | `0` | Scale to zero when idle |
-| `max_blocks` | `4` — `20` | Maximum parallel workers |
-| `use_spot` | `True` | 70–90 % cost reduction for fault-tolerant workloads |
-| `auto_create_instance_profile` | `True` | Automatically grants SSM access |
-| `auto_shutdown` | `True` | Terminate idle workers |
-| `max_idle_time` | `300` | Seconds before idle worker terminates |
+| `max_blocks` | `4`–`20` | Hard ceiling on concurrent instances |
+| `use_spot` | `True` | Large saving for fault-tolerant functions; set `max_retries_on_system_failure` on the engine |
+| `auto_create_instance_profile` | `True` | Creates a role with `AmazonSSMManagedInstanceCore` |
+| `auto_shutdown` + `max_idle_time` | `True`, `300` | Reclaim idle instances |
+| `bake_ami` | `True` | Runs `worker_init` once into an AMI instead of on every launch |
 
----
+`mode="serverless"` is not useful here — Lambda and Fargate cannot run the
+long-lived `globus-compute-endpoint` worker process the engine expects.
 
 ## Examples
 
-### Spot-instance endpoint (cost-optimised)
+Each of these still needs the two edits from step 2.
+
+### Spot endpoint
 
 ```python
 from parsl_ephemeral_aws import GlobusComputeProvider
 
 provider = GlobusComputeProvider(
     region="us-east-1",
+    vpc_id="vpc-0123456789abcdef0",
+    subnet_id="subnet-0123456789abcdef0",
+    security_group_id="sg-0123456789abcdef0",
     instance_type="c5.large",
     mode="standard",
     use_spot=True,
     spot_interruption_handling=True,
-    checkpoint_bucket="my-parsl-checkpoints",   # required for interruption recovery
+    checkpoint_bucket="my-parsl-checkpoints",  # gates detection, see below
     min_blocks=0,
     max_blocks=10,
     auto_create_instance_profile=True,
@@ -183,18 +280,37 @@ provider = GlobusComputeProvider(
 provider.generate_endpoint_config("~/.globus_compute/spot_aws")
 ```
 
-Start the endpoint and submit long-running functions — spot interruptions are
-detected automatically and the work is re-queued from the last checkpoint.
+What actually protects your work is a retry policy on the engine, not the
+interruption handler:
 
-### Container endpoint (reproducible environments)
+```yaml
+engine:
+  type: GlobusComputeEngine
+  encrypted: false
+  max_retries_on_system_failure: 3    # this is what re-runs reclaimed functions
+```
+
+Two limitations, both
+[#137](https://github.com/scttfrdmn/parsl-aws-provider/issues/137):
+`checkpoint_bucket` is an accidental prerequisite for the interruption monitor
+being constructed *at all* — without it you get one WARNING at startup and no
+detection — and what the warning triggers today is a log line, not task
+recovery. Treat it as observability.
+
+`checkpoint_bucket` is also one of the dropped parameters (#138), so add it to
+the YAML by hand.
+
+### Container endpoint
 
 ```python
-from parsl_ephemeral_aws import GlobusComputeProvider
-
 provider = GlobusComputeProvider(
     region="us-west-2",
+    vpc_id="vpc-0123456789abcdef0",
+    subnet_id="subnet-0123456789abcdef0",
+    security_group_id="sg-0123456789abcdef0",
     instance_type="t3.large",
-    container_image="python:3.11-slim",      # or a private ECR image
+    mode="standard",
+    container_image="python:3.11-slim",
     min_blocks=0,
     max_blocks=5,
     auto_create_instance_profile=True,
@@ -204,154 +320,173 @@ provider = GlobusComputeProvider(
 provider.generate_endpoint_config("~/.globus_compute/python311_aws")
 ```
 
-For private ECR images your IAM role needs the ECR permissions from
-`GlobusComputeProvider.minimum_iam_policy(include_ecr=True)`.
+`container_type: docker` means the engine wraps the worker command in
+`docker run`, so `worker_init` must install and start Docker *and* the image must
+contain `globus-compute-endpoint`:
 
-### Multi-region deployment
+```yaml
+    worker_init: "dnf install -y docker\nsystemctl start docker\n"
+```
 
-Deploy one endpoint per region for geographic locality:
+`python:3.11-slim` does not contain it, so build your own image or pass one that
+does. For a private ECR image, add the permissions from
+`minimum_iam_policy(include_ecr=True)`.
+
+### One endpoint per region
 
 ```python
-for region, name in [
-    ("us-east-1", "aws-us-east"),
-    ("eu-west-1", "aws-eu-west"),
-    ("ap-southeast-1", "aws-ap-se"),
-]:
+NETWORK = {
+    "us-east-1": ("vpc-0aaa", "subnet-0aaa", "sg-0aaa"),
+    "eu-west-1": ("vpc-0bbb", "subnet-0bbb", "sg-0bbb"),
+}
+
+for region, name in [("us-east-1", "aws-us-east"), ("eu-west-1", "aws-eu-west")]:
+    vpc_id, subnet_id, security_group_id = NETWORK[region]
     GlobusComputeProvider(
         region=region,
+        vpc_id=vpc_id,
+        subnet_id=subnet_id,
+        security_group_id=security_group_id,
         instance_type="c5.xlarge",
+        mode="standard",
         auto_create_instance_profile=True,
         display_name=f"AWS {region}",
     ).generate_endpoint_config(f"~/.globus_compute/{name}")
 ```
 
-Then start each endpoint and route functions to the nearest one:
+Network IDs are per-region — a VPC in `us-east-1` does not exist in `eu-west-1`,
+so the loop needs a mapping rather than one shared set of IDs. Then route
+functions to the nearest endpoint:
 
 ```python
 from globus_compute_sdk import Executor
 
-ENDPOINTS = {
-    "us-east-1": "uuid-for-us-east",
-    "eu-west-1": "uuid-for-eu-west",
-}
+ENDPOINTS = {"us-east-1": "uuid-for-us-east", "eu-west-1": "uuid-for-eu-west"}
 
 with Executor(endpoint_id=ENDPOINTS["us-east-1"]) as ex:
-    result = ex.submit(my_function, data).result()
+    print(ex.submit(my_function, data).result())
 ```
 
-### IAM policy document
+Each endpoint needs its own daemon process and its own `globus-compute-endpoint
+start`.
 
-Print the minimum IAM policy and attach it to your IAM user/role:
+## Known limitations
 
-```python
-import json
-from parsl_ephemeral_aws import GlobusComputeProvider
+- **`worker_init` is dropped and `encrypted: true` is hardcoded** in the
+  generated config; both prevent workers from registering, and both need the
+  manual edits from step 2
+  ([#138](https://github.com/scttfrdmn/parsl-aws-provider/issues/138)).
+- **37 of 52 provider parameters are dropped** by the generator, including
+  `additional_tags`, the state-backend selection, and every fleet, warm-pool, and
+  AMI-baking option (#138). Add them to `config.yaml` by hand.
+- **Multi-user (manager) endpoints are unsupported**
+  ([#133](https://github.com/scttfrdmn/parsl-aws-provider/issues/133)). Those
+  render `user_config_template.yaml.j2` to a string and the forked user-endpoint
+  process calls `load_config_yaml()` on it directly, never going through
+  `get_config()` — so there is no `config.py` hook and the "not a valid provider"
+  failure returns. Fixing it needs dotted-path support upstream.
+- **The endpoint daemon must be reachable by workers.** Globus Compute removes
+  the reachability requirement from your *client*, not from the daemon host.
+- **`GlobusComputeExecutor` now ships inside Parsl** and talks to a Globus
+  Compute endpoint directly, bypassing providers. If you want to submit *to* an
+  existing endpoint, use that instead; this class is for standing an endpoint
+  *up* on ephemeral AWS.
 
-# Without ECR
-policy = GlobusComputeProvider.minimum_iam_policy()
-
-# With ECR (needed for private container images)
-policy_with_ecr = GlobusComputeProvider.minimum_iam_policy(include_ecr=True)
-
-print(json.dumps(policy, indent=2))
-```
-
----
-
-## Running the E2E Tests
+## Testing
 
 ```bash
-# 1. Install Globus Compute extras (separate venv recommended due to dill pin)
-pip install "parsl-ephemeral-aws[globus]"
-
-# 2. Authenticate
-globus-compute-endpoint login
-
-# 3. Start your endpoint and export its UUID
+uv sync --extra globus
+uv run globus-compute-endpoint login
 export GLOBUS_COMPUTE_ENDPOINT_ID="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
 
-# 4. Run the tests
-AWS_PROFILE=aws pytest tests/aws/test_globus_compute_e2e.py \
+AWS_PROFILE=aws uv run pytest tests/aws/test_globus_compute_e2e.py \
     -m "aws and globus" --no-cov -v
 ```
 
-Config-generation tests (no running endpoint needed):
+Config-generation tests need no running endpoint or AWS resources:
 
 ```bash
-AWS_PROFILE=aws pytest tests/aws/test_globus_compute_e2e.py \
-    -m "aws and globus" -k "Config" --no-cov -v
+uv run pytest tests/unit/test_globus_compute_provider.py --no-cov -v
 ```
-
----
 
 ## Troubleshooting
 
+### The endpoint starts, instances launch, no worker registers
+
+The two step-2 edits. In order of likelihood:
+
+1. **`globus-compute-endpoint` is not installed on the worker.** Reach the
+   instance with `aws ssm start-session --target i-...` and read
+   `/var/log/cloud-init-output.log`; then run `which globus-compute-endpoint`.
+2. **`encrypted: true` is still set.** The worker dies with `FileNotFoundError`
+   on the `--cert_dir` path before it can log anything useful.
+3. **The daemon host is not reachable from the subnet.** Workers connect back to
+   it over ZMQ. Check the daemon host's own security group, not the workers'.
+
+### `'GlobusComputeProvider' is not a valid provider`
+
+`config.py` is missing or was deleted. Regenerate with
+`generate_endpoint_config()`, which writes both files. If you are using a
+multi-user endpoint, this is #133 and has no workaround yet.
+
 ### `globus-compute-endpoint start` hangs
 
-The endpoint waits for an EC2 worker to come online.  Typical causes:
+It is waiting for a worker. Beyond the above:
 
-* **IAM permissions**: ensure `AmazonSSMManagedInstanceCore` is attached to the
-  instance profile (set `auto_create_instance_profile=True` or specify
-  `iam_instance_profile_arn`).
-* **VPC / subnet routing**: the public subnet must have an Internet Gateway and a
-  route to `0.0.0.0/0`. The provider creates this automatically.
-* **AMI not found**: the provider auto-selects the latest Amazon Linux 2023 AMI
-  for the region. If you supply a custom `image_id`, verify it exists in the
-  target region.
+- **IAM**: the instance needs `AmazonSSMManagedInstanceCore` — set
+  `auto_create_instance_profile=True` or pass `iam_instance_profile_arn`.
+- **Egress**: a private subnet needs a NAT gateway or the `ssm`, `ssmmessages`,
+  and `ec2messages` VPC endpoints, plus a route to whatever package index
+  `worker_init` uses.
+- **AMI**: resolved from SSM for the region and architecture. A custom `image_id`
+  must exist in the target region — and note `image_id` is a dropped parameter
+  (#138), so confirm it actually reached the YAML.
 
-### `ResourceNotFoundException` on endpoint start
+### `ResourceNotFoundException` on start
 
-The endpoint UUID stored in `~/.globus_compute/<name>/` does not exist in the
-Globus Compute service (e.g. it was deleted via the web console). Delete the
-local directory and re-run `globus-compute-endpoint start`:
+The UUID in `~/.globus_compute/<name>/` no longer exists in the service. Delete
+the directory and re-register:
 
 ```bash
 rm -rf ~/.globus_compute/my_aws_endpoint
-globus-compute-endpoint start my_aws_endpoint
+uv run globus-compute-endpoint configure my_aws_endpoint
 ```
 
-### Function raises `TaskExecutionFailed`
+Regenerate the config afterwards — `configure` writes a default one.
 
-The Globus Compute worker ran the function but it raised an exception.  Check the
-endpoint log:
+### `TaskExecutionFailed`
+
+The worker ran your function and it raised. Read
+`~/.globus_compute/my_aws_endpoint/endpoint.log`.
+
+### Instances are still running after the endpoint stopped
+
+`globus-compute-endpoint stop` scales blocks in but does not call
+`provider.shutdown()`, and there is no `atexit` hook. Sweep by tag:
 
 ```bash
-tail -f ~/.globus_compute/my_aws_endpoint/endpoint.log
+uv run python tools/cleanup_aws_resources.py --region us-east-1   # --dry-run first
 ```
 
-### `globus-compute-endpoint login` prompts even after first login
-
-Tokens expire after 48 hours of inactivity.  Re-run `login` — it will refresh
-existing tokens without requiring a new browser flow if the refresh token is
-still valid (up to 6 months).
-
-### SSM connectivity: instance not reachable
-
-Verify SSM agent is running on the instance:
+### SSM reports the instance as unreachable
 
 ```bash
 aws ssm describe-instance-information --profile aws
 ```
 
-The instance must have:
-1. `AmazonSSMManagedInstanceCore` policy attached via instance profile.
-2. Network path to `ssm.<region>.amazonaws.com` (outbound 443).
-3. SSM agent version ≥ 3.0 (Amazon Linux 2023 ships with a current version).
+The instance needs `AmazonSSMManagedInstanceCore` via an instance profile,
+outbound 443 to `ssm.<region>.amazonaws.com`, and IMDS enabled — the provider
+sets `HttpTokens: required` with `HttpEndpoint: enabled` precisely because the
+SSM agent needs it.
 
-### Spot interruptions causing function failures
+## See also
 
-Enable `spot_interruption_handling=True` and provide a `checkpoint_bucket`.
-The interruption monitor checkpoints running tasks to S3 every
-`checkpoint_interval` seconds (default 60 s) and re-queues them when a new
-worker comes online.
+- [network-prerequisites.md](network-prerequisites.md) — the VPC, subnet, and
+  security group you must supply
+- [security.md](security.md) — IAM policy, instance profiles, encryption
+- [troubleshooting.md](troubleshooting.md) — provider-level failures
+- [spot_fleet.md](spot_fleet.md) — diversified instance types
+- [Globus Compute documentation](https://globus-compute.readthedocs.io/)
 
----
-
-## See Also
-
-* [EphemeralAWSProvider API reference](operating_modes.md)
-* [Spot instance guide](spot_fleet.md)
-* [State persistence backends](state_persistence.md)
-* [Security and IAM](security.md)
-* [Globus Compute documentation](https://globus-compute.readthedocs.io/)
-* [Globus Compute SDK on PyPI](https://pypi.org/project/globus-compute-sdk/)
+SPDX-License-Identifier: Apache-2.0
+SPDX-FileCopyrightText: 2025-2026 Scott Friedman and Project Contributors

@@ -1,500 +1,195 @@
 #!/usr/bin/env python3
+"""Serverless mode: Lambda functions or Fargate tasks instead of EC2 instances.
+
+Lambda suits short, highly parallel work and needs no network configuration at
+all — functions run in the Lambda-managed VPC. Fargate suits longer or
+larger-memory tasks and does need a subnet and security group, because
+`awsvpcConfiguration` is mandatory for it.
+
+Two things to know before using this mode:
+
+* `worker_init` has no effect on either backend. There is no instance to run it
+  on, so dependencies must be in the Lambda deployment package or layer, or in
+  the container image.
+* The Fargate container image is not configurable through the provider — it is
+  fixed at `public.ecr.aws/lambda/python:3.9` (issue #136). Since running your own
+  image is the usual reason to prefer Fargate, Lambda is the better choice today.
+
+Usage
+-----
+    export AWS_PROFILE=aws
+    export AWS_TEST_REGION=us-east-1
+
+    uv run python examples/serverless_mode.py lambda
+
+    # Fargate additionally needs a subnet and security group:
+    export AWS_TEST_VPC_ID=vpc-...
+    export AWS_TEST_SUBNET_ID=subnet-...
+    export AWS_TEST_SG_ID=sg-...
+    uv run python examples/serverless_mode.py ecs
+
+SPDX-License-Identifier: Apache-2.0
+SPDX-FileCopyrightText: 2025-2026 Scott Friedman and Project Contributors
 """
-Serverless Mode Example for Parsl Ephemeral AWS Provider.
 
-This script demonstrates how to use the Parsl Ephemeral AWS Provider in Serverless Mode.
-In Serverless Mode, the provider leverages AWS Lambda functions or Fargate containers
-to execute tasks without provisioning or managing any EC2 instances. This mode is ideal for:
-
-1. Highly scalable, short-duration tasks (Lambda)
-2. Tasks requiring more memory or longer durations (Fargate)
-3. Reducing infrastructure management overhead
-4. Minimizing costs for intermittent workloads
-
-Key features of Serverless Mode:
-- Zero infrastructure management
-- Rapid scaling to hundreds or thousands of concurrent tasks
-- Pay only for actual compute time used
-- Support for both Lambda and Fargate compute types
-- Simplified security model
-"""
-
-import time
 import logging
+import os
+import sys
+
 import parsl
 from parsl.app.python import python_app
 from parsl.config import Config
 from parsl.executors import HighThroughputExecutor
 
-# Import the EphemeralAWSProvider and ServerlessMode
-from parsl_ephemeral_aws.provider import EphemeralAWSProvider
-from parsl_ephemeral_aws.modes.serverless import ServerlessMode
-from parsl_ephemeral_aws.state.s3 import S3StateStore
+from parsl_ephemeral_aws import EphemeralAWSProvider
 
-# Set up logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("ServerlessModeExample")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger("serverless-mode")
 
 
-# Define a simple Python app for testing
 @python_app
-def serverless_task(task_type="processing", data_size=10, cpu_intensive=False):
-    """
-    A Python app that runs on AWS serverless resources (Lambda or Fargate).
-
-    Parameters
-    ----------
-    task_type : str
-        Type of task to simulate ('processing', 'inference', etc.)
-    data_size : int
-        Simulated data size in MB to process
-    cpu_intensive : bool
-        Whether to perform CPU-intensive calculations
-
-    Returns
-    -------
-    dict
-        Dictionary containing execution info
-    """
-    import os
-    import uuid
+def serverless_task(task_type="processing", data_size=1):
+    """Do a little work and report the execution environment it landed in."""
     import math
+    import os
     import platform
+    import time
 
-    # In serverless mode, we may not have a traditional hostname
-    # Lambda functions use an execution environment ID
-    try:
-        import socket
-
-        hostname = socket.gethostname()
-    except Exception:
-        hostname = f"serverless-{str(uuid.uuid4())[:8]}"
-
-    # Get AWS Lambda specific environment variables if available
-    aws_lambda_function_name = os.environ.get("AWS_LAMBDA_FUNCTION_NAME", "not-lambda")
-    aws_lambda_function_version = os.environ.get(
-        "AWS_LAMBDA_FUNCTION_VERSION", "not-lambda"
-    )
-    aws_region = os.environ.get("AWS_REGION", "unknown")
-
-    # Get container-specific info if in Fargate
-    task_id = os.environ.get("ECS_TASK_ID", "not-ecs")
-    container_id = os.environ.get("ECS_CONTAINER_ID", "not-ecs")
-
-    # Record start time
-    start_time = time.time()
-
-    # Simulate workload based on task_type
-    result_data = {}
+    started = time.time()
 
     if task_type == "processing":
-        # Simulate data processing workload
-        data = [i for i in range(data_size * 100000)]  # Generate dummy data
-        processed_items = len(data)
-        result_data["processed_items"] = processed_items
-
-    elif task_type == "inference":
-        # Simulate ML inference workload
-        if cpu_intensive:
-            # Simulate matrix operations common in ML inference
-            matrix_size = min(
-                1000, data_size * 100
-            )  # Limit matrix size based on data_size
-            matrix = [[math.sin(i * j) for j in range(matrix_size)] for i in range(100)]
-            result = sum(sum(row) for row in matrix)
-            result_data["inference_result"] = result
-        else:
-            # Simulate lightweight inference
-            time.sleep(data_size * 0.1)
-            result_data["inference_result"] = 42
-
+        detail = {"processed_items": sum(1 for _ in range(data_size * 100_000))}
     elif task_type == "etl":
-        # Simulate ETL workload
-        # Process dummy data and transform it
-        source_data = {
-            "records": [{"id": i, "value": i * 2} for i in range(data_size * 100)]
+        records = [{"id": i, "value": i * 2} for i in range(data_size * 100)]
+        transformed = [r["value"] * 1.5 for r in records]
+        detail = {
+            "transformed_count": len(transformed),
+            "avg_value": sum(transformed) / len(transformed) if transformed else 0,
         }
-        transformed_data = [record["value"] * 1.5 for record in source_data["records"]]
-        result_data["transformed_count"] = len(transformed_data)
-        result_data["avg_value"] = (
-            sum(transformed_data) / len(transformed_data) if transformed_data else 0
-        )
-
     else:
-        # Default simple workload
-        time.sleep(data_size * 0.2)
+        primes = [
+            n
+            for n in range(2, 10_000)
+            if all(n % d for d in range(2, int(math.sqrt(n)) + 1))
+        ]
+        detail = {"prime_count": len(primes)}
 
-    # Perform CPU-intensive calculation if requested
-    if cpu_intensive:
-        # Calculate some prime numbers to use CPU
-        primes = []
-        for num in range(2, 10000):
-            is_prime = True
-            for i in range(2, int(math.sqrt(num)) + 1):
-                if num % i == 0:
-                    is_prime = False
-                    break
-            if is_prime:
-                primes.append(num)
-        result_data["prime_count"] = len(primes)
+    # Lambda exports its memory ceiling; Fargate does not.
+    memory_limit = os.environ.get("AWS_LAMBDA_FUNCTION_MEMORY_SIZE", "unknown")
+    on_lambda = "AWS_LAMBDA_FUNCTION_NAME" in os.environ
 
-    # Calculate execution time
-    end_time = time.time()
-    execution_time = end_time - start_time
-
-    # Get available memory limits - in Lambda this is available as an env var
-    memory_limit_mb = os.environ.get(
-        "AWS_LAMBDA_FUNCTION_MEMORY_SIZE",
-        os.environ.get("FARGATE_MEMORY_LIMIT_MB", "unknown"),
-    )
-
-    # Return execution information
     return {
-        "execution_id": str(uuid.uuid4()),
         "task_type": task_type,
-        "data_size_mb": data_size,
-        "cpu_intensive": cpu_intensive,
-        "execution_environment": "Lambda"
-        if aws_lambda_function_name != "not-lambda"
-        else ("Fargate" if task_id != "not-ecs" else "Unknown"),
-        "hostname": hostname,
-        "function_name": aws_lambda_function_name,
-        "function_version": aws_lambda_function_version,
-        "region": aws_region,
-        "ecs_task_id": task_id if task_id != "not-ecs" else None,
-        "container_id": container_id if container_id != "not-ecs" else None,
+        "environment": "Lambda" if on_lambda else "Fargate",
         "platform": platform.platform(),
-        "python_version": platform.python_version(),
-        "memory_limit_mb": memory_limit_mb,
-        "execution_time_seconds": execution_time,
-        "timestamp": time.time(),
-        "result_data": result_data,
+        "python": platform.python_version(),
+        "memory_limit_mb": memory_limit,
+        "execution_time": time.time() - started,
+        "detail": detail,
     }
 
 
-def lambda_mode_example():
-    """Run a workflow using Lambda-based serverless mode."""
-    logger.info("Initializing Serverless Mode with AWS Lambda...")
-
-    # Configure the provider with Serverless Mode (Lambda)
-    provider = EphemeralAWSProvider(
-        mode=ServerlessMode(
-            # AWS Region
-            region="us-west-2",
-            # Lambda-specific configuration
-            compute_type="lambda",  # Use AWS Lambda
-            memory_size=1024,  # Memory in MB
-            timeout=300,  # Maximum function timeout (5 minutes)
-            min_blocks=0,
-            max_blocks=20,  # Can scale to many concurrent invocations
-            # Lambda layers containing dependencies
-            # Create layers with your dependencies including parsl
-            lambda_layers=[
-                "arn:aws:lambda:us-west-2:123456789012:layer:ParslDependencies:1",
-                # Add additional layers as needed for your specific workload
-            ],
-            # Lambda function creation settings
-            function_name_prefix="parsl-serverless-",  # Function name prefix
-            lambda_runtime="python3.9",  # Python runtime version
-            # Optional dead letter queue for failed executions
-            dead_letter_queue_arn="arn:aws:sqs:us-west-2:123456789012:parsl-dlq",
-            # Network settings (if Lambda needs VPC access)
-            # vpc_config={
-            #     "SubnetIds": ["subnet-12345", "subnet-67890"],
-            #     "SecurityGroupIds": ["sg-12345"]
-            # },
-            # Advanced configuration
-            concurrent_invocations_per_function=100,  # Concurrency limit per function
-            environment_variables={
-                "PARSL_WORKER_MODE": "lambda",
-                "LOG_LEVEL": "INFO",
-                # Add custom environment variables here
-            },
-        ),
-        # S3 state storage works well for serverless mode
-        state_store=S3StateStore(
-            bucket="my-parsl-state-bucket",
-            prefix="lambda-mode",
-            region="us-west-2",
-            create_bucket=True,  # Create the bucket if it doesn't exist
-        ),
-        # Lambda execution role
-        execution_role="arn:aws:iam::123456789012:role/ParslLambdaExecutionRole",
-        # No worker_init needed for Lambda - dependencies provided via layers
-        worker_init="",
-        # Resource tagging for organization
-        tags={
+def _build_provider(compute_type: str) -> EphemeralAWSProvider:
+    """Build a serverless provider for the requested backend."""
+    options = {
+        "region": os.environ.get("AWS_TEST_REGION", "us-east-1"),
+        "mode": "serverless",
+        # compute_type accepts "ec2", "lambda", or "ecs". There is no "auto" at
+        # the provider level; leaving the "ec2" default in serverless mode leaves
+        # ServerlessMode on its own internal heuristic.
+        "compute_type": compute_type,
+        "memory_size": 1024,  # MB; Lambda CPU scales with this
+        "timeout": 300,  # seconds; Lambda's own ceiling is 900
+        "min_blocks": 0,
+        "max_blocks": 20,
+        "state_store_type": "file",
+        "state_file_path": f"serverless_{compute_type}_state.json",
+        "additional_tags": {
             "Project": "ParslExample",
-            "Environment": "Development",
-            "ManagedBy": "ParslEphemeralAWSProvider",
-            "Mode": "Serverless-Lambda",
+            "Mode": f"serverless-{compute_type}",
         },
-    )
+    }
 
-    # Create a Parsl configuration with our provider
+    if compute_type == "ecs":
+        # Fargate needs awsvpcConfiguration, so the network IDs are required.
+        options.update(
+            vpc_id=os.environ["AWS_TEST_VPC_ID"],
+            subnet_id=os.environ["AWS_TEST_SUBNET_ID"],
+            security_group_id=os.environ["AWS_TEST_SG_ID"],
+        )
+
+    return EphemeralAWSProvider(**options)
+
+
+def main() -> int:
+    """Run a batch of short tasks on Lambda or Fargate."""
+    compute_type = sys.argv[1] if len(sys.argv) > 1 else "lambda"
+    if compute_type not in ("lambda", "ecs"):
+        logger.error("Usage: %s [lambda|ecs]", sys.argv[0])
+        return 2
+
+    try:
+        provider = _build_provider(compute_type)
+    except KeyError as exc:
+        logger.error("Missing required environment variable: %s", exc)
+        return 2
+
     config = Config(
         executors=[
             HighThroughputExecutor(
-                label="lambda_executor",
+                label=f"{compute_type}_executor",
                 provider=provider,
-                # For Lambda, max_workers controls concurrent invocations per block
-                max_workers=50,
+                max_workers_per_node=10,
+                encrypted=False,  # see #62
             )
         ],
-        run_dir="runinfo_lambda",
+        run_dir=f"runinfo_{compute_type}",
     )
-
-    # Initialize Parsl with our configuration
-    parsl.load(config)
 
     try:
-        logger.info("Submitting tasks to Lambda functions...")
+        parsl.load(config)
 
-        # Submit a variety of tasks to demonstrate Lambda's flexibility
-        tasks = []
+        tasks = [
+            serverless_task(task_type="processing", data_size=size)
+            for size in (1, 5, 10)
+        ]
+        tasks += [serverless_task(task_type="inference") for _ in range(3)]
+        tasks += [serverless_task(task_type="etl", data_size=8) for _ in range(2)]
 
-        # Processing tasks with different data sizes
-        for size in [1, 5, 10]:
-            tasks.append(
-                serverless_task(
-                    task_type="processing", data_size=size, cpu_intensive=False
-                )
-            )
+        logger.info("Submitted %d tasks to %s.", len(tasks), compute_type)
 
-        # Inference tasks
-        for i in range(3):
-            # Some with CPU-intensive workloads
-            cpu_intensive = i % 2 == 0
-            tasks.append(
-                serverless_task(
-                    task_type="inference", data_size=5, cpu_intensive=cpu_intensive
-                )
-            )
-
-        # ETL tasks
-        for i in range(2):
-            tasks.append(
-                serverless_task(task_type="etl", data_size=8, cpu_intensive=False)
-            )
-
-        # Wait for tasks to complete and process results
-        logger.info(f"Waiting for {len(tasks)} Lambda tasks to complete...")
-
-        lambda_results = []
-        for i, task in enumerate(tasks):
+        completed = []
+        for i, future in enumerate(tasks):
             try:
-                result = task.result()
-                lambda_results.append(result)
-
-                # Log task completion and important details
-                logger.info(f"Task {i} ({result['task_type']}) completed:")
-                logger.info(f"  Environment: {result['execution_environment']}")
-                logger.info(f"  Memory: {result['memory_limit_mb']} MB")
+                result = future.result(timeout=600)
+                completed.append(result)
                 logger.info(
-                    f"  Execution time: {result['execution_time_seconds']:.2f} seconds"
+                    "Task %d (%s) on %s: %.2fs, %s MB limit, %s",
+                    i,
+                    result["task_type"],
+                    result["environment"],
+                    result["execution_time"],
+                    result["memory_limit_mb"],
+                    result["detail"],
                 )
+            except Exception as exc:
+                logger.error("Task %d failed: %s", i, exc)
 
-                # Log result-specific details
-                if "result_data" in result:
-                    if "processed_items" in result["result_data"]:
-                        logger.info(
-                            f"  Processed {result['result_data']['processed_items']} items"
-                        )
-                    if "inference_result" in result["result_data"]:
-                        logger.info("  Inference completed")
-                    if "transformed_count" in result["result_data"]:
-                        logger.info(
-                            f"  Transformed {result['result_data']['transformed_count']} records"
-                        )
+        if completed:
+            mean = sum(r["execution_time"] for r in completed) / len(completed)
+            logger.info("%d/%d completed, mean %.2fs", len(completed), len(tasks), mean)
+        return 0 if len(completed) == len(tasks) else 1
 
-            except Exception as e:
-                logger.error(f"Task {i} failed: {str(e)}")
-
-        # Calculate and display some aggregate statistics
-        if lambda_results:
-            avg_execution_time = sum(
-                r["execution_time_seconds"] for r in lambda_results
-            ) / len(lambda_results)
-            logger.info(f"Average execution time: {avg_execution_time:.2f} seconds")
-            logger.info(f"Total tasks completed: {len(lambda_results)}")
-
-    except KeyboardInterrupt:
-        logger.info("Workflow interrupted. Cleaning up resources...")
+    except Exception:
+        logger.exception("Workflow failed")
+        return 1
 
     finally:
-        # Clean up Parsl resources
-        logger.info("Cleaning up Lambda resources...")
         parsl.clear()
-
-        logger.info("Lambda Mode example complete")
-
-
-def fargate_mode_example():
-    """Run a workflow using Fargate-based serverless mode."""
-    logger.info("Initializing Serverless Mode with AWS Fargate...")
-
-    # Configure the provider with Serverless Mode (Fargate)
-    provider = EphemeralAWSProvider(
-        mode=ServerlessMode(
-            # AWS Region
-            region="us-west-2",
-            # Fargate-specific configuration
-            compute_type="fargate",  # Use AWS Fargate
-            memory_size=2048,  # Memory in MB (minimum 1024)
-            cpu=1024,  # CPU units (1024 = 1 vCPU)
-            timeout=3600,  # Maximum task timeout (1 hour)
-            min_blocks=0,
-            max_blocks=10,  # Maximum concurrent tasks
-            # ECS/Fargate cluster configuration
-            cluster_name="parsl-fargate-cluster",  # ECS cluster name
-            # Container image with Parsl and dependencies
-            # You must create a Docker image with your dependencies
-            container_image="123456789012.dkr.ecr.us-west-2.amazonaws.com/parsl-worker:latest",
-            # Network configuration (required for Fargate)
-            # At minimum, you need a VPC with a subnet that has internet access
-            vpc_config={
-                "subnets": ["subnet-12345", "subnet-67890"],
-                "security_groups": ["sg-12345"],
-                "assign_public_ip": True,  # Assign public IP for internet access
-            },
-            # Advanced configuration
-            launch_type="FARGATE",  # Use FARGATE (or FARGATE_SPOT for cost savings)
-            platform_version="LATEST",  # Fargate platform version
-            environment_variables={
-                "PARSL_WORKER_MODE": "fargate",
-                "LOG_LEVEL": "INFO",
-                # Add custom environment variables here
-            },
-        ),
-        # S3 state storage works well for serverless mode
-        state_store=S3StateStore(
-            bucket="my-parsl-state-bucket",
-            prefix="fargate-mode",
-            region="us-west-2",
-            create_bucket=True,  # Create the bucket if it doesn't exist
-        ),
-        # Fargate task execution role
-        execution_role="arn:aws:iam::123456789012:role/ParslFargateExecutionRole",
-        # No worker_init needed for Fargate - dependencies included in container
-        worker_init="",
-        # Resource tagging for organization
-        tags={
-            "Project": "ParslExample",
-            "Environment": "Development",
-            "ManagedBy": "ParslEphemeralAWSProvider",
-            "Mode": "Serverless-Fargate",
-        },
-    )
-
-    # Create a Parsl configuration with our provider
-    config = Config(
-        executors=[
-            HighThroughputExecutor(
-                label="fargate_executor",
-                provider=provider,
-                # For Fargate, max_workers is typically equal to the container's
-                # capacity for parallel processing
-                max_workers=4,
-            )
-        ],
-        run_dir="runinfo_fargate",
-    )
-
-    # Initialize Parsl with our configuration
-    parsl.load(config)
-
-    try:
-        logger.info("Submitting tasks to Fargate containers...")
-
-        # Submit a variety of tasks to demonstrate Fargate's capabilities
-        # Fargate is well-suited for longer-running or more resource-intensive tasks
-        tasks = []
-
-        # CPU-intensive processing tasks
-        for i in range(3):
-            tasks.append(
-                serverless_task(
-                    task_type="processing", data_size=20, cpu_intensive=True
-                )
-            )
-
-        # Complex inference tasks that benefit from more memory
-        for i in range(3):
-            tasks.append(
-                serverless_task(task_type="inference", data_size=15, cpu_intensive=True)
-            )
-
-        # Large ETL tasks
-        for i in range(2):
-            tasks.append(
-                serverless_task(task_type="etl", data_size=25, cpu_intensive=True)
-            )
-
-        # Wait for tasks to complete and process results
-        logger.info(f"Waiting for {len(tasks)} Fargate tasks to complete...")
-
-        fargate_results = []
-        for i, task in enumerate(tasks):
-            try:
-                result = task.result()
-                fargate_results.append(result)
-
-                # Log task completion and important details
-                logger.info(f"Task {i} ({result['task_type']}) completed:")
-                logger.info(f"  Environment: {result['execution_environment']}")
-                logger.info(f"  Container: {result['container_id'] or 'unknown'}")
-                logger.info(
-                    f"  Execution time: {result['execution_time_seconds']:.2f} seconds"
-                )
-
-                # Log result-specific details
-                if "result_data" in result:
-                    if "prime_count" in result["result_data"]:
-                        logger.info(
-                            f"  Calculated {result['result_data']['prime_count']} prime numbers"
-                        )
-                    if "transformed_count" in result["result_data"]:
-                        logger.info(
-                            f"  Transformed {result['result_data']['transformed_count']} records"
-                        )
-
-            except Exception as e:
-                logger.error(f"Task {i} failed: {str(e)}")
-
-        # Calculate and display some aggregate statistics
-        if fargate_results:
-            avg_execution_time = sum(
-                r["execution_time_seconds"] for r in fargate_results
-            ) / len(fargate_results)
-            logger.info(f"Average execution time: {avg_execution_time:.2f} seconds")
-            logger.info(f"Total tasks completed: {len(fargate_results)}")
-
-    except KeyboardInterrupt:
-        logger.info("Workflow interrupted. Cleaning up resources...")
-
-    finally:
-        # Clean up Parsl resources
-        logger.info("Cleaning up Fargate resources...")
-        parsl.clear()
-
-        logger.info("Fargate Mode example complete")
-
-
-def main():
-    """
-    Main function to demonstrate Serverless Mode of the Parsl Ephemeral AWS Provider.
-    """
-    logger.info("Starting Serverless Mode Examples...")
-
-    # Uncomment the mode you want to test
-    # Note: Testing both modes in a single run is possible but not recommended
-    # for production workloads
-
-    lambda_mode_example()
-    # fargate_mode_example()
-
-    logger.info("Serverless Mode examples complete")
+        # Deletes the Lambda functions or the ECS cluster and task definitions.
+        provider.shutdown()
+        logger.info("Provider shut down.")
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

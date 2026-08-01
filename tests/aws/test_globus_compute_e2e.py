@@ -12,9 +12,7 @@ Prerequisites
 
 2. ``globus-compute-sdk`` and ``globus-compute-endpoint`` installed::
 
-       pip install "parsl-ephemeral-aws[globus]"
-       # or:
-       pip install globus-compute-sdk globus-compute-endpoint
+       uv sync --extra globus
 
 3. A registered endpoint UUID — either set ``GLOBUS_COMPUTE_ENDPOINT_ID`` in
    the environment, **or** allow the fixture to register a fresh endpoint by
@@ -22,13 +20,18 @@ Prerequisites
 
 4. Real AWS credentials (``aws`` profile) for EC2 provisioning.
 
+5. ``AWS_TEST_VPC_ID``, ``AWS_TEST_SUBNET_ID``, and ``AWS_TEST_SG_ID``. The
+   provider requires them since #69 and validates them before it builds the
+   operating mode, so patching the mode out does not bypass the check — even the
+   config-generation tests, which touch no AWS resources, need real IDs.
+
 Run with::
 
-    AWS_PROFILE=aws pytest tests/aws/test_globus_compute_e2e.py \\
+    AWS_PROFILE=aws uv run pytest tests/aws/test_globus_compute_e2e.py \\
         -m "aws and globus" --no-cov -v
 
 SPDX-License-Identifier: Apache-2.0
-SPDX-FileCopyrightText: 2025 Scott Friedman and Project Contributors
+SPDX-FileCopyrightText: 2025-2026 Scott Friedman and Project Contributors
 """
 
 import logging
@@ -78,7 +81,7 @@ def _skip_if_no_globus_sdk():
     except ImportError:
         pytest.skip(
             "globus-compute-sdk is not installed. "
-            "Install it with: pip install 'parsl-ephemeral-aws[globus]'"
+            "Install it with: uv sync --extra globus"
         )
 
 
@@ -177,6 +180,36 @@ def _stop_endpoint(endpoint_name: str) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _offline_provider(tmp_path, provider_id: str, network_ids: dict, **kwargs):
+    """Build a GlobusComputeProvider without touching AWS.
+
+    The session, state store, and operating mode are all stubbed, so nothing here
+    creates a resource — but ``network_ids`` is still required, because the
+    provider validates the three IDs before it builds the mode (#69), and there is
+    no way to patch past that.
+    """
+    from unittest.mock import MagicMock, patch
+
+    from parsl_ephemeral_aws.provider import EphemeralAWSProvider
+    from parsl_ephemeral_aws.state.file import FileStateStore
+
+    state_store = FileStateStore(
+        file_path=str(tmp_path / f"{provider_id}.json"), provider_id=provider_id
+    )
+
+    with (
+        patch("parsl_ephemeral_aws.provider.create_session") as mock_sess,
+        patch.object(
+            EphemeralAWSProvider, "_initialize_state_store", return_value=state_store
+        ),
+        patch.object(
+            EphemeralAWSProvider, "_initialize_operating_mode", return_value=MagicMock()
+        ),
+    ):
+        mock_sess.return_value = MagicMock()
+        return GlobusComputeProvider(provider_id=provider_id, **network_ids, **kwargs)
+
+
 @pytest.mark.aws
 @pytest.mark.globus
 @pytest.mark.slow
@@ -185,42 +218,23 @@ class TestGlobusComputeProviderConfig:
 
     These tests exercise the Python layer only (no running Globus Compute
     service required), verifying that the generated ``config.yaml`` is
-    a valid Globus Compute endpoint config.
+    a valid Globus Compute endpoint config. They are nonetheless marked ``aws``:
+    the provider validates the network IDs at construction, so they cannot run
+    without a real pre-provisioned VPC.
     """
 
-    def test_generate_config_standard_mode(self, tmp_path, aws_region):
+    def test_generate_config_standard_mode(self, tmp_path, aws_region, network_ids):
         """generate_endpoint_config() writes a valid config.yaml for standard mode."""
-        from unittest.mock import MagicMock, patch
-        from parsl_ephemeral_aws.provider import EphemeralAWSProvider
-        from parsl_ephemeral_aws.state.file import FileStateStore
-
-        provider_id = f"gc-test-{uuid.uuid4().hex[:8]}"
-        state_file = str(tmp_path / f"{provider_id}.json")
-        state_store = FileStateStore(file_path=state_file, provider_id=provider_id)
-        mode_mock = MagicMock()
-
-        with (
-            patch("parsl_ephemeral_aws.provider.create_session") as mock_sess,
-            patch.object(
-                EphemeralAWSProvider,
-                "_initialize_state_store",
-                return_value=state_store,
-            ),
-            patch.object(
-                EphemeralAWSProvider,
-                "_initialize_operating_mode",
-                return_value=mode_mock,
-            ),
-        ):
-            mock_sess.return_value = MagicMock()
-            provider = GlobusComputeProvider(
-                provider_id=provider_id,
-                region=aws_region,
-                image_id="ami-12345678",
-                instance_type="t3.medium",
-                mode="standard",
-                display_name="E2E Test Endpoint",
-            )
+        provider = _offline_provider(
+            tmp_path,
+            f"gc-test-{uuid.uuid4().hex[:8]}",
+            network_ids,
+            region=aws_region,
+            image_id="ami-12345678",
+            instance_type="t3.medium",
+            mode="standard",
+            display_name="E2E Test Endpoint",
+        )
 
         ep_dir = str(tmp_path / "e2e_endpoint")
         config_path = provider.generate_endpoint_config(ep_dir)
@@ -231,77 +245,38 @@ class TestGlobusComputeProviderConfig:
         assert "display_name: E2E Test Endpoint" in content
         assert f"region: {aws_region}" in content
         assert "instance_type: t3.medium" in content
+        # The IDs must survive into the config: an endpoint reconstructs the
+        # provider from this file and would otherwise hit the #69 guard itself.
+        assert network_ids["subnet_id"] in content
 
-    def test_generate_config_spot_mode(self, tmp_path, aws_region):
+    def test_generate_config_spot_mode(self, tmp_path, aws_region, network_ids):
         """Config for a spot-instance endpoint includes use_spot: true."""
-        from unittest.mock import MagicMock, patch
-        from parsl_ephemeral_aws.provider import EphemeralAWSProvider
-        from parsl_ephemeral_aws.state.file import FileStateStore
-
-        provider_id = f"gc-spot-{uuid.uuid4().hex[:8]}"
-        state_file = str(tmp_path / f"{provider_id}.json")
-        state_store = FileStateStore(file_path=state_file, provider_id=provider_id)
-        mode_mock = MagicMock()
-
-        with (
-            patch("parsl_ephemeral_aws.provider.create_session") as mock_sess,
-            patch.object(
-                EphemeralAWSProvider,
-                "_initialize_state_store",
-                return_value=state_store,
-            ),
-            patch.object(
-                EphemeralAWSProvider,
-                "_initialize_operating_mode",
-                return_value=mode_mock,
-            ),
-        ):
-            mock_sess.return_value = MagicMock()
-            provider = GlobusComputeProvider(
-                provider_id=provider_id,
-                region=aws_region,
-                image_id="ami-12345678",
-                instance_type="t3.medium",
-                use_spot=True,
-                display_name="Spot Endpoint",
-            )
+        provider = _offline_provider(
+            tmp_path,
+            f"gc-spot-{uuid.uuid4().hex[:8]}",
+            network_ids,
+            region=aws_region,
+            image_id="ami-12345678",
+            instance_type="t3.medium",
+            use_spot=True,
+            display_name="Spot Endpoint",
+        )
 
         config_path = provider.generate_endpoint_config(str(tmp_path / "spot_ep"))
         content = Path(config_path).read_text()
         assert "use_spot: true" in content
 
-    def test_generate_config_container_mode(self, tmp_path, aws_region):
+    def test_generate_config_container_mode(self, tmp_path, aws_region, network_ids):
         """Config for a container endpoint includes docker container_type."""
-        from unittest.mock import MagicMock, patch
-        from parsl_ephemeral_aws.provider import EphemeralAWSProvider
-        from parsl_ephemeral_aws.state.file import FileStateStore
-
-        provider_id = f"gc-ctr-{uuid.uuid4().hex[:8]}"
-        state_file = str(tmp_path / f"{provider_id}.json")
-        state_store = FileStateStore(file_path=state_file, provider_id=provider_id)
-        mode_mock = MagicMock()
-
-        with (
-            patch("parsl_ephemeral_aws.provider.create_session") as mock_sess,
-            patch.object(
-                EphemeralAWSProvider,
-                "_initialize_state_store",
-                return_value=state_store,
-            ),
-            patch.object(
-                EphemeralAWSProvider,
-                "_initialize_operating_mode",
-                return_value=mode_mock,
-            ),
-        ):
-            mock_sess.return_value = MagicMock()
-            provider = GlobusComputeProvider(
-                provider_id=provider_id,
-                region=aws_region,
-                image_id="ami-12345678",
-                container_image="python:3.11-slim",
-                display_name="Container Endpoint",
-            )
+        provider = _offline_provider(
+            tmp_path,
+            f"gc-ctr-{uuid.uuid4().hex[:8]}",
+            network_ids,
+            region=aws_region,
+            image_id="ami-12345678",
+            container_image="python:3.11-slim",
+            display_name="Container Endpoint",
+        )
 
         config_path = provider.generate_endpoint_config(str(tmp_path / "ctr_ep"))
         content = Path(config_path).read_text()
@@ -434,11 +409,11 @@ class TestGlobusComputeEndpointLifecycle:
         except (FileNotFoundError, subprocess.CalledProcessError):
             pytest.skip(
                 "globus-compute-endpoint CLI not installed. "
-                "Install with: pip install 'parsl-ephemeral-aws[globus]'"
+                "Install with: uv sync --extra globus"
             )
 
     def test_endpoint_config_written_and_valid(
-        self, tmp_path, aws_session, test_run_id, aws_region
+        self, tmp_path, aws_session, test_run_id, aws_region, network_ids
     ):
         """generate_endpoint_config() writes a config that endpoint CLI accepts."""
         state_file = str(tmp_path / f"state-{test_run_id}.json")
@@ -461,6 +436,7 @@ class TestGlobusComputeEndpointLifecycle:
             waiter_delay=15,
             waiter_max_attempts=40,
             debug=True,
+            **network_ids,
         )
 
         config_path = provider.generate_endpoint_config(endpoint_dir)
@@ -488,7 +464,7 @@ class TestGlobusComputeEndpointLifecycle:
         )
 
     def test_endpoint_start_registers_with_globus(
-        self, tmp_path, aws_session, test_run_id, aws_region
+        self, tmp_path, aws_session, test_run_id, aws_region, network_ids
     ):
         """Starting an endpoint registers it with the Globus Compute service.
 
@@ -517,6 +493,7 @@ class TestGlobusComputeEndpointLifecycle:
             display_name=f"Parsl E2E Test {test_run_id}",
             waiter_delay=15,
             waiter_max_attempts=40,
+            **network_ids,
         )
 
         provider.generate_endpoint_config(endpoint_dir)

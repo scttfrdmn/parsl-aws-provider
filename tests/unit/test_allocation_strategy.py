@@ -24,7 +24,7 @@ RequestSpotFleet boundary. Passing it through unconverted would break every
 spot fleet request.
 
 SPDX-License-Identifier: Apache-2.0
-SPDX-FileCopyrightText: 2025 Scott Friedman and Project Contributors
+SPDX-FileCopyrightText: 2025-2026 Scott Friedman and Project Contributors
 """
 
 import ast

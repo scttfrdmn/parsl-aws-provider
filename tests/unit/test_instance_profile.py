@@ -6,7 +6,7 @@ provider accepted ``auto_create_instance_profile`` but never forwarded it, so no
 profile was ever attached and every dispatch silently fell back to UserData.
 
 SPDX-License-Identifier: Apache-2.0
-SPDX-FileCopyrightText: 2025 Scott Friedman and Project Contributors
+SPDX-FileCopyrightText: 2025-2026 Scott Friedman and Project Contributors
 """
 
 from unittest.mock import MagicMock, patch

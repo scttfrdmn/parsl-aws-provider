@@ -2,7 +2,7 @@
  * Terraform/OpenTofu module for Parsl Ephemeral AWS Provider - EC2 Worker Resources
  *
  * SPDX-License-Identifier: Apache-2.0
- * SPDX-FileCopyrightText: 2025 Scott Friedman and Project Contributors
+ * SPDX-FileCopyrightText: 2025-2026 Scott Friedman and Project Contributors
  */
 
 terraform {

@@ -94,4 +94,4 @@ This document outlines the next steps and planned features for implementing the 
 This roadmap represents approximately 6-8 months of development work. The phases are roughly sequential, but some tasks may be worked on in parallel depending on developer availability and priorities.
 
 SPDX-License-Identifier: Apache-2.0
-SPDX-FileCopyrightText: 2025 Scott Friedman and Project Contributors
+SPDX-FileCopyrightText: 2025-2026 Scott Friedman and Project Contributors

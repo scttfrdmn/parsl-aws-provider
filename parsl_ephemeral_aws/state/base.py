@@ -8,7 +8,7 @@ other and mode-only fields (the baked AMI ID, the warm-pool list) or
 provider-only fields (``job_map``) are silently destroyed (#78).
 
 SPDX-License-Identifier: Apache-2.0
-SPDX-FileCopyrightText: 2025 Scott Friedman and Project Contributors
+SPDX-FileCopyrightText: 2025-2026 Scott Friedman and Project Contributors
 """
 
 import abc

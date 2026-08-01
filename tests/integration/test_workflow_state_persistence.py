@@ -4,7 +4,7 @@ These tests verify that state persistence works correctly across different
 operating modes and scenarios, including interruptions and resumption.
 
 SPDX-License-Identifier: Apache-2.0
-SPDX-FileCopyrightText: 2025 Scott Friedman and Project Contributors
+SPDX-FileCopyrightText: 2025-2026 Scott Friedman and Project Contributors
 """
 
 import os

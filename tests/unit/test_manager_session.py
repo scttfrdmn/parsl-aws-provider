@@ -13,7 +13,7 @@ client the manager happened to reach through the injected session. These tests
 pin the precedence rule itself.
 
 SPDX-License-Identifier: Apache-2.0
-SPDX-FileCopyrightText: 2025 Scott Friedman and Project Contributors
+SPDX-FileCopyrightText: 2025-2026 Scott Friedman and Project Contributors
 """
 
 from unittest.mock import MagicMock

@@ -4,7 +4,7 @@ These tests verify that exceptions are properly raised, caught, and handled
 throughout the codebase, ensuring robust error handling and reporting.
 
 SPDX-License-Identifier: Apache-2.0
-SPDX-FileCopyrightText: 2025 Scott Friedman and Project Contributors
+SPDX-FileCopyrightText: 2025-2026 Scott Friedman and Project Contributors
 """
 
 import pytest

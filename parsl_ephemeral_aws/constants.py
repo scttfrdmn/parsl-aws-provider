@@ -4,7 +4,7 @@ Clean constants for the EphemeralAWSProvider.
 No legacy garbage, just what's actually needed.
 
 SPDX-License-Identifier: Apache-2.0
-SPDX-FileCopyrightText: 2025 Scott Friedman and Project Contributors
+SPDX-FileCopyrightText: 2025-2026 Scott Friedman and Project Contributors
 """
 
 # Operating modes

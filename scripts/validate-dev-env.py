@@ -6,7 +6,7 @@ This script validates that the Parsl Ephemeral AWS Provider development
 environment is properly set up and functional.
 
 SPDX-License-Identifier: Apache-2.0
-SPDX-FileCopyrightText: 2025 Scott Friedman and Project Contributors
+SPDX-FileCopyrightText: 2025-2026 Scott Friedman and Project Contributors
 """
 
 import sys

@@ -18,7 +18,7 @@ Two things about the file's history are worth stating, because both hid bugs:
    off that object. These tests now use the real surface.
 
 SPDX-License-Identifier: Apache-2.0
-SPDX-FileCopyrightText: 2025 Scott Friedman and Project Contributors
+SPDX-FileCopyrightText: 2025-2026 Scott Friedman and Project Contributors
 """
 
 import json

@@ -4,7 +4,7 @@ This module provides robust error handling, retry mechanisms, and recovery strat
 for AWS operations and provider state management.
 
 SPDX-License-Identifier: Apache-2.0
-SPDX-FileCopyrightText: 2025 Scott Friedman and Project Contributors
+SPDX-FileCopyrightText: 2025-2026 Scott Friedman and Project Contributors
 """
 
 import logging

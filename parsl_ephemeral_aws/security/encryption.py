@@ -4,7 +4,7 @@ This module provides secure encryption capabilities for provider state data,
 including encryption at rest and key management following security best practices.
 
 SPDX-License-Identifier: Apache-2.0
-SPDX-FileCopyrightText: 2025 Scott Friedman and Project Contributors
+SPDX-FileCopyrightText: 2025-2026 Scott Friedman and Project Contributors
 """
 
 import logging

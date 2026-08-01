@@ -1,286 +1,140 @@
 #!/usr/bin/env python3
-"""
-Basic usage example for Parsl Ephemeral AWS Provider.
+"""Minimal configurations for each of the three operating modes.
 
-This script demonstrates how to use the Parsl Ephemeral AWS Provider
-in all three operating modes: standard, detached, and serverless.
+This file is a configuration reference rather than a workflow — each function
+builds a provider and prints what it would run on, so the shapes can be compared
+side by side. For runnable end-to-end workflows see standard_mode.py,
+detached_mode.py, serverless_mode.py, and one_shot_mode.py.
+
+`mode` is a string, not a mode object. The provider constructs the mode itself so
+it can inject the AWS session, state store, and resolved AMI; passing
+`StandardMode(...)` raises a `TypeCheckError`. Unknown keyword arguments raise
+`ProviderConfigurationError` rather than being ignored, so options from older
+tutorials fail loudly.
+
+Usage
+-----
+    export AWS_PROFILE=aws
+    export AWS_TEST_REGION=us-east-1
+    export AWS_TEST_VPC_ID=vpc-...
+    export AWS_TEST_SUBNET_ID=subnet-...
+    export AWS_TEST_SG_ID=sg-...
+
+    uv run python examples/basic_usage.py
+
+SPDX-License-Identifier: Apache-2.0
+SPDX-FileCopyrightText: 2025-2026 Scott Friedman and Project Contributors
 """
 
-import time
 import logging
-import parsl
-from parsl.app.python import python_app
-from parsl.config import Config
-from parsl.executors import HighThroughputExecutor
+import os
+import sys
 
-# Import the EphemeralAWSProvider and its modes
-from parsl_ephemeral_aws.provider import EphemeralAWSProvider
-from parsl_ephemeral_aws.modes.standard import StandardMode
-from parsl_ephemeral_aws.modes.detached import DetachedMode
-from parsl_ephemeral_aws.modes.serverless import ServerlessMode
-from parsl_ephemeral_aws.state.s3 import S3StateStore
-from parsl_ephemeral_aws.state.parameter_store import ParameterStoreStateStore
-from parsl_ephemeral_aws.state.file import FileStateStore
+from parsl_ephemeral_aws import EphemeralAWSProvider
 
-# Set up logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("ParslAWSExample")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger("basic-usage")
 
 
-# Define a simple Python app that we will use for testing
-@python_app
-def simple_task(duration=10, fail_rate=0):
-    """
-    A simple Python app that sleeps for a specified duration and then returns.
-    Optionally, can be set to fail at a given rate (0-1) for testing error handling.
-
-    Parameters
-    ----------
-    duration : int
-        Sleep duration in seconds
-    fail_rate : float
-        Probability of task failure (0-1)
-
-    Returns
-    -------
-    dict
-        Dictionary containing execution info
-    """
-    import random
-    import socket
-    import os
-
-    # Get host information
-    hostname = socket.gethostname()
-
-    # Simulate some work
-    time.sleep(duration)
-
-    # Simulate failure with specified probability
-    if random.random() < fail_rate:
-        raise Exception(f"Task failed with {fail_rate} probability on {hostname}")
-
-    # Return useful information
+def _network() -> dict:
+    """Return the pre-provisioned network IDs, which are required since v0.7.0."""
     return {
-        "hostname": hostname,
-        "ip_address": socket.gethostbyname(hostname),
-        "pid": os.getpid(),
-        "execution_time": duration,
-        "timestamp": time.time(),
+        "region": os.environ.get("AWS_TEST_REGION", "us-east-1"),
+        "vpc_id": os.environ["AWS_TEST_VPC_ID"],
+        "subnet_id": os.environ["AWS_TEST_SUBNET_ID"],
+        "security_group_id": os.environ["AWS_TEST_SG_ID"],
     }
 
 
-def run_with_standard_mode():
-    """Run a simple workflow using the standard mode of the provider."""
-    logger.info("Initializing provider with Standard Mode...")
-
-    # Standard mode configuration
-    provider = EphemeralAWSProvider(
-        mode=StandardMode(
-            # AWS-specific configuration
-            region="us-west-2",
-            key_name="your-key-pair-name",  # Optional: SSH key for debugging
-            use_public_ips=True,  # Use public IPs for direct access
-            instance_type="t3.micro",
-            min_blocks=0,
-            max_blocks=4,
-            # Useful for development/debugging - set to False in production
-            skip_instance_profile_check=True,
-        ),
-        # State management (local file for standard mode example)
-        state_store=FileStateStore(file_path="./aws_provider_state.json"),
-        # Common provider parameters
-        instance_profile="ParslWorkerInstanceProfile",  # IAM instance profile
-        vpc_id="vpc-12345",  # Optional: specific VPC to use
-        worker_init="pip install -U pip && pip install parsl boto3",
-        walltime="01:00:00",  # Shutdown instances after this time
-        tags={"Project": "ParslExample", "Environment": "Dev"},
+def standard_mode_provider() -> EphemeralAWSProvider:
+    """EC2 workers that dial back to this machine. Simplest, needs reachability."""
+    return EphemeralAWSProvider(
+        mode="standard",
+        instance_type="t3.small",
+        min_blocks=0,
+        max_blocks=4,
+        # Local file state is fine when one machine owns the workflow.
+        state_store_type="file",
+        state_file_path="basic_usage_standard.json",
+        auto_create_instance_profile=True,
+        auto_shutdown=True,
+        max_idle_time=300,
+        additional_tags={"Project": "ParslExample", "Mode": "standard"},
+        **_network(),
     )
 
-    # Create a configuration with our provider
-    config = Config(
-        executors=[
-            HighThroughputExecutor(
-                label="aws_standard_executor",
-                provider=provider,
-                max_workers=2,  # Workers per block
-            )
-        ]
+
+def detached_mode_provider() -> EphemeralAWSProvider:
+    """A bastion owns the worker lifecycle, so this machine need not be reachable."""
+    return EphemeralAWSProvider(
+        mode="detached",
+        instance_type="t3.small",
+        bastion_instance_type="t3.micro",
+        min_blocks=0,
+        max_blocks=4,
+        # Parameter Store is reachable from both this machine and the bastion,
+        # which is what makes reconnecting from a new process work.
+        state_store_type="parameter_store",
+        parameter_store_path="/parsl/basic-usage-detached",
+        auto_create_instance_profile=True,
+        additional_tags={"Project": "ParslExample", "Mode": "detached"},
+        **_network(),
     )
 
-    # Initialize Parsl with this configuration
-    parsl.load(config)
 
-    try:
-        # Submit 5 tasks
-        tasks = [simple_task(duration=60, fail_rate=0.2) for _ in range(5)]
-
-        # Wait for tasks to complete
-        logger.info("Waiting for all tasks to complete...")
-        for i, task in enumerate(tasks):
-            try:
-                result = task.result()
-                logger.info(f"Task {i} completed on {result['hostname']}")
-            except Exception as e:
-                logger.error(f"Task {i} failed: {str(e)}")
-
-    except KeyboardInterrupt:
-        logger.info("Workflow interrupted. Cleaning up resources...")
-    finally:
-        # Clean up Parsl resources
-        parsl.clear()
-        logger.info("Workflow with Standard Mode complete")
-
-
-def run_with_detached_mode():
-    """Run a simple workflow using the detached mode of the provider."""
-    logger.info("Initializing provider with Detached Mode...")
-
-    # Detached mode configuration
-    provider = EphemeralAWSProvider(
-        mode=DetachedMode(
-            # AWS-specific configuration
-            region="us-west-2",
-            instance_type="t3.micro",
-            min_blocks=0,
-            max_blocks=4,
-            # Detached mode specific parameters
-            bastion_instance_type="t3.nano",
-            bastion_image_id="ami-12345abcdef",  # Amazon Linux 2 AMI
-            key_name="your-key-pair-name",  # Required for Detached mode
-            # Useful for development/debugging
-            skip_instance_profile_check=True,
-        ),
-        # For detached mode, Parameter Store is a good option
-        state_store=ParameterStoreStateStore(
-            region="us-west-2", prefix="/parsl/myproject"
-        ),
-        # Common provider parameters
-        instance_profile="ParslWorkerInstanceProfile",
-        worker_init="pip install -U pip && pip install parsl boto3",
-        walltime="01:00:00",
-        tags={"Project": "ParslExample", "Environment": "Dev"},
+def serverless_mode_provider() -> EphemeralAWSProvider:
+    """Lambda functions instead of instances. No network IDs needed."""
+    return EphemeralAWSProvider(
+        # Lambda runs in the Lambda-managed VPC, so vpc_id/subnet_id/
+        # security_group_id are not required here. ECS/Fargate does need them.
+        region=os.environ.get("AWS_TEST_REGION", "us-east-1"),
+        mode="serverless",
+        compute_type="lambda",  # there is no "auto" at the provider level
+        memory_size=1024,  # MB; Lambda CPU scales with memory
+        timeout=300,  # seconds, Lambda's own ceiling is 900
+        min_blocks=0,
+        max_blocks=20,
+        state_store_type="file",
+        state_file_path="basic_usage_serverless.json",
+        additional_tags={"Project": "ParslExample", "Mode": "serverless"},
     )
 
-    # Create a configuration with our provider
-    config = Config(
-        executors=[
-            HighThroughputExecutor(
-                label="aws_detached_executor",
-                provider=provider,
-                max_workers=2,
-            )
-        ]
-    )
 
-    # Initialize Parsl with this configuration
-    parsl.load(config)
+def main() -> int:
+    """Build one provider per mode and report what each resolved to."""
+    builders = {
+        "standard": standard_mode_provider,
+        "detached": detached_mode_provider,
+        "serverless": serverless_mode_provider,
+    }
 
-    try:
-        # Submit 5 tasks
-        tasks = [simple_task(duration=60, fail_rate=0.2) for _ in range(5)]
+    requested = sys.argv[1:] or ["standard"]
+    for name in requested:
+        if name not in builders:
+            logger.error("Unknown mode %r; choose from %s", name, list(builders))
+            return 2
 
-        # Wait for tasks to complete
-        logger.info("Waiting for all tasks to complete...")
-        for i, task in enumerate(tasks):
-            try:
-                result = task.result()
-                logger.info(f"Task {i} completed on {result['hostname']}")
-            except Exception as e:
-                logger.error(f"Task {i} failed: {str(e)}")
+        logger.info("--- %s mode ---", name)
+        provider = None
+        try:
+            # Construction calls initialize(), which creates real AWS resources
+            # (a launch template, and an IAM role when auto-creating one).
+            provider = builders[name]()
+            logger.info("provider_id: %s", provider.provider_id)
+            for resource_type, entries in provider.list_resources().items():
+                logger.info("  %s: %d", resource_type, len(entries))
+        except KeyError as exc:
+            logger.error("Missing required environment variable: %s", exc)
+            return 2
+        except Exception:
+            logger.exception("Could not build the %s provider", name)
+            return 1
+        finally:
+            if provider is not None:
+                provider.shutdown()
 
-    except KeyboardInterrupt:
-        logger.info("Workflow interrupted. Cleaning up resources...")
-    finally:
-        # Clean up Parsl resources
-        parsl.clear()
-        logger.info("Workflow with Detached Mode complete")
-
-
-def run_with_serverless_mode():
-    """Run a simple workflow using the serverless mode of the provider."""
-    logger.info("Initializing provider with Serverless Mode...")
-
-    # Serverless mode configuration
-    provider = EphemeralAWSProvider(
-        mode=ServerlessMode(
-            # AWS-specific configuration
-            region="us-west-2",
-            # Serverless mode specific configuration
-            compute_type="lambda",  # 'lambda' or 'fargate'
-            memory_size=1024,  # MB for Lambda or Fargate
-            timeout=300,  # seconds (5 minutes)
-            min_blocks=0,
-            max_blocks=10,
-            # For Lambda, include any needed layers
-            lambda_layers=[
-                "arn:aws:lambda:us-west-2:123456789012:layer:ParslDependencies:1"
-            ],
-            # For Fargate, specify container image
-            # container_image="123456789012.dkr.ecr.us-west-2.amazonaws.com/parsl-worker:latest",
-        ),
-        # S3 state storage works well for serverless mode
-        state_store=S3StateStore(
-            bucket="my-parsl-state-bucket", prefix="serverless-mode", region="us-west-2"
-        ),
-        # Common provider parameters
-        execution_role="arn:aws:iam::123456789012:role/ParslWorkerExecutionRole",
-        worker_init="",  # Not directly used in serverless mode - dependencies in layer/container
-        tags={"Project": "ParslExample", "Environment": "Dev"},
-    )
-
-    # Create a configuration with our provider
-    config = Config(
-        executors=[
-            HighThroughputExecutor(
-                label="aws_serverless_executor",
-                provider=provider,
-                # Note: max_workers has a different meaning in serverless mode
-                # It represents concurrent invocations per block
-                max_workers=10,
-            )
-        ]
-    )
-
-    # Initialize Parsl with this configuration
-    parsl.load(config)
-
-    try:
-        # Submit 10 tasks - serverless is good for highly parallel workloads
-        tasks = [simple_task(duration=30, fail_rate=0.1) for _ in range(10)]
-
-        # Wait for tasks to complete
-        logger.info("Waiting for all tasks to complete...")
-        for i, task in enumerate(tasks):
-            try:
-                result = task.result()
-                logger.info(
-                    f"Task {i} completed on {result.get('hostname', 'serverless')}"
-                )
-            except Exception as e:
-                logger.error(f"Task {i} failed: {str(e)}")
-
-    except KeyboardInterrupt:
-        logger.info("Workflow interrupted. Cleaning up resources...")
-    finally:
-        # Clean up Parsl resources
-        parsl.clear()
-        logger.info("Workflow with Serverless Mode complete")
-
-
-def main():
-    """Main function to run examples of all three modes."""
-
-    # Uncomment the mode you want to test
-    # Note: Running multiple modes in a single session not recommended
-    # for real workloads - shown here for demonstration
-
-    run_with_standard_mode()
-    # run_with_detached_mode()
-    # run_with_serverless_mode()
-
-    logger.info("All examples completed!")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

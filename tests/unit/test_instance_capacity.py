@@ -8,7 +8,7 @@ degrade to ``(None, None)`` rather than raise: it runs during ``__init__``, so a
 unreachable EC2 must not stop the provider from constructing.
 
 SPDX-License-Identifier: Apache-2.0
-SPDX-FileCopyrightText: 2025 Scott Friedman and Project Contributors
+SPDX-FileCopyrightText: 2025-2026 Scott Friedman and Project Contributors
 """
 
 from unittest.mock import MagicMock

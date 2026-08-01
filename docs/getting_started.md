@@ -1,29 +1,40 @@
-# Getting Started with Parsl Ephemeral AWS Provider
-
-This guide will help you get started with using the Parsl Ephemeral AWS Provider for your workflows.
+# Getting Started
 
 ## Installation
 
-Install the provider using pip:
+```bash
+uv add parsl-ephemeral-aws
+```
+
+Or, working from a clone:
 
 ```bash
-pip install parsl-ephemeral-aws
+uv sync --extra dev --extra test
 ```
+
+Python 3.10 or newer is required (Parsl 2026.x dropped 3.9).
 
 ## Prerequisites
 
-1. **AWS Credentials**: You need valid AWS credentials with permissions to create and manage EC2 instances, VPCs, and other AWS resources. You can provide these credentials in several ways:
-   - Environment variables (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`)
-   - AWS credentials file (`~/.aws/credentials`)
-   - IAM instance profile (if running on EC2)
+1. **AWS credentials.** Any source botocore understands: environment variables,
+   `~/.aws/credentials`, or an instance profile when running on EC2. Pass
+   `profile_name="myprofile"` to select a named profile.
 
-2. **AMI Selection**: You need an Amazon Machine Image (AMI) that has Python installed and is compatible with your workflow. The provider defaults to using Amazon Linux 2 AMIs, but you can specify any AMI.
+2. **An existing VPC, subnet, and security group.** As of v0.7.0 the provider
+   never creates or deletes network resources — you supply `vpc_id`, `subnet_id`,
+   and `security_group_id`, and they are validated at construction. See
+   [network-prerequisites.md](network-prerequisites.md) for what the security
+   group must allow.
 
-3. **Networking**: You need to understand your networking requirements, especially if you have specific VPC or subnet requirements.
+3. **A reachable client, or detached mode.** Workers connect *outbound* to the
+   Parsl interchange, so in standard mode your client must accept inbound TCP on
+   ports 54000–55000. A laptop behind NAT cannot; use `mode="detached"`.
 
-## Basic Configuration
+You do **not** need to pick an AMI. Leave `image_id` unset and an Amazon Linux
+2023 image matching your instance type's architecture is resolved from AWS's
+public SSM parameters — x86_64 and arm64 alike, in every region.
 
-Here's a minimal example of how to configure Parsl to use the Ephemeral AWS Provider:
+## Basic configuration
 
 ```python
 import parsl
@@ -31,196 +42,251 @@ from parsl.config import Config
 from parsl.executors import HighThroughputExecutor
 from parsl_ephemeral_aws import EphemeralAWSProvider
 
-# Configure the ephemeral AWS provider
 provider = EphemeralAWSProvider(
-    image_id='ami-12345678',  # Replace with a valid AMI ID
-    instance_type='t3.medium',
-    region='us-west-2',
-    init_blocks=1,
-    max_blocks=10
+    region="us-east-1",
+    vpc_id="vpc-0123456789abcdef0",
+    subnet_id="subnet-0123456789abcdef0",
+    security_group_id="sg-0123456789abcdef0",
+    instance_type="t3.medium",
+    init_blocks=0,
+    min_blocks=0,
+    max_blocks=10,
 )
 
-# Create Parsl configuration
 config = Config(
     executors=[
         HighThroughputExecutor(
-            label='aws_executor',
+            label="aws_executor",
             provider=provider,
+            # CurveZMQ certificates live in the client's run_dir, which workers
+            # cannot read. Same-VPC deployments rely on VPC isolation instead;
+            # cross-VPC support is #62.
+            encrypted=False,
         )
     ]
 )
 
-# Load the configuration
 parsl.load(config)
 ```
 
-## Operating Modes
+Construction is not free: it creates a launch template and validates the network
+IDs against AWS, so it needs working credentials.
 
-### Standard Mode
+## Operating modes
 
-This is the default mode where your client directly communicates with worker nodes.
+Select a mode with the `mode` **string**. Full details in
+[operating_modes.md](operating_modes.md).
+
+### Standard (default)
+
+The client talks directly to workers.
 
 ```python
 provider = EphemeralAWSProvider(
-    image_id='ami-12345678',
-    instance_type='t3.medium',
-    region='us-west-2',
-    mode='standard'
+    mode="standard",
+    region="us-east-1",
+    vpc_id="vpc-0123456789abcdef0",
+    subnet_id="subnet-0123456789abcdef0",
+    security_group_id="sg-0123456789abcdef0",
+    instance_type="t3.medium",
 )
 ```
 
-### Detached Mode
+### Detached
 
-In this mode, a bastion host manages workers, allowing your client to disconnect.
+A bastion owns the worker lifecycle, so the client can disconnect.
 
 ```python
 provider = EphemeralAWSProvider(
-    image_id='ami-12345678',
-    instance_type='m5.large',
-    region='us-west-2',
-    mode='detached',
-    bastion_instance_type='t3.micro',
-    state_store='parameter_store',
-    worker_init='''
-        pip install numpy scipy pandas
-    '''
+    mode="detached",
+    region="us-east-1",
+    vpc_id="vpc-0123456789abcdef0",
+    subnet_id="subnet-0123456789abcdef0",
+    security_group_id="sg-0123456789abcdef0",
+    instance_type="m5.large",
+    bastion_instance_type="t3.micro",
+    state_store_type="parameter_store",
+    parameter_store_path="/parsl/my-workflow-state",
+    worker_init="pip3 install --quiet numpy scipy pandas\n",
 )
 ```
 
-### Serverless Mode
+### Serverless
 
-Uses AWS Lambda or ECS/Fargate for execution without EC2 instances.
+Lambda or ECS/Fargate, no EC2 instances. Lambda needs no network IDs at all.
 
 ```python
 provider = EphemeralAWSProvider(
-    image_id='ami-12345678',  # Still needed for some operations
-    region='us-west-2',
-    mode='serverless',
-    worker_type='lambda',
-    lambda_memory=1024,
-    lambda_timeout=900
+    mode="serverless",
+    region="us-east-1",
+    compute_type="lambda",   # or "ecs", which does need subnet + security group
+    memory_size=1024,        # MB
+    timeout=300,             # seconds
+    max_blocks=100,
 )
 ```
 
-## Cost Optimization
+## Cost optimization
 
-Use these features to optimize costs:
-
-### Spot Instances
+### Spot instances
 
 ```python
 provider = EphemeralAWSProvider(
-    image_id='ami-12345678',
-    instance_type='t3.medium',
-    region='us-west-2',
-    use_spot_instances=True,
-    spot_max_price_percentage=80  # Max 80% of on-demand price
+    region="us-east-1",
+    vpc_id="vpc-0123456789abcdef0",
+    subnet_id="subnet-0123456789abcdef0",
+    security_group_id="sg-0123456789abcdef0",
+    instance_type="t3.medium",
+    use_spot=True,
+    spot_max_price_percentage=80,     # cap at 80% of on-demand
+    spot_interruption_handling=True,  # act on the two-minute warning
 )
 ```
 
-### Auto-Scaling
+`spot_interruption_handling=True` creates an EventBridge rule and SQS queue so the
+provider learns of an interruption two minutes ahead, rather than discovering the
+instance already `shutting-down`.
+
+### Scale to zero
 
 ```python
 provider = EphemeralAWSProvider(
-    image_id='ami-12345678',
-    instance_type='t3.medium',
-    region='us-west-2',
-    min_blocks=0,
+    # ... network and compute options ...
+    min_blocks=0,     # no floor; nothing runs when nothing is queued
     max_blocks=10,
-    # Scale down to zero when not in use
+    auto_shutdown=True,
+    max_idle_time=300,  # seconds a RUNNING resource may sit before reclaim
 )
 ```
 
-### Multiple Instance Types
+`max_blocks` also caps concurrent submissions — a job past the limit raises
+rather than queueing.
+
+### Multiple instance types
+
+Diversifying across instance types materially reduces spot interruption rates.
+`instance_types` is a list of **type names**:
 
 ```python
 provider = EphemeralAWSProvider(
-    image_id='ami-12345678',
-    region='us-west-2',
-    use_ec2_fleet=True,
-    instance_types=[
-        {'type': 't3.medium', 'weight': 1},
-        {'type': 'm5.large', 'weight': 2},
-        {'type': 'c5.large', 'weight': 2},
-    ]
+    # ... network options ...
+    use_spot=True,
+    use_spot_fleet=True,
+    instance_types=["t3.medium", "m5.large", "c5.large"],
+    spot_allocation_strategy="price-capacity-optimized",  # the default
 )
 ```
 
-## Using Worker Initialization Scripts
+This uses the EC2 Fleet API (`CreateFleet`) with `Type="instant"`. **Both flags are
+required**: `use_spot_fleet=True` on its own builds no fleet manager, so the block
+falls through to a single on-demand instance with no error
+([#137](https://github.com/scttfrdmn/parsl-aws-provider/issues/137)). With both
+set, the fleet path takes precedence over the single-spot-instance path — see
+[spot_fleet.md](spot_fleet.md).
 
-You can provide a script to run on each worker during initialization:
+### Graviton
+
+arm64 instance types work with no extra configuration; the AMI architecture is
+inferred from the type name.
 
 ```python
 provider = EphemeralAWSProvider(
-    image_id='ami-12345678',
-    instance_type='t3.medium',
-    region='us-west-2',
-    worker_init='''
-        # Install dependencies
-        pip install numpy scipy pandas matplotlib
+    # ... network options ...
+    instance_type="c7g.large",   # arm64 AMI resolved automatically
+)
+```
 
-        # Set up environment
-        export PYTHONPATH=$PYTHONPATH:/path/to/your/modules
+## Worker initialization
 
-        # Download data
+`worker_init` runs on each worker before Parsl starts. It executes as root via
+cloud-init, so no `sudo`.
+
+```python
+provider = EphemeralAWSProvider(
+    # ... network and compute options ...
+    worker_init="""
+        dnf install -y python3.11 python3.11-pip
+        ln -sf /usr/bin/python3.11 /usr/bin/python3
+        pip3.11 install --quiet --upgrade parsl numpy scipy pandas
         aws s3 cp s3://your-bucket/data/ /tmp/data/ --recursive
-    '''
+    """,
 )
 ```
+
+The default installs Parsl on Amazon Linux 2023 and nothing else. If `worker_init`
+is slow, consider `bake_ami=True` (standard mode) to run it once into a custom AMI
+rather than on every launch.
 
 ## Monitoring
 
-The provider captures detailed logs about resource provisioning and task execution:
+The provider logs through the standard `logging` module under the
+`parsl_ephemeral_aws` hierarchy:
 
 ```python
-from parsl_ephemeral_aws.utils.logging import configure_logger
 import logging
 
-# Set up logging
-configure_logger(level=logging.INFO, file_path='parsl_aws.log')
+logging.basicConfig(level=logging.INFO)
+logging.getLogger("parsl_ephemeral_aws").setLevel(logging.DEBUG)
 ```
 
-You can also monitor resources via the AWS Management Console by looking for resources tagged with:
+Or pass `debug=True` to the provider.
+
+In the AWS console, look for resources tagged:
+
 - `ParslResource: true`
-- `ParslWorkflowId: <your-workflow-id>`
+- `ParslWorkflowId: <provider_id>`
 
-## Cleaning Up
+`provider.list_resources()` reports what the provider believes it owns.
 
-The provider automatically cleans up all resources when:
-1. The `shutdown()` method is called
-2. The Python process exits normally
-3. The bastion host times out (in detached mode)
+## Cleaning up
 
-To manually clean up resources:
+Resources are **not** removed at interpreter exit — there is no `atexit` hook.
+Call `shutdown()` explicitly:
 
 ```python
-# Clean up all resources
 provider.shutdown()
+```
+
+This cancels tracked jobs, terminates compute, deletes the launch template and
+any AMI the provider baked, and deletes the persisted state. In detached mode the
+bastion is preserved unless you shut down (see #136 for the unreachable
+`preserve_bastion` option).
+
+`parsl.clear()` does not reliably kill the HTEX interchange subprocess; the
+pattern in `examples/parsl_aws_integration.py` handles that.
+
+To find anything a crash left behind:
+
+```bash
+python tools/cleanup_aws_resources.py --dry-run --region us-east-1
 ```
 
 ## Troubleshooting
 
-### Connection Issues
+Fuller coverage in [troubleshooting.md](troubleshooting.md).
 
-If workers can't connect to your client:
-- Check if your client has a public IP or is behind a NAT
-- Consider using the detached mode
-- Verify security group rules
+**Workers launch but never register.** The client is almost certainly not
+accepting inbound connections on the interchange ports. Confirm with the security
+group attached to your *client*, not the workers. From a NAT'd laptop, switch to
+detached mode.
 
-### Spot Instance Interruptions
+**`ProviderConfigurationError: Unknown configuration option(s): ...`.** The option
+does not exist on this provider. Since #105 unknown keywords are rejected rather
+than ignored, which is why examples from older versions fail loudly — check the
+name against [api_reference.rst](api_reference.rst).
 
-If your spot instances are being interrupted frequently:
-- Try different instance types
-- Increase the spot max price percentage
-- Use the spot interruption behavior setting
-- Consider a mix of spot and on-demand instances
+**`ResourceNotFoundError` on construction.** One of the three network IDs no
+longer exists, or belongs to another region. Earlier versions silently blanked the
+ID and failed later inside `RunInstances`.
 
-### State Persistence Issues
+**Frequent spot interruptions.** Add instance types via `instance_types`, keep
+`spot_allocation_strategy="price-capacity-optimized"`, and enable
+`spot_interruption_handling=True`.
 
-If you're having issues with state persistence:
-- Check AWS permissions for Parameter Store or S3
-- Try using the file state storage for debugging
-- Ensure your workflow ID is unique
+**State persistence problems.** Check IAM permissions for the backend, and keep
+one state location per workflow — two providers sharing one adopt each other's
+`provider_id` and fight over the same resources. See
+[state_persistence.md](state_persistence.md).
 
 SPDX-License-Identifier: Apache-2.0
-SPDX-FileCopyrightText: 2025 Scott Friedman and Project Contributors
+SPDX-FileCopyrightText: 2025-2026 Scott Friedman and Project Contributors

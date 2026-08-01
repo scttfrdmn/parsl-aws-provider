@@ -1,45 +1,41 @@
 # Parsl Ephemeral AWS Provider Documentation
 
-This directory contains the documentation for the Parsl Ephemeral AWS Provider.
+Sphinx sources for the project documentation. This file is not part of the built
+site — it is excluded in `conf.py`.
 
-## Building Documentation
+## Building
 
-To build the documentation:
+```bash
+uv sync --extra dev --extra docs
+uv run make -C docs html
+open docs/_build/html/index.html
+```
 
-1. Install documentation dependencies:
-   ```bash
-   pip install -e ".[docs]"
-   ```
+The build is warning-free and CI runs it with `-W`, so a new warning fails the
+`docs` job. That is deliberate: the tree previously carried 398 warnings, which
+hid ~65 toctree entries pointing at pages nobody had written (#124).
 
-2. Build the documentation:
-   ```bash
-   cd docs
-   make html
-   ```
+## Structure
 
-3. View the documentation:
-   ```bash
-   open _build/html/index.html
-   ```
+- `conf.py` — Sphinx configuration; `release` is read from the installed package
+  rather than hardcoded
+- `index.rst` — landing page and the only toctree
+- `api_reference.rst` — autodoc over the live modules
+- `*.md` — the content pages, rendered through MyST
 
-## Documentation Structure
+Every page in `index.rst`'s toctree exists, and every configuration example is
+checked against the real `EphemeralAWSProvider` signature by
+`tests/unit/test_docs_examples.py`. The provider rejects unknown keyword
+arguments (#105), so a stale option in an example is a crash, not a nitpick — add
+new options to the tests along with the docs.
 
-- `conf.py`: Sphinx configuration
-- `index.rst`: Main documentation page
-- `installation.rst`: Installation instructions
-- `configuration.rst`: Configuration reference
-- `examples/`: Example usage scenarios
-- `api/`: API documentation
+## Contributing
 
-## Contributing to Documentation
-
-To contribute:
-
-1. Make your changes to the appropriate files
-2. Build the documentation to ensure it renders correctly
-3. Submit a pull request with your changes
-
-Please follow the existing documentation style and formatting.
+1. Edit the relevant page.
+2. Run `uv run make -C docs html` and confirm zero warnings.
+3. Run `uv run pytest tests/unit/test_docs_examples.py` if you changed a
+   configuration example.
+4. Open a pull request.
 
 SPDX-License-Identifier: Apache-2.0
-SPDX-FileCopyrightText: 2025 Scott Friedman and Project Contributors
+SPDX-FileCopyrightText: 2025-2026 Scott Friedman and Project Contributors

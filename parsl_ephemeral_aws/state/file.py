@@ -2,7 +2,7 @@
 File-based state store for the EphemeralAWSProvider.
 
 SPDX-License-Identifier: Apache-2.0
-SPDX-FileCopyrightText: 2025 Scott Friedman and Project Contributors
+SPDX-FileCopyrightText: 2025-2026 Scott Friedman and Project Contributors
 """
 
 import json
@@ -47,7 +47,7 @@ class FileStateStore(StateStore):
     Stores state in a single local JSON file. Each ``state_key`` is a top-level
     sub-document under ``_states``, so writing one key preserves the others:
 
-    .. code-block:: json
+    .. code-block:: text
 
         {"_version": 2, "_states": {"provider": {...}, "mode": {...}}}
 

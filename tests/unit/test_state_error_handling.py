@@ -4,7 +4,7 @@ These tests verify that state persistence classes properly handle error conditio
 and edge cases, providing appropriate error messages and recovery mechanisms.
 
 SPDX-License-Identifier: Apache-2.0
-SPDX-FileCopyrightText: 2025 Scott Friedman and Project Contributors
+SPDX-FileCopyrightText: 2025-2026 Scott Friedman and Project Contributors
 """
 
 import inspect
