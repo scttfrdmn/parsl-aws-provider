@@ -4,7 +4,7 @@ These tests verify that the provider correctly handles multi-node jobs like MPI
 workloads across different operating modes.
 
 SPDX-License-Identifier: Apache-2.0
-SPDX-FileCopyrightText: 2025 Scott Friedman and Project Contributors
+SPDX-FileCopyrightText: 2025-2026 Scott Friedman and Project Contributors
 """
 
 import os

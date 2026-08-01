@@ -27,7 +27,7 @@ Two gaps are worth knowing, neither of which this suite hits:
   nothing here depends on them.
 
 SPDX-License-Identifier: Apache-2.0
-SPDX-FileCopyrightText: 2025 Scott Friedman and Project Contributors
+SPDX-FileCopyrightText: 2025-2026 Scott Friedman and Project Contributors
 """
 
 import logging

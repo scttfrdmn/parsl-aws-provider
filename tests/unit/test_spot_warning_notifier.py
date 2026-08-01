@@ -25,7 +25,7 @@ probe proves once but that silently rot afterwards:
   otherwise redeliver on every poll for the whole retention period.
 
 SPDX-License-Identifier: Apache-2.0
-SPDX-FileCopyrightText: 2025 Scott Friedman and Project Contributors
+SPDX-FileCopyrightText: 2025-2026 Scott Friedman and Project Contributors
 """
 
 import json

@@ -5,7 +5,7 @@ The standard mode uses EC2 instances for computation with direct communication
 between the client and worker nodes.
 
 SPDX-License-Identifier: Apache-2.0
-SPDX-FileCopyrightText: 2025 Scott Friedman and Project Contributors
+SPDX-FileCopyrightText: 2025-2026 Scott Friedman and Project Contributors
 """
 
 import logging

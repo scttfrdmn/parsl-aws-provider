@@ -6,7 +6,7 @@ workflows, allowing the client to disconnect and reconnect to the same
 infrastructure.
 
 SPDX-License-Identifier: Apache-2.0
-SPDX-FileCopyrightText: 2025 Scott Friedman and Project Contributors
+SPDX-FileCopyrightText: 2025-2026 Scott Friedman and Project Contributors
 """
 
 import base64
@@ -126,7 +126,7 @@ class DetachedMode(OperatingMode):
             Number of nodes per block, by default 1
         spot_max_price_percentage : Optional[int], optional
             Maximum spot price as a percentage of on-demand price, by default None
-        **kwargs : Any
+        \\*\\*kwargs : Any
             Additional arguments passed to the parent class
         """
         super().__init__(provider_id, session, state_store, **kwargs)
@@ -1826,8 +1826,15 @@ if __name__ == '__main__':
     def cleanup_infrastructure(self) -> None:
         """Clean up infrastructure created by this mode.
 
-        This cleans up the VPC, subnet, and security group if they were created by the provider.
-        The bastion host is preserved if preserve_bastion is True.
+        Terminates the workers, then the bastion — either by deleting its
+        CloudFormation stack or terminating the instance, depending on
+        ``bastion_host_type``. The bastion is left running when
+        ``preserve_bastion`` is set, which is what makes later reconnection
+        possible.
+
+        The VPC, subnet, and security group are **not** touched: they are supplied
+        by the caller and this mode never created them (#69). An earlier version of
+        this docstring claimed otherwise.
         """
         logger.info("Cleaning up infrastructure")
 
@@ -1886,7 +1893,10 @@ if __name__ == '__main__':
 
             self.bastion_id = None
 
-        # Only delete networking if not preserving bastion
+        # Tear down the monitoring thread only when the bastion is going too --
+        # a preserved bastion is still running workers worth watching. (There is
+        # no networking to delete here; the comment that used to say so predated
+        # #69.)
         if not self.preserve_bastion:
             try:
                 # Stop spot interruption monitoring if enabled

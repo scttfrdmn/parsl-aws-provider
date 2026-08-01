@@ -1,101 +1,78 @@
-# Security Best Practices
+# Security
 
-This document outlines security best practices for using the Parsl Ephemeral AWS Provider in your AWS environment.
+## What the provider does for you
 
-## AWS IAM Permissions
+- **IMDSv2 is required on every launch.** `HttpTokens: "required"` is set in the
+  launch template and on every direct `RunInstances` path, so the metadata service
+  rejects the unauthenticated IMDSv1 `GET` — the request an SSRF-ed application
+  can be tricked into making to read the instance's role credentials.
+  `HttpEndpoint` stays enabled because the SSM agent needs it. The hop limit stays
+  at EC2's default of 2, since a container's request costs a hop and a limit of 1
+  would make metadata unreachable from inside one.
+- **No long-lived credentials on instances.** Workers get an IAM instance profile;
+  nothing writes access keys into user data.
+- **No network resources are created or deleted.** Since v0.7.0 the VPC, subnet,
+  and security group are yours. The provider cannot widen your network posture,
+  and cannot delete a security group you supplied — a real hazard before v0.7.0,
+  when `ServerlessMode.cleanup_infrastructure()` called `delete_security_group` on
+  a user-supplied ID with no ownership check.
+- **Every resource is tagged** `ParslResource=true` and
+  `ParslWorkflowId=<provider_id>`, so an orphan is findable and attributable.
+- **Instances terminate rather than stop.**
+  `InstanceInitiatedShutdownBehavior="terminate"` means a finished worker leaves
+  no billed EBS volume behind.
 
-### Principle of Least Privilege
+## Least-privilege IAM policy
 
-The Parsl Ephemeral AWS Provider requires specific IAM permissions to function. Following the principle of least privilege, here's a baseline IAM policy that grants only the necessary permissions:
+The authoritative action set is generated from the code, so it cannot drift from
+what the provider actually calls:
 
-```json
-{
-    "Version": "2012-10-17",
-    "Statement": [
-        {
-            "Effect": "Allow",
-            "Action": [
-                "ec2:RunInstances",
-                "ec2:TerminateInstances",
-                "ec2:DescribeInstances",
-                "ec2:DescribeInstanceStatus",
-                "ec2:CreateTags",
-                "ec2:CreateVpc",
-                "ec2:CreateSubnet",
-                "ec2:CreateSecurityGroup",
-                "ec2:AuthorizeSecurityGroupIngress",
-                "ec2:AuthorizeSecurityGroupEgress",
-                "ec2:DescribeVpcs",
-                "ec2:DescribeSubnets",
-                "ec2:DescribeSecurityGroups",
-                "ec2:DeleteVpc",
-                "ec2:DeleteSubnet",
-                "ec2:DeleteSecurityGroup",
-                "ec2:ModifyVpcAttribute",
-                "ec2:CreateInternetGateway",
-                "ec2:AttachInternetGateway",
-                "ec2:DetachInternetGateway",
-                "ec2:DeleteInternetGateway",
-                "ec2:CreateRouteTable",
-                "ec2:CreateRoute",
-                "ec2:DeleteRouteTable",
-                "ec2:AssociateRouteTable",
-                "ec2:DisassociateRouteTable",
-                "ec2:DescribeInternetGateways",
-                "ec2:DescribeRouteTables"
-            ],
-            "Resource": "*"
-        },
-        {
-            "Effect": "Allow",
-            "Action": [
-                "ssm:PutParameter",
-                "ssm:GetParameter",
-                "ssm:DeleteParameter",
-                "ssm:GetParametersByPath",
-                "ssm:DescribeParameters"
-            ],
-            "Resource": "arn:aws:ssm:*:*:parameter/parsl/*"
-        },
-        {
-            "Effect": "Allow",
-            "Action": [
-                "s3:CreateBucket",
-                "s3:PutObject",
-                "s3:GetObject",
-                "s3:DeleteObject",
-                "s3:ListBucket",
-                "s3:GetBucketLocation"
-            ],
-            "Resource": [
-                "arn:aws:s3:::parsl-*",
-                "arn:aws:s3:::parsl-*/*"
-            ]
-        }
-    ]
-}
+```python
+import json
+
+from parsl_ephemeral_aws import GlobusComputeProvider
+
+print(json.dumps(GlobusComputeProvider.minimum_iam_policy(), indent=2))
+print(json.dumps(GlobusComputeProvider.minimum_iam_policy(include_ecr=True), indent=2))
 ```
 
-### Additional Permissions for Specific Modes
+This is a `@staticmethod` — you do not need to construct a provider to call it,
+and it applies to `EphemeralAWSProvider` just as much as to the Globus subclass.
 
-For specific operating modes, additional permissions may be required:
+It returns four statements: `EC2Management`, `SSMTunneling`,
+`SpotInterruptionWarning`, and `IAMInstanceProfile`, plus `ECRContainerImages`
+when `include_ecr=True`.
 
-#### Detached Mode
+Note what it does **not** grant: no `ec2:CreateVpc`, `CreateSubnet`,
+`CreateSecurityGroup`, `CreateNatGateway`, or `RequestSpotFleet`. Older versions
+of this document asked for all of them. The provider creates no network resources
+(#69) and uses `CreateFleet` rather than the legacy Spot Fleet API (#86).
+
+Every statement uses `Resource: "*"`. Most of these EC2 and IAM actions do not
+support resource-level permissions, but you should scope what you can with
+condition keys — `ec2:ResourceTag/ParslResource` on the terminate and tag actions,
+and `iam:PassedToService: ec2.amazonaws.com` on `iam:PassRole`.
+
+### Additional permissions by mode
+
+**Detached mode** — the bastion runs from a CloudFormation stack:
+
 ```json
 {
     "Effect": "Allow",
     "Action": [
-        "iam:PassRole",
         "cloudformation:CreateStack",
         "cloudformation:DescribeStacks",
+        "cloudformation:DescribeStackEvents",
         "cloudformation:DeleteStack",
-        "cloudformation:DescribeStackEvents"
+        "iam:PassRole"
     ],
     "Resource": "*"
 }
 ```
 
-#### Serverless Mode (Lambda)
+**Serverless mode (Lambda)**:
+
 ```json
 {
     "Effect": "Allow",
@@ -106,15 +83,14 @@ For specific operating modes, additional permissions may be required:
         "lambda:GetFunction",
         "lambda:UpdateFunctionCode",
         "lambda:UpdateFunctionConfiguration",
-        "lambda:AddPermission",
-        "lambda:RemovePermission",
         "iam:PassRole"
     ],
     "Resource": "*"
 }
 ```
 
-#### Serverless Mode (ECS/Fargate)
+**Serverless mode (ECS/Fargate)**:
+
 ```json
 {
     "Effect": "Allow",
@@ -123,25 +99,62 @@ For specific operating modes, additional permissions may be required:
         "ecs:DeleteCluster",
         "ecs:RegisterTaskDefinition",
         "ecs:DeregisterTaskDefinition",
-        "ecs:ListTasks",
-        "ecs:DescribeTasks",
         "ecs:RunTask",
         "ecs:StopTask",
-        "ecs:DescribeServices",
-        "ecs:CreateService",
-        "ecs:DeleteService",
-        "ecs:UpdateService",
+        "ecs:ListTasks",
+        "ecs:DescribeTasks",
         "iam:PassRole"
     ],
     "Resource": "*"
 }
 ```
 
-## IAM Instance Profiles
+**State backends** — Parameter Store:
 
-### Worker Instance Profile
+```json
+{
+    "Effect": "Allow",
+    "Action": [
+        "ssm:PutParameter",
+        "ssm:GetParameter",
+        "ssm:DeleteParameter"
+    ],
+    "Resource": "arn:aws:ssm:*:*:parameter/parsl/*"
+}
+```
 
-For EC2 worker instances, you should create an IAM role and instance profile with only the permissions required for your specific workload. Here's an example minimal policy for worker instances:
+S3:
+
+```json
+{
+    "Effect": "Allow",
+    "Action": ["s3:PutObject", "s3:GetObject", "s3:DeleteObject", "s3:ListBucket"],
+    "Resource": [
+        "arn:aws:s3:::my-parsl-state-bucket",
+        "arn:aws:s3:::my-parsl-state-bucket/*"
+    ]
+}
+```
+
+No `s3:CreateBucket` — the bucket must already exist.
+
+## Instance profiles
+
+### Worker instance profile
+
+With `auto_create_instance_profile=True` the provider creates a role carrying
+`AmazonSSMManagedInstanceCore` and nothing else. That is the minimum for SSM
+`SendCommand`, which the warm-pool and one-shot paths need.
+
+If your workload needs more — reading S3, writing CloudWatch Logs — create the
+role yourself and pass `iam_instance_profile_arn`:
+
+```python
+provider = EphemeralAWSProvider(
+    # ... network and compute options ...
+    iam_instance_profile_arn="arn:aws:iam::123456789012:instance-profile/parsl-worker",
+)
+```
 
 ```json
 {
@@ -149,56 +162,11 @@ For EC2 worker instances, you should create an IAM role and instance profile wit
     "Statement": [
         {
             "Effect": "Allow",
-            "Action": [
-                "logs:CreateLogGroup",
-                "logs:CreateLogStream",
-                "logs:PutLogEvents"
-            ],
-            "Resource": "arn:aws:logs:*:*:*"
-        },
-        {
-            "Effect": "Allow",
-            "Action": [
-                "s3:GetObject",
-                "s3:PutObject",
-                "s3:ListBucket"
-            ],
+            "Action": ["s3:GetObject", "s3:PutObject", "s3:ListBucket"],
             "Resource": [
                 "arn:aws:s3:::your-data-bucket",
                 "arn:aws:s3:::your-data-bucket/*"
             ]
-        }
-    ]
-}
-```
-
-### Bastion Instance Profile (Detached Mode)
-
-For the bastion host in detached mode, a specific role is required to manage EC2 instances and communicate with Parameter Store:
-
-```json
-{
-    "Version": "2012-10-17",
-    "Statement": [
-        {
-            "Effect": "Allow",
-            "Action": [
-                "ec2:RunInstances",
-                "ec2:TerminateInstances",
-                "ec2:DescribeInstances",
-                "ec2:CreateTags"
-            ],
-            "Resource": "*"
-        },
-        {
-            "Effect": "Allow",
-            "Action": [
-                "ssm:PutParameter",
-                "ssm:GetParameter",
-                "ssm:DeleteParameter",
-                "ssm:GetParametersByPath"
-            ],
-            "Resource": "arn:aws:ssm:*:*:parameter/parsl/workflows/*"
         },
         {
             "Effect": "Allow",
@@ -208,228 +176,255 @@ For the bastion host in detached mode, a specific role is required to manage EC2
                 "logs:PutLogEvents"
             ],
             "Resource": "arn:aws:logs:*:*:*"
-        },
-        {
-            "Effect": "Allow",
-            "Action": [
-                "cloudwatch:PutMetricData"
-            ],
-            "Resource": "*"
         }
     ]
 }
 ```
 
-## Network Security
+Attach `AmazonSSMManagedInstanceCore` as well if you use the warm pool or one-shot
+mode.
 
-### VPC Security
+**A role created with `auto_create_instance_profile=True` is not deleted on
+shutdown** ([#132](https://github.com/scttfrdmn/parsl-aws-provider/issues/132)).
+Supply your own ARN if you need to control that lifecycle.
 
-By default, the provider creates a VPC with a single public subnet and security group. For enhanced security:
+### Bastion instance profile (detached mode)
 
-1. **Use Existing VPC**: Provide your own VPC ID to use an existing VPC with proper security controls
-   ```python
-   provider = EphemeralAWSProvider(
-       mode=StandardMode(
-           vpc_id="vpc-12345678",
-           subnet_id="subnet-12345678",
-           security_group_id="sg-12345678",
-           create_vpc=False,
-           # Other parameters...
-       ),
-       # Other parameters...
-   )
-   ```
+The CloudFormation template creates this role, carrying
+`AmazonSSMManagedInstanceCore` plus EC2 and Parameter Store access — the bastion
+launches and terminates workers itself, so it needs `RunInstances`,
+`TerminateInstances`, `DescribeInstances`, `CreateTags`, and read/write on
+`/parsl/*` parameters. The bastion is a compute host with real authority; treat
+its role as the most sensitive part of the deployment.
 
-2. **Restrict Security Group Rules**: Create a security group with minimal access rules
-   ```python
-   # First create a security group with specific rules
-   ec2 = boto3.client('ec2', region_name='us-west-2')
-   response = ec2.create_security_group(
-       GroupName='parsl-restricted-sg',
-       Description='Restricted security group for Parsl workers',
-       VpcId='vpc-12345678'
-   )
-   security_group_id = response['GroupId']
+## Network security
 
-   # Add minimal ingress rules
-   ec2.authorize_security_group_ingress(
-       GroupId=security_group_id,
-       IpPermissions=[
-           {
-               'IpProtocol': 'tcp',
-               'FromPort': 22,
-               'ToPort': 22,
-               'IpRanges': [{'CidrIp': 'your-ip-address/32'}]
-           },
-           {
-               'IpProtocol': 'tcp',
-               'FromPort': 55000,
-               'ToPort': 55100,
-               'IpRanges': [{'CidrIp': 'your-ip-address/32'}]
-           }
-       ]
-   )
+The provider requires an existing VPC, subnet, and security group — there is no
+`create_vpc` option, and passing one raises `ProviderConfigurationError`. See
+[network-prerequisites.md](network-prerequisites.md) for the required rules.
 
-   # Then use this security group in your provider
-   provider = EphemeralAWSProvider(
-       mode=StandardMode(
-           security_group_id=security_group_id,
-           # Other parameters...
-       ),
-       # Other parameters...
-   )
-   ```
+### Scope the security group tightly
 
-3. **Use Private Subnets with NAT Gateway**: For enhanced security, use private subnets with a NAT gateway
-   ```python
-   provider = EphemeralAWSProvider(
-       mode=StandardMode(
-           subnet_id="private-subnet-12345678",
-           use_public_ips=False,
-           # Other parameters...
-       ),
-       # Other parameters...
-   )
-   ```
+Workers need outbound to reach the interchange, AWS APIs, and any package index
+`worker_init` uses. Inbound is where the exposure is.
 
-### Inbound Traffic Control
+```python
+import boto3
 
-By default, worker instances in Standard or Detached modes will need inbound access from your client machine. For better security:
+ec2 = boto3.client("ec2", region_name="us-east-1")
+sg = ec2.create_security_group(
+    GroupName="parsl-workers",
+    Description="Parsl ephemeral workers",
+    VpcId="vpc-0123456789abcdef0",
+)["GroupId"]
 
-1. **Restrict Source IP Ranges**: Limit inbound access to your IP address or CIDR range
-2. **Use a VPN or AWS Direct Connect**: Establish a private connection to your AWS environment
-3. **Consider Detached Mode with SSM**: Use AWS Systems Manager for secure bastion access without opening SSH ports
+# Workers dial the interchange outbound, so no inbound rule is needed for Parsl
+# itself. Add one only for a client that must reach the workers directly.
+ec2.authorize_security_group_ingress(
+    GroupId=sg,
+    IpPermissions=[
+        {
+            "IpProtocol": "tcp",
+            "FromPort": 54000,
+            "ToPort": 55000,
+            "IpRanges": [{"CidrIp": "203.0.113.10/32"}],  # your client, /32
+        }
+    ],
+)
 
-### Encryption in Transit
+provider = EphemeralAWSProvider(
+    region="us-east-1",
+    vpc_id="vpc-0123456789abcdef0",
+    subnet_id="subnet-0123456789abcdef0",
+    security_group_id=sg,
+)
+```
 
-All communication between the provider and AWS services uses HTTPS/TLS. For worker-to-worker communication:
+No SSH rule appears above deliberately. Reach instances with SSM Session Manager
+instead:
 
-1. **Within VPC**: Communication within a VPC is secure by default
-2. **Between Workers and Client**: Use HTTPS or SSH tunneling for secure communication
+```bash
+aws ssm start-session --target i-0123456789abcdef0
+```
 
-## Data Security
+That needs no inbound rule, no key pair, and no public IP, and every session is
+logged in CloudTrail. `key_name` remains available if you want SSH, but it is not
+required for access.
 
-### Encryption at Rest
-
-1. **S3 State Store**: Enable default encryption for your S3 bucket
-   ```python
-   provider = EphemeralAWSProvider(
-       state_store=S3StateStore(
-           bucket="my-parsl-state-bucket",
-           encryption="AES256",  # or "aws:kms"
-           # Other parameters...
-       ),
-       # Other parameters...
-   )
-   ```
-
-2. **Parameter Store**: Use SecureString type for sensitive parameters
-   ```python
-   provider = EphemeralAWSProvider(
-       state_store=ParameterStoreState(
-           prefix="/parsl/workflows/my-workflow",
-           secure=True,  # Uses SecureString type with AWS managed key
-           # Other parameters...
-       ),
-       # Other parameters...
-   )
-   ```
-
-3. **Worker Volumes**: Enable EBS volume encryption for worker instances
-   ```python
-   provider = EphemeralAWSProvider(
-       mode=StandardMode(
-           block_device_mappings=[
-               {
-                   'DeviceName': '/dev/sda1',
-                   'Ebs': {
-                       'VolumeSize': 50,
-                       'VolumeType': 'gp3',
-                       'DeleteOnTermination': True,
-                       'Encrypted': True
-                   }
-               }
-           ],
-           # Other parameters...
-       ),
-       # Other parameters...
-   )
-   ```
-
-### Credentials Management
-
-1. **Avoid Hardcoded Credentials**: Never include AWS credentials in your code
-   ```python
-   # DON'T DO THIS
-   provider = EphemeralAWSProvider(
-       aws_access_key_id="AKIAIOSFODNN7EXAMPLE",
-       aws_secret_access_key="wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
-       # Other parameters...
-   )
-
-   # INSTEAD, use environment variables, IAM roles, or AWS profiles
-   provider = EphemeralAWSProvider(
-       aws_profile="parsl-profile",  # Or omit to use default credentials
-       # Other parameters...
-   )
-   ```
-
-2. **Use IAM Roles**: For EC2 instances and serverless functions, use IAM roles instead of access keys
-3. **Rotate Credentials**: If using access keys, rotate them regularly according to your security policy
-
-## Auditing and Monitoring
-
-### Resource Tagging
-
-All resources created by the provider are tagged for tracking and billing. You can add custom tags:
+### Private subnets
 
 ```python
 provider = EphemeralAWSProvider(
-    tags={
-        "Project": "MyDataScience",
-        "Environment": "Development",
-        "Owner": "username@example.com",
-        "CostCenter": "12345"
-    },
-    # Other parameters...
+    # ... other options ...
+    subnet_id="subnet-private0123456789",
+    use_public_ips=False,
 )
 ```
+
+Instances then need a NAT gateway, or VPC endpoints for `ssm`, `ssmmessages`,
+`ec2messages`, and `s3`, to reach AWS APIs and register with SSM. The provider
+does not create either.
+
+## Data security
+
+### Encryption in transit
+
+Traffic to AWS APIs is HTTPS. Worker-to-interchange ZMQ traffic is a different
+matter: **set `encrypted=False` on `HighThroughputExecutor` for now**. Parsl's
+CurveZMQ certificates are generated in the client's `run_dir`, which workers
+cannot read, so leaving encryption on makes workers fail to register. Same-VPC
+deployments rely on VPC isolation; certificate distribution for cross-VPC and
+internet paths is
+[#62](https://github.com/scttfrdmn/parsl-aws-provider/issues/62).
+
+### Encryption at rest
+
+**S3 state store** — configure default encryption on the bucket itself. There is
+no provider option for this; the provider does not create the bucket, so bucket
+policy is where it belongs:
+
+```bash
+aws s3api put-bucket-encryption --bucket my-parsl-state-bucket \
+  --server-side-encryption-configuration \
+  '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]}'
+```
+
+**Parameter Store** — `ParameterStoreState` supports `SecureString` via
+`use_secure_string=True`, but the provider always constructs it with the default
+`False` and exposes no option. To use it, replace the store after construction and
+before the first `submit()`:
+
+```python
+from parsl_ephemeral_aws.state.parameter_store import ParameterStoreState
+
+provider.state_store = ParameterStoreState(
+    provider=provider,
+    prefix="/parsl/my-workflow",
+    use_secure_string=True,
+)
+```
+
+State documents hold resource IDs and job commands, not credentials — assess
+whether that warrants `SecureString` for your environment.
+
+**EBS volumes** — there is no `block_device_mappings` option. Set
+[EBS encryption by default](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/EBSEncryption.html#encryption-by-default)
+for the account and region, which covers every volume the provider launches
+without needing an option at all.
+
+### Credentials
+
+Never put credentials in code. The provider takes no `aws_access_key_id` or
+`aws_secret_access_key` — it resolves credentials through botocore, so
+environment variables, `~/.aws/credentials`, and instance profiles all work.
+Select a named profile with `profile_name`:
+
+```python
+provider = EphemeralAWSProvider(
+    profile_name="parsl-profile",
+    # ... other options ...
+)
+```
+
+Prefer an instance profile or IAM Identity Center over static keys. If you must
+use keys, rotate them on your usual schedule.
+
+## Auditing and monitoring
+
+### Tagging
+
+```python
+provider = EphemeralAWSProvider(
+    # ... other options ...
+    additional_tags={
+        "Project": "MyDataScience",
+        "Environment": "Development",
+        "Owner": "someone@example.com",
+        "CostCenter": "12345",
+    },
+)
+```
+
+The option is `additional_tags`, not `tags`. These are applied alongside
+`ParslResource` and `ParslWorkflowId`, so cost allocation and orphan sweeps both
+work.
+
+### Audit logging
+
+`parsl_ephemeral_aws.security.audit` provides `AuditLogger` and
+`SecurityMonitor`. `ParameterStoreState` emits `STATE_ACCESS` events when the
+provider has an `audit_logger` attribute — but the provider takes no such
+constructor argument and sets no such attribute, so you must attach one yourself:
+
+```python
+from parsl_ephemeral_aws.security.audit import AuditLogger
+
+provider.audit_logger = AuditLogger(log_file="parsl-audit.jsonl")
+```
+
+Only the Parameter Store backend consults it today. Broader adoption is not yet
+implemented.
 
 ### CloudTrail and CloudWatch
 
-1. **Enable CloudTrail**: Track all API calls made by the provider
-2. **Set up CloudWatch Alarms**: Monitor for unexpected resource usage or costs
-3. **Log Analysis**: Analyze CloudWatch Logs for security events
+- **CloudTrail** records every API call the provider makes, including each
+  `StartSession`. This is your real audit trail.
+- **Budgets and CloudWatch alarms** on EC2 spend are worth setting up: the
+  provider has no cost controls of its own beyond `max_blocks`,
+  `max_idle_time`, and the warm-pool cap.
+- **CloudWatch Logs** hold cloud-init output only if you configure the agent in
+  `worker_init`; the provider does not install it.
 
-## Security Updates
+## Compliance
 
-1. **Keep Dependencies Updated**: Regularly update the provider and its dependencies
-2. **AMI Updates**: Use up-to-date AMIs with security patches
-3. **Security Bulletins**: Monitor AWS security bulletins for relevant issues
+If your workflows touch regulated data:
 
-## Compliance Considerations
+- **VPC endpoints** for `ssm`, `ssmmessages`, `ec2messages`, `s3`, and `logs` keep
+  traffic off the public internet. Create them yourself — there is no provider
+  option.
+- **AWS Config** rules can assert that launched instances match your baseline.
+- **Security Hub** aggregates findings across accounts.
+- Note the default AMI is a public Amazon Linux 2023 image resolved from SSM. If
+  you need a hardened or approved base, pass `image_id` explicitly, or use
+  `bake_ami` with `worker_init` doing the hardening.
 
-If your workflows involve sensitive or regulated data, consider:
+## Emergency shutdown
 
-1. **VPC Endpoints**: Use VPC endpoints to keep traffic within the AWS network
-2. **AWS Artifact**: Access compliance reports for your regulatory needs
-3. **AWS Config**: Continuously monitor and assess your AWS resource configurations
-4. **AWS Security Hub**: Comprehensive view of security alerts and compliance status
-
-## Emergency Shutdown
-
-In case of a security incident or unintended resource usage:
+To tear down everything a provider owns:
 
 ```python
-# Create provider with existing workflow ID
-provider = EphemeralAWSProvider(
-    mode=DetachedMode(
-        workflow_id="compromised-workflow-id",
-        # Minimal parameters needed for connection
-    ),
-    # Other minimal parameters...
-)
-
-# Emergency cleanup - force termination of all resources
-provider.cleanup_all(force=True)
+provider.cleanup_all()   # terminate compute, keep the provider usable
+provider.shutdown()      # ...and delete the launch template, AMI, and state
 ```
+
+Neither takes a `force` argument. To reach the resources of a workflow started by
+another process, construct a provider against the same state location — the
+persisted `provider_id` is adopted automatically:
+
+```python
+provider = EphemeralAWSProvider(
+    mode="detached",
+    region="us-east-1",
+    vpc_id="vpc-0123456789abcdef0",
+    subnet_id="subnet-0123456789abcdef0",
+    security_group_id="sg-0123456789abcdef0",
+    state_store_type="parameter_store",
+    parameter_store_path="/parsl/compromised-workflow",
+)
+provider.shutdown()
+```
+
+If the state is gone, sweep by tag instead:
+
+```bash
+python tools/cleanup_aws_resources.py --region us-east-1            # --dry-run first
+```
+
+## Reporting a vulnerability
+
+Open a
+[security advisory](https://github.com/scttfrdmn/parsl-aws-provider/security/advisories/new)
+rather than a public issue.
+
+SPDX-License-Identifier: Apache-2.0
+SPDX-FileCopyrightText: 2025-2026 Scott Friedman and Project Contributors

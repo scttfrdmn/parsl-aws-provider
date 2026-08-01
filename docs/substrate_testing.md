@@ -230,4 +230,4 @@ SUBSTRATE_ENDPOINT=http://localhost:4599 uv run pytest tests/integration -v
 ```
 
 SPDX-License-Identifier: Apache-2.0
-SPDX-FileCopyrightText: 2025 Scott Friedman and Project Contributors
+SPDX-FileCopyrightText: 2025-2026 Scott Friedman and Project Contributors

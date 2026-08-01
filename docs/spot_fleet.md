@@ -1,161 +1,271 @@
-# Using Spot Fleet with Parsl AWS Provider
+# Fleets: multiple instance types per block
 
-The Parsl AWS Provider supports AWS Spot Fleet for more reliable and cost-effective spot instance provisioning. Spot Fleet allows you to request multiple instance types at once, improving availability and potentially reducing costs.
+Requesting several instance types at once is the single most effective way to
+reduce spot interruptions: EC2 draws from whichever pool has capacity instead of
+failing when your one chosen type is exhausted.
 
-## Benefits of Spot Fleet
+As of v0.7.0 this uses the **EC2 Fleet** API (`CreateFleet`), not Spot Fleet.
+AWS describes Spot Fleet as "a legacy API with no planned investment"
+([#86](https://github.com/scttfrdmn/parsl-aws-provider/issues/86)). The option is
+still spelled `use_spot_fleet` for compatibility.
 
-- **Higher Availability**: Spreads requests across multiple instance types and sizes
-- **Cost Optimization**: Automatically selects the lowest-priced instances from your specified pool
-- **Capacity Management**: Maintains target capacity by replacing terminated instances
-- **Simplified Management**: Single request manages multiple instance types
-- **Flexible Pricing Control**: Set maximum price as a percentage of on-demand pricing
+## What changed with EC2 Fleet
+
+| | Spot Fleet (before) | EC2 Fleet (now) |
+|---|---|---|
+| API | `RequestSpotFleet` | `CreateFleet` with `Type="instant"` |
+| IAM service role | Required (`IamFleetRole`) | None — no role to create or grant |
+| Launch form | Launch specifications or template | Launch template, mandatory |
+| Instance IDs | Polled until the request filled | Returned by the create call |
+| Allocation strategy spelling | camelCase (`priceCapacityOptimized`) | kebab-case (`price-capacity-optimized`) |
+
+The two APIs reject each other's enum spelling, and neither `DryRun` nor a
+zero-capacity request validates it — only a real launch does. The provider uses
+the kebab-case form; the camelCase constant survives for the CloudFormation
+templates and the detached-mode bastion, which drive `AWS::EC2::SpotFleet`
+resources.
+
+## Benefits
+
+- **Higher availability** — draws across instance types, sizes, and families
+- **Fewer interruptions** — `price-capacity-optimized` prefers pools with the
+  deepest spare capacity, then the lowest price among those
+- **Price ceiling** — cap as a percentage of on-demand with
+  `spot_max_price_percentage`
+- **No IAM service role** — one fewer permission to grant
 
 ## Configuration
 
-To use Spot Fleet with the Parsl AWS Provider, you need to set the following parameters:
-
 ```python
-from parsl.providers import EphemeralAWSProvider
+from parsl_ephemeral_aws import EphemeralAWSProvider
 
 provider = EphemeralAWSProvider(
-    # Basic configuration
     region="us-east-1",
+    vpc_id="vpc-0123456789abcdef0",
+    subnet_id="subnet-0123456789abcdef0",
+    security_group_id="sg-0123456789abcdef0",
 
-    # Enable both spot instances and spot fleet
     use_spot=True,
     use_spot_fleet=True,
+    instance_types=["m5.large", "m5a.large", "m6i.large", "c5.large"],
 
-    # Configure multiple instance types
-    instance_types=["t3.small", "t3.medium", "m5.small"],
+    nodes_per_block=2,             # instances per fleet
+    spot_max_price_percentage=80,  # cap at 80% of on-demand
+    spot_allocation_strategy="price-capacity-optimized",  # the default
 
-    # Set number of nodes per block
-    nodes_per_block=2,
-
-    # Maximum price as percentage of on-demand (optional)
-    spot_max_price_percentage=80,
-
-    # Other standard configuration...
-    operating_mode="detached",  # Recommended for long-running workflows
-    workflow_id="my-workflow",
-    # ...
+    mode="standard",
+    max_blocks=4,
 )
 ```
 
-## Required Parameters
+**Both flags are required.** `use_spot_fleet=True` on its own does nothing: the
+gate that builds the fleet manager reads `use_spot and use_spot_fleet`
+(`modes/standard.py:233`), so with `use_spot` unset no manager exists, the launch
+falls through to a single on-demand instance, and nothing reports it
+([#137](https://github.com/scttfrdmn/parsl-aws-provider/issues/137)). With both
+set, the fleet path takes precedence over the single-spot-instance path.
 
-- `use_spot`: Must be set to `True` to use spot instances
-- `use_spot_fleet`: Set to `True` to enable Spot Fleet (instead of individual spot instances)
-- `instance_types`: List of instance types to include in the Spot Fleet request
+## Parameters
 
-## Optional Parameters
+**Required for the fleet path**
 
-- `nodes_per_block`: Number of instances to request per block (default: 1)
-- `spot_max_price_percentage`: Maximum price as percentage of on-demand price (default: 100)
+- `use_spot=True` **and** `use_spot_fleet=True`
+- `instance_types` — a list of instance type **names**, e.g.
+  `["m5.large", "c5.large"]`. Not weighted dictionaries. If omitted, the fleet is
+  created with `instance_type` as its only type, which forfeits the whole point.
 
-## Recommended Operating Mode
+**Optional**
 
-Spot Fleet is most effective with the `detached` operating mode, which provides better support for maintaining state across spot interruptions.
+- `nodes_per_block` (default `1`) — the fleet's target capacity. This is the only
+  path where `nodes_per_block` has an effect; the single-instance launch paths
+  always launch one instance per block.
+- `spot_max_price_percentage` (default: none) — maximum price as a percentage of
+  on-demand. Leave unset to pay up to the on-demand price, which is the AWS
+  default and rarely reached.
+- `spot_allocation_strategy` (default `"price-capacity-optimized"`) — one of
+  `lowest-price`, `diversified`, `capacity-optimized`,
+  `capacity-optimized-prioritized`, `price-capacity-optimized`. An unrecognised
+  value is rejected with a useful message rather than an opaque
+  `InvalidParameterValue` from EC2.
 
-## Automatic Instance Type Selection
+## Instance types are not synthesized for you
 
-If you don't specify `instance_types`, the provider will automatically generate a list based on the primary `instance_type`:
+Earlier versions claimed the provider would derive alternatives from your primary
+`instance_type` (`t3.small` → `m5.small`, `c5.small`, …). It does not, and that
+approach was removed deliberately: string-slicing the family and generation
+produces invalid names for multi-character families like `m5a` and `c6g`, and
+`m5.small` does not exist at all.
 
-1. Uses the specified `instance_type` as the first choice
-2. Adds similar instance types from the same family (compute, memory, general purpose)
-3. Adds a newer generation if applicable
+Choose types yourself. Effective pools share a size and mix families and
+generations:
 
-For example, if `instance_type` is "t3.small", it might automatically use:
-- "t3.small" (primary choice)
-- "m5.small" (similar general purpose)
-- "c5.small" (similar compute family)
-- "t4g.small" (newer generation)
+```python
+instance_types=["m5.xlarge", "m5a.xlarge", "m5n.xlarge", "m6i.xlarge"]
+```
 
-## Resource Tracking
+Keep vCPU and memory comparable across the list, since Parsl sizes its worker pool
+from a single `instance_type`'s capacity.
 
-The provider automatically tracks all Spot Fleet requests and instances, making them visible in:
+## Spot interruption warnings
 
-- Job status tracking via `get_status()`
-- Resource cleanup during `cleanup_resources()`
-- Infrastructure cleanup during `cleanup_infrastructure()`
+An `instant` fleet gets no Capacity Rebalance — `CreateFleet` rejects
+`SpotOptions.MaintenanceStrategies` for that type — so the two-minute warning
+comes from EventBridge instead. Set `spot_interruption_handling=True` and the
+provider creates a rule matching the *EC2 Spot Instance Interruption Warning*
+event with an SQS queue target, which it polls.
 
-## Full Example
+```python
+provider = EphemeralAWSProvider(
+    # ... network options ...
+    use_spot=True,
+    use_spot_fleet=True,
+    instance_types=["m5.large", "m5a.large"],
+    spot_interruption_handling=True,
+    checkpoint_bucket="my-parsl-checkpoints",  # required today, see #137
+)
+```
+
+Detection was verified end to end against real EC2 with a Fault Injection
+Simulator experiment (`aws:ec2:send-spot-instance-interruptions`): the warning
+reached the queue 15.2 s in, with the instance still `running`. That is the point
+— polling EC2 instance state cannot see anything until `shutting-down`, by which
+time it is far too late to react.
+
+*Rebalance Recommendation* is deliberately not matched: it signals elevated risk,
+not an impending reclaim, and treating it as one would tear down healthy workers.
+
+Two limitations, both
+[#137](https://github.com/scttfrdmn/parsl-aws-provider/issues/137):
+
+- **`checkpoint_bucket` is required to get any detection at all.** Without it the
+  monitor is never constructed — one WARNING at startup, then silence. The bucket
+  is not otherwise used on this path.
+- **The warning currently produces a log line, not recovery.** The task-recovery
+  API exists but nothing in the package feeds it. Set `retries` on the Parsl
+  `Config`; that is what actually re-runs work lost to a reclaim.
+
+## Resource tracking
+
+Fleets and their instances are tagged alike, so one sweep finds both:
+
+- `ParslResource=true`
+- `ParslWorkflowId=<provider_id>`
+- `ParslBlockId=<block_id>`
+- `Name=parsl-fleet-<block>` on the fleet, `parsl-node-<block>` on instances
+
+The orphan sweep goes through instances rather than fleets: `describe_fleets` does
+not filter on the `aws:ec2:fleet-id` tag, but `describe_instances` does.
+
+Fleets appear in `provider.status()`, `provider.list_resources()`, and are removed
+by `cleanup_resources()` and `cleanup_infrastructure()`.
+
+## Full example
 
 ```python
 import parsl
-from parsl.app.app import python_app
 from parsl.config import Config
 from parsl.executors import HighThroughputExecutor
-from parsl.providers import EphemeralAWSProvider
-from parsl.addresses import address_by_hostname
+from parsl_ephemeral_aws import EphemeralAWSProvider
 
-# Import StateStore implementation
-from parsl_ephemeral_aws.state import S3StateStore
 
-@python_app
+@parsl.python_app
 def hello(name):
     import platform
+
     return f"Hello, {name} from {platform.node()}"
 
-# Configure provider with Spot Fleet
+
 provider = EphemeralAWSProvider(
     region="us-east-1",
-    operating_mode="detached",
-    workflow_id="spot-fleet-demo",
+    vpc_id="vpc-0123456789abcdef0",
+    subnet_id="subnet-0123456789abcdef0",
+    security_group_id="sg-0123456789abcdef0",
+    mode="standard",
     use_spot=True,
     use_spot_fleet=True,
-    instance_types=["t3.small", "t3.medium", "m5.small"],
+    instance_types=["m5.large", "m5a.large", "m6i.large"],
     nodes_per_block=2,
     spot_max_price_percentage=80,
+    spot_interruption_handling=True,
     max_blocks=4,
-    state_store=S3StateStore(
-        bucket_name="your-state-bucket",
-        key_prefix="parsl-states",
-    ),
+    state_store_type="s3",
+    s3_bucket="your-state-bucket",
+    s3_key="spot-fleet-demo/state.json",
 )
 
-# Create executor with provider
-executor = HighThroughputExecutor(
-    label="spot_fleet_executor",
-    address=address_by_hostname(),
-    provider=provider,
-)
-
-# Create Parsl configuration
 config = Config(
-    executors=[executor],
-    strategy=None,
+    executors=[
+        HighThroughputExecutor(
+            label="spot_fleet_executor",
+            provider=provider,
+            encrypted=False,  # see #62
+        )
+    ],
+    retries=3,  # a reclaimed instance loses its in-flight tasks
 )
 
-# Load configuration
 parsl.load(config)
 
-# Submit and run tasks
-futures = [hello(f"Task {i}") for i in range(10)]
-for future in futures:
+for future in [hello(f"Task {i}") for i in range(10)]:
     print(future.result())
 
-# Cleanup
-parsl.dfk().cleanup()
+parsl.clear()
+provider.shutdown()
 ```
+
+You select the state backend with `state_store_type` and let the provider build
+it; you do not construct a store yourself. See
+[state_persistence.md](state_persistence.md).
 
 ## Limitations
 
-- Spot Fleet is only available in AWS regions where EC2 Spot Fleet is supported
-- IAM permissions must include Spot Fleet related permissions
-- Not all instance types may be available in all regions
-- The IAM role for Spot Fleet is automatically created if it doesn't exist
+- Not every instance type exists in every region or Availability Zone. A fleet
+  that cannot be filled returns fewer instances than requested — or none — rather
+  than raising.
+- The provider passes a single subnet, so the fleet is confined to one
+  Availability Zone. Multi-AZ diversification is not yet exposed.
+- Fleet capacity is not maintained: `Type="instant"` is a one-shot request, so a
+  reclaimed instance is not replaced automatically. Parsl's scaling strategy
+  submits a new block instead.
+
+## Serverless mode also has a fleet path
+
+`mode="serverless"` with `compute_type="ecs"` and `use_spot_fleet=True` launches an
+`instant` EC2 Fleet per job, bypassing ECS entirely — so it is no longer
+serverless in any useful sense, and you are managing instances again. It exists
+because a fleet gives access to instance types and sizes Fargate does not offer.
+`instance_types`, `nodes_per_block`, and `spot_max_price_percentage` all apply.
+
+Note the distinction from `use_spot=True` in the same mode, which stays on Fargate
+and switches the cluster's capacity provider to `FARGATE_SPOT`. `compute_type="lambda"`
+ignores both flags; Lambda has no spot pricing.
+
+If you want a fleet, standard mode is the more direct route. This path is
+primarily useful when the rest of a serverless deployment is already in place.
 
 ## Troubleshooting
 
-If you encounter issues with Spot Fleet:
+**The fleet is created but launches no instances.** Capacity was unavailable at
+your price. Check `describe_fleets` for the error in
+`Instances[].Lifecycle`/`Errors`, add more instance types, and raise or unset
+`spot_max_price_percentage`.
 
-1. Check if Spot Fleet requests are being created in the AWS Console
-2. Verify IAM permissions for the Spot Fleet role
-3. Try using instance types that are more commonly available
-4. Consider increasing the spot_max_price_percentage
-5. Check AWS CloudTrail logs for Spot Fleet API errors
+**`InvalidParameterValue` on the allocation strategy.** You passed a camelCase
+name; `CreateFleet` wants kebab-case (`price-capacity-optimized`).
 
-## Resources
+**Instances launch and then vanish quickly.** That is spot reclamation. Enable
+`spot_interruption_handling=True` to see it coming, diversify further, and set
+`retries` on the Parsl `Config`.
 
-- [AWS Spot Fleet Documentation](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/spot-fleet.html)
-- [Parsl AWS Provider Documentation](https://parsl.readthedocs.io/en/stable/userguide/providers.html#ephemeral-aws-provider)
+**Interruptions are frequent regardless.** Add families and generations rather
+than sizes, and keep `price-capacity-optimized` — `lowest-price` optimises for
+cost at the direct expense of interruption rate.
+
+## References
+
+- [EC2 Fleet](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/ec2-fleet.html)
+- [Spot allocation strategies](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/ec2-fleet-allocation-strategy.html)
+- [Spot interruption notices](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/spot-instance-termination-notices.html)
+
+SPDX-License-Identifier: Apache-2.0
+SPDX-FileCopyrightText: 2025-2026 Scott Friedman and Project Contributors

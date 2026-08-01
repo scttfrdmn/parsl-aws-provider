@@ -4,7 +4,7 @@ These tests verify that the provider correctly scales resources up and down
 based on workload demands in various operating modes.
 
 SPDX-License-Identifier: Apache-2.0
-SPDX-FileCopyrightText: 2025 Scott Friedman and Project Contributors
+SPDX-FileCopyrightText: 2025-2026 Scott Friedman and Project Contributors
 """
 
 import os

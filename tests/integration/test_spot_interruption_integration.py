@@ -4,7 +4,7 @@ These tests verify that spot interruption handling works correctly across
 all operating modes, including detection, checkpointing, and recovery.
 
 SPDX-License-Identifier: Apache-2.0
-SPDX-FileCopyrightText: 2025 Scott Friedman and Project Contributors
+SPDX-FileCopyrightText: 2025-2026 Scott Friedman and Project Contributors
 """
 
 import pytest

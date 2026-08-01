@@ -1,261 +1,233 @@
 # State Persistence
 
-The Parsl Ephemeral AWS Provider includes a robust state persistence system that enables tracking resources, recovering from failures, and resuming workflows across sessions. This document explains the state persistence mechanisms and how to use them.
+The provider persists its state so that resources can be tracked across sessions,
+handed to a bastion in detached mode, and cleaned up after a crash.
 
 ## Overview
 
-State persistence is crucial for an ephemeral AWS provider because:
+State persistence matters because:
 
-1. It enables tracking of all AWS resources created during workflow execution
-2. It allows for proper cleanup of resources, preventing orphaned resources and unexpected costs
-3. It supports workflow recovery after client restarts or disconnections
-4. It enables the detached and serverless modes to function properly
+1. Every AWS resource the provider creates is recorded, so nothing is orphaned.
+2. A restarted provider can adopt the resources a previous run left behind
+   instead of duplicating them.
+3. Detached mode needs state the bastion and the client can both read.
 
-## State Store Types
+## Selecting a store
 
-The provider offers three types of state stores:
-
-1. **File State Store**: Persists state to a local file (simplest option)
-2. **Parameter Store State**: Uses AWS Systems Manager Parameter Store (recommended for detached mode)
-3. **S3 State Store**: Stores state in an Amazon S3 bucket (good for sharing state across environments)
-
-### File State Store
-
-The File State Store is the simplest option, storing state in a local JSON file. It's suitable for local development and testing, or when using Standard mode with a stable client.
+You do **not** construct a store yourself. Choose one with `state_store_type` and
+the provider builds it, wiring in its own session, region, credentials, and audit
+logger:
 
 ```python
 from parsl_ephemeral_aws import EphemeralAWSProvider
-from parsl_ephemeral_aws.state.file import FileStateStore
 
 provider = EphemeralAWSProvider(
-    # Mode configuration...
-    state_store=FileStateStore(
-        file_path="./aws_provider_state.json",
-        backup_interval=300,  # Seconds between backups (optional)
-        backup_count=3,       # Number of backup files to keep (optional)
-    ),
-    # Other provider parameters...
+    region="us-east-1",
+    vpc_id="vpc-0123456789abcdef0",
+    subnet_id="subnet-0123456789abcdef0",
+    security_group_id="sg-0123456789abcdef0",
+    state_store_type="file",                      # "file" | "s3" | "parameter_store"
+    state_file_path="./aws_provider_state.json",  # used by "file"
 )
 ```
 
-**Pros:**
-- Simple to set up and debug
-- No additional AWS services required
-- State is human-readable
+`state_store_type` accepts a string or a `StateStoreType` enum member
+(`from parsl_ephemeral_aws.provider import StateStoreType`).
 
-**Cons:**
-- Not suitable for detached mode operation
-- State lost if client machine fails or file is deleted
-- No sharing of state across different machines
+### File store (default)
 
-### Parameter Store State
-
-The Parameter Store State uses AWS Systems Manager Parameter Store to maintain state. This is ideal for detached mode since the state is accessible from both the client and the bastion host.
+State lives in a local JSON file, written under an `fcntl` lock.
 
 ```python
-from parsl_ephemeral_aws import EphemeralAWSProvider
-from parsl_ephemeral_aws.state.parameter_store import ParameterStoreState
-
 provider = EphemeralAWSProvider(
-    # Mode configuration...
-    state_store=ParameterStoreState(
-        prefix="/parsl/workflows/my-workflow",  # Parameter path prefix
-        region="us-west-2",                     # AWS region
-        secure=True,                           # Use SecureString type (optional)
-        ttl=86400,                             # TTL in seconds (optional)
-    ),
-    # Other provider parameters...
+    # ... network and compute options ...
+    state_store_type="file",
+    state_file_path="./aws_provider_state.json",
 )
 ```
 
-**Pros:**
-- Accessible from multiple locations (client & bastion)
-- Secure storage with encryption options
-- Automatic versioning of state
-- Higher durability than file-based storage
+Good for local development and standard mode. Not usable from a bastion, and the
+state is lost with the machine.
 
-**Cons:**
-- Requires AWS SSM permissions
-- Size limits (4KB per parameter for regular strings, 8KB for secure strings)
-- May incur minimal AWS costs
+### Parameter Store
 
-### S3 State Store
-
-The S3 State Store saves state in an Amazon S3 bucket. This is a good option for serverless mode or when state needs to be accessible from multiple environments.
+State lives in an AWS Systems Manager parameter, readable from both the client and
+the bastion — the reason detached mode prefers it.
 
 ```python
-from parsl_ephemeral_aws import EphemeralAWSProvider
-from parsl_ephemeral_aws.state.s3 import S3StateStore
-
 provider = EphemeralAWSProvider(
-    # Mode configuration...
-    state_store=S3StateStore(
-        bucket="my-parsl-state-bucket",      # S3 bucket name
-        prefix="my-workflow",                # Object key prefix
-        region="us-west-2",                  # AWS region
-        create_bucket=True,                  # Create bucket if it doesn't exist
-        versioning=True,                     # Enable versioning for objects
-    ),
-    # Other provider parameters...
+    # ... network and compute options ...
+    state_store_type="parameter_store",
+    parameter_store_path="/parsl/my-workflow-state",
 )
 ```
 
-**Pros:**
-- Virtually unlimited storage
-- High durability and availability
-- Versioning and lifecycle rules
-- Accessible from anywhere
-- Works well with serverless mode
+Requires `ssm:PutParameter`, `ssm:GetParameter`, and `ssm:DeleteParameter`.
+Standard parameters cap at 4 KB, which a workflow with very many tracked resources
+can reach; use S3 if you expect that.
 
-**Cons:**
-- Requires S3 permissions
-- May incur minimal AWS costs
-- Slightly higher latency than local files
+### S3
 
-## Recommended State Stores by Mode
+```python
+provider = EphemeralAWSProvider(
+    # ... network and compute options ...
+    state_store_type="s3",
+    s3_bucket="my-parsl-state-bucket",
+    s3_key="my-workflow/state.json",
+)
+```
 
-| Mode | Recommended State Store | Reason |
-|------|------------------------|--------|
-| Standard | FileStateStore | Simple and efficient for local operation |
-| Detached | ParameterStoreState | Accessible from both client and bastion host |
-| Serverless | S3StateStore | Highly durable and compatible with serverless resources |
+`s3_bucket` is mandatory for this backend — omitting it raises
+`ProviderConfigurationError`. The bucket must already exist; the provider does not
+create it.
 
-## State Contents
+## Recommended store by mode
 
-The provider state contains:
+| Mode | Store | Reason |
+|------|-------|--------|
+| Standard | `file` | Simplest; the client is the only reader |
+| Detached | `parameter_store` | Readable by both client and bastion |
+| Serverless | `s3` | Durable and reachable from Lambda or Fargate |
 
-1. **Resources**: Map of resource IDs to resource metadata
-2. **Provider ID**: Unique identifier for the provider instance
-3. **Mode Information**: Mode-specific configuration and state
-4. **Infrastructure IDs**: VPC, subnet, security group and other resource IDs
-5. **Initialization Flag**: Whether the mode has been initialized
+## The store interface
 
-Example state content (simplified):
+All three stores implement the same **keyed** interface from
+`parsl_ephemeral_aws.state.base.StateStore`:
+
+```text
+save_state(state_key: str, state_data: Dict[str, Any]) -> None
+load_state(state_key: str) -> Optional[Dict[str, Any]]
+delete_state(state_key: str) -> None
+```
+
+Keys matter. The provider writes under `"provider"` and the operating mode under
+`"mode"`. Before v0.7.0 both wrote a full overwrite to the same slot with
+different key sets, so each destroyed the other's fields — which lost `job_map`
+and, worse, the baked-AMI ID and its ownership flag, leaking an AMI and its EBS
+snapshots on every shutdown.
+
+State files written by v0.6.0 and earlier hold a single flat document with no
+`_states` wrapper. Those still load: the flat document is offered under every key,
+each reader takes the fields it recognises, and the first write upgrades the file.
+
+## State contents
+
+Under the `"provider"` key:
+
+- `provider_id`, `mode`, `timestamp`
+- `resources` — tracked resource IDs and their metadata
+- `job_map` — job ID to resource mapping
+- `warm_instances` — warm-pool members, in standard mode
+
+Under the `"mode"` key, mode-specific fields: the validated `vpc_id`,
+`subnet_id`, `security_group_id`, `initialized`, the launch template ID, and for
+standard mode `baked_ami_id` / `owns_baked_ami`; for detached mode `bastion_id`.
+
 ```json
 {
-  "provider_id": "8f7e3a4d",
-  "mode": "DetachedMode",
-  "vpc_id": "vpc-12345678",
-  "subnet_id": "subnet-12345678",
-  "security_group_id": "sg-12345678",
-  "bastion_id": "i-12345678",
-  "initialized": true,
-  "workflow_id": "workflow-abcdef",
-  "resources": {
-    "job-12345": {
-      "type": "ec2",
-      "job_id": "12345",
-      "instance_id": "i-87654321",
-      "status": "RUNNING",
-      "created_at": 1618012345
+  "_version": 2,
+  "_states": {
+    "provider": {
+      "provider_id": "8f7e3a4d",
+      "mode": "standard",
+      "job_map": {"1": {"resource_id": "res-1"}},
+      "resources": {"res-1": {"instance_id": "i-087654321", "status": "RUNNING"}}
+    },
+    "mode": {
+      "vpc_id": "vpc-0123456789abcdef0",
+      "subnet_id": "subnet-0123456789abcdef0",
+      "security_group_id": "sg-0123456789abcdef0",
+      "initialized": true
     }
   }
 }
 ```
 
-## State Recovery
+## Recovery
 
-The provider automatically attempts to recover state on initialization:
-
-1. On provider creation, the state store's `load_state()` method is called
-2. If state exists and matches the provider ID, it's loaded
-3. The mode verifies that resources in the state still exist
-4. The mode initializes based on the recovered state
-
-To recover a previous workflow (e.g., in detached mode):
+Recovery is automatic. `EphemeralAWSProvider.__init__` loads whatever is stored at
+the configured location, and if the state records a `provider_id` and you did not
+pass one, that ID is adopted — so a second provider pointed at the same state
+location continues the first one's work rather than starting a parallel run:
 
 ```python
-from parsl_ephemeral_aws import EphemeralAWSProvider
-from parsl_ephemeral_aws.modes.detached import DetachedMode
-from parsl_ephemeral_aws.state.parameter_store import ParameterStoreState
-
-# Create provider with same workflow_id as before
+# First run
 provider = EphemeralAWSProvider(
-    mode=DetachedMode(
-        workflow_id="previous-workflow-id",  # Same workflow ID as before
-        reconnect=True,                      # Indicate this is a reconnection
-        # Other mode parameters...
-    ),
-    state_store=ParameterStoreState(
-        prefix="/parsl/workflows/previous-workflow-id",  # Same prefix as before
-        # Other state store parameters...
-    ),
-    # Other provider parameters...
+    mode="detached",
+    state_store_type="parameter_store",
+    parameter_store_path="/parsl/my-workflow-state",
+    vpc_id="vpc-0123456789abcdef0",
+    subnet_id="subnet-0123456789abcdef0",
+    security_group_id="sg-0123456789abcdef0",
+)
+
+# Later, in a new process: same store and path, so the bastion, tracked jobs,
+# and any baked AMI are picked back up.
+provider = EphemeralAWSProvider(
+    mode="detached",
+    state_store_type="parameter_store",
+    parameter_store_path="/parsl/my-workflow-state",
+    vpc_id="vpc-0123456789abcdef0",
+    subnet_id="subnet-0123456789abcdef0",
+    security_group_id="sg-0123456789abcdef0",
 )
 ```
 
-## State Cleanup
+Network IDs are re-validated on load. If a recorded resource has gone,
+`ResourceNotFoundError` is raised rather than the ID being silently blanked — the
+pre-v0.7.0 behaviour, which produced an opaque boto3 error later.
 
-When a workflow completes, you should properly clean up the state:
+## Cleanup
 
 ```python
-# Clean up resources first
-provider.cancel_all_blocks()
-
-# Then clean up the state
-provider.state_store.delete_state()
+provider.shutdown()
 ```
 
-The provider also attempts to clean up state during the `shutdown()` call.
-
-## Implementing Custom State Stores
-
-You can implement custom state stores by extending the `StateStore` abstract base class:
+`shutdown()` terminates tracked compute, deletes the launch template, and deletes
+the state entry. To remove state without touching resources:
 
 ```python
+provider.state_store.delete_state("provider")
+provider.state_store.delete_state("mode")
+```
+
+## Custom stores
+
+Subclass `StateStore` and implement the three keyed methods:
+
+```python
+from typing import Any, Dict, Optional
+
 from parsl_ephemeral_aws.state.base import StateStore
 
+
 class MyCustomStateStore(StateStore):
-    def __init__(self, connection_string, **kwargs):
-        super().__init__(**kwargs)
+    def __init__(self, connection_string: str) -> None:
         self.connection_string = connection_string
-        # Initialize your storage backend
 
-    def save_state(self, state):
-        # Implementation for saving state
-        pass
+    def save_state(self, state_key: str, state_data: Dict[str, Any]) -> None: ...
 
-    def load_state(self):
-        # Implementation for loading state
-        pass
+    def load_state(self, state_key: str) -> Optional[Dict[str, Any]]: ...
 
-    def delete_state(self):
-        # Implementation for deleting state
-        pass
-
-    def list_states(self, prefix=None):
-        # Implementation for listing states
-        pass
+    def delete_state(self, state_key: str) -> None: ...
 ```
 
-## Best Practices
+`load_state` must return `None` for a key that has never been written — the
+provider treats that as "first run", not as an error.
 
-1. **Choose the appropriate state store for your use case:**
-   - Use FileStateStore for development and simple workflows
-   - Use ParameterStoreState for detached mode operations
-   - Use S3StateStore for serverless or cross-environment workflows
+There is no configuration hook for injecting a custom store; assign it after
+construction (`provider.state_store = MyCustomStateStore(...)`) before the first
+`submit()`.
 
-2. **Set unique provider IDs and workflow IDs:**
-   - Using unique IDs prevents state collisions
-   - Predictable IDs make recovery easier
+## Notes
 
-3. **Handle state cleanup properly:**
-   - Always call `provider.cancel_all_blocks()` followed by `provider.shutdown()`
-   - For long-term workflows, consider state TTL settings
+- Keep one state location per workflow. Two concurrent providers sharing a
+  location will adopt each other's `provider_id` and fight over the same
+  resources.
+- Parameter Store operations emit `STATE_ACCESS` audit events when the provider
+  has an `audit_logger`.
+- After any crash, run `tools/cleanup_aws_resources.py --dry-run --region <region>`
+  to check for resources the state no longer names.
 
-4. **Monitor state size:**
-   - Large state objects may hit size limits in Parameter Store
-   - Consider S3 for workflows with many resources
-
-5. **Implement proper error handling:**
-   - Handle cases where state cannot be loaded or saved
-   - Implement recovery mechanisms for partial failures
-
-6. **Consider state security:**
-   - Use secure=True for ParameterStoreState with sensitive data
-   - Use appropriate IAM permissions for state stores
-   - Encrypt S3 objects for sensitive workloads
-
-7. **Test recovery scenarios:**
-   - Practice workflow recovery from saved state
-   - Verify that resources are properly tracked and cleaned up
+SPDX-License-Identifier: Apache-2.0
+SPDX-FileCopyrightText: 2025-2026 Scott Friedman and Project Contributors

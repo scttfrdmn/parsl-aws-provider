@@ -5,7 +5,7 @@ so the real body had never run — and it raised ``ValueError`` on every call.
 These tests execute it.
 
 SPDX-License-Identifier: Apache-2.0
-SPDX-FileCopyrightText: 2025 Scott Friedman and Project Contributors
+SPDX-FileCopyrightText: 2025-2026 Scott Friedman and Project Contributors
 """
 
 import io

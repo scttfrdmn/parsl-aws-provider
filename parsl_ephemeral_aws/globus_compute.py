@@ -106,7 +106,7 @@ Parameter Store access), and ``mode="serverless"`` (Lambda, ECS, CloudWatch
 Logs, and IAM role lifecycle).
 
 SPDX-License-Identifier: Apache-2.0
-SPDX-FileCopyrightText: 2025 Scott Friedman and Project Contributors
+SPDX-FileCopyrightText: 2025-2026 Scott Friedman and Project Contributors
 """
 
 import logging
@@ -238,7 +238,7 @@ class GlobusComputeProvider(EphemeralAWSProvider):
     display_name : str, optional
         Human-readable name for the Globus Compute endpoint.
         Default is ``"Ephemeral AWS Endpoint"``.
-    **kwargs
+    \\*\\*kwargs
         All keyword arguments accepted by ``EphemeralAWSProvider``.
     """
 

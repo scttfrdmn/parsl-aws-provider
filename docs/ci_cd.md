@@ -176,4 +176,4 @@ on `PATH` rather than `.venv`. Use `uv run` (or the Makefile, which does).
 ```
 
 SPDX-License-Identifier: Apache-2.0
-SPDX-FileCopyrightText: 2025 Scott Friedman and Project Contributors
+SPDX-FileCopyrightText: 2025-2026 Scott Friedman and Project Contributors

@@ -27,13 +27,18 @@ Usage
     export AWS_PROFILE=aws
     export AWS_TEST_REGION=us-west-2   # optional, default us-west-2
 
+    # Required: the provider never creates network resources.
+    export AWS_TEST_VPC_ID=vpc-...
+    export AWS_TEST_SUBNET_ID=subnet-...
+    export AWS_TEST_SG_ID=sg-...
+
     uv run python examples/parsl_aws_integration.py
 
 The script prints the hostname, platform, and Python version of the EC2
 instance that ran the function.
 
 SPDX-License-Identifier: Apache-2.0
-SPDX-FileCopyrightText: 2025 Scott Friedman and Project Contributors
+SPDX-FileCopyrightText: 2025-2026 Scott Friedman and Project Contributors
 """
 
 import logging
@@ -167,19 +172,25 @@ def main() -> int:
         WORKER_PORT_RANGE[1],
     )
 
-    # Use the default VPC and its default subnet to avoid hitting the 5-VPC
-    # per-region limit.  Pass them explicitly; set create_vpc=False so the
-    # provider does not attempt to create a new VPC.
-    default_vpc_id = os.environ.get("AWS_DEFAULT_VPC_ID")
-    default_subnet_id = os.environ.get("AWS_DEFAULT_SUBNET_ID")
+    # The network is always yours: since v0.7.0 the provider never creates a VPC,
+    # subnet, or security group, and raises if any of the three is missing.
+    # See docs/network-prerequisites.md.
+    try:
+        vpc_id = os.environ["AWS_TEST_VPC_ID"]
+        subnet_id = os.environ["AWS_TEST_SUBNET_ID"]
+        security_group_id = os.environ["AWS_TEST_SG_ID"]
+    except KeyError as exc:
+        logger.error("Missing required environment variable: %s", exc)
+        logger.error("Set AWS_TEST_VPC_ID, AWS_TEST_SUBNET_ID, and AWS_TEST_SG_ID.")
+        return 2
 
     provider = EphemeralAWSProvider(
         region=AWS_REGION,
         instance_type="t3.small",  # t3.micro may OOM during pip install
         mode="standard",
-        create_vpc=not bool(default_vpc_id),  # skip VPC creation if pre-supplied
-        vpc_id=default_vpc_id,
-        subnet_id=default_subnet_id,
+        vpc_id=vpc_id,
+        subnet_id=subnet_id,
+        security_group_id=security_group_id,
         state_store_type="file",
         # Use a unique state file per run to avoid stale state from previous
         # failed/interrupted runs overriding the provided vpc_id/subnet_id.

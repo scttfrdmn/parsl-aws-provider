@@ -14,7 +14,7 @@ Run with::
     AWS_PROFILE=aws pytest tests/aws/ -m "aws" --no-cov -v
 
 SPDX-License-Identifier: Apache-2.0
-SPDX-FileCopyrightText: 2025 Scott Friedman and Project Contributors
+SPDX-FileCopyrightText: 2025-2026 Scott Friedman and Project Contributors
 """
 
 import time

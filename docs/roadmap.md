@@ -131,4 +131,4 @@ This document outlines the development roadmap for the Parsl Ephemeral AWS Provi
 We welcome your feedback on this roadmap. Please open an issue on GitHub to suggest additional features or reprioritization.
 
 SPDX-License-Identifier: Apache-2.0
-SPDX-FileCopyrightText: 2025 Scott Friedman and Project Contributors
+SPDX-FileCopyrightText: 2025-2026 Scott Friedman and Project Contributors

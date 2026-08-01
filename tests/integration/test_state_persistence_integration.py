@@ -4,7 +4,7 @@ These tests verify that each state persistence implementation works correctly
 with real storage backends (file system, substrate for AWS services).
 
 SPDX-License-Identifier: Apache-2.0
-SPDX-FileCopyrightText: 2025 Scott Friedman and Project Contributors
+SPDX-FileCopyrightText: 2025-2026 Scott Friedman and Project Contributors
 """
 
 import os

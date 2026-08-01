@@ -127,3 +127,6 @@ echo ""
 echo "Environment setup complete!"
 echo "Activate the virtual environment with: source .venv/bin/activate"
 echo "Set environment variables with: source $ENV_FILE"
+
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2025-2026 Scott Friedman and Project Contributors

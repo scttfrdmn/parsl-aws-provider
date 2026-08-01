@@ -4,7 +4,7 @@ This module provides configurable security policies to replace hardcoded 0.0.0.0
 CIDR blocks with environment-appropriate security rules.
 
 SPDX-License-Identifier: Apache-2.0
-SPDX-FileCopyrightText: 2025 Scott Friedman and Project Contributors
+SPDX-FileCopyrightText: 2025-2026 Scott Friedman and Project Contributors
 """
 
 import logging

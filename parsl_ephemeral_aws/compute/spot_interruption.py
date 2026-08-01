@@ -4,7 +4,7 @@ This module provides functionality for detecting and responding to AWS spot inst
 interruption notices, allowing Parsl tasks to be checkpointed and recovered.
 
 SPDX-License-Identifier: Apache-2.0
-SPDX-FileCopyrightText: 2025 Scott Friedman and Project Contributors
+SPDX-FileCopyrightText: 2025-2026 Scott Friedman and Project Contributors
 """
 
 import json

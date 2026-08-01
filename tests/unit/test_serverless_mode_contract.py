@@ -5,7 +5,7 @@ manager contract (#72), the parameters lost between provider and mode (#73), and
 the network guard that demanded IDs Lambda has no use for (#74).
 
 SPDX-License-Identifier: Apache-2.0
-SPDX-FileCopyrightText: 2025 Scott Friedman and Project Contributors
+SPDX-FileCopyrightText: 2025-2026 Scott Friedman and Project Contributors
 """
 
 from unittest.mock import MagicMock

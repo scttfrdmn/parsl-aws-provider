@@ -13,7 +13,7 @@ need no Globus credentials and touch no network, which is why they live in
 `tests/unit/` rather than behind the `globus` marker in `tests/aws/`.
 
 SPDX-License-Identifier: Apache-2.0
-SPDX-FileCopyrightText: 2025 Scott Friedman and Project Contributors
+SPDX-FileCopyrightText: 2025-2026 Scott Friedman and Project Contributors
 """
 
 import uuid

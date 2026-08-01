@@ -3,7 +3,7 @@
 These tests use the moto library to mock AWS services for realistic integration testing.
 
 SPDX-License-Identifier: Apache-2.0
-SPDX-FileCopyrightText: 2025 Scott Friedman and Project Contributors
+SPDX-FileCopyrightText: 2025-2026 Scott Friedman and Project Contributors
 """
 
 import unittest

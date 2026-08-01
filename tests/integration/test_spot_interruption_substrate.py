@@ -4,7 +4,7 @@ This module focuses on testing spot interruption handling with substrate's
 mocked AWS services, simulating actual AWS API calls and responses.
 
 SPDX-License-Identifier: Apache-2.0
-SPDX-FileCopyrightText: 2025 Scott Friedman and Project Contributors
+SPDX-FileCopyrightText: 2025-2026 Scott Friedman and Project Contributors
 """
 
 import pytest

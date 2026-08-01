@@ -42,4 +42,4 @@ goto end
 popd
 
 REM SPDX-License-Identifier: Apache-2.0
-REM SPDX-FileCopyrightText: 2025 Scott Friedman and Project Contributors
+REM SPDX-FileCopyrightText: 2025-2026 Scott Friedman and Project Contributors

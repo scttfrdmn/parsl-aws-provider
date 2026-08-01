@@ -13,9 +13,18 @@ import sys
 sys.path.insert(0, os.path.abspath(".."))
 
 project = "Parsl Ephemeral AWS Provider"
-copyright = "2025, Scott Friedman and Project Contributors"
+copyright = "2025-2026, Scott Friedman and Project Contributors"
 author = "Scott Friedman and Project Contributors"
-release = "0.1.0"  # Update with the actual version
+
+# Read the version from the installed package rather than restating it. This was
+# pinned at "0.1.0" through five releases, because a hardcoded literal here has
+# nothing to keep it honest -- bump-my-version does not know about it.
+try:
+    from importlib.metadata import version as _pkg_version
+
+    release = _pkg_version("parsl-ephemeral-aws")
+except Exception:  # pragma: no cover - docs build without the package installed
+    release = "unknown"
 
 # -- General configuration ---------------------------------------------------
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#general-configuration
@@ -32,7 +41,21 @@ extensions = [
 ]
 
 templates_path = ["_templates"]
-exclude_patterns = ["_build", "Thumbs.db", ".DS_Store", ".venv", "venv"]
+exclude_patterns = [
+    "_build",
+    "Thumbs.db",
+    ".DS_Store",
+    ".venv",
+    "venv",
+    # Notes for people editing the docs, not a page of the built site.
+    "README.md",
+]
+
+# Warnings are errors. Every page here is now checked against the real API, so a
+# new warning means a genuine break -- a dead cross-reference, a missing include,
+# a malformed table. The build carried 398 of them before #124, which is what let
+# ~65 toctree entries name pages nobody had written.
+nitpicky = False
 
 intersphinx_mapping = {
     "python": ("https://docs.python.org/3", None),
@@ -44,9 +67,10 @@ intersphinx_mapping = {
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#options-for-html-output
 
 html_theme = "sphinx_rtd_theme"
-html_static_path = ["_static"]
-html_logo = "_static/logo.png"  # Add a logo file if you have one
-html_favicon = "_static/favicon.ico"  # Add a favicon if you have one
+
+# No html_static_path/html_logo/html_favicon: `_static/` does not exist, and
+# naming a logo and favicon inside it produced three warnings on every build for
+# files that were never added.
 
 # -- Napoleon settings ------------------------------------------------------
 napoleon_google_docstring = True
@@ -78,3 +102,6 @@ autodoc_default_options = {
     "show-inheritance": True,
 }
 autoclass_content = "both"
+
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2025-2026 Scott Friedman and Project Contributors

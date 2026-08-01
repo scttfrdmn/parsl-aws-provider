@@ -4,7 +4,7 @@ This mode uses AWS Lambda and ECS/Fargate for executing jobs without EC2 instanc
 providing cost-effective serverless execution for suitable workloads.
 
 SPDX-License-Identifier: Apache-2.0
-SPDX-FileCopyrightText: 2025 Scott Friedman and Project Contributors
+SPDX-FileCopyrightText: 2025-2026 Scott Friedman and Project Contributors
 """
 
 import logging
