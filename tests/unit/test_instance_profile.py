@@ -19,7 +19,9 @@ from moto import mock_aws
 from parsl_ephemeral_aws.modes.standard import StandardMode
 from parsl_ephemeral_aws.utils.aws import (
     _wait_for_instance_profile,
+    delete_ssm_instance_profile,
     get_or_create_ssm_instance_profile,
+    ssm_instance_profile_names,
 )
 
 
@@ -369,4 +371,253 @@ class TestStandardModeProfileResolution:
             mode.initialize()
 
         assert mode.initialized is True
+        assert mode.iam_instance_profile_arn is None
+
+
+class TestDeleteSSMInstanceProfile:
+    """``delete_ssm_instance_profile`` is the inverse of the creator (#132).
+
+    Nothing deleted the role or profile before this, so every run left a standing
+    principal holding ``AmazonSSMManagedInstanceCore`` behind. The account under
+    test had accumulated 94 of them against IAM's 1,000-role quota.
+    """
+
+    def test_round_trip_leaves_nothing_behind(self, iam_session):
+        """Create then delete must return IAM to its starting state."""
+        session = iam_session
+        iam = session.client("iam")
+
+        get_or_create_ssm_instance_profile(
+            session=session, name_suffix="rt", auto_create=True
+        )
+        role_name, profile_name = ssm_instance_profile_names("rt")
+        # Precondition: both really exist, so the assertions below mean something.
+        iam.get_role(RoleName=role_name)
+        iam.get_instance_profile(InstanceProfileName=profile_name)
+
+        assert delete_ssm_instance_profile(session, "rt") is True
+
+        with pytest.raises(ClientError) as role_gone:
+            iam.get_role(RoleName=role_name)
+        assert role_gone.value.response["Error"]["Code"] == "NoSuchEntity"
+
+        with pytest.raises(ClientError) as profile_gone:
+            iam.get_instance_profile(InstanceProfileName=profile_name)
+        assert profile_gone.value.response["Error"]["Code"] == "NoSuchEntity"
+
+    def test_deleting_what_was_never_created_succeeds(self, iam_session):
+        """Cleanup runs on partially-completed paths, so absent means done.
+
+        Reporting failure here would turn an already-clean account into a logged
+        error on every teardown.
+        """
+        assert delete_ssm_instance_profile(iam_session, "never-existed") is True
+
+    def test_is_idempotent(self, iam_session):
+        """A second delete must not report failure."""
+        session = iam_session
+        get_or_create_ssm_instance_profile(
+            session=session, name_suffix="twice", auto_create=True
+        )
+
+        assert delete_ssm_instance_profile(session, "twice") is True
+        assert delete_ssm_instance_profile(session, "twice") is True
+
+    def test_detaches_operator_added_policies_too(self, iam_session):
+        """``delete_role`` refuses while *any* policy is attached.
+
+        Detaching only ``AmazonSSMManagedInstanceCore`` by name would strand the
+        role forever the moment an operator attached anything else, so the
+        implementation lists what is actually there.
+        """
+        session = iam_session
+        iam = session.client("iam")
+        get_or_create_ssm_instance_profile(
+            session=session, name_suffix="extra", auto_create=True
+        )
+        role_name, _ = ssm_instance_profile_names("extra")
+        iam.attach_role_policy(
+            RoleName=role_name,
+            PolicyArn="arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess",
+        )
+
+        assert delete_ssm_instance_profile(session, "extra") is True
+
+        with pytest.raises(ClientError):
+            iam.get_role(RoleName=role_name)
+
+    def test_the_names_match_the_creator(self):
+        """The creator and deleter derive names from one helper, not two literals."""
+        assert ssm_instance_profile_names("abc") == (
+            "parsl-ephemeral-ssm-role-abc",
+            "parsl-ephemeral-ssm-profile-abc",
+        )
+
+
+class TestStandardModeProfileOwnership:
+    """Who deletes the IAM pair, and who must never delete it (#132)."""
+
+    @pytest.fixture
+    def mock_session(self):
+        session = MagicMock(spec=boto3.Session)
+        session.region_name = "us-east-1"
+        return session
+
+    @pytest.fixture
+    def mock_state_store(self):
+        store = MagicMock()
+        store.load_state.return_value = None
+        return store
+
+    def _mode(self, mock_session, mock_state_store, **overrides):
+        params = {
+            "provider_id": "test-provider",
+            "session": mock_session,
+            "state_store": mock_state_store,
+            "image_id": "ami-12345",
+            "region": "us-east-1",
+            **NETWORK_IDS,
+        }
+        params.update(overrides)
+        return StandardMode(**params)
+
+    def test_auto_created_profile_is_owned_and_deleted(
+        self, mock_session, mock_state_store
+    ):
+        """The leak itself: an auto-created pair must be torn down."""
+        mode = self._mode(
+            mock_session,
+            mock_state_store,
+            one_shot=True,
+            auto_create_instance_profile=True,
+        )
+
+        with patch(
+            "parsl_ephemeral_aws.modes.standard.get_or_create_ssm_instance_profile",
+            return_value="arn:aws:iam::1:instance-profile/auto",
+        ):
+            mode.initialize()
+
+        assert mode._owns_instance_profile is True
+
+        with patch(
+            "parsl_ephemeral_aws.modes.standard.delete_ssm_instance_profile"
+        ) as delete:
+            mode.cleanup_infrastructure()
+
+        delete.assert_called_once_with(mock_session, "test-provider")
+
+    def test_a_supplied_profile_is_never_deleted(self, mock_session, mock_state_store):
+        """The dangerous case. A caller's profile is shared infrastructure.
+
+        Deleting it would break every other workload using it -- a worse bug than
+        the leak, and the same hazard as the serverless SG deletion in #100.
+        """
+        mode = self._mode(
+            mock_session,
+            mock_state_store,
+            one_shot=True,
+            iam_instance_profile_arn="arn:aws:iam::1:instance-profile/theirs",
+            auto_create_instance_profile=True,
+        )
+        mode.initialize()
+
+        assert mode._owns_instance_profile is False
+
+        with patch(
+            "parsl_ephemeral_aws.modes.standard.delete_ssm_instance_profile"
+        ) as delete:
+            mode.cleanup_infrastructure()
+
+        delete.assert_not_called()
+
+    def test_nothing_is_deleted_when_nothing_was_created(
+        self, mock_session, mock_state_store
+    ):
+        """No flag, no ARN, no IAM call on either end."""
+        mode = self._mode(mock_session, mock_state_store)
+        mode.initialize()
+
+        assert mode._owns_instance_profile is False
+
+        with patch(
+            "parsl_ephemeral_aws.modes.standard.delete_ssm_instance_profile"
+        ) as delete:
+            mode.cleanup_infrastructure()
+
+        delete.assert_not_called()
+
+    def test_ownership_survives_a_restart(self, mock_session, mock_state_store):
+        """A resumed provider must still delete the pair it created earlier.
+
+        The names derive from ``provider_id``, so on restart the resolver *fetches*
+        rather than creates. Gating ownership on create-vs-fetch would therefore
+        disown the pair on every restart and leak it permanently -- which is why
+        the flag is persisted rather than recomputed.
+        """
+        mock_state_store.load_state.return_value = {
+            "provider_id": "test-provider",
+            "resources": {},
+            "initialized": True,
+            "owns_instance_profile": True,
+        }
+        mode = self._mode(
+            mock_session,
+            mock_state_store,
+            one_shot=True,
+            auto_create_instance_profile=True,
+        )
+
+        assert mode.load_state() is True
+        assert mode._owns_instance_profile is True
+
+        with patch(
+            "parsl_ephemeral_aws.modes.standard.delete_ssm_instance_profile"
+        ) as delete:
+            mode.cleanup_infrastructure()
+
+        delete.assert_called_once_with(mock_session, "test-provider")
+
+    def test_ownership_is_persisted(self, mock_session, mock_state_store):
+        """``save_state`` must carry the flag, or the restart case cannot work."""
+        mode = self._mode(
+            mock_session,
+            mock_state_store,
+            one_shot=True,
+            auto_create_instance_profile=True,
+        )
+
+        with patch(
+            "parsl_ephemeral_aws.modes.standard.get_or_create_ssm_instance_profile",
+            return_value="arn:aws:iam::1:instance-profile/auto",
+        ):
+            mode.initialize()
+
+        mode.save_state()
+
+        saved = mock_state_store.save_state.call_args[0][1]
+        assert saved["owns_instance_profile"] is True
+
+    def test_a_failed_deletion_does_not_raise(self, mock_session, mock_state_store):
+        """Cleanup must not mask whatever the caller was originally doing."""
+        mode = self._mode(
+            mock_session,
+            mock_state_store,
+            one_shot=True,
+            auto_create_instance_profile=True,
+        )
+
+        with patch(
+            "parsl_ephemeral_aws.modes.standard.get_or_create_ssm_instance_profile",
+            return_value="arn:aws:iam::1:instance-profile/auto",
+        ):
+            mode.initialize()
+
+        with patch(
+            "parsl_ephemeral_aws.modes.standard.delete_ssm_instance_profile",
+            side_effect=RuntimeError("AccessDenied"),
+        ):
+            mode.cleanup_infrastructure()  # must not raise
+
+        # And the ARN is dropped either way: it no longer names anything usable.
         assert mode.iam_instance_profile_arn is None
