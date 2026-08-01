@@ -24,8 +24,8 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
         with:
           enable-cache: true
       - name: Sync environment
@@ -52,8 +52,8 @@ jobs:
   type-check:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
         with:
           enable-cache: true
       - name: Sync environment
@@ -74,8 +74,8 @@ jobs:
         # matrix entries could not have installed the package at all.
         python-version: ["3.10", "3.11", "3.12"]
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
         with:
           enable-cache: true
           python-version: ${{ matrix.python-version }}
@@ -100,7 +100,7 @@ jobs:
         # letting coverage silently rot.
         run: uv run pytest tests/unit tests/security -v --cov-fail-under=65
       - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v5
+        uses: codecov/codecov-action@v7
         with:
           files: ./coverage.xml
           flags: unittests
@@ -131,8 +131,8 @@ jobs:
         # see into the container's PATH assumptions reliably. The wait step below
         # polls from the runner instead, where curl is guaranteed.
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
         with:
           enable-cache: true
       - name: Sync environment
@@ -163,7 +163,7 @@ jobs:
           SUBSTRATE_ENDPOINT: http://localhost:4566
         run: uv run pytest tests/test_substrate_emulation.py -v --no-cov
       - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v5
+        uses: codecov/codecov-action@v7
         with:
           files: ./coverage.xml
           flags: integration
@@ -183,14 +183,14 @@ jobs:
       id-token: write      # OIDC, so no long-lived keys live in secrets
       contents: read
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
         with:
           enable-cache: true
       - name: Sync environment
         run: uv sync --locked --extra dev --extra test
       - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@v6
         with:
           role-to-assume: ${{ secrets.AWS_E2E_ROLE_ARN }}
           aws-region: ${{ vars.AWS_TEST_REGION }}
@@ -213,7 +213,7 @@ jobs:
   test-bats:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Set up bats
         # `sudo` applied to the npm line only, so `mkdir -p /usr/local/lib/bats`
         # ran unprivileged and the step died on "Permission denied" once the
@@ -236,8 +236,8 @@ jobs:
     runs-on: ubuntu-latest
     needs: [lint, unit-tests]
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
         with:
           enable-cache: true
       - name: Build package
@@ -250,7 +250,7 @@ jobs:
         run: |
           python -m zipfile -l dist/*.whl | grep -q 'templates/cloudformation/' \
             || { echo "::error::CloudFormation templates missing from wheel"; exit 1; }
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: dist
           path: dist/
@@ -259,8 +259,8 @@ jobs:
     runs-on: ubuntu-latest
     needs: [lint, unit-tests]
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
         with:
           enable-cache: true
       - name: Sync environment
@@ -270,7 +270,7 @@ jobs:
         # #124, which hid ~65 toctree entries pointing at pages nobody had
         # written. Zero now, so keep it that way.
         run: uv run make -C docs html SPHINXOPTS="-W"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: documentation
           path: docs/_build/html/
