@@ -1438,6 +1438,7 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
                     resources_to_cleanup.append(resource_id)
 
         # Process COMPLETED → WARM transitions
+        state_dirty = False
         if warm_transitions:
             with self._lock:
                 current_warm = [
@@ -1450,6 +1451,9 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
                 for resource_id in warm_transitions:
                     if resource_id not in self.resources:
                         continue
+                    # Every branch below mutates resource status and the mode's
+                    # reuse list, so the state file is now behind memory.
+                    state_dirty = True
                     if len(current_warm) < self.warm_pool_size:
                         # Transition this instance into the warm pool
                         self.resources[resource_id]["status"] = STATUS_WARM
@@ -1515,12 +1519,30 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
                             if job_id and job_id in self.job_map:
                                 del self.job_map[job_id]
 
-                # Save the updated state
-                self._save_state()
-
+                state_dirty = True
                 logger.info(f"Cleaned up {len(resources_to_cleanup)} resources")
             except Exception as e:
                 logger.error(f"Failed to clean up resources: {e}")
+
+        # Persist whatever changed. This must run even when nothing needed
+        # terminating: a COMPLETED → WARM transition is a state change by
+        # itself, and dropping it means a restarted provider forgets the warm
+        # instances it is still being billed for.
+        #
+        # Both documents, because the warm pool is recorded in both and the
+        # mode's copy is the one that survives: __init__ restores
+        # ``_warm_instances`` from the provider key, then
+        # ``operating_mode.initialize()`` runs ``load_state()``, which overwrites
+        # it from the mode key. Saving only the provider key here left that key
+        # stale, so a successor read the pool and then immediately discarded it.
+        if state_dirty:
+            self._save_state()
+            mode_save_state = getattr(self.operating_mode, "save_state", None)
+            if callable(mode_save_state):
+                try:
+                    mode_save_state()
+                except Exception as e:
+                    logger.error(f"Failed to save operating mode state: {e}")
 
     def scale_in(self, blocks: int) -> List[str]:
         """Scale in the number of blocks by the specified amount.

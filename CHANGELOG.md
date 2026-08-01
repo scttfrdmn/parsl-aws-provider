@@ -79,6 +79,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the removed API only, and never exported from the package root (refs #137).
 
 ### Fixed
+- **A warm instance was forgotten the moment it went warm, and then billed for
+  indefinitely.** `_cleanup_resources()` moved a finished warm-pool instance to
+  `STATUS_WARM` in memory, but reached `_save_state()` only inside its
+  `if resources_to_cleanup:` branch — and a transition into a pool that still
+  has room terminates nothing, so that branch never ran. The state file went on
+  saying `COMPLETED` with an empty `warm_instances`. A provider reconstructed
+  from that file — the reason the state store exists — restored no warm
+  instances, so it neither reused them (the next submit paid a full cold start,
+  defeating the pool) nor applied their TTL (nothing ever terminated them),
+  while AWS billed them at the full Running rate. `_cleanup_resources()` now
+  tracks a dirty flag across both blocks and persists once at the end — and
+  persists *both* documents, because the second half of the same defect was that
+  only the provider key was ever written. The mode's copy is the one that
+  survives: `__init__` restores `_warm_instances` from the provider key, then
+  `operating_mode.initialize()` runs `load_state()`, which overwrites it from the
+  stale mode key, so a successor read the pool and discarded it a few lines
+  later. The existing unit tests all asserted in-memory state, which was always
+  correct; the new regression test reads the file back instead (closes #163).
 - **Every Spot Fleet `StandardMode` created went to the account the environment
   named, not the one the caller configured.** `StandardMode.__init__` builds a
   stand-in provider object for `SpotFleetManager`, and that object carried the
@@ -230,6 +248,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   their sandbox. The watched filename is read from the `state_file_path` signature
   default rather than hardcoded, so renaming the default cannot quietly disable
   the check (refs #93).
+- **Real-AWS E2E coverage for the warm pool**, `tests/aws/test_warm_pool_e2e.py`,
+  which had none. Every property the pool is sold on is a live-AWS property that
+  a mock asserts by construction: that SSM `SendCommand` actually reached the
+  instance, that no *second* `RunInstances` was issued, that `worker_init` did not
+  run again, and that a WARM instance — a **billed**, running instance — is
+  terminated by TTL expiry, by pool-full eviction, and by `shutdown()`.
+
+  The reuse and eviction tests count instances by the `E2ETestRunId` tag applied
+  in the launch's own `TagSpecifications`, so an instance cannot exist for the run
+  without being counted. `worker_init` is a file append rather than the
+  Parsl-installing default, both to keep the suite's runtime workable and to make
+  "ran once, job ran twice" readable off the instance over SSM.
+  `test_status_follows_the_ssm_command_not_the_instance_state` is the one that
+  cannot be faked another way: on the warm path the instance stays `running`
+  whether the command succeeded or failed, so a FAILED verdict can only have come
+  from the invocation's response code (closes #65).
 
 ### Security
 - **The IAM leak fixed above was accumulating standing privileged principals.**
