@@ -67,7 +67,7 @@ dev = [
     "ruff>=0.15.4",
     "mypy>=0.812",
     "bandit>=1.7.0",
-    "pre-commit>=2.15.0",
+    "pre-commit>=4.6.1",
     "bump-my-version>=1.0.0",
 ]
 test = [
