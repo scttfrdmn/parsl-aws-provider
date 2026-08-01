@@ -79,6 +79,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the removed API only, and never exported from the package root (refs #137).
 
 ### Fixed
+- **`error_history` recorded only the fleet errors nobody could classify.**
+  `SpotFleetManager._translate_fleet_error()` called
+  `RobustErrorHandler.handle_error()` on the unrecognized fallthrough alone, so
+  the five families it *did* understand — launch-template not found, insufficient
+  capacity, invalid fleet configuration, spot quota exceeded, and throttling —
+  were translated to typed exceptions and never counted. That is backwards: those
+  are exactly the failures a caller reads out of the history to decide whether to
+  back off, diversify instance types, or request a limit increase, whereas an
+  unclassifiable error is the least actionable of the set.
+  `get_error_statistics()` was therefore blind to every failure the code
+  understood. Recording now happens before classification, so every branch
+  records (closes #120).
+
+  The issue's second half — that `_create_spot_fleet_with_retry` named a retry it
+  did not perform — was already resolved: the method is now
+  `_translate_fleet_error`, and `@retry_with_backoff()` decorates `create_blocks`.
+  The two tests pinning the old behaviour still called the removed name, so
+  `patch.object`'s missing-attribute check had been failing them both rather than
+  exercising anything; they are retargeted and parametrized over all six
+  families.
 - **Every `auto_create_instance_profile` run leaked an IAM role and an instance
   profile.** `StandardMode._resolve_instance_profile()` created a
   `parsl-ephemeral-ssm-{role,profile}-<provider_id>` pair, and `provider_id` is a
