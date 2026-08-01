@@ -265,6 +265,47 @@ class TestWarmPool:
         assert "warm_since" in provider.resources["i-001"]
         assert "i-001" in mode._warm_instances
 
+    def test_completed_to_warm_transition_is_persisted(self, tmp_dir):
+        """The COMPLETED → WARM transition must reach the state file.
+
+        Regression test for the defect the #65 E2E suite caught: every other
+        warm-pool test in this class asserts only in-memory state, and
+        ``_cleanup_resources()`` used to call ``_save_state()`` solely inside its
+        ``if resources_to_cleanup:`` branch. A transition into a pool with room
+        terminates nothing, so it took that branch zero times and the file kept
+        saying ``COMPLETED`` with an empty ``warm_instances``.
+
+        That is not a cosmetic staleness. A provider reconstructed from the file
+        -- the whole point of the state store -- restores no warm instances, so
+        it neither reuses them nor applies their TTL, while AWS keeps billing
+        them at the full Running rate until something else notices. Asserted by
+        reading the file rather than the object, which is the only way to tell
+        the two apart.
+
+        The mode's ``save_state()`` must be driven too, and that half is the one a
+        restart actually depends on: ``__init__`` restores ``_warm_instances``
+        from the provider key, then ``operating_mode.initialize()`` calls
+        ``load_state()``, which overwrites it from the mode key. Persisting only
+        the provider document looked right on the file and still lost the pool on
+        restart — which is what the live #65 run showed.
+        """
+        provider, mode = self._make_warm_provider(tmp_dir)
+
+        provider.resources["i-001"] = {
+            "job_id": "j-001",
+            "status": "COMPLETED",
+            "warm_pool": True,
+            "timestamp": time.time(),
+        }
+        provider.job_map["j-001"] = {"resource_id": "i-001", "status": "COMPLETED"}
+
+        provider._cleanup_resources()
+
+        persisted = provider.state_store.load_state(STATE_KEY_PROVIDER)
+        assert persisted["resources"]["i-001"]["status"] == "WARM"
+        assert persisted["warm_instances"] == ["i-001"]
+        mode.save_state.assert_called()
+
     def test_warm_instance_not_cleaned_up_before_ttl(self, tmp_dir):
         """A WARM instance within its TTL is not terminated."""
         provider, mode = self._make_warm_provider(tmp_dir, warm_pool_ttl=600)
