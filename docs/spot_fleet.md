@@ -121,7 +121,6 @@ provider = EphemeralAWSProvider(
     use_spot_fleet=True,
     instance_types=["m5.large", "m5a.large"],
     spot_interruption_handling=True,
-    checkpoint_bucket="my-parsl-checkpoints",  # required today, see #137
 )
 ```
 
@@ -134,15 +133,17 @@ time it is far too late to react.
 *Rebalance Recommendation* is deliberately not matched: it signals elevated risk,
 not an impending reclaim, and treating it as one would tear down healthy workers.
 
-Two limitations, both
-[#137](https://github.com/scttfrdmn/parsl-aws-provider/issues/137):
+A detected reclaim marks the affected block `FAILED`. That is the whole response,
+and it is the correct one: Parsl stops dispatching to a failed block and re-runs
+its tasks elsewhere under `retries`. **Set `retries` on the Parsl `Config`** — the
+provider cannot checkpoint a task itself, because a Parsl provider is never told
+which tasks a block is running; it is handed a command and returns a block ID
+([#137](https://github.com/scttfrdmn/parsl-aws-provider/issues/137)).
 
-- **`checkpoint_bucket` is required to get any detection at all.** Without it the
-  monitor is never constructed — one WARNING at startup, then silence. The bucket
-  is not otherwise used on this path.
-- **The warning currently produces a log line, not recovery.** The task-recovery
-  API exists but nothing in the package feeds it. Set `retries` on the Parsl
-  `Config`; that is what actually re-runs work lost to a reclaim.
+The block is marked for the *whole fleet*, not just the reclaimed instance, since
+the fleet is what carries a Parsl job ID. Note the marker is deliberately sticky:
+a fleet whose instances AWS is taking back still reports itself active, so
+re-deriving status would overwrite it on the next poll.
 
 ## Resource tracking
 

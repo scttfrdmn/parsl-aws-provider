@@ -202,7 +202,6 @@ provider = EphemeralAWSProvider(
     spot_max_price="0.05",  # a string: dollars per hour
     spot_allocation_strategy="price-capacity-optimized",
     spot_interruption_handling=True,
-    checkpoint_bucket="my-parsl-checkpoints",  # required today, see #137
     worker_init="pip3 install --quiet --upgrade parsl scikit-learn\n",
 )
 
@@ -250,11 +249,13 @@ provider.shutdown()
 EventBridge rule and SQS queue so the provider learns of the reclaim about two
 minutes ahead rather than noticing the instance already `shutting-down`.
 
-Two caveats, both [#137](https://github.com/scttfrdmn/parsl-aws-provider/issues/137):
-without a `checkpoint_bucket` the monitor is not constructed at all — you get one
-WARNING at startup and no detection — and what the warning currently triggers is a
-log line, not task recovery. So **`retries` on the Parsl `Config` is what actually
-saves your work**; treat the warning as observability for now.
+What a detected reclaim does is mark the block `FAILED`, which is what makes Parsl
+stop dispatching to it and re-run its tasks elsewhere. **`retries` on the Parsl
+`Config` is therefore what actually saves your work** — the provider cannot
+checkpoint a task, because it is never told which tasks a block is running
+([#137](https://github.com/scttfrdmn/parsl-aws-provider/issues/137)). Set
+`retries` to at least 1 whenever `use_spot=True`; without it a reclaim fails the
+app instead of retrying it.
 
 ## Diversified instance types via EC2 Fleet
 

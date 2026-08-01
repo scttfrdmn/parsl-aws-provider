@@ -1,7 +1,9 @@
-"""Utilities for handling AWS spot instance interruptions.
+"""Detection of AWS spot instance interruptions.
 
-This module provides functionality for detecting and responding to AWS spot instance
-interruption notices, allowing Parsl tasks to be checkpointed and recovered.
+This module detects that AWS is reclaiming a spot instance and calls the
+handlers registered for it. It does not decide what to do about it: the
+response lives on :class:`~parsl_ephemeral_aws.modes.base.OperatingMode`, which
+marks the doomed block interrupted so Parsl re-runs its tasks.
 
 SPDX-License-Identifier: Apache-2.0
 SPDX-FileCopyrightText: 2025-2026 Scott Friedman and Project Contributors
@@ -17,7 +19,6 @@ import boto3
 from typing import Dict, List, Optional, Callable, Any
 from botocore.exceptions import ClientError
 
-from parsl_ephemeral_aws.exceptions import SpotInstanceError
 from parsl_ephemeral_aws.constants import (
     DEFAULT_SPOT_INTERRUPTION_CHECK_INTERVAL,
     DEFAULT_SPOT_INTERRUPTION_LEAD_TIME,
@@ -43,11 +44,13 @@ class SpotInterruptionMonitor:
 
     Detection runs on two tracks. The EventBridge warning is the one that
     matters: it arrives roughly two minutes *before* the reclaim, with the
-    instance still running, which is the only point at which checkpointing can
-    succeed. The EC2-state poll is kept as a fallback for when the notifier
-    could not be created (missing ``events``/``sqs`` permissions, say), but it
-    can only ever report an interruption post-facto, once the instance has
-    already reached ``shutting-down``.
+    instance still running, so the block can be marked ``STATUS_INTERRUPTED``
+    while the executor still has time to stop dispatching into it. The EC2-state
+    poll is kept as a fallback for when the notifier could not be created
+    (missing ``events``/``sqs`` permissions, say), but it can only ever report an
+    interruption post-facto, once the instance has already reached
+    ``shutting-down`` -- by which time work has been dispatched to a worker that
+    is already gone.
 
     Attributes
     ----------
@@ -247,7 +250,7 @@ class SpotInterruptionMonitor:
         except Exception as e:
             # Degrade to the EC2-state poll rather than failing the workflow.
             # The poll cannot see a warning in advance, so log loudly enough that
-            # the loss of checkpointing lead time is visible.
+            # the loss of the two-minute lead time is visible.
             logger.warning(
                 "Could not create the spot interruption notifier, falling back "
                 "to post-facto EC2 state polling -- interruptions will be "
@@ -309,8 +312,8 @@ class SpotInterruptionMonitor:
         Each message is an EventBridge envelope whose ``detail`` carries
         ``instance-id`` and ``instance-action``. Confirmed against a real
         FIS-driven interruption; the arriving instance was still ``running``,
-        which is what makes this usable for checkpointing where the EC2-state
-        poll is not.
+        which is what makes this track actionable where the EC2-state poll is
+        not.
 
         The rule cannot be scoped to specific instances -- their IDs are not
         known until the fleet launches -- so it matches every spot interruption
@@ -358,7 +361,7 @@ class SpotInterruptionMonitor:
                 "InstanceAction": detail.get("instance-action", "terminate"),
                 "NoticeTime": time.time(),
                 # Distinguishes an advance warning from the post-facto poll, so a
-                # handler can tell whether it has time to checkpoint.
+                # handler can tell whether the instance is still alive.
                 "Source": "eventbridge",
             }
             self._queue_warning(instance_id, event_details, ec2_client)
@@ -400,10 +403,10 @@ class SpotInterruptionMonitor:
         """Detect already-interrupted instances from their EC2 state.
 
         The fallback track. It reports an interruption only once the instance has
-        reached ``shutting-down`` or ``stopping`` -- after the reclaim, too late
-        to checkpoint -- so it exists to catch what the EventBridge notifier
-        misses, or to cover the case where the notifier could not be created at
-        all. :meth:`_poll_warning_queue` is the one that gives advance notice.
+        reached ``shutting-down`` or ``stopping`` -- after the reclaim -- so it
+        exists to catch what the EventBridge notifier misses, or to cover the case
+        where the notifier could not be created at all.
+        :meth:`_poll_warning_queue` is the one that gives advance notice.
         """
         if not self.instance_handlers:
             return
@@ -428,9 +431,9 @@ class SpotInterruptionMonitor:
                                 "InstanceId": instance_id,
                                 "InstanceAction": "terminate",
                                 "NoticeTime": time.time(),
-                                # No lead time left on this track; a handler can
-                                # skip checkpointing rather than attempt it
-                                # against an instance that is already going.
+                                # No lead time left on this track: the instance is
+                                # already going, so a handler knows the marker is
+                                # after the fact rather than ahead of it.
                                 "Source": "ec2-state",
                             }
                             self.event_queue.put(
@@ -530,491 +533,19 @@ class SpotInterruptionMonitor:
             pass
 
 
-class SpotInterruptionHandler:
-    """Handler for spot instance interruptions.
-
-    This class provides utilities for implementing recovery actions when spot
-    instances are interrupted. It includes functionality for saving and loading
-    checkpoint data, redirecting tasks to other instances, and prioritizing
-    task recovery.
-
-    Attributes
-    ----------
-    session : boto3.Session
-        AWS session for making API calls
-    checkpoint_bucket : Optional[str]
-        S3 bucket name for storing checkpoint data
-    checkpoint_prefix : str
-        S3 key prefix for checkpoint data
-    recovery_queue : queue.PriorityQueue
-        Queue for prioritizing recovery tasks
-    """
-
-    def __init__(
-        self,
-        session: boto3.Session,
-        checkpoint_bucket: Optional[str] = None,
-        checkpoint_prefix: str = "parsl/checkpoints",
-    ) -> None:
-        """Initialize the SpotInterruptionHandler.
-
-        Parameters
-        ----------
-        session : boto3.Session
-            AWS session for making API calls
-        checkpoint_bucket : Optional[str], optional
-            S3 bucket name for storing checkpoint data, by default None
-        checkpoint_prefix : str, optional
-            S3 key prefix for checkpoint data, by default "parsl/checkpoints"
-        """
-        self.session = session
-        self.checkpoint_bucket = checkpoint_bucket
-        self.checkpoint_prefix = checkpoint_prefix
-        self.recovery_queue = queue.PriorityQueue()
-
-        # Ensure S3 bucket exists if specified
-        if self.checkpoint_bucket:
-            self._ensure_bucket_exists()
-
-    def _ensure_bucket_exists(self) -> None:
-        """Ensure the checkpoint S3 bucket exists."""
-        s3 = self.session.client("s3")
-
-        try:
-            s3.head_bucket(Bucket=self.checkpoint_bucket)
-        except ClientError as e:
-            error_code = e.response["Error"]["Code"]
-            if error_code == "404":
-                # Bucket doesn't exist, create it
-                try:
-                    s3.create_bucket(Bucket=self.checkpoint_bucket)
-                    logger.info(f"Created checkpoint bucket {self.checkpoint_bucket}")
-                except Exception as e:
-                    logger.error(f"Failed to create checkpoint bucket: {e}")
-                    raise
-            else:
-                logger.error(f"Error checking checkpoint bucket: {e}")
-                raise
-
-    def save_checkpoint(
-        self, task_id: str, data: Dict[str, Any], priority: int = 1
-    ) -> str:
-        """Save checkpoint data to S3.
-
-        Parameters
-        ----------
-        task_id : str
-            Unique identifier for the task
-        data : Dict[str, Any]
-            Checkpoint data to save
-        priority : int, optional
-            Recovery priority (lower is higher priority), by default 1
-
-        Returns
-        -------
-        str
-            S3 URI for the saved checkpoint
-
-        Raises
-        ------
-        SpotInstanceError
-            If checkpoint cannot be saved
-        """
-        if not self.checkpoint_bucket:
-            raise SpotInstanceError("No checkpoint bucket specified")
-
-        s3 = self.session.client("s3")
-        key = f"{self.checkpoint_prefix}/{task_id}.json"
-
-        try:
-            s3.put_object(
-                Bucket=self.checkpoint_bucket,
-                Key=key,
-                Body=json.dumps(data),
-                ServerSideEncryption="AES256",
-                Metadata={
-                    "Priority": str(priority),
-                    "Timestamp": str(int(time.time())),
-                },
-            )
-            return f"s3://{self.checkpoint_bucket}/{key}"
-        except Exception as e:
-            logger.error(f"Failed to save checkpoint for task {task_id}: {e}")
-            raise SpotInstanceError(f"Failed to save checkpoint: {e}")
-
-    def load_checkpoint(self, task_id: str) -> Optional[Dict[str, Any]]:
-        """Load checkpoint data from S3.
-
-        Parameters
-        ----------
-        task_id : str
-            Unique identifier for the task
-
-        Returns
-        -------
-        Optional[Dict[str, Any]]
-            Checkpoint data or None if not found
-
-        Raises
-        ------
-        SpotInstanceError
-            If checkpoint cannot be loaded
-        """
-        if not self.checkpoint_bucket:
-            raise SpotInstanceError("No checkpoint bucket specified")
-
-        s3 = self.session.client("s3")
-        key = f"{self.checkpoint_prefix}/{task_id}.json"
-
-        try:
-            response = s3.get_object(Bucket=self.checkpoint_bucket, Key=key)
-            return json.loads(response["Body"].read())
-        except ClientError as e:
-            if e.response["Error"]["Code"] == "NoSuchKey":
-                return None
-            logger.error(f"Failed to load checkpoint for task {task_id}: {e}")
-            raise SpotInstanceError(f"Failed to load checkpoint: {e}")
-        except Exception as e:
-            logger.error(f"Failed to load checkpoint for task {task_id}: {e}")
-            raise SpotInstanceError(f"Failed to load checkpoint: {e}")
-
-    def queue_task_for_recovery(
-        self, task_id: str, checkpoint_uri: str, priority: int = 1
-    ) -> None:
-        """Queue a task for recovery.
-
-        Parameters
-        ----------
-        task_id : str
-            Unique identifier for the task
-        checkpoint_uri : str
-            URI for the checkpoint data
-        priority : int, optional
-            Recovery priority (lower is higher priority), by default 1
-        """
-        self.recovery_queue.put((priority, time.time(), task_id, checkpoint_uri))
-        logger.info(f"Queued task {task_id} for recovery with priority {priority}")
-
-    def get_next_recovery_task(self) -> Optional[Dict[str, Any]]:
-        """Get the next task to recover.
-
-        Returns
-        -------
-        Optional[Dict[str, Any]]
-            Task recovery information or None if queue is empty
-        """
-        try:
-            (
-                priority,
-                timestamp,
-                task_id,
-                checkpoint_uri,
-            ) = self.recovery_queue.get_nowait()
-            return {
-                "task_id": task_id,
-                "checkpoint_uri": checkpoint_uri,
-                "priority": priority,
-                "timestamp": timestamp,
-            }
-        except queue.Empty:
-            return None
-
-    def handle_instance_interruption(
-        self, instance_id: str, event: Dict[str, Any]
-    ) -> None:
-        """Handle spot instance interruption.
-
-        This method should be implemented by subclasses to provide specific
-        recovery actions for the application.
-
-        Parameters
-        ----------
-        instance_id : str
-            ID of the interrupted instance
-        event : Dict[str, Any]
-            Interruption event details
-        """
-        # This is a placeholder that should be overridden by subclasses
-        logger.warning(f"Spot instance {instance_id} is being interrupted: {event}")
-
-    def handle_fleet_interruption(
-        self, fleet_id: str, instance_ids: List[str], event: Dict[str, Any]
-    ) -> None:
-        """Handle spot fleet interruption.
-
-        This method should be implemented by subclasses to provide specific
-        recovery actions for the application.
-
-        Parameters
-        ----------
-        fleet_id : str
-            ID of the spot fleet
-        instance_ids : List[str]
-            IDs of the interrupted instances
-        event : Dict[str, Any]
-            Interruption event details
-        """
-        # This is a placeholder that should be overridden by subclasses
-        logger.warning(
-            f"Spot fleet {fleet_id} instances {instance_ids} are being interrupted: {event}"
-        )
-
-
-class ParslSpotInterruptionHandler(SpotInterruptionHandler):
-    """Parsl-specific handler for spot instance interruptions.
-
-    This class extends SpotInterruptionHandler to provide Parsl-specific
-    functionality for task recovery.
-
-    Attributes
-    ----------
-    session : boto3.Session
-        AWS session for making API calls
-    checkpoint_bucket : Optional[str]
-        S3 bucket name for storing checkpoint data
-    checkpoint_prefix : str
-        S3 key prefix for checkpoint data
-    executor : Any
-        Parsl executor for submitting recovery tasks
-    executor_label : str
-        Label of the executor for task submission
-    """
-
-    def __init__(
-        self,
-        session: boto3.Session,
-        checkpoint_bucket: Optional[str] = None,
-        checkpoint_prefix: str = "parsl/checkpoints",
-        executor=None,
-        executor_label: str = "default",
-    ) -> None:
-        """Initialize the ParslSpotInterruptionHandler.
-
-        Parameters
-        ----------
-        session : boto3.Session
-            AWS session for making API calls
-        checkpoint_bucket : Optional[str], optional
-            S3 bucket name for storing checkpoint data, by default None
-        checkpoint_prefix : str, optional
-            S3 key prefix for checkpoint data, by default "parsl/checkpoints"
-        executor : Any, optional
-            Parsl executor for submitting recovery tasks, by default None
-        executor_label : str, optional
-            Label of the executor for task submission, by default "default"
-        """
-        super().__init__(session, checkpoint_bucket, checkpoint_prefix)
-        self.executor = executor
-        self.executor_label = executor_label
-        self.task_mapping = {}  # instance_id -> list of task_ids
-
-    def register_task(self, task_id: str, instance_id: str) -> None:
-        """Register a task running on a specific instance.
-
-        Parameters
-        ----------
-        task_id : str
-            Unique identifier for the task
-        instance_id : str
-            ID of the instance running the task
-        """
-        if instance_id not in self.task_mapping:
-            self.task_mapping[instance_id] = []
-
-        self.task_mapping[instance_id].append(task_id)
-        logger.debug(f"Registered task {task_id} on instance {instance_id}")
-
-    def handle_instance_interruption(
-        self, instance_id: str, event: Dict[str, Any]
-    ) -> None:
-        """Handle spot instance interruption for Parsl tasks.
-
-        Parameters
-        ----------
-        instance_id : str
-            ID of the interrupted instance
-        event : Dict[str, Any]
-            Interruption event details
-        """
-        logger.warning(f"Spot instance {instance_id} is being interrupted: {event}")
-
-        # Get tasks running on this instance
-        tasks = self.task_mapping.get(instance_id, [])
-        if not tasks:
-            logger.info(f"No registered tasks found for instance {instance_id}")
-            return
-
-        logger.info(
-            f"Found {len(tasks)} tasks to recover from interrupted instance {instance_id}"
-        )
-
-        # Queue tasks for recovery
-        for task_id in tasks:
-            try:
-                # Attempt to load checkpoint data for this task
-                checkpoint_data = self.load_checkpoint(task_id)
-                if checkpoint_data:
-                    self.queue_task_for_recovery(
-                        task_id,
-                        f"s3://{self.checkpoint_bucket}/{self.checkpoint_prefix}/{task_id}.json",
-                    )
-                else:
-                    logger.warning(f"No checkpoint data found for task {task_id}")
-            except Exception as e:
-                logger.error(f"Error processing task {task_id} for recovery: {e}")
-
-        # Clean up task mapping
-        if instance_id in self.task_mapping:
-            del self.task_mapping[instance_id]
-
-    def handle_fleet_interruption(
-        self, fleet_id: str, instance_ids: List[str], event: Dict[str, Any]
-    ) -> None:
-        """Handle spot fleet interruption for Parsl tasks.
-
-        Parameters
-        ----------
-        fleet_id : str
-            ID of the spot fleet
-        instance_ids : List[str]
-            IDs of the interrupted instances
-        event : Dict[str, Any]
-            Interruption event details
-        """
-        logger.warning(
-            f"Spot fleet {fleet_id} instances {instance_ids} are being interrupted: {event}"
-        )
-
-        # Process each interrupted instance
-        for instance_id in instance_ids:
-            self.handle_instance_interruption(instance_id, event)
-
-    def recover_tasks(self) -> None:
-        """Process the recovery queue and resubmit tasks."""
-        if not self.executor:
-            logger.warning("No executor provided for task recovery")
-            return
-
-        tasks_recovered = 0
-
-        # Process recovery queue
-        while True:
-            task_info = self.get_next_recovery_task()
-            if not task_info:
-                break
-
-            task_id = task_info["task_id"]
-            checkpoint_uri = task_info["checkpoint_uri"]
-
-            try:
-                # Here we would use the Parsl executor to resubmit the task
-                # The actual implementation would depend on how tasks are represented in Parsl
-                logger.info(
-                    f"Recovering task {task_id} using checkpoint {checkpoint_uri}"
-                )
-
-                # In a real implementation, we would:
-                # 1. Load the checkpoint data
-                # 2. Create a new Parsl future
-                # 3. Submit the task to the executor
-                # 4. Update any dependent tasks
-
-                tasks_recovered += 1
-
-            except Exception as e:
-                logger.error(f"Failed to recover task {task_id}: {e}")
-
-        logger.info(f"Recovered {tasks_recovered} tasks")
-
-
-# Decorator function for making functions checkpointable
-def checkpointable(
-    checkpoint_bucket: Optional[str] = None,
-    checkpoint_prefix: str = "parsl/checkpoints",
-    checkpoint_interval: int = 60,  # seconds
-):
-    """Decorator to make a function checkpointable for spot interruption recovery.
-
-    This decorator adds checkpointing capabilities to a function, allowing it
-    to be recovered if interrupted by a spot instance termination.
-
-    Parameters
-    ----------
-    checkpoint_bucket : Optional[str], optional
-        S3 bucket for storing checkpoints, by default None
-    checkpoint_prefix : str, optional
-        S3 key prefix for checkpoints, by default "parsl/checkpoints"
-    checkpoint_interval : int, optional
-        Interval between checkpoints in seconds, by default 60
-
-    Returns
-    -------
-    Callable
-        Decorated function with checkpointing
-
-    Example
-    -------
-    >>> @checkpointable(checkpoint_bucket="my-bucket")
-    >>> def my_function(x, y, checkpoint_data=None):
-    >>>     # Initialize from checkpoint if available
-    >>>     if checkpoint_data:
-    >>>         state = checkpoint_data
-    >>>     else:
-    >>>         state = {"iteration": 0, "result": 0}
-    >>>
-    >>>     # Simulate work with checkpointing
-    >>>     for i in range(state["iteration"], 100):
-    >>>         state["result"] += x * y
-    >>>         state["iteration"] = i + 1
-    >>>
-    >>>         # Return checkpoint at intervals
-    >>>         if (i + 1) % 10 == 0:
-    >>>             yield state
-    >>>
-    >>>     return state["result"]
-    """
-
-    def decorator(func):
-        def wrapper(*args, **kwargs):
-            # Parse any checkpoint data provided
-            checkpoint_data = kwargs.pop("checkpoint_data", None)
-
-            # Create a generator from the function
-            gen = func(*args, checkpoint_data=checkpoint_data, **kwargs)
-
-            # If function is not a generator, make it one
-            if not hasattr(gen, "__iter__") and not hasattr(gen, "__next__"):
-                return gen
-
-            # Process generator, capturing checkpoints
-            last_checkpoint = time.time()
-            result = None
-
-            try:
-                while True:
-                    # Get next checkpoint or result
-                    try:
-                        checkpoint = next(gen)
-
-                        # Save checkpoint if interval has passed
-                        current_time = time.time()
-                        if current_time - last_checkpoint >= checkpoint_interval:
-                            # In a real implementation, we would save to S3 here
-                            # For now, just update the last checkpoint time
-                            last_checkpoint = current_time
-
-                    except StopIteration as e:
-                        result = e.value
-                        break
-
-                return result
-
-            except Exception as e:
-                # In case of exception, try to save a final checkpoint
-                # This could be triggered by a spot interruption
-                logger.error(f"Error in checkpointable function: {e}")
-                raise
-
-        return wrapper
-
-    return decorator
+# The interruption *response* is not here: it lives on
+# ``modes.base.OperatingMode.handle_instance_interruption``, which marks the
+# doomed block ``STATUS_INTERRUPTED`` so the provider reports
+# ``JobState.FAILED`` and Parsl re-runs the lost tasks under the executor's own
+# ``retries``.
+#
+# This module used to also carry ``SpotInterruptionHandler`` and
+# ``ParslSpotInterruptionHandler``, a checkpoint/recovery API that could not
+# work at this layer and never ran (#137). Its entry point was
+# ``register_task(task_id, instance_id)``, and a Parsl provider is never told a
+# task ID -- ``submit(command, tasks_per_node, job_name)`` is the whole
+# contract, because providers manage *blocks* while the executor manages tasks.
+# Nothing in the package could call it, so ``task_mapping`` was always empty,
+# every interruption logged "No registered tasks found", and
+# ``save_checkpoint``/``recover_tasks``/``checkpointable`` were dead alongside
+# it. Being documented as working made it worse than absent.

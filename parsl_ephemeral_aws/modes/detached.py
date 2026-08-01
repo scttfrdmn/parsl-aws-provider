@@ -26,6 +26,7 @@ from parsl_ephemeral_aws.constants import (
     RESOURCE_TYPE_CLOUDFORMATION,
     RESOURCE_TYPE_SPOT_FLEET,
     STATUS_CANCELED,
+    STATUS_INTERRUPTED,
     STATUS_PENDING,
     STATUS_RUNNING,
     STATUS_UNKNOWN,
@@ -47,10 +48,7 @@ from parsl_ephemeral_aws.utils.aws import (
 from parsl_ephemeral_aws.compute.spot_fleet_cleanup import (
     cleanup_all_spot_fleet_resources,
 )
-from parsl_ephemeral_aws.compute.spot_interruption import (
-    SpotInterruptionMonitor,
-    ParslSpotInterruptionHandler,
-)
+from parsl_ephemeral_aws.compute.spot_interruption import SpotInterruptionMonitor
 
 
 logger = logging.getLogger(__name__)
@@ -146,28 +144,17 @@ class DetachedMode(OperatingMode):
         self.nodes_per_block = nodes_per_block
         self.spot_max_price_percentage = spot_max_price_percentage
 
-        # Initialize spot interruption handling if enabled
+        # Initialize spot interruption handling if enabled. use_spot_fleet is
+        # included because a fleet is only ever requested for spot capacity, and
+        # a bucket is no longer a prerequisite -- detection needs no S3 (#137).
         self.spot_interruption_monitor = None
-        self.spot_interruption_handler = None
 
-        if self.use_spot and self.spot_interruption_handling:
-            if not self.checkpoint_bucket and self.spot_interruption_handling:
-                logger.warning(
-                    "Spot interruption handling is enabled but no checkpoint bucket specified"
-                )
-            else:
-                logger.debug(
-                    "Initializing SpotInterruptionMonitor and Handler for DetachedMode"
-                )
-                self.spot_interruption_monitor = SpotInterruptionMonitor(
-                    self.session, provider_id=self.provider_id
-                )
-                self.spot_interruption_handler = ParslSpotInterruptionHandler(
-                    session=self.session,
-                    checkpoint_bucket=self.checkpoint_bucket,
-                    checkpoint_prefix=self.checkpoint_prefix,
-                )
-                self.spot_interruption_monitor.start_monitoring()
+        if (self.use_spot or self.use_spot_fleet) and self.spot_interruption_handling:
+            logger.debug("Initializing SpotInterruptionMonitor for DetachedMode")
+            self.spot_interruption_monitor = SpotInterruptionMonitor(
+                self.session, provider_id=self.provider_id
+            )
+            self.spot_interruption_monitor.start_monitoring()
 
         # Update resources dict to include bastion host
         self.resources = self.resources or {}
@@ -1612,6 +1599,14 @@ if __name__ == '__main__':
                 status_map[resource_id] = STATUS_UNKNOWN
                 continue
 
+            # An interruption is sticky: the bastion's status document is
+            # written by the reclaimed instance itself, so it cannot report its
+            # own reclaim, and re-reading it would overwrite the marker set by
+            # handle_instance_interruption on the very next poll (#137).
+            if resource.get("status") == STATUS_INTERRUPTED:
+                status_map[resource_id] = STATUS_INTERRUPTED
+                continue
+
             job_id = resource.get("job_id")
             if not job_id:
                 status_map[resource_id] = STATUS_UNKNOWN
@@ -1909,7 +1904,6 @@ if __name__ == '__main__':
                             f"Failed to stop spot interruption monitoring: {e}"
                         )
                     self.spot_interruption_monitor = None
-                    self.spot_interruption_handler = None
 
                 # Clear initialization flag only if we're cleaning up everything
                 self.initialized = False
@@ -2088,21 +2082,16 @@ if __name__ == '__main__':
                     )
 
                     # Initialize or clean up spot interruption handling based on new setting
-                    if self.spot_interruption_handling and self.use_spot:
+                    if self.spot_interruption_handling and (
+                        self.use_spot or self.use_spot_fleet
+                    ):
                         if not self.spot_interruption_monitor:
                             logger.debug(
-                                "Initializing SpotInterruptionMonitor and Handler after state load"
+                                "Initializing SpotInterruptionMonitor after state load"
                             )
                             self.spot_interruption_monitor = SpotInterruptionMonitor(
                                 self.session,
                                 provider_id=self.provider_id,
-                            )
-                            self.spot_interruption_handler = (
-                                ParslSpotInterruptionHandler(
-                                    session=self.session,
-                                    checkpoint_bucket=self.checkpoint_bucket,
-                                    checkpoint_prefix=self.checkpoint_prefix,
-                                )
                             )
                             self.spot_interruption_monitor.start_monitoring()
                     elif (
@@ -2114,21 +2103,16 @@ if __name__ == '__main__':
                         )
                         self.spot_interruption_monitor.stop_monitoring()
                         self.spot_interruption_monitor = None
-                        self.spot_interruption_handler = None
 
                 # Re-register existing spot instances with interruption monitor if needed
-                if (
-                    self.spot_interruption_handling
-                    and self.spot_interruption_monitor
-                    and self.spot_interruption_handler
-                ):
+                if self.spot_interruption_handling and self.spot_interruption_monitor:
                     for resource_id, resource in self.resources.items():
                         if resource.get("type") == RESOURCE_TYPE_EC2 and resource.get(
                             "is_spot", False
                         ):
                             self.spot_interruption_monitor.register_instance(
                                 resource_id,
-                                self.spot_interruption_handler.handle_instance_interruption,
+                                self.handle_instance_interruption,
                             )
                             logger.info(
                                 f"Re-registered spot instance {resource_id} for interruption handling"
@@ -2141,7 +2125,7 @@ if __name__ == '__main__':
                             fleet_request_id = resource.get("fleet_request_id")
                             self.spot_interruption_monitor.register_fleet(
                                 fleet_request_id,
-                                self.spot_interruption_handler.handle_fleet_interruption,
+                                self.handle_fleet_interruption,
                             )
                             logger.info(
                                 f"Re-registered spot fleet {fleet_request_id} for interruption handling"

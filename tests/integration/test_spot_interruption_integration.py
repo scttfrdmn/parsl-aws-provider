@@ -1,518 +1,304 @@
-"""Integration tests for spot interruption handling using substrate.
+"""Integration tests for the spot interruption response, across all three modes.
 
-These tests verify that spot interruption handling works correctly across
-all operating modes, including detection, checkpointing, and recovery.
+Detection is covered in ``test_spot_interruption_substrate.py``; this file covers
+what happens *after* a reclaim is detected — the mode marking the block so the
+provider reports FAILED and Parsl re-runs its tasks. That path is per-mode, and
+the wiring differs in each: StandardMode registers each spot instance as it is
+created, DetachedMode re-registers them from state after a restart, and
+ServerlessMode registers a fleet whose ID is not its own resource key.
+
+Interruptions are driven by putting an event on ``monitor.event_queue`` and
+calling ``_process_interruption_events()``. That is the seam the monitoring thread
+itself uses, and it is the only workable one here: substrate does not emulate
+``events``, and it never sets ``InstanceLifecycle``, so neither the EventBridge
+warning nor the EC2-state poll can originate an interruption against the
+emulator. Everything downstream of the queue is the real code.
+
+The checkpoint/recovery API the previous version of this file tested was deleted
+in #137. It could not work at this layer: its entry point was
+``register_task(task_id, instance_id)``, and a Parsl provider is never told a
+task ID — it is handed a command and returns a block ID.
 
 SPDX-License-Identifier: Apache-2.0
 SPDX-FileCopyrightText: 2025-2026 Scott Friedman and Project Contributors
 """
 
-import pytest
 import time
 import uuid
-from unittest.mock import patch
 
-from parsl_ephemeral_aws.modes.standard import StandardMode
+import pytest
+
+from parsl_ephemeral_aws.compute.spot_interruption import SpotInterruptionMonitor
+from parsl_ephemeral_aws.constants import (
+    RESOURCE_TYPE_EC2,
+    RESOURCE_TYPE_SPOT_FLEET,
+    STATUS_INTERRUPTED,
+    STATUS_RUNNING,
+)
 from parsl_ephemeral_aws.modes.detached import DetachedMode
 from parsl_ephemeral_aws.modes.serverless import ServerlessMode
-from parsl_ephemeral_aws.compute.spot_interruption import (
-    SpotInterruptionMonitor,
-    SpotInterruptionHandler,
-    ParslSpotInterruptionHandler,
-)
+from parsl_ephemeral_aws.modes.standard import StandardMode
 from parsl_ephemeral_aws.state.file import FileStateStore
-from tests.substrate_support import (
-    get_substrate_session,
-    is_substrate_available,
-)
+from tests.substrate_support import cleanup_substrate_vpc, setup_substrate_vpc
 
-
-@pytest.fixture(scope="session")
-def substrate_available():
-    """Check if substrate is available for testing."""
-    if not is_substrate_available():
-        pytest.skip("substrate not available - start with 'make substrate-up'")
-    return True
-
-
-@pytest.fixture(scope="session")
-def substrate_session(substrate_available):
-    """Create a session connected to substrate."""
-    return get_substrate_session()
-
-
-@pytest.fixture
-def temp_state_store(tmpdir):
-    """Create a temporary state store for testing."""
-    state_file = tmpdir.join("state.json")
-    return FileStateStore(file_path=str(state_file))
+pytestmark = [pytest.mark.integration, pytest.mark.substrate]
 
 
 @pytest.fixture
 def provider_id():
-    """Generate a unique provider ID for tests."""
+    """A unique provider ID, so concurrent runs cannot collide on state keys."""
     return f"test-provider-{uuid.uuid4().hex[:8]}"
 
 
 @pytest.fixture
-def checkpoint_bucket(substrate_session, provider_id):
-    """Create a temporary S3 bucket for checkpoints."""
-    bucket_name = f"test-checkpoint-bucket-{provider_id.split('-')[-1]}"
-    s3_client = substrate_session.client("s3")
-
-    try:
-        s3_client.create_bucket(Bucket=bucket_name)
-    except Exception as e:
-        pytest.skip(f"Failed to create S3 bucket: {e}")
-
-    yield bucket_name
-
-    # Cleanup
-    try:
-        # Delete all objects in the bucket
-        objects = s3_client.list_objects_v2(Bucket=bucket_name)
-        if "Contents" in objects:
-            delete_keys = {
-                "Objects": [{"Key": obj["Key"]} for obj in objects["Contents"]]
-            }
-            s3_client.delete_objects(Bucket=bucket_name, Delete=delete_keys)
-
-        # Delete the bucket
-        s3_client.delete_bucket(Bucket=bucket_name)
-    except Exception as e:
-        print(f"Error cleaning up bucket {bucket_name}: {e}")
+def state_store(tmp_path, provider_id):
+    """A file-backed store, which is what makes the restart test possible."""
+    return FileStateStore(
+        file_path=str(tmp_path / "state.json"), provider_id=provider_id
+    )
 
 
 @pytest.fixture
-def mock_spot_instance_id(substrate_session):
-    """Create a spot instance ID for testing."""
-    return f"i-spot-{uuid.uuid4().hex[:8]}"
+def network(substrate_session):
+    """Pre-provisioned VPC/subnet/SG — required of every mode since #69."""
+    ids = setup_substrate_vpc()
+    yield ids
+    cleanup_substrate_vpc(ids["vpc_id"])
 
 
-@pytest.fixture
-def mock_spot_fleet_id(substrate_session):
-    """Create a spot fleet ID for testing."""
-    return f"sfr-{uuid.uuid4().hex[:8]}"
-
-
-@pytest.mark.integration
-class TestSpotInterruptionHandlingSubstrate:
-    """Integration tests for spot interruption handling using substrate."""
-
-    @pytest.mark.substrate
-    def test_spot_interruption_monitor_creation(self, substrate_session):
-        """Test that SpotInterruptionMonitor can be initialized."""
-        monitor = SpotInterruptionMonitor(session=substrate_session)
-        assert monitor is not None
-        assert monitor.session == substrate_session
-        assert monitor.instance_handlers == {}
-        assert monitor.fleet_handlers == {}
-
-        # Start monitoring
-        monitor.start_monitoring()
-        assert monitor.monitoring_thread is not None
-        assert monitor.monitoring_thread.is_alive()
-
-        # Stop monitoring
-        monitor.stop_monitoring()
-        time.sleep(0.5)  # Let thread terminate
-        assert not monitor.monitoring_thread.is_alive()
-
-    @pytest.mark.substrate
-    def test_spot_interruption_handler_with_s3(
-        self, substrate_session, checkpoint_bucket
-    ):
-        """Test that SpotInterruptionHandler can use S3 for checkpoints."""
-        handler = SpotInterruptionHandler(
-            session=substrate_session,
-            checkpoint_bucket=checkpoint_bucket,
-            checkpoint_prefix="test-checkpoints",
+def _interrupt_instance(monitor, instance_id):
+    """Deliver an instance reclaim through the queue the monitor thread drains."""
+    monitor.event_queue.put(
+        (
+            "instance",
+            instance_id,
+            {
+                "InstanceId": instance_id,
+                "InstanceAction": "terminate",
+                "NoticeTime": time.time(),
+                "Source": "eventbridge",
+            },
         )
+    )
+    monitor._process_interruption_events()
 
-        assert handler is not None
-        assert handler.checkpoint_bucket == checkpoint_bucket
 
-        # Test saving a checkpoint
-        task_id = f"task-{uuid.uuid4().hex[:8]}"
-        test_data = {"state": "running", "progress": 50, "timestamp": time.time()}
-
-        uri = handler.save_checkpoint(task_id, test_data)
-        assert uri == f"s3://{checkpoint_bucket}/test-checkpoints/{task_id}.json"
-
-        # Test loading the checkpoint
-        loaded_data = handler.load_checkpoint(task_id)
-        assert loaded_data is not None
-        assert loaded_data["state"] == "running"
-        assert loaded_data["progress"] == 50
-
-    @pytest.mark.substrate
-    def test_parsl_handler_task_registration(
-        self, substrate_session, checkpoint_bucket, mock_spot_instance_id
-    ):
-        """Test that tasks can be registered with the ParslSpotInterruptionHandler."""
-        handler = ParslSpotInterruptionHandler(
-            session=substrate_session,
-            checkpoint_bucket=checkpoint_bucket,
-            checkpoint_prefix="test-checkpoints",
+def _interrupt_fleet(monitor, fleet_id, instance_ids):
+    """Deliver a fleet reclaim through the queue the monitor thread drains."""
+    monitor.event_queue.put(
+        (
+            "fleet",
+            fleet_id,
+            instance_ids,
+            {
+                "FleetRequestId": fleet_id,
+                "InstanceAction": "terminate",
+                "NoticeTime": time.time(),
+                "Source": "eventbridge",
+            },
         )
+    )
+    monitor._process_interruption_events()
 
-        # Register tasks
-        task_ids = [f"task-{uuid.uuid4().hex[:8]}" for _ in range(3)]
-        for task_id in task_ids:
-            handler.register_task(task_id, mock_spot_instance_id)
 
-        # Verify tasks were registered
-        assert mock_spot_instance_id in handler.task_mapping
-        assert len(handler.task_mapping[mock_spot_instance_id]) == 3
-        for task_id in task_ids:
-            assert task_id in handler.task_mapping[mock_spot_instance_id]
+class TestStandardModeInterruption:
+    """StandardMode registers each spot instance as it creates it."""
 
-    @pytest.mark.substrate
-    def test_standard_mode_with_spot_interruption(
-        self,
-        substrate_session,
-        temp_state_store,
-        provider_id,
-        checkpoint_bucket,
-        mock_spot_instance_id,
-    ):
-        """Test that StandardMode can handle spot interruptions."""
-        # Create StandardMode instance with spot interruption handling
+    @pytest.fixture
+    def mode(self, substrate_session, state_store, provider_id, network):
         mode = StandardMode(
             provider_id=provider_id,
             session=substrate_session,
-            state_store=temp_state_store,
+            state_store=state_store,
             region="us-east-1",
-            instance_type="t2.micro",
-            image_id="ami-12345678",  # Dummy AMI ID for testing
+            instance_type="t3.micro",
+            image_id="ami-12345678",
+            vpc_id=network["vpc_id"],
+            subnet_id=network["subnet_id"],
+            security_group_id=network["security_group_id"],
             use_spot=True,
             spot_interruption_handling=True,
-            checkpoint_bucket=checkpoint_bucket,
-            checkpoint_prefix="test/checkpoints",
         )
+        yield mode
+        if mode.spot_interruption_monitor:
+            mode.spot_interruption_monitor.stop_monitoring()
 
-        try:
-            # Initialize mode
-            mode.initialize()
+    def test_a_reclaim_marks_the_block_the_provider_reports_on(self, mode):
+        """The whole point of #137, through a real mode rather than a stub.
 
-            # Verify spot interruption monitor was created
-            assert mode.spot_interruption_monitor is not None
-            assert mode.spot_interruption_handler is not None
+        Before this, the reclaim was *invisible* rather than merely unhandled:
+        EC2 reports a reclaimed instance as ``shutting-down``, which
+        ``EC2_STATUS_MAPPING`` renders COMPLETED, so the block reported success
+        and its tasks were silently dropped instead of being re-run.
+        """
+        instance_id = f"i-{uuid.uuid4().hex[:16]}"
+        mode.resources[instance_id] = {
+            "type": RESOURCE_TYPE_EC2,
+            "job_id": "job-1",
+            "status": STATUS_RUNNING,
+            "is_spot": True,
+        }
 
-            # Mock instance creation response
-            with patch.object(mode, "_create_ec2_instance") as mock_create_instance:
-                mock_create_instance.return_value = {
-                    "instance_id": mock_spot_instance_id,
-                    "private_ip": "10.0.0.5",
-                    "public_ip": "54.123.456.789",
-                    "dns_name": "ec2-54-123-456-789.compute-1.amazonaws.com",
-                }
+        # The real registration call, made by _create_spot_instance on every
+        # spot launch — not a hand-wired handler.
+        mode._register_spot_instance(instance_id)
+        assert instance_id in mode.spot_interruption_monitor.instance_handlers
 
-                # Submit a job
-                job_id = f"test-job-{uuid.uuid4().hex[:8]}"
-                command = "echo hello"
-                resource_id = mode.submit_job(job_id, command, 1)
+        _interrupt_instance(mode.spot_interruption_monitor, instance_id)
 
-            # Verify spot instance was registered with monitor
-            assert (
-                mock_spot_instance_id
-                in mode.spot_interruption_monitor.instance_handlers
-            )
+        assert mode.resources[instance_id]["status"] == STATUS_INTERRUPTED
+        # And it survives the next poll, which is what makes the marker mean
+        # anything: get_job_status must not re-derive COMPLETED from the
+        # shutting-down instance.
+        assert mode.get_job_status([instance_id])[instance_id] == STATUS_INTERRUPTED
 
-            # Mock a spot interruption event
-            event = {
-                "detail-type": "EC2 Spot Instance Interruption Warning",
-                "source": "aws.ec2",
-                "detail": {
-                    "instance-id": mock_spot_instance_id,
-                    "instance-action": "terminate",
-                },
-            }
+    def test_an_untracked_instance_does_not_break_the_monitor(self, mode):
+        """A warning can arrive for an instance the mode no longer tracks.
 
-            # Save a checkpoint before interruption
-            checkpoint_data = {
-                "job_id": job_id,
-                "progress": 75,
-                "timestamp": time.time(),
-            }
+        The monitor polls on its own thread, so a job that finished and was
+        cleaned up between the poll and the dispatch is routine. Raising here
+        would kill the monitoring thread and take every *other* instance's
+        interruption handling down with it.
+        """
+        instance_id = f"i-{uuid.uuid4().hex[:16]}"
+        mode._register_spot_instance(instance_id)
 
-            # Set up task in handler
-            mode.spot_interruption_handler.register_task(job_id, mock_spot_instance_id)
-            uri = mode.spot_interruption_handler.save_checkpoint(
-                job_id, checkpoint_data
-            )
+        _interrupt_instance(mode.spot_interruption_monitor, instance_id)
 
-            # Trigger interruption handler
-            handler_func = mode.spot_interruption_monitor.instance_handlers[
-                mock_spot_instance_id
-            ]
-            handler_func(mock_spot_instance_id, event["detail"])
+        assert instance_id not in mode.resources
 
-            # Verify task was queued for recovery
-            assert not mode.spot_interruption_handler.recovery_queue.empty()
 
-            # Get the recovery task
-            recovery_task = mode.spot_interruption_handler.get_next_recovery_task()
-            assert recovery_task is not None
-            assert recovery_task["task_id"] == job_id
+class TestDetachedModeInterruption:
+    """DetachedMode's registrations have to survive a restart.
 
-            # Load the checkpoint
-            loaded_data = mode.spot_interruption_handler.load_checkpoint(job_id)
-            assert loaded_data is not None
-            assert loaded_data["job_id"] == job_id
-            assert loaded_data["progress"] == 75
+    Its whole reason to exist is that the driver can go away and come back, so a
+    registration held only in the monitor's in-memory dict would be lost exactly
+    when it is most needed.
+    """
 
-        finally:
-            # Clean up resources
-            if (
-                hasattr(mode, "spot_interruption_monitor")
-                and mode.spot_interruption_monitor
-            ):
-                mode.spot_interruption_monitor.stop_monitoring()
-
-            mode.cleanup_infrastructure()
-
-    @pytest.mark.substrate
-    def test_detached_mode_with_spot_interruption(
-        self,
-        substrate_session,
-        temp_state_store,
-        provider_id,
-        checkpoint_bucket,
-        mock_spot_instance_id,
-    ):
-        """Test that DetachedMode can handle spot interruptions."""
-        # Create DetachedMode instance with spot interruption handling
-        workflow_id = f"test-workflow-{uuid.uuid4().hex[:8]}"
-        mode = DetachedMode(
+    def _mode(self, session, state_store, provider_id, network, workflow_id):
+        return DetachedMode(
             provider_id=provider_id,
-            session=substrate_session,
-            state_store=temp_state_store,
+            session=session,
+            state_store=state_store,
             region="us-east-1",
-            instance_type="t2.micro",
-            image_id="ami-12345678",  # Dummy AMI ID for testing
+            instance_type="t3.micro",
+            image_id="ami-12345678",
+            vpc_id=network["vpc_id"],
+            subnet_id=network["subnet_id"],
+            security_group_id=network["security_group_id"],
             workflow_id=workflow_id,
-            bastion_instance_type="t2.micro",
-            bastion_host_type="direct",  # Use direct mode for simpler testing
+            bastion_instance_type="t3.micro",
+            bastion_host_type="direct",
             use_spot=True,
             spot_interruption_handling=True,
-            checkpoint_bucket=checkpoint_bucket,
-            checkpoint_prefix="test/checkpoints",
         )
 
-        try:
-            # Initialize mode
-            with patch.object(mode, "_create_bastion_host") as mock_create_bastion:
-                mock_create_bastion.return_value = {
-                    "instance_id": f"i-bastion-{uuid.uuid4().hex[:8]}",
-                    "private_ip": "10.0.0.2",
-                    "public_ip": "54.123.456.789",
-                    "dns_name": "ec2-54-123-456-789.compute-1.amazonaws.com",
-                }
-                mode.initialize()
-
-            # Verify spot interruption monitor was created
-            assert mode.spot_interruption_monitor is not None
-            assert mode.spot_interruption_handler is not None
-
-            # Mock instance creation response
-            with patch.object(mode, "_create_ec2_instance") as mock_create_instance:
-                mock_create_instance.return_value = {
-                    "instance_id": mock_spot_instance_id,
-                    "private_ip": "10.0.0.5",
-                    "public_ip": "54.123.456.789",
-                    "dns_name": "ec2-54-123-456-789.compute-1.amazonaws.com",
-                }
-
-                # Submit a job
-                job_id = f"test-job-{uuid.uuid4().hex[:8]}"
-                command = "echo hello"
-                resource_id = mode.submit_job(job_id, command, 1)
-
-            # Verify spot instance was registered with monitor
-            assert (
-                mock_spot_instance_id
-                in mode.spot_interruption_monitor.instance_handlers
-            )
-
-            # Verify state persistence
-            mode.save_state()
-
-            # Create a new mode instance to simulate restart
-            mode2 = DetachedMode(
-                provider_id=provider_id,
-                session=substrate_session,
-                state_store=temp_state_store,
-                region="us-east-1",
-                instance_type="t2.micro",
-                image_id="ami-12345678",  # Dummy AMI ID for testing
-                workflow_id=workflow_id,
-                bastion_instance_type="t2.micro",
-                bastion_host_type="direct",  # Use direct mode for simpler testing
-                use_spot=True,
-                spot_interruption_handling=True,
-                checkpoint_bucket=checkpoint_bucket,
-                checkpoint_prefix="test/checkpoints",
-            )
-
-            # Load state
-            mode2.load_state()
-
-            # Verify spot interruption monitor was recreated with the same registrations
-            assert mode2.spot_interruption_monitor is not None
-            assert (
-                mock_spot_instance_id
-                in mode2.spot_interruption_monitor.instance_handlers
-            )
-
-        finally:
-            # Clean up resources
-            if (
-                hasattr(mode, "spot_interruption_monitor")
-                and mode.spot_interruption_monitor
-            ):
-                mode.spot_interruption_monitor.stop_monitoring()
-
-            mode.preserve_bastion = False  # Ensure bastion cleanup
-            mode.cleanup_infrastructure()
-
-    @pytest.mark.substrate
-    def test_serverless_mode_with_spot_fleet(
-        self,
-        substrate_session,
-        temp_state_store,
-        provider_id,
-        checkpoint_bucket,
-        mock_spot_fleet_id,
+    def test_registrations_are_rebuilt_from_state_after_a_restart(
+        self, substrate_session, state_store, provider_id, network
     ):
-        """Test that ServerlessMode can handle spot fleet interruptions."""
-        # Create ServerlessMode instance with spot interruption handling
+        instance_id = f"i-{uuid.uuid4().hex[:16]}"
+        workflow_id = f"test-workflow-{uuid.uuid4().hex[:8]}"
+
+        first = self._mode(
+            substrate_session, state_store, provider_id, network, workflow_id
+        )
+        try:
+            first.resources[instance_id] = {
+                "type": RESOURCE_TYPE_EC2,
+                "job_id": "job-1",
+                "status": STATUS_RUNNING,
+                "is_spot": True,
+            }
+            first.save_state()
+        finally:
+            if first.spot_interruption_monitor:
+                first.spot_interruption_monitor.stop_monitoring()
+
+        second = self._mode(
+            substrate_session, state_store, provider_id, network, workflow_id
+        )
+        try:
+            assert second.load_state() is True
+
+            # Re-registered from the persisted resource record, without the
+            # instance ever being launched again.
+            assert instance_id in second.spot_interruption_monitor.instance_handlers
+
+            _interrupt_instance(second.spot_interruption_monitor, instance_id)
+
+            assert second.resources[instance_id]["status"] == STATUS_INTERRUPTED
+            # This mode reads status from a document the worker writes, so a
+            # reclaimed instance cannot report its own reclaim — it just stops
+            # updating. Re-deriving would overwrite the marker with a stale
+            # RUNNING.
+            assert (
+                second.get_job_status([instance_id])[instance_id] == STATUS_INTERRUPTED
+            )
+        finally:
+            if second.spot_interruption_monitor:
+                second.spot_interruption_monitor.stop_monitoring()
+
+
+class TestServerlessModeFleetInterruption:
+    """A fleet ID is never the resource key, in any mode.
+
+    ServerlessMode keys a fleet-backed job by ``serverless-<job_id>`` and records
+    the fleet as a ``fleet_request_id`` *field*, so the direct
+    ``resources[fleet_id]`` lookup ``handle_fleet_interruption`` used to do missed
+    every single time — the block Parsl holds kept reporting healthy straight
+    through the reclaim. This is that gap, closed and pinned.
+    """
+
+    @pytest.fixture
+    def mode(self, substrate_session, state_store, provider_id, network):
         mode = ServerlessMode(
             provider_id=provider_id,
             session=substrate_session,
-            state_store=temp_state_store,
+            state_store=state_store,
             region="us-east-1",
             worker_type="ecs",
-            ecs_task_cpu=256,
-            ecs_task_memory=512,
-            ecs_container_image="amazon/amazon-ecs-sample",
+            vpc_id=network["vpc_id"],
+            subnet_id=network["subnet_id"],
+            security_group_id=network["security_group_id"],
             use_spot=True,
             use_spot_fleet=True,
             spot_interruption_handling=True,
-            checkpoint_bucket=checkpoint_bucket,
-            checkpoint_prefix="test/checkpoints",
-            instance_types=["t2.micro", "t3.micro"],
+            instance_types=["t3.micro", "t3.small"],
+        )
+        yield mode
+        if mode.spot_interruption_monitor:
+            mode.spot_interruption_monitor.stop_monitoring()
+
+    def test_a_fleet_reclaim_reaches_the_block_that_records_the_fleet(self, mode):
+        fleet_id = f"fleet-{uuid.uuid4().hex[:12]}"
+        resource_id = "serverless-job-1"
+        instance_ids = [f"i-{uuid.uuid4().hex[:16]}" for _ in range(2)]
+
+        mode.resources[resource_id] = {
+            "job_id": "job-1",
+            "resource_type": RESOURCE_TYPE_SPOT_FLEET,
+            "use_spot_fleet": True,
+            "fleet_request_id": fleet_id,
+            "instance_ids": instance_ids,
+            "status": STATUS_RUNNING,
+        }
+        mode.spot_interruption_monitor.register_fleet(
+            fleet_id, mode.handle_fleet_interruption
         )
 
-        try:
-            # Initialize mode
-            mode.initialize()
+        _interrupt_fleet(mode.spot_interruption_monitor, fleet_id, instance_ids[:1])
 
-            # Verify spot interruption monitor was created
-            assert mode.spot_interruption_monitor is not None
-            assert mode.spot_interruption_handler is not None
+        assert mode.resources[resource_id]["status"] == STATUS_INTERRUPTED
+        # A reclaimed fleet still reports itself active, so re-deriving status
+        # from it would hand back a healthy-looking answer on the next poll.
+        assert mode.get_job_status([resource_id])[resource_id] == STATUS_INTERRUPTED
 
-            # Mock CloudFormation stack creation
-            with patch.object(
-                mode, "_create_cloudformation_stack"
-            ) as mock_create_stack:
-                mock_create_stack.return_value = {
-                    "stack_id": f"arn:aws:cloudformation:us-east-1:123456789012:stack/stack-{uuid.uuid4().hex[:8]}/abcdef12",
-                    "stack_name": f"stack-{uuid.uuid4().hex[:8]}",
-                }
+    def test_the_monitor_is_started_by_construction(self, mode):
+        """This mode starts monitoring in ``__init__``, unlike StandardMode.
 
-                # Mock CloudFormation stack description to include spot fleet ID
-                cf_client = substrate_session.client("cloudformation")
-                cf_client.describe_stacks.return_value = {
-                    "Stacks": [
-                        {
-                            "StackStatus": "CREATE_COMPLETE",
-                            "Outputs": [
-                                {
-                                    "OutputKey": "SpotFleetRequestId",
-                                    "OutputValue": mock_spot_fleet_id,
-                                }
-                            ],
-                        }
-                    ]
-                }
-
-                # Submit a job
-                job_id = f"test-job-{uuid.uuid4().hex[:8]}"
-                command = "echo hello"
-                resource_id = mode._submit_ecs_job(
-                    job_id, command, 1, "test-job", job_id
-                )
-
-            # Register fleet manually to test
-            mode.spot_interruption_monitor.register_fleet(
-                mock_spot_fleet_id,
-                mode.spot_interruption_handler.handle_fleet_interruption,
-            )
-
-            # Verify spot fleet was registered with monitor
-            assert mock_spot_fleet_id in mode.spot_interruption_monitor.fleet_handlers
-
-            # Mock a spot fleet interruption event
-            event = {
-                "detail-type": "EC2 Spot Fleet Interruption Warning",
-                "source": "aws.ec2",
-                "detail": {
-                    "spot-fleet-request-id": mock_spot_fleet_id,
-                    "instance-action": "terminate",
-                },
-            }
-
-            # Get a list of instances in the fleet (mock)
-            instance_ids = [f"i-fleet-{uuid.uuid4().hex[:8]}" for _ in range(2)]
-
-            # Trigger fleet interruption handler
-            handler_func = mode.spot_interruption_monitor.fleet_handlers[
-                mock_spot_fleet_id
-            ]
-            handler_func(mock_spot_fleet_id, instance_ids, event["detail"])
-
-            # Verify state persistence
-            mode.save_state()
-
-            # Create a new mode instance to simulate restart
-            mode2 = ServerlessMode(
-                provider_id=provider_id,
-                session=substrate_session,
-                state_store=temp_state_store,
-                region="us-east-1",
-                worker_type="ecs",
-                ecs_task_cpu=256,
-                ecs_task_memory=512,
-                ecs_container_image="amazon/amazon-ecs-sample",
-                use_spot=True,
-                use_spot_fleet=True,
-                spot_interruption_handling=True,
-                checkpoint_bucket=checkpoint_bucket,
-                checkpoint_prefix="test/checkpoints",
-                instance_types=["t2.micro", "t3.micro"],
-            )
-
-            # Load state
-            mode2.load_state()
-
-            # Verify fleet resources were restored in state
-            assert mode2.spot_interruption_monitor is not None
-
-            # Re-register fleet for testing
-            mode2.spot_interruption_monitor.register_fleet(
-                mock_spot_fleet_id,
-                mode2.spot_interruption_handler.handle_fleet_interruption,
-            )
-
-            assert mock_spot_fleet_id in mode2.spot_interruption_monitor.fleet_handlers
-
-        finally:
-            # Clean up resources
-            if (
-                hasattr(mode, "spot_interruption_monitor")
-                and mode.spot_interruption_monitor
-            ):
-                mode.spot_interruption_monitor.stop_monitoring()
-
-            mode.cleanup_infrastructure()
+        Worth pinning: a monitor nobody started detects nothing, and the
+        difference between the two modes is easy to lose in a refactor.
+        """
+        assert isinstance(mode.spot_interruption_monitor, SpotInterruptionMonitor)
+        assert mode.spot_interruption_monitor.monitoring_thread.is_alive()

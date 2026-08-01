@@ -408,122 +408,88 @@ class TestWorkflowStatePersistence:
             assert len(mode2.resources) == 0
 
     @pytest.mark.substrate
-    def test_interruption_and_recovery(self, substrate_session, file_state_store):
-        """Test interruption and recovery with state persistence."""
-        # Create a StandardMode instance
+    def test_an_interruption_survives_a_restart(
+        self, substrate_session, file_state_store
+    ):
+        """An interrupted block must still read as interrupted after a restart.
+
+        A reclaim is precisely the event most likely to be followed by the driver
+        going away, so a marker held only in memory would be lost exactly when it
+        matters. If the restored block came back RUNNING, the provider would keep
+        waiting on capacity AWS already took, and if it came back COMPLETED --
+        which is what ``EC2_STATUS_MAPPING`` makes of a ``shutting-down``
+        instance -- its tasks would be silently dropped instead of re-run (#137).
+
+        This used to test a checkpoint/recovery API that #137 deleted: its entry
+        point was ``register_task(task_id, instance_id)``, and a Parsl provider is
+        never told a task ID. What replaces it is the response that *is*
+        implementable at this layer -- mark the block, let Parsl's own ``retries``
+        re-run the tasks -- checked across the persistence boundary this file
+        exists to cover.
+        """
         provider_id = f"test-provider-{uuid.uuid4().hex[:8]}"
+        instance_id = f"i-spot-{uuid.uuid4().hex[:12]}"
 
-        # Set up mocks for AWS services using substrate
-        with patch("boto3.Session", return_value=substrate_session):
-            # Create a standard mode
-            mode = StandardMode(
+        def build_mode():
+            return StandardMode(
                 provider_id=provider_id,
                 session=substrate_session,
                 state_store=file_state_store,
                 region="us-east-1",
-                instance_type="t2.micro",
-                image_id="ami-12345678",  # Dummy AMI
-                use_spot=True,  # Enable spot instances
-                spot_interruption_handling=True,  # Enable spot interruption handling
-            )
-
-            # Initialize mode - mock infrastructure creation
-            with patch.object(mode, "_create_vpc", return_value="vpc-12345"):
-                with patch.object(mode, "_create_subnet", return_value="subnet-12345"):
-                    with patch.object(
-                        mode, "_create_security_group", return_value="sg-12345"
-                    ):
-                        mode.initialize()
-
-            # Verify mode is initialized with spot interruption handling
-            assert mode.initialized
-            assert mode.spot_interruption_monitor is not None
-            assert mode.spot_interruption_handler is not None
-
-            # Mock job submission with spot instance
-            with patch.object(mode, "_create_ec2_instance") as mock_create_instance:
-                instance_id = f"i-spot-{uuid.uuid4().hex[:12]}"
-                mock_create_instance.return_value = {
-                    "instance_id": instance_id,
-                    "private_ip": "10.0.0.1",
-                    "public_ip": "54.123.456.789",
-                    "dns_name": "ec2-54-123-456-789.compute-1.amazonaws.com",
-                    "spot_instance": True,
-                }
-
-                # Submit a job
-                job_id = f"test-job-{uuid.uuid4().hex[:8]}"
-                resource_id = mode.submit_job(job_id, "echo 'Test job'", 1)
-
-            # Verify resource was created and registered
-            assert resource_id in mode.resources
-            assert instance_id in mode.spot_interruption_monitor.instance_handlers
-
-            # Save state
-            mode.save_state()
-
-            # Simulate spot interruption by manually calling the handler
-            event = {
-                "InstanceId": instance_id,
-                "InstanceAction": "terminate",
-                "Time": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            }
-
-            # Register a mock task with the handler
-            mode.spot_interruption_handler.register_task(job_id, instance_id)
-
-            # Save checkpoint data
-            checkpoint_data = {
-                "job_id": job_id,
-                "progress": 50,
-                "timestamp": time.time(),
-            }
-            mode.spot_interruption_handler.save_checkpoint(job_id, checkpoint_data)
-
-            # Trigger spot interruption handler
-            handler_func = mode.spot_interruption_monitor.instance_handlers[instance_id]
-            handler_func(instance_id, event)
-
-            # Verify task was queued for recovery
-            assert not mode.spot_interruption_handler.recovery_queue.empty()
-
-            # Save state after interruption
-            mode.save_state()
-
-            # Create a new mode instance to simulate restart
-            mode2 = StandardMode(
-                provider_id=provider_id,
-                session=substrate_session,
-                state_store=file_state_store,
-                region="us-east-1",
-                instance_type="t2.micro",
-                image_id="ami-12345678",  # Dummy AMI
+                instance_type="t3.micro",
+                image_id="ami-12345678",
+                vpc_id="vpc-12345",
+                subnet_id="subnet-12345",
+                security_group_id="sg-12345",
                 use_spot=True,
                 spot_interruption_handling=True,
             )
 
-            # Load state
-            mode2.load_state()
+        mode = build_mode()
+        try:
+            mode.resources[instance_id] = {
+                "type": "ec2",
+                "job_id": f"test-job-{uuid.uuid4().hex[:8]}",
+                "status": "RUNNING",
+                "is_spot": True,
+                "created_at": time.time(),
+            }
+            # The real registration path, as used by every spot launch.
+            mode._register_spot_instance(instance_id)
 
-            # Verify spot interruption state was loaded
-            assert mode2.spot_interruption_handler is not None
+            # Drive the reclaim through the queue the monitoring thread drains,
+            # rather than reaching for the handler directly -- substrate emulates
+            # neither EventBridge nor a spot ``InstanceLifecycle``, so this is the
+            # only seam that can originate one here.
+            mode.spot_interruption_monitor.event_queue.put(
+                (
+                    "instance",
+                    instance_id,
+                    {"InstanceId": instance_id, "InstanceAction": "terminate"},
+                )
+            )
+            mode.spot_interruption_monitor._process_interruption_events()
 
-            # Get recovery task
-            recovery_task = mode2.spot_interruption_handler.get_next_recovery_task()
-            assert recovery_task is not None
-            assert recovery_task["task_id"] == job_id
+            assert mode.resources[instance_id]["status"] == "INTERRUPTED"
+            mode.save_state()
+        finally:
+            if mode.spot_interruption_monitor:
+                mode.spot_interruption_monitor.stop_monitoring()
 
-            # Verify checkpoint data was preserved
-            checkpoint = mode2.spot_interruption_handler.load_checkpoint(job_id)
-            assert checkpoint is not None
-            assert checkpoint["job_id"] == job_id
-            assert checkpoint["progress"] == 50
+        mode2 = build_mode()
+        try:
+            assert mode2.load_state() is True
 
-            # Clean up
-            with patch.object(mode2, "_delete_ec2_instance"):
-                with patch.object(mode2, "_delete_security_group"):
-                    with patch.object(mode2, "_delete_subnet"):
-                        with patch.object(mode2, "_delete_vpc"):
-                            if mode2.spot_interruption_monitor:
-                                mode2.spot_interruption_monitor.stop_monitoring()
-                            mode2.cleanup_infrastructure()
+            assert mode2.resources[instance_id]["status"] == "INTERRUPTED"
+            # And the reason came back with it, so a FAILED block is diagnosable
+            # without going to CloudTrail.
+            assert mode2.resources[instance_id]["interruption_event"] == {
+                "InstanceId": instance_id,
+                "InstanceAction": "terminate",
+            }
+            # Still sticky on the far side: get_job_status must not re-derive a
+            # healthy-looking status from the instance EC2 is tearing down.
+            assert mode2.get_job_status([instance_id])[instance_id] == "INTERRUPTED"
+        finally:
+            if mode2.spot_interruption_monitor:
+                mode2.spot_interruption_monitor.stop_monitoring()

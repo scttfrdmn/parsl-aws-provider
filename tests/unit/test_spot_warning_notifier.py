@@ -2,7 +2,8 @@
 
 The EC2-state poll that predated this could only ever report an interruption
 post-facto: an interrupted instance is first observable at ``shutting-down``,
-which is after the reclaim and far too late to checkpoint. An ``instant`` fleet
+which is after the reclaim and after the executor has already dispatched work to
+a worker that is gone. An ``instant`` fleet
 gets no Capacity Rebalance either -- ``CreateFleet`` rejects
 ``SpotOptions.MaintenanceStrategies`` for that type -- so an EventBridge rule
 delivering to SQS, polled by the driver, is what supplies the two-minute
@@ -161,8 +162,8 @@ class TestCreateSpotInterruptionNotifier:
         Without the condition the policy grants ``events.amazonaws.com`` at
         large, which is every EventBridge rule in every account -- a queue any
         stranger can inject a fabricated interruption warning into, and this
-        monitor's handlers act on those warnings by checkpointing and
-        rescheduling.
+        monitor's handlers act on those warnings by failing the block the
+        instance belongs to.
         """
         _, events, sqs = _clients()
 
@@ -182,9 +183,9 @@ class TestCreateSpotInterruptionNotifier:
         """A warning is worthless once its two minutes are up.
 
         Default SQS retention is four days. Replaying a stale warning against a
-        long-dead instance would have the handler checkpoint and reschedule work
-        that already finished or already failed, so the retention is cut to the
-        window in which the message can still be acted on.
+        long-dead instance would fail a block that already finished, so the
+        retention is cut to the window in which the message can still be acted
+        on.
         """
         _, events, sqs = _clients()
 
@@ -426,9 +427,9 @@ class TestMonitorNotifierLifecycle:
         """Losing the advance warning is worse than the poll, not fatal.
 
         A caller whose IAM policy grants no ``events``/``sqs`` still gets a
-        working provider; what it loses is the lead time to checkpoint. Raising
-        here would make the two new permissions mandatory for every spot
-        workflow, including ones that do no checkpointing at all.
+        working provider; what it loses is the two-minute lead time, falling back
+        to the post-facto EC2-state poll. Raising here would make the two new
+        permissions mandatory for every spot workflow.
         """
         monitor = SpotInterruptionMonitor(session, provider_id="abcdef123456")
 
@@ -582,10 +583,9 @@ class TestPollWarningQueue:
     def test_the_source_marks_it_as_an_advance_warning(self, monitor, sqs):
         """This is how a handler knows it has two minutes rather than none.
 
-        The EC2-state track stamps ``ec2-state`` and fires on an instance that
-        is already dying; a handler that cannot tell them apart must either
-        assume the worst and skip checkpointing entirely, or attempt a
-        checkpoint that cannot complete.
+        The EC2-state track stamps ``ec2-state`` and fires on an instance that is
+        already dying, so a handler that cannot tell the two apart cannot tell
+        whether it is marking a block ahead of the reclaim or after it.
         """
         monitor.register_instance("i-abc123", MagicMock())
 

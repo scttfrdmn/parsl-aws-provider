@@ -27,6 +27,7 @@ from parsl_ephemeral_aws.constants import (
     STATUS_CANCELED,
     STATUS_COMPLETED,
     STATUS_FAILED,
+    STATUS_INTERRUPTED,
     STATUS_PENDING,
     STATUS_RUNNING,
     STATUS_UNKNOWN,
@@ -40,10 +41,7 @@ from parsl_ephemeral_aws.exceptions import (
 from parsl_ephemeral_aws.modes.base import OperatingMode
 from parsl_ephemeral_aws.state.base import STATE_KEY_MODE
 from parsl_ephemeral_aws.compute.spot_fleet import SpotFleetManager
-from parsl_ephemeral_aws.compute.spot_interruption import (
-    SpotInterruptionMonitor,
-    ParslSpotInterruptionHandler,
-)
+from parsl_ephemeral_aws.compute.spot_interruption import SpotInterruptionMonitor
 from parsl_ephemeral_aws.utils.aws import (
     architecture_for_instance_type,
     build_launch_template_data,
@@ -228,9 +226,12 @@ class StandardMode(OperatingMode):
         # Initialize SpotFleetManager if using spot fleet
         self.spot_fleet_manager = None
         self.spot_interruption_monitor = None
-        self.spot_interruption_handler = None
 
-        if self.use_spot and self.use_spot_fleet:
+        # use_spot_fleet alone is enough, and use_spot alone is not: every
+        # consumer of this manager gates on use_spot_fleet, so requiring
+        # `use_spot and use_spot_fleet` left the manager None for a fleet caller
+        # and silently degraded the launch to a single on-demand instance (#137).
+        if self.use_spot_fleet:
             # Create a simplified provider object for the SpotFleetManager
             # The SpotFleetManager expects a provider object with certain attributes
             provider = type(
@@ -269,21 +270,11 @@ class StandardMode(OperatingMode):
         # monitoring thread is only started after infrastructure is fully set up.
         # This prevents the monitor thread from leaking if __init__ succeeds but
         # a later call (e.g. initialize()) raises before cleanup can run.
-        if self.use_spot and self.spot_interruption_handling:
-            if not self.checkpoint_bucket and self.spot_interruption_handling:
-                logger.warning(
-                    "Spot interruption handling is enabled but no checkpoint bucket specified"
-                )
-            else:
-                logger.debug("Initializing SpotInterruptionMonitor and Handler")
-                self.spot_interruption_monitor = SpotInterruptionMonitor(
-                    self.session, provider_id=self.provider_id
-                )
-                self.spot_interruption_handler = ParslSpotInterruptionHandler(
-                    session=self.session,
-                    checkpoint_bucket=self.checkpoint_bucket,
-                    checkpoint_prefix=self.checkpoint_prefix,
-                )
+        if (self.use_spot or self.use_spot_fleet) and self.spot_interruption_handling:
+            logger.debug("Initializing SpotInterruptionMonitor")
+            self.spot_interruption_monitor = SpotInterruptionMonitor(
+                self.session, provider_id=self.provider_id
+            )
 
     # ------------------------------------------------------------------
     # AMI baking helpers
@@ -666,21 +657,16 @@ class StandardMode(OperatingMode):
                     )
 
                     # Initialize or clean up spot interruption handling based on new setting
-                    if self.spot_interruption_handling and self.use_spot:
+                    if self.spot_interruption_handling and (
+                        self.use_spot or self.use_spot_fleet
+                    ):
                         if not self.spot_interruption_monitor:
                             logger.debug(
-                                "Initializing SpotInterruptionMonitor and Handler after state load"
+                                "Initializing SpotInterruptionMonitor after state load"
                             )
                             self.spot_interruption_monitor = SpotInterruptionMonitor(
                                 self.session,
                                 provider_id=self.provider_id,
-                            )
-                            self.spot_interruption_handler = (
-                                ParslSpotInterruptionHandler(
-                                    session=self.session,
-                                    checkpoint_bucket=self.checkpoint_bucket,
-                                    checkpoint_prefix=self.checkpoint_prefix,
-                                )
                             )
                             self.spot_interruption_monitor.start_monitoring()
                     elif (
@@ -692,7 +678,6 @@ class StandardMode(OperatingMode):
                         )
                         self.spot_interruption_monitor.stop_monitoring()
                         self.spot_interruption_monitor = None
-                        self.spot_interruption_handler = None
 
                 # Load SpotFleetManager state if available
                 if (
@@ -728,7 +713,6 @@ class StandardMode(OperatingMode):
                     if (
                         self.spot_interruption_handling
                         and self.spot_interruption_monitor
-                        and self.spot_interruption_handler
                     ):
                         for block_data in self.spot_fleet_manager.blocks.values():
                             fleet_id = block_data.get("fleet_request_id")
@@ -736,7 +720,7 @@ class StandardMode(OperatingMode):
                                 continue
                             self.spot_interruption_monitor.register_fleet(
                                 fleet_id,
-                                self.spot_interruption_handler.handle_fleet_interruption,
+                                self.handle_fleet_interruption,
                             )
                             logger.info(
                                 f"Re-registered EC2 Fleet {fleet_id} for "
@@ -967,12 +951,16 @@ class StandardMode(OperatingMode):
 
             # Track the resource
             resource_type = RESOURCE_TYPE_EC2
+            fleet_request_id = None
             if (
                 self.use_spot_fleet
                 and self.spot_fleet_manager
                 and instance_id in self.spot_fleet_manager.blocks
             ):
                 resource_type = RESOURCE_TYPE_SPOT_FLEET
+                fleet_request_id = self.spot_fleet_manager.blocks[instance_id].get(
+                    "fleet_request_id"
+                )
 
             resource_data: Dict[str, Any] = {
                 "type": resource_type,
@@ -983,6 +971,14 @@ class StandardMode(OperatingMode):
                 "command": command,
                 "tasks_per_node": tasks_per_node,
             }
+
+            if fleet_request_id:
+                # The monitor registers the *fleet* ID, but this record is keyed
+                # by block ID, so without this field handle_fleet_interruption
+                # has no way back to the block it must mark (#137). The manager's
+                # own blocks dict is not enough: it is not persisted in state, so
+                # a resumed provider would lose the link.
+                resource_data["fleet_request_id"] = fleet_request_id
 
             if self._uses_ssm_dispatch():
                 # Cold start for the SSM paths: wait for SSM, then dispatch. The
@@ -1361,8 +1357,11 @@ class StandardMode(OperatingMode):
             if self.iam_instance_profile_arn:
                 run_args["IamInstanceProfile"] = {"Arn": self.iam_instance_profile_arn}
 
-        # Use spot instances if requested
-        if self.use_spot:
+        # Use spot instances if requested. use_spot_fleet implies spot: a fleet
+        # request is only ever placed for spot capacity, and testing use_spot
+        # alone here sent a use_spot_fleet=True caller down the on-demand path
+        # so the fleet was never requested (#137).
+        if self.use_spot or self.use_spot_fleet:
             return self._create_spot_instance(run_args)
         else:
             # Create on-demand instance
@@ -1546,14 +1545,10 @@ class StandardMode(OperatingMode):
 
     def _register_spot_instance(self, instance_id: str) -> None:
         """Register *instance_id* with the interruption monitor, if enabled."""
-        if (
-            self.spot_interruption_handling
-            and self.spot_interruption_monitor
-            and self.spot_interruption_handler
-        ):
+        if self.spot_interruption_handling and self.spot_interruption_monitor:
             self.spot_interruption_monitor.register_instance(
                 instance_id,
-                self.spot_interruption_handler.handle_instance_interruption,
+                self.handle_instance_interruption,
             )
             logger.info(
                 f"Registered spot instance {instance_id} for interruption handling"
@@ -1656,18 +1651,14 @@ class StandardMode(OperatingMode):
             # The block records a single "fleet_request_id"; this used to read a
             # "fleet_requests" list that no code has ever written, so no fleet
             # was ever actually registered.
-            if (
-                self.spot_interruption_handling
-                and self.spot_interruption_monitor
-                and self.spot_interruption_handler
-            ):
+            if self.spot_interruption_handling and self.spot_interruption_monitor:
                 fleet_id = self.spot_fleet_manager.blocks.get(block_id, {}).get(
                     "fleet_request_id"
                 )
                 if fleet_id:
                     self.spot_interruption_monitor.register_fleet(
                         fleet_id,
-                        self.spot_interruption_handler.handle_fleet_interruption,
+                        self.handle_fleet_interruption,
                     )
                     logger.info(
                         f"Registered EC2 Fleet {fleet_id} for interruption handling"
@@ -1732,6 +1723,15 @@ class StandardMode(OperatingMode):
             resource = self.resources.get(resource_id)
             if not resource:
                 status_map[resource_id] = STATUS_UNKNOWN
+                continue
+
+            # An interruption is sticky. Everything below re-derives status from
+            # AWS, and a reclaimed instance goes to "shutting-down", which
+            # EC2_STATUS_MAPPING renders COMPLETED -- so without this the marker
+            # set by handle_instance_interruption is overwritten on the very next
+            # poll and the reclaim is reported as success again (#137).
+            if resource.get("status") == STATUS_INTERRUPTED:
+                status_map[resource_id] = STATUS_INTERRUPTED
                 continue
 
             # Any resource carrying an SSM command ID — warm pool or one-shot —
@@ -2048,7 +2048,6 @@ class StandardMode(OperatingMode):
                 except Exception as e:
                     logger.error(f"Failed to stop spot interruption monitoring: {e}")
                 self.spot_interruption_monitor = None
-                self.spot_interruption_handler = None
 
             # Deregister baked AMI if this provider created it
             if self._baked_ami_id and getattr(self, "_owns_baked_ami", False):

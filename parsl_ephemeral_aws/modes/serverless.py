@@ -30,6 +30,7 @@ from parsl_ephemeral_aws.constants import (
     STATUS_FAILED,
     STATUS_CANCELLED,
     STATUS_COMPLETED,
+    STATUS_INTERRUPTED,
     STATUS_UNKNOWN,
     DEFAULT_LAMBDA_TIMEOUT,
     DEFAULT_LAMBDA_MEMORY,
@@ -49,10 +50,7 @@ from parsl_ephemeral_aws.modes.base import OperatingMode
 from parsl_ephemeral_aws.state.base import STATE_KEY_MODE
 from parsl_ephemeral_aws.compute.lambda_func import LambdaManager
 from parsl_ephemeral_aws.compute.ecs import ECSManager
-from parsl_ephemeral_aws.compute.spot_interruption import (
-    SpotInterruptionMonitor,
-    ParslSpotInterruptionHandler,
-)
+from parsl_ephemeral_aws.compute.spot_interruption import SpotInterruptionMonitor
 from parsl_ephemeral_aws.utils.aws import (
     architecture_for_instance_type,
     build_fleet_launch_template_configs,
@@ -103,6 +101,8 @@ class ServerlessMode(OperatingMode):
         Number of nodes per block for Spot Fleet
     spot_max_price_percentage : Optional[float]
         Maximum spot price as percentage of on-demand price
+    lambda_code_bucket : Optional[str]
+        Caller-supplied S3 bucket for staging Lambda deployment packages
     lambda_manager : LambdaManager
         Manager for Lambda functions
     ecs_manager : ECSManager
@@ -135,6 +135,7 @@ class ServerlessMode(OperatingMode):
         compute_type: Optional[str] = None,
         memory_size: Optional[int] = None,
         timeout: Optional[int] = None,
+        lambda_code_bucket: Optional[str] = None,
         **kwargs: Any,
     ) -> None:
         """Initialize the serverless mode.
@@ -198,6 +199,16 @@ class ServerlessMode(OperatingMode):
         timeout : Optional[int], optional
             Lambda timeout in seconds, forwarded by ``EphemeralAWSProvider``.
             Overrides ``lambda_timeout`` when supplied.
+        lambda_code_bucket : Optional[str], optional
+            Existing S3 bucket to stage Lambda deployment packages in. A
+            caller-supplied bucket is reused as-is and never deleted; when
+            omitted, a provider-scoped bucket is created on first use and removed
+            by ``cleanup_infrastructure()``.
+
+            This is the surviving half of the old ``checkpoint_bucket``
+            parameter. Its checkpointing purpose was removed in #137 along with
+            the unimplementable task-recovery API, but the staging override was
+            real and is kept under a name that says what it does.
         """
         # compute_type is the provider-facing name for worker_type. Map it before
         # validating so an invalid value is reported against the real input.
@@ -284,34 +295,24 @@ class ServerlessMode(OperatingMode):
         self.ecs_manager: Optional[ECSManager] = None
         self.cf_client = self.session.client("cloudformation")
 
-        # Bucket that stages Lambda deployment packages, resolved on first use.
-        # _owns_lambda_code_bucket records whether we created it, so a
-        # caller-supplied checkpoint_bucket is never deleted on cleanup.
-        self._lambda_code_bucket: Optional[str] = None
+        # Bucket that stages Lambda deployment packages. A caller-supplied one is
+        # adopted here; otherwise it is created on first use.
+        # _owns_lambda_code_bucket records that we created it, so cleanup only
+        # ever deletes a bucket of our own making.
+        self._lambda_code_bucket: Optional[str] = lambda_code_bucket
         self._owns_lambda_code_bucket = False
 
-        # Initialize spot interruption handling if enabled
+        # Initialize spot interruption handling if enabled. Detection needs no
+        # S3 bucket -- requiring one meant a caller who asked for interruption
+        # handling and gave no bucket silently got none at all (#137).
         self.spot_interruption_monitor = None
-        self.spot_interruption_handler = None
 
         if (self.use_spot or self.use_spot_fleet) and self.spot_interruption_handling:
-            if not self.checkpoint_bucket and self.spot_interruption_handling:
-                logger.warning(
-                    "Spot interruption handling is enabled but no checkpoint bucket specified"
-                )
-            else:
-                logger.debug(
-                    "Initializing SpotInterruptionMonitor and Handler for ServerlessMode"
-                )
-                self.spot_interruption_monitor = SpotInterruptionMonitor(
-                    self.session, provider_id=self.provider_id
-                )
-                self.spot_interruption_handler = ParslSpotInterruptionHandler(
-                    session=self.session,
-                    checkpoint_bucket=self.checkpoint_bucket,
-                    checkpoint_prefix=self.checkpoint_prefix,
-                )
-                self.spot_interruption_monitor.start_monitoring()
+            logger.debug("Initializing SpotInterruptionMonitor for ServerlessMode")
+            self.spot_interruption_monitor = SpotInterruptionMonitor(
+                self.session, provider_id=self.provider_id
+            )
+            self.spot_interruption_monitor.start_monitoring()
 
     def initialize(self) -> None:
         """Initialize serverless mode.
@@ -626,10 +627,10 @@ class ServerlessMode(OperatingMode):
     def _ensure_lambda_code_bucket(self) -> str:
         """Return the S3 bucket used to stage Lambda deployment packages.
 
-        Prefers ``checkpoint_bucket`` when the caller supplied one, so a
-        configured bucket is reused rather than a second one created. Otherwise a
-        provider-scoped bucket is created on first use and removed by
-        ``cleanup_infrastructure()``.
+        A provider-scoped bucket is created on first use and removed by
+        ``cleanup_infrastructure()``. A ``lambda_code_bucket`` supplied by the
+        caller is returned unchanged and left alone at cleanup --
+        ``_owns_lambda_code_bucket`` stays False, which is what protects it.
 
         Returns
         -------
@@ -637,10 +638,6 @@ class ServerlessMode(OperatingMode):
             Name of the bucket to stage deployment packages in.
         """
         if self._lambda_code_bucket:
-            return self._lambda_code_bucket
-
-        if self.checkpoint_bucket:
-            self._lambda_code_bucket = self.checkpoint_bucket
             return self._lambda_code_bucket
 
         s3 = self.session.client("s3")
@@ -819,6 +816,15 @@ class ServerlessMode(OperatingMode):
             resource = self.resources.get(resource_id)
             if not resource:
                 status_map[resource_id] = STATUS_UNKNOWN
+                continue
+
+            # An interruption is sticky. The fleet and stack lookups below both
+            # re-derive status, and neither can see a reclaim -- a fleet whose
+            # instances AWS is taking back still reports itself active -- so
+            # without this the marker set by handle_fleet_interruption is
+            # overwritten on the very next poll (#137).
+            if resource.get("status") == STATUS_INTERRUPTED:
+                status_map[resource_id] = STATUS_INTERRUPTED
                 continue
 
             # A fleet-backed job has no stack: the fleet is created directly, so
@@ -1093,14 +1099,10 @@ class ServerlessMode(OperatingMode):
         # Registration is immediate now: the fleet ID comes back from CreateFleet
         # itself. It used to require polling stack outputs for up to 3 minutes,
         # during which an interruption would have gone unhandled.
-        if (
-            self.spot_interruption_handling
-            and self.spot_interruption_monitor
-            and self.spot_interruption_handler
-        ):
+        if self.spot_interruption_handling and self.spot_interruption_monitor:
             self.spot_interruption_monitor.register_fleet(
                 fleet_id,
-                self.spot_interruption_handler.handle_fleet_interruption,
+                self.handle_fleet_interruption,
             )
             logger.info(f"Registered EC2 Fleet {fleet_id} for interruption handling")
 
@@ -1587,8 +1589,8 @@ class ServerlessMode(OperatingMode):
     def _delete_lambda_code_bucket(self) -> None:
         """Delete the Lambda code bucket, but only if this mode created it.
 
-        A caller-supplied ``checkpoint_bucket`` is left alone: it belongs to the
-        caller and may hold checkpoints.
+        ``_owns_lambda_code_bucket`` is the guard: a bucket this mode merely
+        found and reused is left alone.
         """
         if not self._owns_lambda_code_bucket or not self._lambda_code_bucket:
             return
@@ -1634,7 +1636,6 @@ class ServerlessMode(OperatingMode):
             except Exception as e:
                 logger.error(f"Failed to stop spot interruption monitoring: {e}")
             self.spot_interruption_monitor = None
-            self.spot_interruption_handler = None
 
         # Clean up compute managers
         if self.lambda_manager:
@@ -1864,18 +1865,11 @@ class ServerlessMode(OperatingMode):
                     ):
                         if not self.spot_interruption_monitor:
                             logger.debug(
-                                "Initializing SpotInterruptionMonitor and Handler after state load"
+                                "Initializing SpotInterruptionMonitor after state load"
                             )
                             self.spot_interruption_monitor = SpotInterruptionMonitor(
                                 self.session,
                                 provider_id=self.provider_id,
-                            )
-                            self.spot_interruption_handler = (
-                                ParslSpotInterruptionHandler(
-                                    session=self.session,
-                                    checkpoint_bucket=self.checkpoint_bucket,
-                                    checkpoint_prefix=self.checkpoint_prefix,
-                                )
                             )
                             self.spot_interruption_monitor.start_monitoring()
                     elif (
@@ -1887,14 +1881,9 @@ class ServerlessMode(OperatingMode):
                         )
                         self.spot_interruption_monitor.stop_monitoring()
                         self.spot_interruption_monitor = None
-                        self.spot_interruption_handler = None
 
                 # Re-register existing spot fleet resources with interruption monitor if needed
-                if (
-                    self.spot_interruption_handling
-                    and self.spot_interruption_monitor
-                    and self.spot_interruption_handler
-                ):
+                if self.spot_interruption_handling and self.spot_interruption_monitor:
                     for resource_id, resource in self.resources.items():
                         from parsl_ephemeral_aws.constants import (
                             RESOURCE_TYPE_SPOT_FLEET,
@@ -1908,7 +1897,7 @@ class ServerlessMode(OperatingMode):
                             fleet_request_id = resource.get("fleet_request_id")
                             self.spot_interruption_monitor.register_fleet(
                                 fleet_request_id,
-                                self.spot_interruption_handler.handle_fleet_interruption,
+                                self.handle_fleet_interruption,
                             )
                             logger.info(
                                 f"Re-registered spot fleet {fleet_request_id} for interruption handling"

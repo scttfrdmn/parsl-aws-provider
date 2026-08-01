@@ -1,4 +1,14 @@
-"""Unit tests for the spot interruption handler.
+"""Unit tests for spot interruption detection and the response to it.
+
+Two halves, matching the split in the package: ``SpotInterruptionMonitor``
+detects that AWS is reclaiming capacity and calls the registered handler, and
+``OperatingMode.handle_*_interruption`` decides what that means -- mark the
+block interrupted so the provider reports FAILED and Parsl re-runs the tasks.
+
+The checkpoint/recovery API these tests used to cover was deleted in #137. It
+could not work at this layer: its entry point was
+``register_task(task_id, instance_id)``, and a Parsl provider is never told a
+task ID.
 
 SPDX-License-Identifier: Apache-2.0
 SPDX-FileCopyrightText: 2025-2026 Scott Friedman and Project Contributors
@@ -6,20 +16,13 @@ SPDX-FileCopyrightText: 2025-2026 Scott Friedman and Project Contributors
 
 import pytest
 import boto3
-import json
 import threading
 import queue
 from unittest.mock import MagicMock, patch
 
-from parsl_ephemeral_aws.compute.spot_interruption import (
-    SpotInterruptionMonitor,
-    SpotInterruptionHandler,
-    ParslSpotInterruptionHandler,
-    checkpointable,
-)
-from parsl_ephemeral_aws.exceptions import (
-    SpotInstanceError,
-)
+from parsl_ephemeral_aws.compute.spot_interruption import SpotInterruptionMonitor
+from parsl_ephemeral_aws.constants import STATUS_INTERRUPTED, STATUS_RUNNING
+from parsl_ephemeral_aws.modes.base import OperatingMode
 
 pytestmark = pytest.mark.unit
 
@@ -271,402 +274,151 @@ class TestSpotInterruptionMonitor:
         )
 
 
-class TestSpotInterruptionHandler:
-    """Tests for the SpotInterruptionHandler class."""
+class _StubMode(OperatingMode):
+    """Minimal concrete mode: the interruption response lives on the base class.
+
+    Testing it here rather than through StandardMode keeps the assertions on the
+    one thing under test. The per-mode half -- that ``get_job_status`` does not
+    overwrite the marker on the next poll -- is covered in each mode's own tests.
+    """
+
+    def initialize(self):
+        self.initialized = True
+
+    def submit_job(self, job_id, command, tasks_per_node=1, job_name=None):
+        raise NotImplementedError
+
+    def get_job_status(self, resource_ids):
+        return {rid: self.resources[rid]["status"] for rid in resource_ids}
+
+    def cancel_jobs(self, resource_ids):
+        raise NotImplementedError
+
+    def cleanup_resources(self, resource_ids):
+        raise NotImplementedError
+
+    def cleanup_infrastructure(self):
+        pass
+
+    def list_resources(self):
+        return {"instances": []}
+
+    def cleanup_all(self):
+        pass
+
+
+class TestInterruptionResponse:
+    """``OperatingMode.handle_*_interruption`` — the response to a reclaim (#137).
+
+    Before this existed, an interruption was *invisible* rather than merely
+    unhandled: the reclaimed instance went to "shutting-down", which
+    EC2_STATUS_MAPPING renders COMPLETED, so the block reported success and its
+    tasks were silently dropped.
+    """
 
     @pytest.fixture
-    def mock_session(self):
-        """Create a mock boto3 session."""
-        session = MagicMock(spec=boto3.Session)
-        return session
-
-    @pytest.fixture
-    def mock_s3_client(self):
-        """Create a mock S3 client."""
-        client = MagicMock()
-
-        # Mock head_bucket
-        client.head_bucket.return_value = {}
-
-        # Mock get_object
-        client.get_object.return_value = {
-            "Body": MagicMock(read=lambda: json.dumps({"test": "data"}).encode())
+    def mode(self):
+        mode = _StubMode(
+            provider_id="test-provider",
+            session=MagicMock(spec=boto3.Session),
+            state_store=MagicMock(),
+            vpc_id="vpc-12345",
+            subnet_id="subnet-12345",
+            security_group_id="sg-12345",
+            use_spot=True,
+            spot_interruption_handling=True,
+        )
+        mode.resources = {
+            "i-test1": {"status": STATUS_RUNNING},
+            "i-test2": {"status": STATUS_RUNNING},
+            "fleet-test1": {"status": STATUS_RUNNING},
         }
+        return mode
 
-        return client
-
-    @pytest.fixture
-    def handler(self, mock_session, mock_s3_client):
-        """Create a SpotInterruptionHandler instance."""
-        mock_session.client.return_value = mock_s3_client
-
-        return SpotInterruptionHandler(
-            session=mock_session,
-            checkpoint_bucket="test-bucket",
-            checkpoint_prefix="test/prefix",
-        )
-
-    def test_init(self, handler, mock_session):
-        """Test initialization of SpotInterruptionHandler."""
-        assert handler.session == mock_session
-        assert handler.checkpoint_bucket == "test-bucket"
-        assert handler.checkpoint_prefix == "test/prefix"
-        assert isinstance(handler.recovery_queue, queue.PriorityQueue)
-
-        # Verify bucket existence was checked
-        mock_session.client.return_value.head_bucket.assert_called_with(
-            Bucket="test-bucket"
-        )
-
-    def test_init_without_bucket(self, mock_session):
-        """Test initialization without a checkpoint bucket."""
-        handler = SpotInterruptionHandler(session=mock_session, checkpoint_bucket=None)
-
-        assert handler.checkpoint_bucket is None
-        assert mock_session.client.return_value.head_bucket.call_count == 0
-
-    def test_save_checkpoint(self, handler, mock_s3_client):
-        """Test saving a checkpoint."""
-        task_id = "task-123"
-        data = {"status": "in_progress", "iteration": 42}
-
-        uri = handler.save_checkpoint(task_id, data)
-
-        assert (
-            uri
-            == f"s3://{handler.checkpoint_bucket}/{handler.checkpoint_prefix}/{task_id}.json"
-        )
-
-        # Verify S3 put_object was called correctly. Checkpoints are encrypted at
-        # rest — the kwarg has been in spot_interruption.py since v0.2.0 and this
-        # expectation never caught up.
-        mock_s3_client.put_object.assert_called_with(
-            Bucket="test-bucket",
-            Key=f"{handler.checkpoint_prefix}/{task_id}.json",
-            Body=json.dumps(data),
-            ServerSideEncryption="AES256",
-            Metadata={
-                "Priority": "1",
-                "Timestamp": mock_s3_client.put_object.call_args[1]["Metadata"][
-                    "Timestamp"
-                ],
-            },
-        )
-
-    def test_save_checkpoint_no_bucket(self, mock_session):
-        """Test saving a checkpoint with no bucket configured.
-
-        ``save_checkpoint`` raises ``SpotInstanceError``, the *parent* of
-        ``SpotInterruptionError`` — which is what its docstring documents and what
-        ``load_checkpoint`` raises for the same reason. The assertion here named
-        the subclass, so it could never match.
-        """
-        handler = SpotInterruptionHandler(session=mock_session)
-
-        with pytest.raises(SpotInstanceError):
-            handler.save_checkpoint("task-123", {})
-
-    def test_load_checkpoint(self, handler, mock_s3_client):
-        """Test loading a checkpoint."""
-        task_id = "task-123"
-
-        data = handler.load_checkpoint(task_id)
-
-        assert data == {"test": "data"}
-
-        # Verify S3 get_object was called correctly
-        mock_s3_client.get_object.assert_called_with(
-            Bucket="test-bucket", Key=f"{handler.checkpoint_prefix}/{task_id}.json"
-        )
-
-    def test_load_checkpoint_not_found(self, handler, mock_s3_client):
-        """Test loading a checkpoint that doesn't exist."""
-        from botocore.exceptions import ClientError
-
-        # Mock get_object to raise NoSuchKey error
-        mock_s3_client.get_object.side_effect = ClientError(
-            {"Error": {"Code": "NoSuchKey", "Message": "Not found"}}, "GetObject"
-        )
-
-        data = handler.load_checkpoint("missing-task")
-
-        assert data is None
-
-    def test_queue_task_for_recovery(self, handler):
-        """Test queuing a task for recovery."""
-        task_id = "task-123"
-        checkpoint_uri = "s3://test-bucket/test/prefix/task-123.json"
-        priority = 2
-
-        handler.queue_task_for_recovery(task_id, checkpoint_uri, priority)
-
-        # Verify the task was added to the queue
-        queued_item = handler.recovery_queue.get()
-        assert queued_item[0] == priority  # Priority
-        assert queued_item[2] == task_id  # Task ID
-        assert queued_item[3] == checkpoint_uri  # Checkpoint URI
-
-    def test_get_next_recovery_task(self, handler):
-        """Test getting the next recovery task."""
-        # Add tasks to the queue
-        handler.queue_task_for_recovery("task-1", "uri-1", 2)
-        handler.queue_task_for_recovery("task-2", "uri-2", 1)  # Higher priority
-
-        # Get the next task (should be task-2)
-        task = handler.get_next_recovery_task()
-
-        assert task["task_id"] == "task-2"
-        assert task["checkpoint_uri"] == "uri-2"
-        assert task["priority"] == 1
-
-        # Get the next task (should be task-1)
-        task = handler.get_next_recovery_task()
-
-        assert task["task_id"] == "task-1"
-        assert task["checkpoint_uri"] == "uri-1"
-        assert task["priority"] == 2
-
-        # No more tasks
-        task = handler.get_next_recovery_task()
-        assert task is None
-
-    def test_handle_instance_interruption(self, handler):
-        """Test the base implementation of handle_instance_interruption."""
-        # This is just a placeholder in the base class, so no real logic to test
-        instance_id = "i-test1"
+    def test_instance_interruption_marks_the_block(self, mode):
         event = {"InstanceId": "i-test1", "InstanceAction": "terminate"}
 
-        # Should not raise an exception
-        handler.handle_instance_interruption(instance_id, event)
+        mode.handle_instance_interruption("i-test1", event)
 
-    def test_handle_fleet_interruption(self, handler):
-        """Test the base implementation of handle_fleet_interruption."""
-        # This is just a placeholder in the base class, so no real logic to test
-        fleet_id = "fleet-test1"
-        instance_ids = ["i-test1", "i-test2"]
-        event = {"FleetRequestId": fleet_id, "InstanceAction": "terminate"}
+        assert mode.resources["i-test1"]["status"] == STATUS_INTERRUPTED
+        # The event is kept so a FAILED block is diagnosable without going back
+        # to CloudTrail for the reason.
+        assert mode.resources["i-test1"]["interruption_event"] == event
+        # Only the named instance: a reclaim is per-instance, not per-provider.
+        assert mode.resources["i-test2"]["status"] == STATUS_RUNNING
 
-        # Should not raise an exception
-        handler.handle_fleet_interruption(fleet_id, instance_ids, event)
+    def test_untracked_instance_is_ignored(self, mode):
+        """A warning can arrive for an instance we no longer track.
 
+        The monitor polls on its own thread, so a job that finished and was
+        cleaned up between the poll and the dispatch is normal, not an error --
+        this must not raise into the monitoring thread.
+        """
+        mode.handle_instance_interruption("i-unknown", {"InstanceAction": "terminate"})
 
-class TestParslSpotInterruptionHandler:
-    """Tests for the ParslSpotInterruptionHandler class."""
+        assert "i-unknown" not in mode.resources
 
-    @pytest.fixture
-    def mock_session(self):
-        """Create a mock boto3 session."""
-        session = MagicMock(spec=boto3.Session)
-        return session
+    def test_fleet_interruption_marks_fleet_and_named_instances(self, mode):
+        event = {"FleetRequestId": "fleet-test1", "Source": "eventbridge"}
 
-    @pytest.fixture
-    def mock_s3_client(self):
-        """Create a mock S3 client."""
-        client = MagicMock()
+        mode.handle_fleet_interruption("fleet-test1", ["i-test1"], event)
 
-        # Mock head_bucket
-        client.head_bucket.return_value = {}
+        # The fleet block is what Parsl holds a job ID for, so it is the one that
+        # must go FAILED; the instances are marked too so status is consistent.
+        assert mode.resources["fleet-test1"]["status"] == STATUS_INTERRUPTED
+        assert mode.resources["fleet-test1"]["interruption_event"] == event
+        assert mode.resources["i-test1"]["status"] == STATUS_INTERRUPTED
+        # A fleet reclaim names the affected instances; the rest keep running.
+        assert mode.resources["i-test2"]["status"] == STATUS_RUNNING
 
-        # Mock get_object
-        client.get_object.return_value = {
-            "Body": MagicMock(read=lambda: json.dumps({"test": "data"}).encode())
+    def test_untracked_fleet_still_marks_its_instances(self, mode):
+        """The fleet ID may not be a tracked resource in every mode.
+
+        DetachedMode tracks the bastion-side job rather than the fleet, so the
+        instance loop has to run whether or not the fleet ID resolves.
+        """
+        mode.handle_fleet_interruption("fleet-unknown", ["i-test2"], {})
+
+        assert mode.resources["i-test2"]["status"] == STATUS_INTERRUPTED
+
+    def test_fleet_is_found_through_the_block_that_records_it(self, mode):
+        """The fleet ID is a *field*, not the resource key, in every real mode.
+
+        StandardMode keys a fleet block by block ID and the other two by
+        ``serverless-<job_id>``, recording the fleet as ``fleet_request_id``. A
+        direct ``resources[fleet_id]`` lookup therefore missed every time, so the
+        block Parsl holds kept reporting healthy through the reclaim — the
+        original bug, surviving in the fleet path only.
+        """
+        mode.resources["block-7"] = {
+            "status": STATUS_RUNNING,
+            "fleet_request_id": "fleet-abc",
         }
 
-        return client
-
-    @pytest.fixture
-    def mock_executor(self):
-        """Create a mock Parsl executor."""
-        executor = MagicMock()
-        return executor
-
-    @pytest.fixture
-    def handler(self, mock_session, mock_s3_client, mock_executor):
-        """Create a ParslSpotInterruptionHandler instance."""
-        mock_session.client.return_value = mock_s3_client
-
-        return ParslSpotInterruptionHandler(
-            session=mock_session,
-            checkpoint_bucket="test-bucket",
-            checkpoint_prefix="test/prefix",
-            executor=mock_executor,
-            executor_label="test_executor",
+        mode.handle_fleet_interruption(
+            "fleet-abc", ["i-test1"], {"Source": "ec2-state"}
         )
 
-    def test_init(self, handler, mock_session, mock_executor):
-        """Test initialization of ParslSpotInterruptionHandler."""
-        assert handler.session == mock_session
-        assert handler.checkpoint_bucket == "test-bucket"
-        assert handler.checkpoint_prefix == "test/prefix"
-        assert handler.executor == mock_executor
-        assert handler.executor_label == "test_executor"
-        assert handler.task_mapping == {}
-
-    def test_register_task(self, handler):
-        """Test registering a task."""
-        handler.register_task("task-1", "i-test1")
-        handler.register_task("task-2", "i-test1")
-        handler.register_task("task-3", "i-test2")
-
-        assert "i-test1" in handler.task_mapping
-        assert "i-test2" in handler.task_mapping
-        assert handler.task_mapping["i-test1"] == ["task-1", "task-2"]
-        assert handler.task_mapping["i-test2"] == ["task-3"]
-
-    def test_handle_instance_interruption(self, handler, mock_s3_client):
-        """Test handling an instance interruption."""
-        # Register tasks
-        handler.register_task("task-1", "i-test1")
-        handler.register_task("task-2", "i-test1")
-
-        # Mock successful checkpoint loading
-        mock_s3_client.get_object.return_value = {
-            "Body": MagicMock(read=lambda: json.dumps({"checkpoint": "data"}).encode())
+        assert mode.resources["block-7"]["status"] == STATUS_INTERRUPTED
+        assert mode.resources["block-7"]["interruption_event"] == {
+            "Source": "ec2-state"
         }
+        # A block backed by a different fleet is untouched.
+        assert mode.resources["fleet-test1"]["status"] == STATUS_RUNNING
 
-        # Handle interruption
-        instance_id = "i-test1"
-        event = {"InstanceId": instance_id, "InstanceAction": "terminate"}
+    def test_monitor_dispatches_to_the_mode(self, mode):
+        """The two halves connect: what the monitor calls is what the mode does.
 
-        handler.handle_instance_interruption(instance_id, event)
-
-        # Verify checkpoints were loaded
-        assert mock_s3_client.get_object.call_count == 2
-
-        # Verify tasks were queued for recovery
-        assert not handler.recovery_queue.empty()
-        priority1, time1, task_id1, uri1 = handler.recovery_queue.get()
-        priority2, time2, task_id2, uri2 = handler.recovery_queue.get()
-
-        assert task_id1 in ["task-1", "task-2"]
-        assert task_id2 in ["task-1", "task-2"]
-        assert task_id1 != task_id2
-
-        # Verify task mapping was cleaned up
-        assert "i-test1" not in handler.task_mapping
-
-    def test_handle_fleet_interruption(self, handler):
-        """Test handling a fleet interruption."""
-        # Setup spy on handle_instance_interruption
-        handler.handle_instance_interruption = MagicMock()
-
-        # Handle fleet interruption
-        fleet_id = "fleet-test1"
-        instance_ids = ["i-test1", "i-test2"]
-        event = {"FleetRequestId": fleet_id, "InstanceAction": "terminate"}
-
-        handler.handle_fleet_interruption(fleet_id, instance_ids, event)
-
-        # Verify handle_instance_interruption was called for each instance
-        assert handler.handle_instance_interruption.call_count == 2
-        handler.handle_instance_interruption.assert_any_call("i-test1", event)
-        handler.handle_instance_interruption.assert_any_call("i-test2", event)
-
-    def test_recover_tasks(self, handler, mock_s3_client, mock_executor):
-        """Test recovering tasks."""
-        # Queue tasks for recovery
-        handler.queue_task_for_recovery(
-            "task-1", "s3://test-bucket/test/prefix/task-1.json"
-        )
-        handler.queue_task_for_recovery(
-            "task-2", "s3://test-bucket/test/prefix/task-2.json", priority=2
+        Registering the *bound method* is the whole wiring. This used to point at
+        a handler object whose task mapping nothing ever populated, so every
+        interruption logged "No registered tasks found" and did nothing.
+        """
+        monitor = SpotInterruptionMonitor(session=MagicMock(spec=boto3.Session))
+        monitor.register_instance("i-test1", mode.handle_instance_interruption)
+        monitor.event_queue.put(
+            ("instance", "i-test1", {"InstanceAction": "terminate"})
         )
 
-        # Process recovery queue
-        handler.recover_tasks()
+        monitor._process_interruption_events()
 
-        # Executor would be used in a real implementation, but we just verify
-        # that the method doesn't fail for now. In a real implementation we
-        # would check if new futures were created.
-        assert handler.recovery_queue.empty()
-
-
-class TestCheckpointableDecorator:
-    """Tests for the checkpointable decorator."""
-
-    def test_checkpointable_function(self):
-        """Test that a function can be decorated with checkpointable."""
-
-        @checkpointable(checkpoint_bucket="test-bucket")
-        def test_func(x, y, checkpoint_data=None):
-            if checkpoint_data:
-                state = checkpoint_data
-            else:
-                state = {"iteration": 0, "result": 0}
-
-            for i in range(state["iteration"], 5):
-                state["result"] += x * y
-                state["iteration"] = i + 1
-                yield state
-
-            return state["result"]
-
-        # Function should still be callable
-        result = test_func(2, 3)
-
-        # Should have computed 2*3*5 = 30
-        assert result == 30
-
-    def test_checkpointable_with_initial_checkpoint(self):
-        """Test resuming from a checkpoint."""
-
-        @checkpointable()
-        def test_func(checkpoint_data=None):
-            if checkpoint_data:
-                state = checkpoint_data
-            else:
-                state = {"iteration": 0, "result": 0}
-
-            for i in range(state["iteration"], 5):
-                state["result"] += i
-                state["iteration"] = i + 1
-                yield state
-
-            return state["result"]
-
-        # Start from a checkpoint at iteration 3
-        checkpoint_data = {"iteration": 3, "result": 3}  # 0+1+2=3
-        result = test_func(checkpoint_data=checkpoint_data)
-
-        # Should have computed 3+3+4 = 10
-        assert result == 10
-
-    def test_checkpointable_non_generator(self):
-        """Test using checkpointable on a non-generator function."""
-
-        @checkpointable()
-        def test_func(x, checkpoint_data=None):
-            if checkpoint_data:
-                return checkpoint_data["result"] + x
-            return x
-
-        # Regular function call
-        assert test_func(5) == 5
-
-        # With checkpoint
-        assert test_func(5, checkpoint_data={"result": 10}) == 15
-
-    def test_checkpointable_exception_handling(self):
-        """Test exception handling in checkpointable function."""
-
-        @checkpointable()
-        def test_func(checkpoint_data=None):
-            if checkpoint_data:
-                iteration = checkpoint_data["iteration"]
-            else:
-                iteration = 0
-
-            for i in range(iteration, 5):
-                if i == 3:
-                    raise ValueError("Test exception")
-                yield {"iteration": i + 1}
-
-            return "Done"
-
-        # Function should raise the exception
-        with pytest.raises(ValueError):
-            test_func()
-
-        # With checkpoint before the exception
-        result = test_func(checkpoint_data={"iteration": 4})
-        assert result == "Done"
+        assert mode.resources["i-test1"]["status"] == STATUS_INTERRUPTED

@@ -22,6 +22,7 @@ from parsl_ephemeral_aws.constants import (
     WORKER_TYPE_LAMBDA,
     WORKER_TYPE_ECS,
     WORKER_TYPE_AUTO,
+    STATUS_INTERRUPTED,
     STATUS_PENDING,
     STATUS_RUNNING,
     STATUS_SUCCEEDED,
@@ -565,6 +566,34 @@ class TestServerlessMode:
 
         # Verify resource was updated
         assert serverless_mode.resources[resource_id]["status"] == STATUS_RUNNING
+
+    def test_get_job_status_keeps_an_interruption(
+        self, serverless_mode, mock_cf_client
+    ):
+        """A reclaim marked by the monitor survives the next poll (#137).
+
+        Neither route below can see a reclaim: a fleet whose instances AWS is
+        taking back still reports itself active, and the CloudFormation stack
+        stays CREATE_COMPLETE. Re-deriving would overwrite the marker with a
+        healthy-looking RUNNING on the very next poll.
+        """
+        resource_id = "serverless-lambda-job-1"
+        serverless_mode.resources = {
+            resource_id: {
+                "job_id": "job-1",
+                "worker_type": WORKER_TYPE_LAMBDA,
+                "stack_name": "parsl-lambda-12345",
+                "status": STATUS_INTERRUPTED,
+                "created_at": time.time() - 10,
+                "resource_type": RESOURCE_TYPE_LAMBDA_FUNCTION,
+            }
+        }
+
+        status = serverless_mode.get_job_status([resource_id])
+
+        assert status[resource_id] == STATUS_INTERRUPTED
+        assert serverless_mode.resources[resource_id]["status"] == STATUS_INTERRUPTED
+        mock_cf_client.describe_stacks.assert_not_called()
 
     def test_get_lambda_status(self, serverless_mode):
         """Test Lambda job status calculation."""

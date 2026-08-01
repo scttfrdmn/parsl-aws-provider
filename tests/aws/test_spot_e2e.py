@@ -298,13 +298,15 @@ class TestSpotComputeLifecycle:
 class TestSpotInterruptionMonitor:
     """Verify spot interruption monitoring behaviour.
 
-    These tests require a provider with ``spot_interruption_handling=True`` and
-    a real S3 bucket for checkpoints.  Each test creates its own provider so
-    that the S3 bucket lifecycle matches the test lifetime.
+    ``spot_interruption_handling=True`` is the only requirement. It used to also
+    need an S3 bucket, because the monitor was built only when a
+    ``checkpoint_bucket`` was configured -- so a caller who asked for
+    interruption handling and gave no bucket silently got none at all. #137
+    removed both that gate and the checkpointing API behind it.
     """
 
     def _make_interruption_provider(
-        self, tmp_path, aws_session, test_run_id, aws_region, checkpoint_bucket: str
+        self, tmp_path, aws_session, test_run_id, aws_region
     ) -> EphemeralAWSProvider:
         """Helper: create a provider with interruption handling enabled."""
         state_file = str(tmp_path / f"state-int-{test_run_id}.json")
@@ -314,7 +316,6 @@ class TestSpotInterruptionMonitor:
             mode="standard",
             use_spot=True,
             spot_interruption_handling=True,
-            checkpoint_bucket=checkpoint_bucket,
             state_store_type="file",
             state_file_path=state_file,
             auto_shutdown=True,
@@ -333,33 +334,17 @@ class TestSpotInterruptionMonitor:
     def test_interruption_monitor_starts_after_initialize(
         self, tmp_path, aws_session, test_run_id, aws_region
     ):
-        """After initialize() the spot interruption monitor thread is running.
-
-        Creates a temporary S3 bucket for checkpoints, initialises the provider,
-        and asserts that ``spot_interruption_monitor.monitoring_thread.is_alive()``
-        is True.
-        """
-        s3 = aws_session.client("s3", region_name=aws_region)
-        bucket_name = f"parsl-e2e-cp-{test_run_id}"
-
-        if aws_region == "us-east-1":
-            s3.create_bucket(Bucket=bucket_name)
-        else:
-            s3.create_bucket(
-                Bucket=bucket_name,
-                CreateBucketConfiguration={"LocationConstraint": aws_region},
-            )
-
+        """After initialize() the spot interruption monitor thread is running."""
         provider = self._make_interruption_provider(
-            tmp_path, aws_session, test_run_id, aws_region, bucket_name
+            tmp_path, aws_session, test_run_id, aws_region
         )
         try:
             provider.operating_mode.initialize()
 
             monitor = provider.operating_mode.spot_interruption_monitor
             assert monitor is not None, (
-                "spot_interruption_monitor should be set when "
-                "spot_interruption_handling=True and a checkpoint_bucket is given"
+                "spot_interruption_monitor should be set whenever "
+                "spot_interruption_handling=True"
             )
             assert (
                 monitor.monitoring_thread is not None
@@ -370,19 +355,6 @@ class TestSpotInterruptionMonitor:
                 provider.shutdown()
             except Exception as exc:
                 logger.warning("interruption provider shutdown: %s", exc)
-            # Delete checkpoint bucket
-            try:
-                paginator = s3.get_paginator("list_objects_v2")
-                for page in paginator.paginate(Bucket=bucket_name):
-                    objects = page.get("Contents", [])
-                    if objects:
-                        s3.delete_objects(
-                            Bucket=bucket_name,
-                            Delete={"Objects": [{"Key": o["Key"]} for o in objects]},
-                        )
-                s3.delete_bucket(Bucket=bucket_name)
-            except Exception as exc:
-                logger.warning("checkpoint bucket cleanup: %s (ignored)", exc)
 
     def test_forced_termination_transitions_out_of_running(
         self, spot_provider, aws_session, aws_region

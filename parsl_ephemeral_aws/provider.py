@@ -35,6 +35,7 @@ from parsl_ephemeral_aws.constants import (
     DEFAULT_WARM_POOL_TTL,
     DEFAULT_WORKER_INIT,
     MAX_WARM_POOL_SIZE,
+    STATUS_INTERRUPTED,
     STATUS_WARM,
 )
 from parsl_ephemeral_aws.exceptions import (
@@ -76,11 +77,17 @@ _STRING_TO_JOB_STATE: Dict[str, JobState] = {
     # WARM = instance idle in warm pool; the JOB is done so Parsl sees RUNNING
     # (prevents premature cancellation while we reuse the instance).
     "WARM": JobState.RUNNING,
+    # INTERRUPTED = AWS has issued the two-minute spot reclaim warning. FAILED
+    # rather than COMPLETED because the block did not finish its work: FAILED is
+    # what stops the executor dispatching to it and lets Parsl's own `retries`
+    # re-run the lost tasks (#137). Kept distinct as a string so state files and
+    # logs record the cause.
+    "INTERRUPTED": JobState.FAILED,
 }
 
 # Job states that are terminal (Parsl will not re-submit once in these states)
 _TERMINAL_STATES: frozenset = frozenset(
-    {"COMPLETED", "FAILED", "CANCELED", "CANCELLED"}
+    {"COMPLETED", "FAILED", "CANCELED", "CANCELLED", "INTERRUPTED"}
 )
 
 
@@ -168,13 +175,12 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
         or 'lowest-price'. Converted to the camelCase spelling Spot Fleet
         requires at the API boundary.
     spot_interruption_handling : bool, optional
-        Whether to enable spot interruption handling. Default is False.
-    checkpoint_bucket : Optional[str], optional
-        S3 bucket name for storing task checkpoints, required if spot_interruption_handling is True.
-    checkpoint_prefix : str, optional
-        S3 key prefix for checkpoint data. Default is 'parsl/checkpoints'.
-    checkpoint_interval : int, optional
-        Interval between checkpoints in seconds. Default is 60.
+        Whether to detect spot interruptions. Default is False. When enabled, an
+        interrupted block is reported to Parsl as FAILED rather than COMPLETED,
+        so the executor stops dispatching to it and re-runs the lost tasks under
+        its own ``retries`` setting. No checkpointing is performed: a provider
+        never sees task state, so re-running is the only recovery available at
+        this layer. Set ``retries`` on your Parsl config to make use of it.
     additional_tags : Dict[str, str], optional
         Additional tags to apply to AWS resources.
     auto_shutdown : bool, optional
@@ -286,9 +292,6 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
         use_spot_fleet: bool = False,
         instance_types: Optional[List[str]] = None,
         spot_max_price_percentage: Optional[int] = None,
-        checkpoint_bucket: Optional[str] = None,
-        checkpoint_prefix: str = "parsl/checkpoints",
-        checkpoint_interval: int = 60,
         additional_tags: Optional[Dict[str, str]] = None,
         auto_shutdown: bool = True,
         max_idle_time: int = DEFAULT_MAX_IDLE_TIME,
@@ -385,9 +388,6 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
         self.use_spot_fleet = use_spot_fleet
         self.instance_types = instance_types or []
         self.spot_max_price_percentage = spot_max_price_percentage
-        self.checkpoint_bucket = checkpoint_bucket
-        self.checkpoint_prefix = checkpoint_prefix
-        self.checkpoint_interval = checkpoint_interval
         self.additional_tags = additional_tags or {}
         self.auto_shutdown = auto_shutdown
         self.max_idle_time = max_idle_time
@@ -850,9 +850,6 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
             "instance_types": self.instance_types,
             "spot_max_price_percentage": self.spot_max_price_percentage,
             "nodes_per_block": self.nodes_per_block,
-            "checkpoint_bucket": self.checkpoint_bucket,
-            "checkpoint_prefix": self.checkpoint_prefix,
-            "checkpoint_interval": self.checkpoint_interval,
             "additional_tags": self.additional_tags,
             "auto_shutdown": self.auto_shutdown,
             "max_idle_time": self.max_idle_time,
@@ -1256,15 +1253,21 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
                         warm_transitions.append(resource_id)
                         continue  # decision made below
 
-                    elif status in ("FAILED", "CANCELED"):
+                    # STATUS_INTERRUPTED is here rather than in the WARM branch
+                    # above on purpose: a reclaimed instance is being taken by
+                    # AWS, so it must never be recycled into the pool (#137).
+                    elif status in ("FAILED", "CANCELED", STATUS_INTERRUPTED):
                         resources_to_cleanup.append(resource_id)
                         continue
 
                     else:
                         continue  # PENDING/RUNNING — leave alone
 
-                # Normal (non-warm-pool) lifecycle
-                if status in ["COMPLETED", "FAILED", "CANCELED"]:
+                # Normal (non-warm-pool) lifecycle. STATUS_INTERRUPTED terminates
+                # like any other terminal state -- omitting it leaked the
+                # instance, trading a silently-successful reclaim for a silent
+                # cost leak (#137).
+                if status in ["COMPLETED", "FAILED", "CANCELED", STATUS_INTERRUPTED]:
                     resources_to_cleanup.append(resource_id)
                 elif (
                     self.auto_shutdown

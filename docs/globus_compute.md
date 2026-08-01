@@ -286,7 +286,6 @@ provider = GlobusComputeProvider(
     mode="standard",
     use_spot=True,
     spot_interruption_handling=True,
-    checkpoint_bucket="my-parsl-checkpoints",  # gates detection, see below
     min_blocks=0,
     max_blocks=10,
     auto_create_instance_profile=True,
@@ -306,12 +305,11 @@ engine:
   max_retries_on_system_failure: 3    # this is what re-runs reclaimed functions
 ```
 
-Two limitations, both
-[#137](https://github.com/scttfrdmn/parsl-aws-provider/issues/137):
-`checkpoint_bucket` is an accidental prerequisite for the interruption monitor
-being constructed *at all* — without it you get one WARNING at startup and no
-detection — and what the warning triggers today is a log line, not task
-recovery. Treat it as observability.
+This is not a limitation to work around; it is the division of labour. A detected
+reclaim marks the block failed, and re-running the functions that were on it is
+the engine's job — the provider is never told which functions a block is running
+([#137](https://github.com/scttfrdmn/parsl-aws-provider/issues/137)). So leave
+`max_retries_on_system_failure` at a non-zero value whenever `use_spot=True`.
 
 ### Container endpoint
 

@@ -19,6 +19,7 @@ from parsl_ephemeral_aws.exceptions import (
 )
 from parsl_ephemeral_aws.constants import (
     RESOURCE_TYPE_BASTION,
+    STATUS_INTERRUPTED,
     STATUS_PENDING,
     STATUS_RUNNING,
     STATUS_CANCELLED,
@@ -377,6 +378,25 @@ class TestDetachedMode:
 
         # Verify resource was updated
         assert detached_mode.resources[resource_id]["status"] == STATUS_RUNNING
+
+    def test_get_job_status_keeps_an_interruption(self, detached_mode, mock_ssm_client):
+        """A reclaim marked by the monitor survives the next poll (#137).
+
+        The status document this mode reads is written by the worker itself, so a
+        reclaimed instance cannot report its own reclaim — it simply stops
+        updating, leaving the last value it wrote. Re-reading would therefore
+        overwrite ``STATUS_INTERRUPTED`` with a stale RUNNING.
+        """
+        resource_id = "serverless-job-1"
+        detached_mode.resources = {
+            resource_id: {"job_id": "job-1", "status": STATUS_INTERRUPTED}
+        }
+
+        status = detached_mode.get_job_status([resource_id])
+
+        assert status[resource_id] == STATUS_INTERRUPTED
+        assert detached_mode.resources[resource_id]["status"] == STATUS_INTERRUPTED
+        mock_ssm_client.get_parameter.assert_not_called()
 
     def test_cancel_jobs(self, detached_mode, mock_ssm_client):
         """Test canceling jobs via bastion host."""

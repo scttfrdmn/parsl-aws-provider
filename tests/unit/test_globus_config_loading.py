@@ -300,7 +300,6 @@ class TestEveryParameterSurvivesTheRoundTrip:
             pytest.param({"baked_ami_id": "ami-0bakedbakedbaked0"}, id="baked-ami"),
             pytest.param({"key_name": "mykey", "use_public_ips": False}, id="access"),
             pytest.param({"auto_shutdown": False, "max_idle_time": 900}, id="idle"),
-            pytest.param({"checkpoint_bucket": "ckpt"}, id="checkpoint"),
             pytest.param({"profile_name": "aws"}, id="profile"),
         ],
     )
@@ -431,8 +430,6 @@ class TestEveryParameterSurvivesTheRoundTrip:
             "spot_max_price": "0.05",
             "spot_allocation_strategy": "capacity-optimized",
             "spot_interruption_handling": True,
-            "checkpoint_prefix": "cp",
-            "checkpoint_interval": 30,
             "auto_shutdown": False,
             "max_idle_time": 900,
             "bastion_instance_type": "t3.small",
