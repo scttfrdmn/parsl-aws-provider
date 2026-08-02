@@ -284,7 +284,7 @@ the provider believes it owns.
 To find what a crash left behind:
 
 ```bash
-uv run python tools/cleanup_aws_resources.py --dry-run --region us-east-1
+parsl-aws-cleanup --dry-run --region us-east-1
 ```
 
 ## Examples

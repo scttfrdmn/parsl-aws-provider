@@ -280,7 +280,7 @@ pattern in `examples/parsl_aws_integration.py` handles that.
 To find anything a crash left behind:
 
 ```bash
-python tools/cleanup_aws_resources.py --dry-run --region us-east-1
+parsl-aws-cleanup --dry-run --region us-east-1
 ```
 
 ## Troubleshooting

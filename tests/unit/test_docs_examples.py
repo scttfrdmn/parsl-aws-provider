@@ -23,6 +23,7 @@ import importlib
 import importlib.util
 import inspect
 import re
+import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -406,6 +407,39 @@ def test_example_disables_htex_encryption(path: Path):
         elif getattr(encrypted.value, "value", None) is not False:
             failures.append(f"{path.name}:{node.lineno}: encrypted= is not False")
     assert not failures, "\n".join(failures)
+
+
+@pytest.mark.parametrize("path", _example_files(), ids=lambda p: p.name)
+def test_example_imports(path: Path):
+    """Every example imports cleanly.
+
+    ``test_example_parses`` only AST-parses, which cannot see a name that does
+    not exist at the other end of an import. Four of the eight examples carried
+    ``from parsl.app.python import python_app`` -- valid syntax, and an
+    ``ImportError`` on every run, because that module exports ``PythonApp``
+    rather than the decorator. Among them were ``standard_mode.py``, the README's
+    headline validation command, and ``detached_mode.py``, the documented NAT
+    workaround: both dead on arrival for over a release, with a green suite
+    (#198).
+
+    Importing is safe because every example guards its entry point behind
+    ``if __name__ == "__main__"``, so only module scope runs: imports,
+    ``logging.basicConfig``, constants, and the ``@python_app`` decorators. No
+    AWS call is reachable from there, and nothing is constructed -- provider
+    construction would reach AWS, so an example that did that at module scope
+    would be a defect this test should surface anyway.
+
+    The module is loaded under a private name and dropped from ``sys.modules``
+    afterwards, so eight examples that all define ``main`` cannot collide.
+    """
+    spec = importlib.util.spec_from_file_location(f"_example_{path.stem}", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        sys.modules.pop(spec.name, None)
 
 
 @pytest.mark.parametrize("path", _example_files(), ids=lambda p: p.name)

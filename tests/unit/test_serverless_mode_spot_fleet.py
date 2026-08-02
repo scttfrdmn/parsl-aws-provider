@@ -715,3 +715,92 @@ class TestServerlessModeSpotFleet:
         assert spot_resource["resource_type"] == RESOURCE_TYPE_SPOT_FLEET
         assert spot_resource["fleet_request_id"] == "sfr-12345"
         assert spot_resource["use_spot_fleet"] is True
+
+
+class TestFleetUserDataRunsWorkerInit:
+    """The fleet path has to honour ``worker_init`` like every other EC2 path.
+
+    ``ServerlessMode`` inherits ``self.worker_init`` from ``OperatingMode`` and
+    ``_build_fleet_user_data`` silently dropped it, so a fleet instance booted a
+    bare Amazon Linux image -- no Parsl, none of the workload's dependencies --
+    and ran the job command against it. UserData is the *only* opportunity to
+    install anything on that instance, and it was spent (#198).
+
+    ``StandardMode._build_user_data`` and
+    ``SpotFleetManager._generate_user_data`` both include it, so this was the
+    single EC2 path that did not.
+    """
+
+    @pytest.fixture
+    def mode(self):
+        """A ServerlessMode with a distinctive ``worker_init``."""
+        session = MagicMock(spec=boto3.Session)
+        session.region_name = "us-east-1"
+        return ServerlessMode(
+            provider_id="test-provider",
+            session=session,
+            state_store=MagicMock(),
+            worker_type=WORKER_TYPE_ECS,
+            use_spot_fleet=True,
+            worker_init="pip3 install --quiet numpy scipy\n",
+            vpc_id="vpc-12345",
+            subnet_id="subnet-12345",
+            security_group_id="sg-12345",
+        )
+
+    def test_worker_init_appears_in_the_user_data(self, mode):
+        """The commands reach the instance at all."""
+        user_data = mode._build_fleet_user_data("python3 -m parsl.executors.x")
+
+        assert "pip3 install --quiet numpy scipy" in user_data
+
+    def test_worker_init_runs_before_the_command(self, mode):
+        """Order is the point: dependencies must exist before the job runs.
+
+        Present-but-after would still fail with the same ``ImportError`` as
+        absent, so position is the assertion, not mere inclusion.
+        """
+        user_data = mode._build_fleet_user_data("python3 -m parsl.executors.x")
+
+        assert user_data.index("pip3 install") < user_data.index("command.sh")
+
+    def test_the_shebang_stays_first(self, mode):
+        """``worker_init`` must not displace the interpreter line.
+
+        Inserting it ahead of ``#!/bin/bash`` would make cloud-init refuse the
+        whole script, which is a worse failure than the one being fixed.
+        """
+        user_data = mode._build_fleet_user_data("run-me")
+
+        assert user_data.startswith("#!/bin/bash\n")
+
+    def test_the_command_and_shutdown_survive(self, mode):
+        """The pre-existing behaviour is unchanged.
+
+        ``shutdown -h now`` pairs with ``InstanceInitiatedShutdownBehavior=terminate``:
+        without it a one-command instance idles at full price.
+        """
+        user_data = mode._build_fleet_user_data("run-me")
+
+        assert "run-me" in user_data
+        assert "shutdown -h now" in user_data
+
+    def test_an_empty_worker_init_adds_no_stray_section(self):
+        """The default is empty, and must stay clean."""
+        session = MagicMock(spec=boto3.Session)
+        session.region_name = "us-east-1"
+        mode = ServerlessMode(
+            provider_id="test-provider",
+            session=session,
+            state_store=MagicMock(),
+            worker_type=WORKER_TYPE_ECS,
+            use_spot_fleet=True,
+            vpc_id="vpc-12345",
+            subnet_id="subnet-12345",
+            security_group_id="sg-12345",
+        )
+
+        user_data = mode._build_fleet_user_data("run-me")
+
+        assert "User-provided worker initialization" not in user_data
+        assert user_data.startswith("#!/bin/bash\n")

@@ -53,8 +53,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   prefix — `parsl-ephemeral-ssm-role-`, `parsl-ephemeral-ssm-profile-`,
   `parsl-ephemeral-spot-fleet-role-`, `parsl-ephemeral-sg`,
   `parsl-ephemeral-cluster` — keeps its existing spelling, because
-  `tools/cleanup_aws_resources.py` reaps orphans by prefix and renaming them
-  would strand already-created resources in live accounts.
+  `parsl-aws-cleanup` reaps orphans by prefix and renaming them would strand
+  already-created resources in live accounts.
 
 ### Added
 - **The documentation is actually published.** CI's `docs` job has built the
@@ -118,6 +118,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   4.0.1).
 
 ### Fixed
+- **The orphan sweep shipped in no artifact, and found nothing when it was
+  reachable** (#198). Two independent defects in the one tool that bounds the bill
+  after a crash. Nothing terminates instances automatically — Parsl never calls
+  `provider.shutdown()`, `HighThroughputExecutor.shutdown()` documents that it does
+  not terminate workers, and `parsl/dataflow/dflow.py`'s `atexit_cleanup` only logs
+  — so after a `KeyboardInterrupt` or an uncaught exception this sweep is the whole
+  recovery path.
+
+  - **Not distributed.** It lived at `tools/cleanup_aws_resources.py`, and `tools/`
+    is in neither the wheel nor the sdist, so every documented
+    `python tools/cleanup_aws_resources.py` invocation worked only inside a git
+    clone. Moved to `parsl_aws_provider/cleanup.py` and exposed as the
+    `parsl-aws-cleanup` console script via `[project.scripts]`; verified from a
+    fresh venv installed from the built wheel alone. `main()` returns an exit
+    status rather than calling `sys.exit()` — `console_scripts` uses the return
+    value — which also makes it testable. `logging.basicConfig` moved out of module
+    scope into `main()`, since configuring the root logger at import would hijack
+    logging for anyone merely importing `parsl_aws_provider`.
+  - **Its filters matched nothing the package writes.** It queried EC2 for
+    `tag:parsl_provider` matching `*aws-enhanced*` and for security groups named
+    `aws-enhanced-*`. Neither string appears anywhere in this package — not as a
+    tag key, not as a value, not as a group name — so the tool documented as the
+    way to find orphaned billable resources reported "No resources to clean up!"
+    against an account full of them. It now queries both conventions the package
+    actually writes: `CreatedBy=ParslEphemeralAWSProvider` (standard mode) and the
+    `ParslResource` tag key (detached mode and the serverless fleet), and matches
+    security groups against `DEFAULT_SECURITY_GROUP_NAME`. The two tag conventions
+    need two `describe_instances` calls unioned by instance ID, because EC2 ANDs
+    its `Filters` — a single call passing both returns only instances carrying
+    *both*, which no mode writes. Proved against real AWS in us-west-2: five live
+    orphaned security groups the old filter reported as zero, and 0-vs-2 on live
+    instances tagged one per convention.
+- **Serverless mode discarded `worker_init` on the fleet path** (#198). Found while
+  fixing the above. `ServerlessMode._build_fleet_user_data` never referenced
+  `self.worker_init`, so a fleet instance booted a bare Amazon Linux image — no
+  Parsl, none of the workload's dependencies — and ran the job command against it.
+  UserData is the only opportunity to install anything on that instance, and it was
+  spent. `StandardMode._build_user_data` and
+  `SpotFleetManager._generate_user_data` both include it, so this was the single
+  EC2 path that did not. `examples/serverless_spot_fleet_example.py` now passes a
+  `worker_init` that installs its own imports, which it could not do before.
+- **Four examples raised `ImportError` on the first line a user would run** (#198).
+  `from parsl.app.python import python_app` names nothing — the decorator is
+  `parsl.python_app`, defined in `parsl/app/app.py`. `standard_mode.py`,
+  `detached_mode.py`, `serverless_mode.py` and `spot_interruption_example.py` were
+  all unrunnable for a full release, and `spot_fleet_example.py` used a third
+  spelling; all five now import from `parsl` directly. The existing docs test only
+  AST-parsed each example, which cannot see a name that does not exist at the other
+  end of an import, so it stayed green over all four. `test_example_imports` now
+  executes each module — safe because every example guards its entry point with
+  `if __name__ == "__main__"`.
 - **`minimum_iam_policy()` granted creates without deletes, silently re-creating
   the #132 leak** (#195). The policy carried `iam:CreateRole`,
   `iam:CreateInstanceProfile`, `iam:AddRoleToInstanceProfile`,

@@ -1,22 +1,40 @@
-#!/usr/bin/env python3
-"""
-AWS Resource Cleanup Script for Parsl AWS Provider Testing
-Safely removes all test instances, security groups, and other resources.
+"""Sweep for AWS resources this provider left behind, and delete them.
+
+Installed as the ``parsl-aws-cleanup`` console script. It lives in the package
+rather than under ``tools/`` because that is the only way it reaches a user who
+installed from a wheel: ``tools/`` ships in neither the wheel nor the sdist, so
+every documented ``python tools/cleanup_aws_resources.py`` invocation worked
+only inside a git clone (#198).
+
+That mattered more than a normal missing-file bug, because nothing stops the
+billing automatically. Parsl never calls ``provider.shutdown()``;
+``HighThroughputExecutor.shutdown()`` says outright that it does not terminate
+workers; and ``parsl/dataflow/dflow.py``'s ``atexit_cleanup`` only logs. So a
+``KeyboardInterrupt``, an uncaught exception, or a driver crash leaves EC2
+instances running until someone notices, and this is the tool that bounds the
+damage.
+
+Usage
+-----
+    parsl-aws-cleanup --dry-run --region us-east-1    # report only
+    parsl-aws-cleanup --region us-east-1              # delete, after confirming
+
+SPDX-License-Identifier: Apache-2.0
+SPDX-FileCopyrightText: 2025-2026 Scott Friedman and Project Contributors
 """
 
-import boto3
-import time
-import sys
-from typing import List, Dict, Optional
 import logging
+import sys
+import time
+from typing import Dict, List, Optional
+
+import boto3
 
 from parsl_aws_provider.utils.aws import (
     delete_ssm_instance_profile,
     ssm_instance_profile_names,
 )
 
-# Configure logging
-logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
 
 # Both halves of the pair are named for the provider_id, so the suffix is what
@@ -24,6 +42,32 @@ logger = logging.getLogger(__name__)
 _ROLE_PREFIX, _PROFILE_PREFIX = (
     prefix[: -len("suffix")] for prefix in ssm_instance_profile_names("suffix")
 )
+
+# The package tags EC2 resources two different ways, and a sweep that knows only
+# one of them misses whole modes:
+#
+#   StandardMode          CreatedBy=ParslEphemeralAWSProvider, ProviderId=...
+#   DetachedMode          ParslResource=true, ParslWorkflowId=...
+#   ServerlessMode fleet  ParslResource=true, ParslWorkflowId=...
+#
+# This tool previously filtered on `tag:parsl_provider` matching `*aws-enhanced*`
+# and on security groups named `aws-enhanced-*`. Neither string appears anywhere
+# in the package -- not as a tag key, not as a value, not as a group name -- so
+# the sweep documented as the way to find orphaned billable resources reported
+# "No resources to clean up!" against an account full of them (#198).
+#
+# Tag *keys* rather than values are matched where possible, so a renamed value
+# cannot silently narrow the sweep again.
+_INSTANCE_TAG_FILTERS = (
+    {"Name": "tag:CreatedBy", "Values": ["ParslEphemeralAWSProvider"]},
+    {"Name": "tag-key", "Values": ["ParslResource"]},
+)
+
+# Security groups are no longer created by the provider (#69), so any match is a
+# pre-v0.7.0 leftover. `parsl-ephemeral-sg` is DEFAULT_SECURITY_GROUP_NAME, which
+# is the name the removed creation path used; the wildcard also catches the
+# suffixed variants.
+_SECURITY_GROUP_NAME_PATTERNS = ["parsl-ephemeral-sg", "parsl-ephemeral-sg-*"]
 
 
 class AWSResourceCleaner:
@@ -59,48 +103,59 @@ class AWSResourceCleaner:
             sys.exit(1)
 
     def get_parsl_instances(self) -> List[Dict]:
-        """Get all instances created by Parsl AWS provider."""
-        try:
-            response = self.ec2_client.describe_instances(
-                Filters=[
-                    {"Name": "tag:parsl_provider", "Values": ["*aws-enhanced*"]},
-                    {
-                        "Name": "instance-state-name",
-                        "Values": ["running", "pending", "stopping", "stopped"],
-                    },
-                ]
-            )
+        """Get all live instances created by this provider, across all modes.
 
-            instances = []
-            for reservation in response["Reservations"]:
-                for instance in reservation["Instances"]:
-                    instances.append(
+        One ``describe_instances`` call per tag convention, unioned by instance
+        ID. They cannot be combined into a single call: EC2 ``Filters`` are
+        ANDed, so passing both would return only instances carrying *both*
+        conventions -- which no mode writes.
+        """
+        instances: Dict[str, Dict] = {}
+
+        for tag_filter in _INSTANCE_TAG_FILTERS:
+            try:
+                paginator = self.ec2_client.get_paginator("describe_instances")
+                pages = paginator.paginate(
+                    Filters=[
+                        dict(tag_filter),
                         {
-                            "id": instance["InstanceId"],
-                            "state": instance["State"]["Name"],
-                            "launch_time": instance["LaunchTime"],
-                            "name": next(
-                                (
-                                    tag["Value"]
-                                    for tag in instance.get("Tags", [])
-                                    if tag["Key"] == "Name"
+                            "Name": "instance-state-name",
+                            "Values": ["running", "pending", "stopping", "stopped"],
+                        },
+                    ]
+                )
+                for page in pages:
+                    for reservation in page["Reservations"]:
+                        for instance in reservation["Instances"]:
+                            instances[instance["InstanceId"]] = {
+                                "id": instance["InstanceId"],
+                                "state": instance["State"]["Name"],
+                                "launch_time": instance["LaunchTime"],
+                                "name": next(
+                                    (
+                                        tag["Value"]
+                                        for tag in instance.get("Tags", [])
+                                        if tag["Key"] == "Name"
+                                    ),
+                                    "No Name",
                                 ),
-                                "No Name",
-                            ),
-                        }
-                    )
+                            }
+            except Exception as e:
+                logger.error(f"Error getting instances for {tag_filter['Name']}: {e}")
 
-            return sorted(instances, key=lambda x: x["launch_time"], reverse=True)
-
-        except Exception as e:
-            logger.error(f"Error getting instances: {e}")
-            return []
+        return sorted(instances.values(), key=lambda x: x["launch_time"], reverse=True)
 
     def get_parsl_security_groups(self) -> List[Dict]:
-        """Get all security groups created by Parsl AWS provider."""
+        """Get security groups left over from before #69 removed SG creation.
+
+        The provider has created no security group since v0.7.0, so a match here
+        is a pre-v0.7.0 orphan rather than something a current run left behind.
+        """
         try:
             response = self.ec2_client.describe_security_groups(
-                Filters=[{"Name": "group-name", "Values": ["aws-enhanced-*"]}]
+                Filters=[
+                    {"Name": "group-name", "Values": _SECURITY_GROUP_NAME_PATTERNS}
+                ]
             )
 
             return [
@@ -375,12 +430,26 @@ class AWSResourceCleaner:
         return success
 
 
-def main():
-    """Main cleanup function."""
+def main(argv: Optional[List[str]] = None) -> int:
+    """Entry point for the ``parsl-aws-cleanup`` console script.
+
+    Returns an exit status rather than calling ``sys.exit()`` so the function is
+    testable; ``console_scripts`` uses the return value as the process status.
+
+    ``basicConfig`` is called here rather than at import, because this module is
+    now part of the installed package: configuring the root logger on import
+    would hijack logging for anyone who merely imports ``parsl_aws_provider``.
+    """
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="Clean up AWS resources created by Parsl testing"
+        prog="parsl-aws-cleanup",
+        description=(
+            "Find and delete AWS resources left behind by this provider. "
+            "Sweeps by tag, so it finds resources no state file names -- the "
+            "case after a crash or KeyboardInterrupt, which Parsl does not "
+            "clean up."
+        ),
     )
     parser.add_argument(
         "--profile",
@@ -397,13 +466,15 @@ def main():
         help="Show what would be deleted without deleting",
     )
 
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
     cleaner = AWSResourceCleaner(profile_name=args.profile, region=args.region)
     success = cleaner.cleanup_all(dry_run=args.dry_run)
 
-    sys.exit(0 if success else 1)
+    return 0 if success else 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

@@ -1175,10 +1175,18 @@ class ServerlessMode(OperatingMode):
         template's ``InstanceInitiatedShutdownBehavior=terminate``: the instance
         exists to run one command, so it should terminate when that is done
         instead of idling at full price.
+
+        ``worker_init`` runs first, as it does on every other EC2 path
+        (``StandardMode._build_user_data`` and
+        ``SpotFleetManager._generate_user_data``). It was previously dropped
+        here, so a fleet instance in this mode booted a bare Amazon Linux image
+        with no Parsl installed and ran ``command`` against it -- the one
+        opportunity to install anything, silently discarded (#198).
         """
-        return (
-            "#!/bin/bash\n"
-            'echo "Starting Parsl worker..."\n'
+        script = '#!/bin/bash\necho "Starting Parsl worker..."\n'
+        if self.worker_init:
+            script += f"\n# User-provided worker initialization\n{self.worker_init}\n"
+        return script + (
             "mkdir -p /tmp/parsl\n"
             f"cat > /tmp/parsl/command.sh <<'PARSL_EOF'\n{command}\nPARSL_EOF\n"
             "chmod +x /tmp/parsl/command.sh\n"

@@ -103,9 +103,12 @@ The provider creates and manages:
 
 It does **not** create or delete VPCs, subnets, or security groups.
 
-EC2 resources are tagged `ParslResource=true` and `ParslWorkflowId=<provider_id>`
-so anything left behind is findable. `tools/cleanup_aws_resources.py --dry-run`
-reports orphans.
+EC2 resources are tagged so anything left behind is findable, in one of two
+conventions depending on the mode: standard mode writes
+`CreatedBy=ParslEphemeralAWSProvider` and `ProviderId=<provider_id>`, while
+detached mode and the serverless fleet write `ParslResource=true` and
+`ParslWorkflowId=<provider_id>`. `parsl-aws-cleanup --dry-run` queries both and
+reports the union.
 
 ## State management
 

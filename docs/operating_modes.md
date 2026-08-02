@@ -410,7 +410,7 @@ configuration carries over.
 
 ### Any mode
 - `provider.list_resources()` reports what the provider believes it owns
-- `python tools/cleanup_aws_resources.py --dry-run --region <region>` finds
+- `parsl-aws-cleanup --dry-run --region <region>` finds
   resources tagged `ParslResource=true` that the state no longer names
 
 SPDX-License-Identifier: Apache-2.0
