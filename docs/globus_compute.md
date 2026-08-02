@@ -6,11 +6,14 @@ environment — including behind corporate firewalls, university networks, and h
 routers.
 
 ```{note}
-Before v0.8.0 the generated `config.yaml` dropped `worker_init`, hardcoded
-`encrypted: true`, and omitted 37 of 52 provider parameters — so every endpoint
-needed two manual edits before a worker could start
+Before v0.9.0 the generated `config.yaml` put the `engine:` block at the top level,
+which makes `globus-compute-endpoint start` refuse it outright
+([#196](https://github.com/scttfrdmn/parsl-aws-provider/issues/196)); before v0.8.0
+it also dropped `worker_init`, hardcoded `encrypted: true`, and omitted 37 of 52
+provider parameters
 ([#138](https://github.com/scttfrdmn/parsl-aws-provider/issues/138)). Generated
-configs are now complete and start unedited. Read
+configs are now startable and complete, unedited. **Regenerate any endpoint
+directory created by an earlier version.** Read
 [Known limitations](#known-limitations) before deploying.
 ```
 
@@ -112,28 +115,55 @@ provider = GlobusComputeProvider(
 provider.generate_endpoint_config("~/.globus_compute/my_aws_endpoint")
 ```
 
-This writes **two** files:
+This writes **four** files, and returns the path to the second:
 
 | File | Purpose |
 |---|---|
-| `config.yaml` | the configuration — the file to edit |
-| `config.py` | a loader shim; do not edit |
+| `config.yaml` | manager configuration: `display_name`, and nothing else |
+| `user_config_template.yaml.j2` | the `engine:` block and all AWS settings — the file to edit |
+| `user_environment.yaml` | a `PYTHONPATH` pointing at `_bootstrap/` |
+| `_bootstrap/sitecustomize.py` | the import that registers the provider; do not edit |
 
-Both are needed. Globus Compute resolves a provider's `type:` key by
+**Why the split.** `globus-compute-endpoint` 4.15.0 classifies a config by one
+key: `load_config_yaml()` pops `engine`, returning a `ManagerEndpointConfig` when
+it is absent and a `UserEndpointConfig` when it is present. `start` refuses
+anything that is not a `ManagerEndpointConfig`, and the only other entry point,
+`_start-user-endpoint`, is invoked solely by a running manager. So a `config.yaml`
+carrying a top-level `engine:` block cannot be started at all — which is what the
+generator used to emit
+([#196](https://github.com/scttfrdmn/parsl-aws-provider/issues/196)). Upstream's
+own packaged `default_config.yaml` is the single line `display_name: null`, with
+the engine in the template, for the same reason.
+
+**Why the bootstrap.** Globus Compute resolves a provider's `type:` key by
 `getattr(parsl.providers, type_name, None)` and raises when that is `None`, so a
 class Parsl does not ship is unreachable — and `getattr` cannot walk a dotted
-path, so `type: parsl_aws_provider.globus_compute.GlobusComputeProvider` can
-never resolve either. Importing `parsl_aws_provider` assigns the class onto
-`parsl.providers`, but the endpoint daemon has no reason to import this package.
-The `config.py` shim does that import and then hands `config.yaml` to Globus
-Compute's own loader; `get_config()` prefers `config.py` when both are present,
-which is what makes the pair work
-([#87](https://github.com/scttfrdmn/parsl-aws-provider/issues/87)).
+path, so `type: parsl_aws_provider.globus_compute.GlobusComputeProvider` can never
+resolve either
+([#87](https://github.com/scttfrdmn/parsl-aws-provider/issues/87)). Importing
+`parsl_aws_provider` assigns the class onto `parsl.providers`, but the process
+that loads the template never imports this package: the manager forks and
+`execvpe`s a *fresh interpreter*, which reads its rendered config from stdin. The
+one seam into that child is `user_environment.yaml`, which the manager merges into
+its environment immediately before the exec. Pointing `PYTHONPATH` at a directory
+holding `sitecustomize.py` makes Python run that import during `site`
+initialisation — before any user code, and so before the config is parsed.
+
+If [#133](https://github.com/scttfrdmn/parsl-aws-provider/issues/133) lands
+upstream (dotted-path provider resolution), the bootstrap becomes unnecessary and
+`type:` can name the class directly.
+
+```{note}
+Generation works on any platform, but *running* a manager endpoint needs Linux:
+`globus-compute-endpoint` 4.15.0 requires `pyprctl`, and on macOS `start` exits
+with "multi-user endpoints are not supported on this system".
+```
 
 ### 2. Read the two keys that are set for you
 
-No edits are required. Two generated keys are worth understanding, because both
-are the difference between a worker that registers and one that dies silently:
+No edits are required. Two keys in `user_config_template.yaml.j2` are worth
+understanding, because both are the difference between a worker that registers and
+one that dies silently:
 
 ```yaml
 engine:
@@ -185,11 +215,25 @@ they can use this provider at all.
 uv run globus-compute-endpoint start my_aws_endpoint
 ```
 
-It registers and prints its UUID:
+Registration happens as part of starting — there is no separate `register`
+subcommand. The first start registers the endpoint, writes the UUID to
+`endpoint.json`, and prints it:
 
 ```
 Starting endpoint; registered endpoint ID: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
 ```
+
+To reuse a UUID you already have, pass it on the first start:
+
+```bash
+uv run globus-compute-endpoint start my_aws_endpoint --endpoint-uuid <uuid>
+```
+
+There is no *top-level* config key for it, in either file: `BaseConfig` raises
+`Unexpected keyword argument` and the config becomes unloadable. Under
+`engine.provider` it is legal — that is a `GlobusComputeProvider` kwarg, not an
+endpoint one — so `endpoint_id=` reaches the template there, and `config.yaml`
+additionally carries the `--endpoint-uuid` invocation as a comment.
 
 ### 4. Submit from anywhere
 
@@ -227,15 +271,15 @@ of its own:
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `endpoint_id` | `str \| None` | `None` | Endpoint UUID. Emitted into `config.yaml` as a provider key and a trailing comment. |
+| `endpoint_id` | `str \| None` | `None` | Endpoint UUID. Emitted as a provider key in the template, and as the `--endpoint-uuid` reminder in `config.yaml`. |
 | `container_image` | `str \| None` | `None` | Image URI. Sets `container_type: docker` and `container_uri` under `engine`. |
-| `display_name` | `str` | `"Ephemeral AWS Endpoint"` | Label shown in the Globus Compute web console. |
+| `display_name` | `str` | `"Ephemeral AWS Endpoint"` | Label shown in the Globus Compute web console. The one key in `config.yaml`. |
 | `encrypted` | `bool` | `False` | CurveZMQ encryption on the engine. `True` needs [#62](https://github.com/scttfrdmn/parsl-aws-provider/issues/62) — see step 2. |
 
 `worker_init` also differs from the base class: `GlobusComputeProvider` defaults
 it to a script that installs `globus-compute-endpoint`, not just `parsl`.
 
-**Which parameters reach `config.yaml`.** Every parameter you pass, plus
+**Which parameters reach the template.** Every parameter you pass, plus
 `region`, `instance_type`, `mode`, `max_blocks`, and `worker_init` whether you
 pass them or not. The list comes from `inspect.signature`, so a parameter added to
 `EphemeralAWSProvider` is emitted without anyone updating the generator — the
@@ -386,12 +430,17 @@ start`.
   distribution exists ([#62](https://github.com/scttfrdmn/parsl-aws-provider/issues/62)),
   so `encrypted` defaults to `False` and High-Assurance endpoints — which reject
   that — cannot use this provider.
-- **Multi-user (manager) endpoints are unsupported**
-  ([#133](https://github.com/scttfrdmn/parsl-aws-provider/issues/133)). Those
-  render `user_config_template.yaml.j2` to a string and the forked user-endpoint
-  process calls `load_config_yaml()` on it directly, never going through
-  `get_config()` — so there is no `config.py` hook and the "not a valid provider"
-  failure returns. Fixing it needs dotted-path support upstream.
+- **The bootstrap is a workaround, not the fix.** Resolving the provider inside
+  the forked user-endpoint process depends on a `PYTHONPATH`/`sitecustomize` hook
+  rather than on anything Globus Compute supports for this. Dotted-path provider
+  resolution upstream
+  ([#133](https://github.com/scttfrdmn/parsl-aws-provider/issues/133)) would let
+  `type:` name the class directly and make `user_environment.yaml` and
+  `_bootstrap/` unnecessary. Until then, if you hand-edit those two away, the
+  endpoint fails with "not a valid provider".
+- **Running an endpoint needs Linux.** `globus-compute-endpoint` 4.15.0 depends on
+  `pyprctl`, which is Linux-only; `start` refuses on macOS. Config generation works
+  anywhere.
 - **The endpoint daemon must be reachable by workers.** Globus Compute removes
   the reachability requirement from your *client*, not from the daemon host.
 - **`GlobusComputeExecutor` now ships inside Parsl** and talks to a Globus
@@ -435,9 +484,24 @@ In order of likelihood:
 
 ### `'GlobusComputeProvider' is not a valid provider`
 
-`config.py` is missing or was deleted. Regenerate with
-`generate_endpoint_config()`, which writes both files. If you are using a
-multi-user endpoint, this is #133 and has no workaround yet.
+`user_environment.yaml` or `_bootstrap/sitecustomize.py` is missing, or
+`PYTHONPATH` in the former no longer points at the latter — that pair is what
+imports this package in the forked user-endpoint process. Regenerate with
+`generate_endpoint_config()`, which writes all four files.
+
+If both are present, the package is not installed in the interpreter the endpoint
+runs under. `sitecustomize.py` prints the underlying `ImportError` to stderr rather
+than raising, so check the endpoint log for a
+`parsl-aws-provider: could not import parsl_aws_provider` line.
+
+### `contains an 'engine' field; endpoint will not start`
+
+A `config.yaml` with a top-level `engine:` block, which is what this package
+generated before v0.9.0
+([#196](https://github.com/scttfrdmn/parsl-aws-provider/issues/196)). Regenerate:
+the engine block now belongs in `user_config_template.yaml.j2`, and
+`generate_endpoint_config()` also deletes any stale `config.py`, which would
+otherwise win over `config.yaml` and reinstate the old shape.
 
 ### `globus-compute-endpoint start` hangs
 
@@ -449,20 +513,23 @@ It is waiting for a worker. Beyond the above:
   and `ec2messages` VPC endpoints, plus a route to whatever package index
   `worker_init` uses.
 - **AMI**: resolved from SSM for the region and architecture, and only emitted
-  into `config.yaml` when you passed it explicitly. A custom `image_id` must exist
-  in the target region.
+  into `user_config_template.yaml.j2` when you passed it explicitly. A custom
+  `image_id` must exist in the target region.
 
 ### `ResourceNotFoundException` on start
 
-The UUID in `~/.globus_compute/<name>/` no longer exists in the service. Delete
-the directory and re-register:
+The UUID in `~/.globus_compute/<name>/endpoint.json` no longer exists in the
+service. Delete the directory and let the next start register a fresh one:
 
 ```bash
 rm -rf ~/.globus_compute/my_aws_endpoint
-uv run globus-compute-endpoint configure my_aws_endpoint
 ```
 
-Regenerate the config afterwards — `configure` writes a default one.
+Then re-run `generate_endpoint_config()` and start again. Do **not** use
+`globus-compute-endpoint configure` to recreate it — that writes its own
+`config.yaml`, which this package's generator then has to overwrite, and an
+operator who forgets the second step is left with a default endpoint that runs
+nothing on AWS.
 
 ### `TaskExecutionFailed`
 

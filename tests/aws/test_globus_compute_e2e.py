@@ -110,13 +110,24 @@ def _skip_if_no_endpoint_id() -> str:
 # ---------------------------------------------------------------------------
 
 
+_last_start_failure: Optional[str] = None
+
+
 def _start_endpoint(
     endpoint_name: str, timeout: int = ENDPOINT_START_TIMEOUT_S
 ) -> Optional[str]:
     """Start a globus-compute-endpoint and return its UUID.
 
-    Returns None if the endpoint fails to start within *timeout* seconds.
+    Returns None if the endpoint fails to start within *timeout* seconds, and
+    records why in ``_last_start_failure`` so the caller's assertion can report it.
+
+    That reporting is the whole reason this helper is not just a ``subprocess.run``:
+    until #196 the generated config could never start, and the only signal was a
+    warning in the log plus a bare "did not start or register" assertion, which
+    reads like a timeout rather than a rejected config.
     """
+    global _last_start_failure
+    _last_start_failure = None
     try:
         result = subprocess.run(
             ["globus-compute-endpoint", "start", endpoint_name],
@@ -126,9 +137,14 @@ def _start_endpoint(
         )
         logger.info("endpoint start stdout: %s", result.stdout[:500])
         if result.returncode != 0:
-            logger.warning("endpoint start failed: %s", result.stderr[:500])
+            _last_start_failure = (
+                f"`start` exited {result.returncode}\n"
+                f"stdout: {result.stdout[-1500:]}\nstderr: {result.stderr[-1500:]}"
+            )
+            logger.warning("endpoint start failed: %s", _last_start_failure)
             return None
     except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+        _last_start_failure = f"could not run globus-compute-endpoint: {exc}"
         logger.warning("globus-compute-endpoint not available: %s", exc)
         return None
 
@@ -217,14 +233,18 @@ class TestGlobusComputeProviderConfig:
     """Verify GlobusComputeProvider config generation works end-to-end.
 
     These tests exercise the Python layer only (no running Globus Compute
-    service required), verifying that the generated ``config.yaml`` is
-    a valid Globus Compute endpoint config. They are nonetheless marked ``aws``:
-    the provider validates the network IDs at construction, so they cannot run
-    without a real pre-provisioned VPC.
+    service required), verifying that the generated endpoint directory is a valid
+    Globus Compute endpoint config. They are nonetheless marked ``aws``: the
+    provider validates the network IDs at construction, so they cannot run without
+    a real pre-provisioned VPC.
+
+    Since #196 ``generate_endpoint_config()`` returns the path to
+    ``user_config_template.yaml.j2``, which is where the ``engine:`` block and all
+    AWS settings live -- so that is the file these read.
     """
 
     def test_generate_config_standard_mode(self, tmp_path, aws_region, network_ids):
-        """generate_endpoint_config() writes a valid config.yaml for standard mode."""
+        """generate_endpoint_config() writes a valid template for standard mode."""
         provider = _offline_provider(
             tmp_path,
             f"gc-test-{uuid.uuid4().hex[:8]}",
@@ -242,12 +262,15 @@ class TestGlobusComputeProviderConfig:
         assert os.path.isfile(config_path)
         content = Path(config_path).read_text()
         assert "GlobusComputeEngine" in content
-        assert "display_name: E2E Test Endpoint" in content
         assert f"region: {aws_region}" in content
         assert "instance_type: t3.medium" in content
         # The IDs must survive into the config: an endpoint reconstructs the
         # provider from this file and would otherwise hit the #69 guard itself.
         assert network_ids["subnet_id"] in content
+
+        # display_name is the manager's, and lives in the other file.
+        manager = Path(ep_dir) / "config.yaml"
+        assert "display_name: E2E Test Endpoint" in manager.read_text()
 
     def test_generate_config_spot_mode(self, tmp_path, aws_region, network_ids):
         """Config for a spot-instance endpoint includes use_spot: true."""
@@ -282,6 +305,43 @@ class TestGlobusComputeProviderConfig:
         content = Path(config_path).read_text()
         assert "container_type: docker" in content
         assert "python:3.11-slim" in content
+
+    def test_manager_config_passes_the_start_gate(
+        self, tmp_path, aws_region, network_ids
+    ):
+        """The assertion whose absence let #196 ship.
+
+        Every other test here reads the generated *text*, which is exactly the blind
+        spot: the old single-file output was well-formed, internally consistent, and
+        rejected by ``start`` on the first thing it checks. ``start`` accepts a
+        ``ManagerEndpointConfig`` and nothing else, and ``load_config_yaml`` returns
+        that only when there is no top-level ``engine:`` key -- so asserting on the
+        class is asserting on startability.
+
+        Mirrors ``tests/unit/test_globus_config_loading.py``, which does the same
+        without needing real network IDs. Kept here too because this is the file that
+        claims to cover the endpoint lifecycle end to end.
+        """
+        from globus_compute_endpoint.endpoint.config import ManagerEndpointConfig
+        from globus_compute_endpoint.endpoint.config.utils import get_config
+
+        provider = _offline_provider(
+            tmp_path,
+            f"gc-gate-{uuid.uuid4().hex[:8]}",
+            network_ids,
+            region=aws_region,
+            image_id="ami-12345678",
+            display_name="Gate Endpoint",
+        )
+        ep_dir = tmp_path / "gate_ep"
+        provider.generate_endpoint_config(str(ep_dir))
+
+        config = get_config(ep_dir)
+
+        assert isinstance(config, ManagerEndpointConfig)
+        # No provider was constructed on the way here, which is why this test needs
+        # no AWS mocking: a rejected config can no longer leak an IAM pair.
+        assert getattr(config, "engine", None) is None
 
 
 # ---------------------------------------------------------------------------
@@ -502,6 +562,7 @@ class TestGlobusComputeEndpointLifecycle:
         assert endpoint_id, (
             f"Endpoint '{endpoint_name}' did not start or register within "
             f"{ENDPOINT_START_TIMEOUT_S}s"
+            + (f"\n{_last_start_failure}" if _last_start_failure else "")
         )
         logger.info("Endpoint started: id=%s", endpoint_id)
 

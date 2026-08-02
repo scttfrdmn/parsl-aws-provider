@@ -194,10 +194,12 @@ the block quietly falls through to a single on-demand instance
 > **Full guide**: [docs/globus_compute.md](https://scttfrdmn.github.io/parsl-aws-provider/globus_compute.html) — architecture,
 > IAM setup, spot and container examples, multi-region deployment, troubleshooting.
 
-`GlobusComputeProvider` generates the endpoint directory rather than making you
-hand-write YAML, including the `config.py` shim that makes the config loadable at
-all — Globus Compute resolves a provider by attribute lookup on `parsl.providers`,
-which does not know this class until something imports it.
+`GlobusComputeProvider` generates the whole endpoint directory rather than making
+you hand-write YAML — including the two pieces that are easy to get wrong: the
+`engine:` block belongs in `user_config_template.yaml.j2` and not in `config.yaml`,
+or `start` refuses the endpoint outright; and the forked user-endpoint process
+never imports this package, so a `sitecustomize` bootstrap on its `PYTHONPATH` is
+what makes Globus Compute's attribute lookup on `parsl.providers` find the class.
 
 ```bash
 uv sync --extra globus

@@ -1,13 +1,15 @@
 """Unit tests for GlobusComputeProvider.
 
 Verifies config generation for standard, spot, and container variants, the
-``parsl.providers`` registration and ``config.py`` shim that make a generated
-config loadable (#87), and the minimum_iam_policy() helper.
+``parsl.providers`` registration (#87) and the ``sitecustomize`` bootstrap that
+makes it reach the exec'd user-endpoint process (#196), and the
+minimum_iam_policy() helper.
 
 SPDX-License-Identifier: Apache-2.0
 SPDX-FileCopyrightText: 2025-2026 Scott Friedman and Project Contributors
 """
 
+import ast
 import os
 import uuid
 from pathlib import Path
@@ -15,10 +17,11 @@ from unittest.mock import MagicMock, patch
 
 import parsl.providers
 import pytest
+import yaml
 
 from parsl_aws_provider import GlobusComputeProvider
 from parsl_aws_provider.globus_compute import (
-    _CONFIG_PY_SHIM,
+    _BOOTSTRAP_DIRNAME,
     _PROVIDER_TYPE,
     _register_with_parsl_providers,
 )
@@ -200,9 +203,17 @@ class TestGlobusComputeProviderConstruction:
 
 @pytest.mark.unit
 class TestGenerateEndpointConfig:
-    """Verify generate_endpoint_config() writes a correct config.yaml."""
+    """Verify generate_endpoint_config() writes a startable four-file layout.
 
-    def test_creates_directory_and_file(self, tmp_path):
+    Before #196 everything went into one ``config.yaml``, engine block included.
+    That single key is what ``load_config_yaml()`` classifies on: present means
+    ``UserEndpointConfig``, and ``start`` refuses anything that is not a
+    ``ManagerEndpointConfig``. So the output could never be started, and each
+    attempt to debug it leaked another IAM pair. The engine block now lives in
+    ``user_config_template.yaml.j2``, which is what these tests read.
+    """
+
+    def test_creates_directory_and_returns_the_template(self, tmp_path):
         provider = _make_provider(tmp_path)
         endpoint_dir = str(tmp_path / "my_endpoint")
 
@@ -210,50 +221,96 @@ class TestGenerateEndpointConfig:
 
         assert os.path.isdir(endpoint_dir)
         assert os.path.isfile(result_path)
-        assert result_path == str(tmp_path / "my_endpoint" / "config.yaml")
+        assert result_path == str(
+            tmp_path / "my_endpoint" / "user_config_template.yaml.j2"
+        )
 
     def test_returns_absolute_path(self, tmp_path):
         provider = _make_provider(tmp_path)
         result_path = provider.generate_endpoint_config(str(tmp_path / "ep"))
         assert os.path.isabs(result_path)
 
-    def test_config_contains_display_name(self, tmp_path):
+    def test_writes_all_four_files(self, tmp_path):
+        """Every one of them is load-bearing; a missing one is a broken endpoint."""
+        provider = _make_provider(tmp_path)
+        provider.generate_endpoint_config(str(tmp_path / "ep"))
+        ep = tmp_path / "ep"
+
+        assert (ep / "config.yaml").is_file()
+        assert (ep / "user_config_template.yaml.j2").is_file()
+        assert (ep / "user_environment.yaml").is_file()
+        assert (ep / _BOOTSTRAP_DIRNAME / "sitecustomize.py").is_file()
+
+    def test_manager_config_has_no_engine_key(self, tmp_path):
+        """The #196 blocker, asserted at its narrowest.
+
+        ``load_config_yaml`` does ``config_dict.pop("engine", None)`` and picks
+        ``ManagerEndpointConfig`` only when the result is ``None``. One key
+        decides whether the endpoint can start at all.
+        """
+        provider = _make_provider(tmp_path)
+        provider.generate_endpoint_config(str(tmp_path / "ep"))
+        loaded = yaml.safe_load((tmp_path / "ep" / "config.yaml").read_text())
+
+        assert "engine" not in loaded
+
+    def test_manager_config_omits_the_template_path(self, tmp_path):
+        """``user_config_template_path`` must not be emitted.
+
+        Its setter resolves the value against the *process* working directory and
+        raises ``ValueError`` if the result does not exist, so naming the file
+        relatively breaks ``start`` from anywhere but the endpoint directory.
+        Omitting it lets ``Endpoint.user_config_template_path()`` fall back to
+        ``endpoint_dir / "user_config_template.yaml.j2"`` -- the file we wrote.
+        """
+        provider = _make_provider(tmp_path)
+        provider.generate_endpoint_config(str(tmp_path / "ep"))
+        loaded = yaml.safe_load((tmp_path / "ep" / "config.yaml").read_text())
+
+        assert "user_config_template_path" not in loaded
+
+    def test_manager_config_contains_display_name(self, tmp_path):
         provider = _make_provider(tmp_path, display_name="Test Endpoint")
-        config_path = provider.generate_endpoint_config(str(tmp_path / "ep"))
-        content = Path(config_path).read_text()
+        provider.generate_endpoint_config(str(tmp_path / "ep"))
+        content = (tmp_path / "ep" / "config.yaml").read_text()
         assert "display_name: Test Endpoint" in content
 
-    def test_config_contains_engine_type(self, tmp_path):
+    def test_template_contains_engine_type(self, tmp_path):
         provider = _make_provider(tmp_path)
-        config_path = provider.generate_endpoint_config(str(tmp_path / "ep"))
-        content = Path(config_path).read_text()
+        content = Path(
+            provider.generate_endpoint_config(str(tmp_path / "ep"))
+        ).read_text()
         assert "type: GlobusComputeEngine" in content
 
-    def test_config_contains_provider_type(self, tmp_path):
+    def test_template_contains_provider_type(self, tmp_path):
         provider = _make_provider(tmp_path)
-        config_path = provider.generate_endpoint_config(str(tmp_path / "ep"))
-        content = Path(config_path).read_text()
+        content = Path(
+            provider.generate_endpoint_config(str(tmp_path / "ep"))
+        ).read_text()
         assert f"type: {_PROVIDER_TYPE}" in content
 
-    def test_config_contains_region(self, tmp_path):
+    def test_template_contains_region(self, tmp_path):
         provider = _make_provider(tmp_path)
-        config_path = provider.generate_endpoint_config(str(tmp_path / "ep"))
-        content = Path(config_path).read_text()
+        content = Path(
+            provider.generate_endpoint_config(str(tmp_path / "ep"))
+        ).read_text()
         assert "region: us-east-1" in content
 
-    def test_config_contains_instance_type(self, tmp_path):
+    def test_template_contains_instance_type(self, tmp_path):
         provider = _make_provider(tmp_path)
-        config_path = provider.generate_endpoint_config(str(tmp_path / "ep"))
-        content = Path(config_path).read_text()
+        content = Path(
+            provider.generate_endpoint_config(str(tmp_path / "ep"))
+        ).read_text()
         assert "instance_type: t3.micro" in content
 
-    def test_config_contains_mode(self, tmp_path):
+    def test_template_contains_mode(self, tmp_path):
         provider = _make_provider(tmp_path)
-        config_path = provider.generate_endpoint_config(str(tmp_path / "ep"))
-        content = Path(config_path).read_text()
+        content = Path(
+            provider.generate_endpoint_config(str(tmp_path / "ep"))
+        ).read_text()
         assert "mode: standard" in content
 
-    def test_config_encrypted_flag(self, tmp_path):
+    def test_template_encrypted_flag(self, tmp_path):
         """False by default, and reflects the constructor argument (#138).
 
         This asserted ``true`` while the value was hardcoded, which is how a
@@ -262,12 +319,12 @@ class TestGenerateEndpointConfig:
         ``FileNotFoundError`` before registering (#62).
         """
         provider = _make_provider(tmp_path)
-        config_path = provider.generate_endpoint_config(str(tmp_path / "ep"))
-        assert "encrypted: false" in Path(config_path).read_text()
+        path = provider.generate_endpoint_config(str(tmp_path / "ep"))
+        assert "encrypted: false" in Path(path).read_text()
 
         explicit = _make_provider(tmp_path, encrypted=True)
-        config_path = explicit.generate_endpoint_config(str(tmp_path / "ep2"))
-        assert "encrypted: true" in Path(config_path).read_text()
+        path = explicit.generate_endpoint_config(str(tmp_path / "ep2"))
+        assert "encrypted: true" in Path(path).read_text()
 
     def test_existing_directory_is_ok(self, tmp_path):
         """Calling generate_endpoint_config twice does not raise."""
@@ -277,21 +334,41 @@ class TestGenerateEndpointConfig:
         # Second call should overwrite without error
         provider.generate_endpoint_config(ep_dir)
 
-    def test_todo_placeholder_when_no_endpoint_id(self, tmp_path):
-        """When endpoint_id is None the config includes a TODO reminder."""
-        provider = _make_provider(tmp_path)
-        assert provider.endpoint_id is None
-        config_path = provider.generate_endpoint_config(str(tmp_path / "ep"))
-        content = Path(config_path).read_text()
-        assert "TODO" in content
+    def test_endpoint_id_is_never_a_top_level_config_key(self, tmp_path):
+        """``BaseConfig`` rejects ``endpoint_id`` -- it is not a Globus config field.
 
-    def test_endpoint_id_written_when_set(self, tmp_path):
+        It stays legal where it is emitted, nested under ``engine.provider``, because
+        there it binds to a ``GlobusComputeProvider`` kwarg. At the top level of
+        either file it would raise ``Unexpected keyword argument``, which is exactly
+        what the old output's ``TODO`` instructed the reader to do.
+        """
         ep_id = str(uuid.uuid4())
         provider = _make_provider(tmp_path, endpoint_id=ep_id)
-        config_path = provider.generate_endpoint_config(str(tmp_path / "ep"))
-        content = Path(config_path).read_text()
+        provider.generate_endpoint_config(str(tmp_path / "ep"))
+
+        for name in ("config.yaml", "user_config_template.yaml.j2"):
+            loaded = yaml.safe_load((tmp_path / "ep" / name).read_text())
+            assert "endpoint_id" not in loaded
+
+        template = yaml.safe_load(
+            (tmp_path / "ep" / "user_config_template.yaml.j2").read_text()
+        )
+        assert template["engine"]["provider"]["endpoint_id"] == ep_id
+
+    def test_endpoint_id_is_surfaced_as_a_start_flag(self, tmp_path):
+        """It is reachable by the manager too, via ``--endpoint-uuid``.
+
+        The manager writes the UUID to ``endpoint.json``; that flag is the only way
+        to supply a pre-existing one, so ``config.yaml`` says so rather than
+        pretending there is a key for it.
+        """
+        ep_id = str(uuid.uuid4())
+        provider = _make_provider(tmp_path, endpoint_id=ep_id)
+        provider.generate_endpoint_config(str(tmp_path / "ep"))
+        content = (tmp_path / "ep" / "config.yaml").read_text()
+
         assert ep_id in content
-        assert "TODO" not in content
+        assert "--endpoint-uuid" in content
 
     def test_network_ids_written(self, tmp_path):
         """The IDs #69 made required appear in the provider block.
@@ -307,37 +384,68 @@ class TestGenerateEndpointConfig:
         assert "subnet_id: subnet-test001" in content
         assert "security_group_id: sg-test00001" in content
 
-    def test_writes_config_py_shim(self, tmp_path):
-        """``config.py`` is written alongside ``config.yaml`` (#87)."""
-        provider = _make_provider(tmp_path)
-        provider.generate_endpoint_config(str(tmp_path / "ep"))
-        assert (tmp_path / "ep" / "config.py").is_file()
+    def test_bootstrap_imports_the_package(self, tmp_path):
+        """The whole purpose of the bootstrap is the registering import.
 
-    def test_shim_imports_the_package(self, tmp_path):
-        """The shim's whole purpose is the import that registers the class."""
-        provider = _make_provider(tmp_path)
-        provider.generate_endpoint_config(str(tmp_path / "ep"))
-        shim = (tmp_path / "ep" / "config.py").read_text()
-        assert "import parsl_aws_provider" in shim
-        assert "load_config_yaml" in shim
-
-    def test_shim_defines_module_level_config(self, tmp_path):
-        """``_load_config_py`` reads a module-level ``config``; compile the shim.
-
-        Compiling proves the generated file is syntactically valid without
-        executing it (execution would need globus-compute-endpoint installed).
+        The manager forks and ``execvpe``s a fresh interpreter for the user
+        endpoint, which reads its config from stdin -- so nothing in this package
+        is imported there and the bare ``GlobusComputeProvider`` name does not
+        resolve. ``sitecustomize`` runs during ``site`` initialisation, before any
+        user code, which is early enough.
         """
         provider = _make_provider(tmp_path)
         provider.generate_endpoint_config(str(tmp_path / "ep"))
-        shim_path = tmp_path / "ep" / "config.py"
-        compile(shim_path.read_text(), str(shim_path), "exec")
-        assert "\nconfig = " in _CONFIG_PY_SHIM
+        bootstrap = tmp_path / "ep" / _BOOTSTRAP_DIRNAME / "sitecustomize.py"
 
-    def test_returned_path_is_the_yaml_not_the_shim(self, tmp_path):
-        """The return value stays the file a caller would edit."""
+        assert "import parsl_aws_provider" in bootstrap.read_text()
+        compile(bootstrap.read_text(), str(bootstrap), "exec")
+
+    def test_bootstrap_does_not_re_raise(self, tmp_path):
+        """A missing package must not break every interpreter on the PYTHONPATH.
+
+        ``sitecustomize`` is imported by *any* process that inherits the path.
+        Raising there would take out unrelated commands; the endpoint failing
+        with "not a valid provider" is the narrower blast radius.
+        """
         provider = _make_provider(tmp_path)
-        result = provider.generate_endpoint_config(str(tmp_path / "ep"))
-        assert result.endswith("config.yaml")
+        provider.generate_endpoint_config(str(tmp_path / "ep"))
+        source = (tmp_path / "ep" / _BOOTSTRAP_DIRNAME / "sitecustomize.py").read_text()
+
+        # Parsed rather than grepped: the file's own comment says "re-raised".
+        tree = ast.parse(source)
+        assert not [n for n in ast.walk(tree) if isinstance(n, ast.Raise)]
+        assert "file=sys.stderr" in source
+
+    def test_user_environment_points_at_the_bootstrap(self, tmp_path):
+        """The only seam into the exec'd child is ``user_environment.yaml``.
+
+        The manager reads it and merges it into ``env`` immediately before
+        ``os.execvpe``. The path must be absolute: the child's working directory
+        is not the endpoint directory.
+        """
+        provider = _make_provider(tmp_path)
+        provider.generate_endpoint_config(str(tmp_path / "ep"))
+        loaded = yaml.safe_load((tmp_path / "ep" / "user_environment.yaml").read_text())
+
+        expected = tmp_path.resolve() / "ep" / _BOOTSTRAP_DIRNAME
+        assert loaded["PYTHONPATH"] == str(expected)
+        assert os.path.isabs(loaded["PYTHONPATH"])
+
+    def test_a_stale_config_py_is_removed(self, tmp_path):
+        """``get_config`` prefers ``config.py``, so leaving one keeps the bug.
+
+        Anyone regenerating a directory built before #196 would otherwise get the
+        fix on disk and the old unstartable shape at load time.
+        """
+        ep = tmp_path / "ep"
+        ep.mkdir()
+        stale = ep / "config.py"
+        stale.write_text("config = None\n")
+
+        provider = _make_provider(tmp_path)
+        provider.generate_endpoint_config(str(ep))
+
+        assert not stale.exists()
 
 
 # ---------------------------------------------------------------------------
