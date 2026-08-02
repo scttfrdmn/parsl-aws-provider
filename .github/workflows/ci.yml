@@ -126,8 +126,8 @@ jobs:
         # two together, deliberately -- they had drifted, this pin sitting on
         # 0.76.0 while compose moved to 0.82.0, so CI was validating against an
         # emulator six releases older than the one developers ran. See that file
-        # for what 0.85.0 fixes.
-        image: ghcr.io/scttfrdmn/substrate:0.85.0
+        # for what each release fixes.
+        image: ghcr.io/scttfrdmn/substrate:0.87.0
         ports:
           - 4566:4566
         # No `--health-cmd`. The image is Alpine and ships no curl, and GitHub
@@ -147,9 +147,10 @@ jobs:
         # Now gating. This carried `continue-on-error: true` while #92's debt was
         # outstanding -- 46 mode constructions omitted the network IDs #69 made
         # required, so the suite could not pass and gating would have made every
-        # PR red. #92 closed in v0.8.0 and the suite is green (130 passed, 1
-        # skipped against substrate 0.85.0), so the exemption now only hides
-        # regressions.
+        # PR red. #92 closed in v0.8.0 and the suite is green (131 passed, 0
+        # skipped against substrate 0.87.0 -- 130 passed and 1 skipped on 0.85.0,
+        # the skip being the CloudFormation guard that lifted itself when
+        # substrate#483 landed), so the exemption now only hides regressions.
         env:
           # Structural, not secret: substrate authenticates against nothing, but
           # botocore refuses to sign a request without credentials present.
