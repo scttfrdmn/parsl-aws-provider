@@ -1,188 +1,203 @@
-# Parsl AWS Provider with Universal Connectivity
+# Parsl AWS Provider
 
-**Deploy parallel computing on AWS from any network environment - corporate firewalls, university networks, home routers - no IT coordination required.**
+**Ephemeral AWS compute for [Parsl](https://parsl.readthedocs.io/) — EC2, Spot
+Fleet, Lambda, or Fargate, scaled from zero and torn down when you are done.**
 
+[![CI](https://github.com/scttfrdmn/parsl-aws-provider/actions/workflows/ci.yml/badge.svg)](https://github.com/scttfrdmn/parsl-aws-provider/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
-[![Python](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
-[![AWS](https://img.shields.io/badge/AWS-SSM%20%7C%20EC2%20%7C%20S3-orange.svg)](https://aws.amazon.com/)
-[![Parsl](https://img.shields.io/badge/Parsl-Compatible-green.svg)](https://parsl.readthedocs.io/)
-[![Globus](https://img.shields.io/badge/Globus%20Compute-Integrated-purple.svg)](https://globus-compute.readthedocs.io/)
-[![Docker](https://img.shields.io/badge/Docker-Container%20Support-blue.svg)](https://www.docker.com/)
-[![Status](https://img.shields.io/badge/Status-Alpha-yellow.svg)](CHANGELOG.md)
+[![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
+[![Docs](https://img.shields.io/badge/docs-github.io-blue.svg)](https://scttfrdmn.github.io/parsl-aws-provider/)
+[![Status](https://img.shields.io/badge/Status-Alpha-yellow.svg)](https://github.com/scttfrdmn/parsl-aws-provider/blob/main/CHANGELOG.md)
 
-> **Independent project.** This is an unaffiliated, community-maintained package. It
-> is **not** an official or endorsed product of Amazon Web Services, the Parsl
+> **Independent project.** This is unaffiliated, community-maintained work. It is
+> **not** an official or endorsed product of Amazon Web Services, the Parsl
 > project, or Globus. It is not the AWS provider that ships with Parsl — that is
-> `parsl.providers.AWSProvider`, maintained by the Parsl project. See
-> [NOTICE](NOTICE) for trademark attribution.
+> `parsl.providers.AWSProvider`, maintained by the Parsl project, with a different
+> configuration contract. See [NOTICE](https://github.com/scttfrdmn/parsl-aws-provider/blob/main/NOTICE) for trademark attribution.
 
-## 🚀 What This Enables
+> **Alpha.** The public interface is settling but not settled, and several paths
+> are covered only against mocks and a local emulator rather than real AWS —
+> [#166](https://github.com/scttfrdmn/parsl-aws-provider/issues/166) tracks which.
+> Everything here creates billable resources.
 
-✅ **Universal Connectivity**: Deploy from behind any firewall or NAT
-✅ **Container Execution**: Full Docker support with reproducible environments
-✅ **Real Scientific Computing**: 2M+ operations/second validated performance
-✅ **Zero Configuration**: No local network changes required
-✅ **Production Ready**: End-to-end containerized execution verified
+## What it gives you
 
-## 🌐 Network Environment Support
+- **Three operating modes.** `standard` (your client talks to the workers),
+  `detached` (a bastion owns the worker lifecycle so your client can disconnect),
+  and `serverless` (Lambda or ECS/Fargate, no instances at all).
+- **Scale to zero.** `min_blocks=0` means nothing runs, and nothing bills, when
+  nothing is queued.
+- **Spot, with diversification.** Multiple instance types through the EC2 Fleet
+  API, `price-capacity-optimized` allocation, and interruption warnings delivered
+  two minutes ahead over EventBridge and SQS.
+- **No AMI to pick.** Amazon Linux 2023 is resolved from AWS's public SSM
+  parameters for your region and your instance type's architecture — x86_64 and
+  Graviton alike.
+- **State that outlives the process.** A local file, S3, or SSM Parameter Store,
+  so a later session can adopt a running workflow.
+- **Globus Compute endpoints**, via `GlobusComputeProvider`, which generates the
+  endpoint directory for you.
 
-**Confirmed Working From:**
-- Corporate networks with restrictive firewalls
-- University campuses with complex network policies
-- Home networks behind NAT routers
-- Hotel/conference WiFi with heavy restrictions
-- VPN environments (corporate and institutional)
+## Install
 
-**Zero Local Configuration Required:**
-- No firewall rule modifications
-- No port forwarding setup
-- No IT department coordination
-- No public IP requirements
-
-## 📊 Quick Performance Validation
-
-```bash
-# Test universal connectivity + real computation
-git clone https://github.com/scttfrdmn/parsl-aws-provider
-cd parsl-aws-provider
-uv sync --extra dev --extra test
-uv run python examples/standard_mode.py
-
-# Expected output:
-# 🎉 REAL COMPUTE TEST SUCCESS
-# ✅ 2,031,877 operations/second on AWS
-# ✅ SSH reverse tunneling working with real workloads
-```
-
-## 🛠️ Installation and Setup
-
-### Prerequisites
+Not yet on PyPI ([#180](https://github.com/scttfrdmn/parsl-aws-provider/issues/180)),
+so install from the repository:
 
 ```bash
-# 1. AWS Account with programmatic access
-aws configure
-# Enter: Access Key ID, Secret Access Key, region (e.g. us-east-1)
-
-# 2. Python 3.10+
-pip install parsl boto3
+uv add git+https://github.com/scttfrdmn/parsl-aws-provider
 ```
 
-### Quick Start: Standard Parallel Computing
+Python 3.10 or newer (Parsl 2026.x dropped 3.9). This project manages
+environments with [uv](https://docs.astral.sh/uv/); from a clone, `uv sync --extra
+dev --extra test`.
+
+## Before your first run
+
+Two prerequisites are easy to miss, and each one produces a failure that does not
+look like its cause.
+
+**1. You supply the network.** Since v0.7.0 the provider creates and deletes no
+network resources: `vpc_id`, `subnet_id`, and `security_group_id` are required and
+validated against AWS at construction. See
+[network-prerequisites.md](https://scttfrdmn.github.io/parsl-aws-provider/network-prerequisites.html).
+
+**2. In standard mode your client must be reachable.** Parsl's HTEX workers dial
+*outbound* to an interchange that runs next to your client, so the client has to
+accept **inbound TCP on ports 54000–55000** from the workers. A laptop behind a
+home or office NAT cannot, and there is no tunnel that changes that — the workers
+will launch, never register, and time out. Run the client on EC2 in the same VPC,
+or use `mode="detached"`, where a bastion does the coordinating and nothing needs
+to reach your client.
+
+Construction itself calls AWS — it creates a launch template and validates those
+IDs — so it needs working credentials, and it is not free.
+
+## Quick start
 
 ```python
-from phase15_enhanced import AWSProvider
+import parsl
 from parsl.config import Config
 from parsl.executors import HighThroughputExecutor
-import parsl
+from parsl_aws_provider import EphemeralAWSProvider
 
-# Configure AWS provider - works from any network
-provider = AWSProvider(
+provider = EphemeralAWSProvider(
     region="us-east-1",
-    instance_type="c5.large",      # Choose your instance type
-    enable_ssm_tunneling=True,     # Enable universal connectivity
-    init_blocks=1,
-    max_blocks=5
+    vpc_id="vpc-0123456789abcdef0",
+    subnet_id="subnet-0123456789abcdef0",
+    security_group_id="sg-0123456789abcdef0",
+    instance_type="c5.large",
+    min_blocks=0,
+    max_blocks=5,
 )
 
-config = Config(executors=[
-    HighThroughputExecutor(label='aws_executor', provider=provider)
-])
+config = Config(
+    executors=[
+        HighThroughputExecutor(
+            label="aws_executor",
+            provider=provider,
+            # CurveZMQ certificates are generated in the client's run_dir, which
+            # remote workers cannot read, so they would fail to register with no
+            # useful error. Same-VPC deployments rely on VPC isolation instead;
+            # certificate distribution is #62.
+            encrypted=False,
+        )
+    ]
+)
 
 parsl.load(config)
 
-# Define computational work
+
 @parsl.python_app
-def scientific_computation(dataset_size):
+def integrate(n):
     import math
-    import time
 
-    start = time.time()
-    result = sum(math.sqrt(i * 2.5) * math.sin(i / 1000.0) for i in range(dataset_size))
+    return sum(math.sqrt(i) for i in range(n))
 
-    return {
-        'result': result,
-        'compute_time': time.time() - start,
-        'ops_per_second': dataset_size / (time.time() - start)
-    }
 
-# Execute on AWS
-futures = [scientific_computation(100000) for _ in range(10)]
-results = [f.result() for f in futures]
-
-for i, result in enumerate(results):
-    print(f"Task {i}: {result['ops_per_second']:,.0f} ops/sec")
-
-parsl.clear()
+try:
+    futures = [integrate(100_000) for _ in range(10)]
+    print([f.result() for f in futures])
+finally:
+    parsl.clear()
+    # Not optional: parsl.clear() releases Parsl's resources, not AWS ones, and
+    # there is no atexit hook. Omitting this leaves instances running.
+    provider.shutdown()
 ```
 
-### Quick Start: Container-Based Computing
+Credentials come from anywhere botocore looks — environment variables,
+`~/.aws/credentials`, or an instance profile on EC2. Pass
+`profile_name="myprofile"` to select a named profile; the provider accepts no key
+arguments.
+
+## Operating modes
+
+`mode` is a **string**. Full details in
+[operating_modes.md](https://scttfrdmn.github.io/parsl-aws-provider/operating_modes.html).
 
 ```python
-from container_executor import ContainerHighThroughputExecutor
-from phase15_enhanced import AWSProvider
-import parsl
-
-# Container executor with scientific software
-container_executor = ContainerHighThroughputExecutor(
-    label="science_containers",
-    provider=AWSProvider(
-        enable_ssm_tunneling=True,
-        instance_type="c5.xlarge",
-        region="us-east-1"
-    ),
-    container_image="continuumio/miniconda3:latest",
-    container_runtime="docker",
-    max_workers_per_node=1
+# Detached: a bastion owns the workers, so the client may disconnect and reconnect.
+provider = EphemeralAWSProvider(
+    mode="detached",
+    region="us-east-1",
+    vpc_id="vpc-0123456789abcdef0",
+    subnet_id="subnet-0123456789abcdef0",
+    security_group_id="sg-0123456789abcdef0",
+    instance_type="m5.large",
+    bastion_instance_type="t3.micro",
+    state_store_type="parameter_store",   # readable by client and bastion alike
+    parameter_store_path="/parsl/my-workflow-state",
 )
-
-config = parsl.Config(executors=[container_executor])
-parsl.load(config)
-
-@parsl.python_app
-def containerized_analysis():
-    """Scientific analysis in reproducible container environment."""
-    import os
-    import subprocess
-
-    # Verify container execution
-    in_container = os.path.exists("/.dockerenv")
-
-    # Install scientific packages in container
-    subprocess.run(['conda', 'install', '-y', 'numpy', 'scipy'],
-                   capture_output=True, check=True)
-
-    import numpy as np
-
-    # NumPy computation with full isolation
-    matrix = np.random.rand(1000, 1000)
-    eigenvalues = np.linalg.eigvals(matrix)
-
-    return {
-        "in_container": in_container,
-        "eigenvalue_count": len(eigenvalues),
-        "max_eigenvalue": float(np.max(eigenvalues)),
-        "analysis_complete": True
-    }
-
-result = containerized_analysis().result()
-print(f"✅ Container execution: {result['in_container']}")
-print(f"🔬 Analysis: {result['eigenvalue_count']} eigenvalues computed")
-
-parsl.clear()
 ```
 
-## 🌐 Globus Compute Integration
+```python
+# Serverless: Lambda needs no network IDs at all; ECS/Fargate needs subnet + SG.
+provider = EphemeralAWSProvider(
+    mode="serverless",
+    region="us-east-1",
+    compute_type="lambda",   # or "ecs"
+    memory_size=1024,        # MB
+    timeout=300,             # seconds
+    max_blocks=100,
+)
+```
 
-> **Full guide**: [docs/globus_compute.md](docs/globus_compute.md) — architecture,
-> IAM setup, spot/container examples, multi-region deployment, and troubleshooting.
+To reconnect to a detached workflow, construct a provider against the **same**
+state location: the `provider_id`, the bastion, and the job map are adopted
+automatically. Note that `preserve_bastion` defaults to `True`, so the bastion
+keeps running — and keeps billing — after `shutdown()`. That is what makes
+adoption possible; pass `preserve_bastion=False` to tear it down instead.
 
-Run functions on ephemeral EC2 from any network — including behind a NAT, which
-standard mode cannot do.
+## Spot instances
 
-### Endpoint Configuration
+```python
+provider = EphemeralAWSProvider(
+    region="us-east-1",
+    vpc_id="vpc-0123456789abcdef0",
+    subnet_id="subnet-0123456789abcdef0",
+    security_group_id="sg-0123456789abcdef0",
+    use_spot=True,
+    use_spot_fleet=True,   # both flags are required; see below
+    instance_types=["c5.large", "c5a.large", "m5.large"],
+    spot_max_price_percentage=80,      # cap at 80% of on-demand
+    spot_interruption_handling=True,   # act on the two-minute warning
+)
+```
 
-Generate the endpoint directory from the provider rather than hand-writing YAML.
-It writes both files Globus Compute needs, and needs no edits to start:
+Diversifying across instance types materially reduces interruption rates. **Both
+spot flags are required**: `use_spot_fleet=True` alone builds no fleet manager and
+the block quietly falls through to a single on-demand instance
+([#137](https://github.com/scttfrdmn/parsl-aws-provider/issues/137)). See
+[spot_fleet.md](https://scttfrdmn.github.io/parsl-aws-provider/spot_fleet.html).
+
+## Globus Compute
+
+> **Full guide**: [docs/globus_compute.md](https://scttfrdmn.github.io/parsl-aws-provider/globus_compute.html) — architecture,
+> IAM setup, spot and container examples, multi-region deployment, troubleshooting.
+
+`GlobusComputeProvider` generates the endpoint directory rather than making you
+hand-write YAML, including the `config.py` shim that makes the config loadable at
+all — Globus Compute resolves a provider by attribute lookup on `parsl.providers`,
+which does not know this class until something imports it.
 
 ```bash
 uv sync --extra globus
@@ -198,7 +213,6 @@ provider = GlobusComputeProvider(
     subnet_id="subnet-0123456789abcdef0",
     security_group_id="sg-0123456789abcdef0",
     instance_type="c5.large",
-    mode="standard",
     auto_create_instance_profile=True,
     min_blocks=0,
     max_blocks=20,
@@ -212,510 +226,164 @@ provider.generate_endpoint_config("~/.globus_compute/aws_research_endpoint")
 uv run globus-compute-endpoint start aws_research_endpoint
 ```
 
-The `config.py` shim written alongside `config.yaml` is what makes the config
-loadable at all — Globus Compute resolves a provider by attribute lookup on
-`parsl.providers`, which does not know this class until something imports it.
+Because a Globus Compute endpoint reaches *outbound* to the Globus service, this
+is also the way to drive AWS workers from a client that cannot accept inbound
+connections.
 
-### Function Execution
+## Moving data
 
-```python
-from globus_compute_sdk import Client
-
-def research_computation(dataset_params):
-    """Scientific function for remote execution."""
-    import math
-    import time
-
-    start_time = time.time()
-
-    # Scientific computation
-    results = []
-    for i in range(dataset_params['sample_count']):
-        value = math.sqrt(i * dataset_params['scale_factor']) * math.sin(i / 1000)
-        results.append(value)
-
-    analysis = {
-        'sample_count': len(results),
-        'mean': sum(results) / len(results),
-        'max': max(results),
-        'computation_time': time.time() - start_time
-    }
-
-    return analysis
-
-# Submit function to AWS endpoint
-gc = Client()
-endpoint_id = "your-aws-endpoint-uuid"
-
-task_id = gc.run(
-    research_computation,
-    endpoint_id=endpoint_id,
-    dataset_params={'sample_count': 50000, 'scale_factor': 2.5}
-)
-
-result = gc.get_result(task_id)
-print(f"🧬 Research complete: {result['sample_count']} samples analyzed")
-```
-
-## 📁 Efficient Data Movement
-
-**Optimal Architecture**: SSH tunnels for coordination, S3/HTTPS for data
-
-### S3 Data Flow Pattern
+Keep bulk data out of the Parsl control channel: have workers pull from S3 or
+HTTPS directly, and return summaries.
 
 ```python
+from parsl import bash_app
+
+
 @bash_app
 def process_s3_dataset(s3_input_uri, s3_output_uri):
-    """Download from S3, process, upload results - no tunnel bandwidth waste."""
+    """Large data over S3 (AWS-internal); only the completion message goes back."""
     return f"""
-    # Download data (AWS-internal, high bandwidth)
-    aws s3 cp {s3_input_uri} /tmp/dataset.csv --region us-east-1
-
-    # Process locally on AWS instance
-    python3 << 'EOF'
-import csv
-import json
-import statistics
-
-# Load and analyze data
-with open('/tmp/dataset.csv', 'r') as f:
-    reader = csv.DictReader(f)
-    data = list(reader)
-
-# Statistical analysis
-numerical_data = [float(row['value']) for row in data if row.get('value')]
-analysis = {{
-    'sample_count': len(data),
-    'mean': statistics.mean(numerical_data),
-    'std_dev': statistics.stdev(numerical_data),
-    'analysis_complete': True
-}}
-
-with open('/tmp/results.json', 'w') as f:
-    json.dump(analysis, f, indent=2)
-EOF
-
-    # Upload results (AWS-internal, high bandwidth)
-    aws s3 cp /tmp/results.json {s3_output_uri} --region us-east-1
-
-    echo "Analysis complete: {s3_output_uri}"
-    """
-
-# Usage: Large data via S3, coordination via tunnel
-result = process_s3_dataset(
-    "s3://my-research-bucket/large_dataset.csv",
-    "s3://my-research-bucket/analysis_results.json"
-).result()
-```
-
-### Public Data via HTTPS
-
-```python
-@python_app
-def analyze_public_dataset(dataset_url):
-    """Download public research data via HTTPS and analyze."""
-    import urllib.request
-    import json
-    import csv
-
-    # Download directly to AWS worker (no tunnel)
-    urllib.request.urlretrieve(dataset_url, "/tmp/public_data.csv")
-
-    # Analyze
-    with open("/tmp/public_data.csv", 'r') as f:
-        reader = csv.DictReader(f)
-        data = list(reader)
-
-    # Return analysis summary (small message via tunnel)
-    return {
-        'dataset_url': dataset_url,
-        'record_count': len(data),
-        'columns': list(data[0].keys()) if data else [],
-        'analysis_complete': True
-    }
-```
-
-See [`docs/examples.md`](docs/examples.md) for data flow patterns.
-
-## 🐳 Container Support
-
-Full Docker container execution with proper networking:
-
-```python
-from container_executor import ContainerHighThroughputExecutor
-
-# Bioinformatics container
-bio_executor = ContainerHighThroughputExecutor(
-    provider=AWSProvider(enable_ssm_tunneling=True),
-    container_image="biocontainers/blast:2.12.0_cv1",
-    container_runtime="docker"
-)
-
-@parsl.python_app
-def blast_analysis(sequence):
-    """BLAST analysis in containerized environment."""
-    import subprocess
-    import os
-
-    # Verify container execution
-    in_container = os.path.exists("/.dockerenv")
-
-    # Use pre-installed BLAST tools
-    result = subprocess.run([
-        "blastp", "-query", "/tmp/query.fasta",
-        "-subject", "/tmp/query.fasta", "-outfmt", "6"
-    ], capture_output=True, text=True)
-
-    return {
-        "in_container": in_container,
-        "blast_results": result.stdout,
-        "analysis_complete": True
-    }
-```
-
-## 🏗️ Architecture
-
-### SSH Reverse Tunneling over AWS SSM
-
-```
-┌─────────────────┐    SSH over SSM    ┌──────────────────┐
-│ Local Controller│ ◄──────────────── │ AWS EC2 Instance │
-│                 │                    │                  │
-│ Parsl           │                    │ ┌──────────────┐ │
-│ Interchange     │                    │ │ Docker       │ │
-│ :54809          │                    │ │ Container    │ │
-│                 │                    │ │ --network    │ │
-│                 │ ────────────────── │ │ host         │ │
-└─────────────────┘   127.0.0.1:54809  │ │ Parsl Worker │ │
-                                       │ └──────────────┘ │
-                                       └──────────────────┘
-```
-
-**Key Innovation**: Uses AWS SSM as transport for SSH reverse tunnels, enabling bidirectional communication through any firewall without local configuration.
-
-### Data Flow Architecture
-
-```
-Control Flow (SSH Tunnels):          Data Flow (S3/HTTPS):
-┌─────────────────┐                   ┌─────────────────┐
-│ Job Submission  │ ────SSH Tunnel──► │ Large Datasets  │
-│ Worker Status   │ ◄──SSH Tunnel──── │ Result Files    │
-│ Error Messages  │                   │ Public Data     │
-│ (lightweight)   │                   │ (high bandwidth)│
-└─────────────────┘                   └─────────────────┘
-```
-
-## 📋 Configuration Options
-
-### Basic Provider Configuration
-
-```python
-provider = AWSProvider(
-    # AWS Settings
-    region="us-east-1",                    # AWS region
-    instance_type="c5.large",              # EC2 instance type
-    ami_id="ami-0cab818949226441f",        # Custom AMI (optional)
-
-    # Connectivity
-    enable_ssm_tunneling=True,             # Universal connectivity
-
-    # Scaling
-    init_blocks=1,                         # Initial instances
-    max_blocks=10,                         # Maximum instances
-    min_blocks=0,                          # Minimum instances
-
-    # Python Environment
-    python_version="3.10",                 # Python version
-    worker_init="pip install numpy",       # Worker setup commands
-)
-```
-
-### Container Executor Configuration
-
-```python
-from container_executor import ContainerHighThroughputExecutor
-
-container_executor = ContainerHighThroughputExecutor(
-    label="container_work",
-    provider=AWSProvider(enable_ssm_tunneling=True),
-
-    # Container Settings
-    container_image="python:3.10-slim",    # Docker image
-    container_runtime="docker",            # Runtime (docker/podman)
-    container_options="--network host",    # Docker options
-
-    # Execution
-    max_workers_per_node=1,                # Workers per instance
-)
-```
-
-### Instance Type Examples
-
-```python
-# Compute-optimized
-instance_type="c5.4xlarge"     # 16 vCPUs, 32 GB RAM
-
-# Memory-optimized
-instance_type="r5.2xlarge"     # 8 vCPUs, 64 GB RAM
-
-# GPU instances
-instance_type="g4dn.xlarge"    # 4 vCPUs, 16 GB RAM, 1 GPU
-
-# ARM-based (cost-optimized)
-instance_type="c7g.large"      # 2 vCPUs, 4 GB RAM (Graviton)
-```
-
-## 💾 Data Movement Patterns
-
-### Pattern 1: S3 Data Processing
-
-```python
-@bash_app
-def process_s3_research_data(s3_input_uri, s3_output_uri):
-    """Efficient: Large data via S3, coordination via SSH tunnel."""
-    return f"""
-    # Download from S3 (AWS-internal, fast)
     aws s3 cp {s3_input_uri} /tmp/data.csv
-
-    # Process on AWS instance
-    python3 analysis_script.py /tmp/data.csv /tmp/results.json
-
-    # Upload results to S3 (AWS-internal, fast)
+    python3 /opt/analysis.py /tmp/data.csv /tmp/results.json
     aws s3 cp /tmp/results.json {s3_output_uri}
-
-    echo "Complete"  # Only this message via SSH tunnel
     """
-
-# Process 1GB dataset efficiently
-result = process_s3_research_data(
-    "s3://research-bucket/large_dataset.csv",
-    "s3://research-bucket/results/analysis.json"
-).result()
 ```
 
-### Pattern 2: Public Data via HTTPS
+The instance profile must carry the S3 permissions for this; see
+[security.md](https://scttfrdmn.github.io/parsl-aws-provider/security.html). More patterns in
+[docs/examples.md](https://scttfrdmn.github.io/parsl-aws-provider/examples.html).
+
+## Worker setup
+
+`worker_init` runs on each worker through cloud-init, as root — no `sudo`, no
+shebang. The default installs Python 3.11 and Parsl on Amazon Linux 2023 and
+nothing else.
 
 ```python
-@python_app
-def analyze_public_dataset(dataset_url):
-    """Download public data directly, bypass SSH tunnel."""
-    import urllib.request
-    import json
-    import csv
-
-    # Download directly to AWS worker
-    urllib.request.urlretrieve(dataset_url, "/tmp/public_data.csv")
-
-    # Process and return summary
-    with open("/tmp/public_data.csv", 'r') as f:
-        reader = csv.DictReader(f)
-        data = list(reader)
-
-    return {
-        'source_url': dataset_url,
-        'record_count': len(data),
-        'analysis_complete': True
-    }
+provider = EphemeralAWSProvider(
+    # ... network options ...
+    worker_init="""
+        dnf install -y python3.11 python3.11-pip
+        ln -sf /usr/bin/python3.11 /usr/bin/python3
+        pip3.11 install --quiet --upgrade parsl numpy scipy
+    """,
+)
 ```
 
-## 📖 Usage Examples
+If that is slow, `bake_ami=True` (standard mode) runs it once into a custom AMI
+instead of on every launch.
 
-### Scientific Computing Examples
+## Cleaning up
 
-| Example | Description | File |
-|---------|-------------|------|
-| **Standard mode** | EC2 workers, driver stays attached | [`standard_mode.py`](examples/standard_mode.py) |
-| **Parsl integration** | End-to-end HTEX config | [`parsl_aws_integration.py`](examples/parsl_aws_integration.py) |
-| **Detached mode** | Bastion survives the driver | [`detached_mode.py`](examples/detached_mode.py) |
-| **Serverless** | Lambda / Fargate workers | [`serverless_mode.py`](examples/serverless_mode.py) |
-| **Spot fleet** | Mixed instance types, interruption handling | [`spot_fleet_example.py`](examples/spot_fleet_example.py) |
+Nothing runs at interpreter exit. `provider.shutdown()` cancels tracked jobs,
+terminates compute, deletes the launch template and any AMI the provider baked,
+and removes the persisted state. Resources carry `ParslResource=true` and
+`ParslWorkflowId=<provider_id>` tags, and `provider.list_resources()` reports what
+the provider believes it owns.
 
-### Real-World Use Cases
-
-**Climate Research**: Process 50TB satellite data from researchers' homes during COVID lockdowns
-```python
-@parsl.python_app
-def process_climate_tile(s3_tile_uri):
-    # Download tile, process, upload results
-    return climate_analysis_results
-```
-
-**Drug Discovery**: Molecular dynamics simulations from corporate networks
-```python
-@parsl.python_app
-def molecular_simulation(compound_params):
-    # Protein folding simulation
-    return simulation_results
-```
-
-**Genomics**: Multi-institutional sequence analysis collaboration
-```python
-def genomics_pipeline(s3_sequence_data):
-    # Bioinformatics analysis in containers
-    return genomics_results
-```
-
-## 🔧 Technical Implementation
-
-### SSH Reverse Tunneling Solution
-
-Our provider uses **SSH reverse tunneling over AWS SSM** to solve the fundamental connectivity challenge:
-
-1. **SSH over SSM**: AWS SSM Session Manager as transport layer
-2. **Reverse Tunnels**: Workers connect back to local controller via tunnels
-3. **Command Rewriting**: Automatically modify worker commands for tunnel endpoints
-4. **Container Support**: Full Docker execution with proper networking
-
-### Key Technical Breakthroughs
-
-1. **Base64 Command Encoding**: Safely pass complex Docker commands through shell layers
-2. **Host Networking**: `--network host` for container SSH tunnel access
-3. **GatewayPorts Configuration**: SSH daemon setup for container connectivity
-4. **Quote Preservation**: Eliminate shell parsing that corrupts commands
-
-## 📚 Documentation
-
-- **[Usage Examples](examples/)** - Complete working examples
-- **[Getting Started](docs/getting_started.md)** - Install, configure, first run
-- **[Operating Modes](docs/operating_modes.md)** - Standard, detached, serverless
-- **[Network Prerequisites](docs/network-prerequisites.md)** - VPC, subnet, and security group requirements
-- **[Troubleshooting](docs/troubleshooting.md)** - Common failures and how to clear them
-
-## 🎯 When to Use Each Approach
-
-### Use Direct Parsl Provider When:
-- Building custom scientific workflows
-- Need direct control over AWS resources
-- Integrating with existing Parsl codes
-- Developing new parallel applications
-
-### Use Globus Compute Integration When:
-- Deploying institutional Function-as-a-Service
-- Multi-site research collaborations
-- Providing computing services to research groups
-- Building production research infrastructure
-
-## 💰 Cost and Performance
-
-### Validated Performance
-- **Mathematical Operations**: 2,031,877 ops/second
-- **String Processing**: 163,949 records/second
-- **Container Execution**: Full isolation, minimal overhead
-- **Network Latency**: ~50ms additional for tunnel routing
-
-### Cost Examples
-```python
-cost_examples = {
-    'single_computation': '$0.002',      # 1M operations
-    'parallel_100_tasks': '$2.50',       # 100 parallel tasks
-    'genomics_batch': '$0.05',           # 50 sequence analyses
-    'idle_cost': '$0.00'                 # Zero when not computing
-}
-```
-
-## 🛡️ AWS Permissions
-
-Required IAM permissions for the AWS Provider:
-
-```json
-{
-    "Version": "2012-10-17",
-    "Statement": [
-        {
-            "Effect": "Allow",
-            "Action": [
-                "ec2:RunInstances",
-                "ec2:TerminateInstances",
-                "ec2:DescribeInstances",
-                "ec2:DescribeInstanceStatus",
-                "ec2:CreateTags",
-                "ec2:DescribeImages",
-                "ec2:CreateSecurityGroup",
-                "ec2:DescribeSecurityGroups",
-                "ec2:AuthorizeSecurityGroupIngress",
-                "ssm:SendCommand",
-                "ssm:GetCommandInvocation",
-                "ssm:DescribeInstanceInformation",
-                "ssm:StartSession",
-                "ssm:TerminateSession"
-            ],
-            "Resource": "*"
-        }
-    ]
-}
-```
-
-## 🐛 Troubleshooting
-
-### Common Issues
-
-**Workers not connecting**:
-- Verify AWS credentials: `aws sts get-caller-identity`
-- Check SSM agent: Instance must have SSM agent installed
-- Confirm security groups allow SSH (port 22)
-
-**Container execution failing**:
-- Use AMI with Docker pre-installed: `ami-0cab818949226441f`
-- Verify container image accessibility
-- Check Docker daemon status on instances
-
-**Data transfer slow**:
-- Use S3 for large files instead of SSH tunnel transfer
-- Consider AWS region proximity to data sources
-- Use appropriate instance types for data processing
-
-### Debug Commands
+To find what a crash left behind:
 
 ```bash
-# Test AWS connectivity
-aws sts get-caller-identity
-
-# Test SSM access
-aws ssm describe-instance-information --region us-east-1
-
-# Validate provider setup
-uv run python examples/standard_mode.py
+uv run python tools/cleanup_aws_resources.py --dry-run --region us-east-1
 ```
 
-## 🤝 Contributing
+## Examples
 
-We welcome contributions! Areas of focus:
+Eight runnable scripts in [`examples/`](https://github.com/scttfrdmn/parsl-aws-provider/tree/main/examples/), each reading its network IDs
+from the environment. Every one creates real AWS resources.
 
-- **Performance Optimization**: Improve startup times and throughput
-- **Container Support**: Additional runtimes (Singularity, Podman)
-- **Data Integration**: Enhanced S3/storage patterns
-- **Documentation**: Usage examples and tutorials
-- **Testing**: Expand test coverage and validation
+| Example | What it shows |
+|---|---|
+| [standard_mode.py](https://github.com/scttfrdmn/parsl-aws-provider/blob/main/examples/standard_mode.py) | The common case: EC2 workers connecting back to your client |
+| [basic_usage.py](https://github.com/scttfrdmn/parsl-aws-provider/blob/main/examples/basic_usage.py) | One provider configured for all three modes, side by side |
+| [parsl_aws_integration.py](https://github.com/scttfrdmn/parsl-aws-provider/blob/main/examples/parsl_aws_integration.py) | A full Parsl workflow, driven from EC2 in the same VPC |
+| [detached_mode.py](https://github.com/scttfrdmn/parsl-aws-provider/blob/main/examples/detached_mode.py) | A bastion owning the workers, and how reconnection works |
+| [serverless_mode.py](https://github.com/scttfrdmn/parsl-aws-provider/blob/main/examples/serverless_mode.py) | Lambda functions or Fargate tasks instead of instances |
+| [spot_fleet_example.py](https://github.com/scttfrdmn/parsl-aws-provider/blob/main/examples/spot_fleet_example.py) | An EC2 Fleet across several instance types |
+| [spot_interruption_example.py](https://github.com/scttfrdmn/parsl-aws-provider/blob/main/examples/spot_interruption_example.py) | Detecting a reclaim two minutes ahead |
+| [serverless_spot_fleet_example.py](https://github.com/scttfrdmn/parsl-aws-provider/blob/main/examples/serverless_spot_fleet_example.py) | Serverless mode's fleet path — an unusual corner |
 
-### Development Setup
+## Documentation
+
+<https://scttfrdmn.github.io/parsl-aws-provider/>
+
+- [Getting Started](https://scttfrdmn.github.io/parsl-aws-provider/getting_started.html) — install, configure, first run
+- [Network Prerequisites](https://scttfrdmn.github.io/parsl-aws-provider/network-prerequisites.html) — VPC, subnet, and security group requirements
+- [Operating Modes](https://scttfrdmn.github.io/parsl-aws-provider/operating_modes.html) — standard, detached, serverless, and the options each accepts
+- [Spot Fleet](https://scttfrdmn.github.io/parsl-aws-provider/spot_fleet.html) — diversification and interruption handling
+- [State Persistence](https://scttfrdmn.github.io/parsl-aws-provider/state_persistence.html) — file, S3, and Parameter Store backends
+- [Security](https://scttfrdmn.github.io/parsl-aws-provider/security.html) — least-privilege IAM, instance profiles, encryption
+- [Architecture](https://scttfrdmn.github.io/parsl-aws-provider/architecture.html) — how the pieces fit
+- [Troubleshooting](https://scttfrdmn.github.io/parsl-aws-provider/troubleshooting.html) — common failures and how to clear them
+- [Examples](https://scttfrdmn.github.io/parsl-aws-provider/examples.html) — annotated configurations
+
+## AWS permissions
+
+Do not copy a policy out of a README — it drifts. Generate the current one from
+the code, which cannot:
+
+```python
+import json
+
+from parsl_aws_provider import GlobusComputeProvider
+
+print(json.dumps(GlobusComputeProvider.minimum_iam_policy(), indent=2))
+```
+
+It is a `@staticmethod`, so you need no provider instance — and it describes the
+base provider just as well, despite living on the Globus subclass.
+[security.md](https://scttfrdmn.github.io/parsl-aws-provider/security.html) explains what it deliberately omits — no
+`ec2:CreateVpc`, no `CreateSecurityGroup` — and what each mode adds.
+
+## Troubleshooting
+
+Fuller coverage in [troubleshooting.md](https://scttfrdmn.github.io/parsl-aws-provider/troubleshooting.html).
+
+**Workers launch but never register.** Almost always the inbound-port
+prerequisite above. Check the security group on your *client*, not the workers.
+
+**`ProviderConfigurationError: Unknown configuration option(s): ...`.** The option
+does not exist. Unknown keywords are rejected rather than ignored, which is why
+configurations from older versions fail loudly — check the name against
+[api_reference.rst](https://scttfrdmn.github.io/parsl-aws-provider/api_reference.html).
+
+**`ResourceNotFoundError` on construction.** One of the three network IDs does not
+exist, or belongs to another region.
 
 ```bash
-git clone https://github.com/your-org/parsl-aws-provider
+aws sts get-caller-identity                                   # credentials work?
+aws ssm describe-instance-information --region us-east-1       # SSM sees anything?
+```
+
+## Contributing
+
+Issues and pull requests are welcome. All work goes on a feature branch and merges
+via a PR; issues carry `severity:`, `type:`, and `component:` labels and a
+milestone. See [CLAUDE.md](https://github.com/scttfrdmn/parsl-aws-provider/blob/main/CLAUDE.md) for the development conventions and
+[docs/ci_cd.md](https://scttfrdmn.github.io/parsl-aws-provider/ci_cd.html) for what CI checks.
+
+```bash
+git clone https://github.com/scttfrdmn/parsl-aws-provider
 cd parsl-aws-provider
 
-# Environment and dependencies (uv only -- no pip, venv, or pyenv)
+# uv only — no pip, venv, or pyenv
 uv sync --extra dev --extra test
 
-# Test installation
-uv run pytest tests/unit -m unit --no-cov -q
+uv run pytest tests/unit tests/security --no-cov -q
+uv run ruff check . && uv run ruff format --check .
 ```
 
-## 📄 License
+Integration tests run against [substrate](https://github.com/scttfrdmn/substrate),
+a local AWS emulator (`make substrate-up`) — see
+[substrate_testing.md](https://scttfrdmn.github.io/parsl-aws-provider/substrate_testing.html). Tests under `tests/aws/` need
+real credentials and cost money.
 
-Apache License 2.0 - see [LICENSE](LICENSE) file for details.
+## License
 
-## 🙏 Acknowledgments
+Apache License 2.0 — see [LICENSE](https://github.com/scttfrdmn/parsl-aws-provider/blob/main/LICENSE) and [NOTICE](https://github.com/scttfrdmn/parsl-aws-provider/blob/main/NOTICE).
 
-- **Parsl Team**: Excellent parallel scripting framework
-- **Globus Compute**: Function-as-a-Service platform integration
-- **AWS**: Robust cloud infrastructure for scientific computing
+## Support
 
-## 📞 Support
-
-- **Issues**: [GitHub Issues](https://github.com/your-org/parsl-aws-provider/issues)
-- **Parsl Community**: [Parsl Documentation](https://parsl.readthedocs.io)
-- **Globus Support**: [Globus Compute Documentation](https://globus-compute.readthedocs.io)
-
----
-
-**Transform your research workflows**: Access unlimited AWS computational power from any network environment with zero configuration required.
+- [GitHub Issues](https://github.com/scttfrdmn/parsl-aws-provider/issues)
+- [Parsl documentation](https://parsl.readthedocs.io)
+- [Globus Compute documentation](https://globus-compute.readthedocs.io)
