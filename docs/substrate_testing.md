@@ -37,12 +37,12 @@ any step ran.
 The compose file is pinned to a specific image tag, deliberately — an emulator that
 silently changes under CI turns an unrelated PR red.
 
-`/health` reports the real version as of 0.85.0 — `{"status":"ok","version":"v0.85.0"}` —
+`/health` reports the real version since 0.85.0 — `{"status":"ok","version":"v0.87.0"}` —
 so `make substrate-status` is enough to confirm the pin. Released images used to
 report `"version":"dev"` whatever their tag
 ([substrate#402](https://github.com/scttfrdmn/substrate/issues/402)); against an
 older image, use
-`podman image inspect ghcr.io/scttfrdmn/substrate:0.85.0 --format '{{.Digest}}'`
+`podman image inspect ghcr.io/scttfrdmn/substrate:0.87.0 --format '{{.Digest}}'`
 instead.
 
 When bumping the pin, change it in **two** places — `docker-compose.substrate.yml`
@@ -182,33 +182,68 @@ provider.
 
 ## Known gaps
 
-Verified by probing substrate `0.85.0` directly, not read off the milestones.
-Three of the four are why part of the suite still uses moto (#183); the
-EventBridge row is a gap this project turns to its advantage rather than one it
-works around.
+Verified by probing substrate `0.87.0` directly, not read off the milestones.
+CloudFormation is why part of the suite still uses moto (#183); the EventBridge
+row is a gap this project turns to its advantage rather than one it works around.
 
 | Gap | Effect | Upstream |
 |---|---|---|
-| CloudFormation is not exposed over HTTP; `create_stack` returns `ServiceNotAvailable` | `DetachedMode`'s bastion stack and six `ServerlessMode` tests that drive `cf_client` cannot run here. `tests/integration/test_serverless_mode_spot_fleet_integration.py` stays on moto for exactly this reason; real coverage is in `tests/aws/` | [substrate#483](https://github.com/scttfrdmn/substrate/issues/483) |
+| CloudFormation stacks reach `CREATE_COMPLETE` having created nothing the caller can find — see below, this is two distinct defects | `tests/integration/test_serverless_mode_spot_fleet_integration.py` and `test_detached_mode_spot_fleet_integration.py` stay on moto; real coverage is in `tests/aws/` | [substrate#483](https://github.com/scttfrdmn/substrate/issues/483) reopened the door; the remainder is unfiled |
 | EventBridge is not emulated; `PutRule` returns `501 service not emulated: awsevents` | The spot-warning notifier's degradation path is testable *because* of this. The warning path itself is covered end to end by wiring an SQS queue directly, since the monitor only ever reads warnings through SQS | — |
-| IAM does not serve AWS-managed policies — `get_policy` on `arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore` returns `NoSuchEntity` (though `attach_role_policy` accepts it) | The unit suite keeps moto with `MOTO_IAM_LOAD_MANAGED_POLICIES=true`, which serves the real policy documents | [substrate#484](https://github.com/scttfrdmn/substrate/issues/484) |
-| The instance-type catalog is partial — `t3.micro` resolves, `m5.xlarge` does not | `describe_instance_capacity` tests stay on moto, which knows the full catalog | [substrate#485](https://github.com/scttfrdmn/substrate/issues/485) |
 
-Not a gap this suite trips over, but recorded because it makes a substrate-backed
-assertion unable to fail: `describe_instance_type_offerings` ignores the
-`instance-type` filter, returning all eight catalog types for any value —
-including one that does not exist, where real AWS returns none. Filed as item 2
-of [substrate#485](https://github.com/scttfrdmn/substrate/issues/485). Do not
-write an offerings-based availability check against the emulator and read a pass
-as meaningful.
+### CloudFormation
 
-CloudFormation is the one to read carefully before assuming it is simply absent:
-substrate *implements* it (`emulator/betty_cfn.go` and ~40
+Read this before assuming CFN either works or is absent — through `0.85.0` it was
+neither. It was *implemented* (`emulator/betty_cfn.go` plus ~40
 `betty_cfn_v*_plugins.go` files, covering parameters, outputs, conditions, change
-sets and drift), but registers no `cloudformation` plugin — `/ready` lists 64
-plugins and none is CFN, and the similarly-named `cfPlugin` is CloudFront. The
-support is reachable only from Go, through the in-process `betty.Deploy` client,
-so no amount of boto3 configuration will find it.
+sets and drift) but registered no `cloudformation` plugin, so `create_stack`
+returned `ServiceNotAvailable` and the support was reachable only from Go, through
+the in-process `betty.Deploy` client. The similarly-named `cfPlugin` is CloudFront.
+
+`0.87.0` registers a real plugin
+([substrate#483](https://github.com/scttfrdmn/substrate/issues/483)), and the whole
+API surface this repo drives works over the wire: `create_stack`, `describe_stacks`
+with `Outputs`, `describe_stack_resources`, `delete_stack`, both waiters,
+`Parameters` and `Capabilities`. `DescribeStackEvents` has no backing event model
+([substrate#501](https://github.com/scttfrdmn/substrate/issues/501)) but nothing
+here calls it.
+
+Two defects behind that surface are why moto stays. Neither is filed upstream yet.
+
+**YAML short-form intrinsics are not resolved.** `!Sub`, `!Ref`, `!If`, `!GetAtt`
+are stripped and the raw scalar used as a literal, while the `Fn::`-prefixed long
+forms are correct — `Fn::Sub: 'x-${P}'` substitutes, `Fn::If` picks the right
+branch on both true and false conditions, but `!Sub 'x-${P}'` yields the physical
+ID `x-${p}`. Every template in `parsl_aws_provider/templates/cloudformation/` uses
+the short forms, so deploying `ecs_worker.yml` produces a task definition whose ARN
+embeds an unevaluated condition array:
+
+```
+arn:aws:ecs:us-east-1:123456789012:task-definition/["HasTaskFamily","TaskFamily","parsl-task-${WorkflowId}-${JobId}"]:1
+```
+
+**Resources are written to a different account than the caller reads.**
+`StackDeployer.dispatch` (`emulator/betty_cfn.go:2847`) synthesises its
+`RequestContext` from the constants `testAccountID` (`123456789012`) and
+`defaultRegion` rather than threading the inbound request's identity. The caller is
+account `000000000000`, so `AWS::EC2::Instance`, `AWS::EC2::LaunchTemplate`,
+`AWS::ECS::Cluster` and `AWS::Logs::LogGroup` all report `CREATE_COMPLETE` with
+plausible physical IDs that resolve nowhere in any region — `describe_instances`
+raises `InvalidInstanceID.NotFound`, `list_clusters` returns empty. A direct
+`run_instances` is visible immediately, so this is not general EC2 breakage; it is
+the same partitioning that
+[substrate#391](https://github.com/scttfrdmn/substrate/issues/391) covered for
+regions. `AWS::IAM::Role` and `AWS::IAM::InstanceProfile` cross the boundary
+intact because IAM is global, which is what makes the split look like missing
+resource handlers rather than one misplaced struct — the handlers exist, and
+`deployEC2Instance` really does dispatch `RunInstances`.
+
+`bastion.yml` needs `AWS::EC2::Instance` and `AWS::EC2::LaunchTemplate`, so
+`DetachedMode` gets a stack it cannot then query. Relatedly, `delete_stack` removes
+the stack record — `describe_stacks` correctly raises `ValidationError` afterwards —
+but not the stack's resources: an S3 bucket and an IAM role both outlive their
+stack. A teardown assertion that only checks the stack is gone passes for the wrong
+reason.
 
 Fixed since, and no longer worked around anywhere:
 
@@ -221,6 +256,8 @@ Fixed since, and no longer worked around anywhere:
 | Fleet instances carried no `aws:ec2:fleet-id` tag, so tests hand-applied it | Substrate stamps it, and now *rejects* manual `aws:`-prefixed keys as reserved — so the old workaround is an error, not merely redundant | [substrate#443](https://github.com/scttfrdmn/substrate/issues/443) |
 | `?publicAccessBlock` was unrouted: `PUT` hit `CreateBucket`, `DELETE` **deleted the bucket** | Routed, so `S3State(create_bucket_if_not_exists=True)` is covered instead of xfailed | [substrate#446](https://github.com/scttfrdmn/substrate/issues/446) |
 | `/health` reported `"version":"dev"` regardless of tag | Reports the real version | [substrate#402](https://github.com/scttfrdmn/substrate/issues/402) |
+| IAM served no service-role managed policies — `get_policy` on `arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore` raised `NoSuchEntity` for an ARN `attach_role_policy` had just accepted | All five this project attaches resolve, with documents and version IDs | [substrate#484](https://github.com/scttfrdmn/substrate/issues/484) |
+| The instance-type catalog held eight hardcoded types (`m5.xlarge` absent), an unknown type returned HTTP 200 + an empty list, and `describe_instance_type_offerings` ignored the `instance-type` filter entirely — so an offerings-based availability assertion could not fail | Every type this project names resolves, unknown types raise `InvalidInstanceType`, and the offerings filter discriminates | [substrate#485](https://github.com/scttfrdmn/substrate/issues/485) |
 
 `RequestSpotFleet` and `RequestSpotInstances` are still unimplemented and are not
 coming back here: #86 moved this provider onto `CreateFleet`, so nothing calls them.

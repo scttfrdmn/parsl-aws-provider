@@ -8,6 +8,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **The substrate emulator pin moves `0.85.0` → `0.87.0`**, in
+  `docker-compose.substrate.yml` and `.github/workflows/ci.yml` together. 0.87.0
+  carries all three fixes filed from this repo while probing 0.85.0, and the
+  integration suite goes from **130 passed / 1 skipped** to **131 passed / 0
+  skipped**. Nothing in the suite changed to achieve that: the CloudFormation
+  guard lifted itself, because `tests/conftest.py` probes
+  `/_localstack/health` rather than hardcoding a verdict.
+
+  - [substrate#484](https://github.com/scttfrdmn/substrate/issues/484) — IAM now
+    serves the service-role managed policies. `get_policy` on
+    `AmazonSSMManagedInstanceCore` used to raise `NoSuchEntity` for an ARN
+    `attach_role_policy` had just accepted, and that asymmetry is what made it
+    read as a consumer bug.
+  - [substrate#485](https://github.com/scttfrdmn/substrate/issues/485) — the
+    instance-type catalog covers every type this project names, an unknown type
+    raises `InvalidInstanceType`, and `describe_instance_type_offerings` honours
+    its `instance-type` filter. That last one mattered most: the filter was dead
+    code, so an offerings-based availability assertion could not fail.
+  - [substrate#483](https://github.com/scttfrdmn/substrate/issues/483) — a real
+    `cloudformation` plugin is registered. Through 0.85.0 CFN was implemented but
+    unrouted, reachable only from Go via `betty.Deploy`.
+
+  CloudFormation still is not a moto replacement, and #183 stays open for it.
+  substrate does not resolve YAML short-form intrinsics — `!Sub`, `!Ref`, `!If`
+  are stripped and the raw scalar used literally, while the `Fn::` long forms are
+  correct — and `StackDeployer.dispatch` writes resources as account
+  `123456789012` while the caller is `000000000000`. Every template in
+  `parsl_aws_provider/templates/cloudformation/` uses the short forms, so a stack
+  reaches `CREATE_COMPLETE` having created nothing the caller can query.
+  `docs/substrate_testing.md` records both, with the evidence.
 - **`ruff` floor raised to `0.16.0`, and the lint rule selection made explicit.**
   0.16.0 changed the *implicit* default rule set from 59 rules to 413, which is a
   breaking change for any project that never wrote a `select` — and this was one.

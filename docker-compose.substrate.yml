@@ -42,10 +42,34 @@ services:
     #     That unblocks S3State(create_bucket_if_not_exists=True), which was
     #     xfailed and verified nowhere (#166).
     #
+    # 0.87.0 clears three more, all filed from this repo while probing 0.85.0:
+    #
+    #   substrate#484 (262b911) IAM serves the service-role managed policies, so
+    #     get_policy on AmazonSSMManagedInstanceCore resolves instead of raising
+    #     NoSuchEntity for an ARN attach_role_policy had already accepted.
+    #   substrate#485 (64912ef) the instance-type catalog covers every type this
+    #     project names, an unknown type raises InvalidInstanceType, and the
+    #     describe_instance_type_offerings `instance-type` filter discriminates
+    #     instead of being dead code that could not fail.
+    #   substrate#483 (ff3521a) a real `cloudformation` plugin is registered --
+    #     through 0.85.0 CFN was implemented but unrouted, reachable only from Go
+    #     via betty.Deploy. The whole surface this repo drives now works over the
+    #     wire, which unskips the DetachedMode bastion test. That skip lifted
+    #     itself: tests/conftest.py probes /_localstack/health rather than
+    #     hardcoding a version.
+    #
+    # CFN is still not a moto replacement, for two reasons worth knowing before
+    # you try: substrate does not resolve YAML short-form intrinsics (`!Sub`,
+    # `!Ref`, `!If` are stripped and the raw scalar used literally, while the
+    # `Fn::` long forms work), and StackDeployer.dispatch writes resources as
+    # account 123456789012 while the caller is 000000000000. A stack built from
+    # any template in templates/cloudformation/ therefore reaches CREATE_COMPLETE
+    # having created nothing the caller can find. See docs/substrate_testing.md.
+    #
     # Verify a bump reaches the image, not just the git tag: substrate cuts
     # release commits, so a merged fix sits on `main` after the newest tag and is
     # invisible to this pin. `git tag --contains <sha>` is the check.
-    image: ghcr.io/scttfrdmn/substrate:0.85.0
+    image: ghcr.io/scttfrdmn/substrate:0.87.0
     container_name: parsl-substrate
     ports:
       - "4566:4566"
