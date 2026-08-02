@@ -183,14 +183,32 @@ provider.
 ## Known gaps
 
 Verified by probing substrate `0.85.0` directly, not read off the milestones.
-Only two gaps remain, and both are why part of the suite still uses moto:
+Three of the four are why part of the suite still uses moto (#183); the
+EventBridge row is a gap this project turns to its advantage rather than one it
+works around.
 
 | Gap | Effect | Upstream |
 |---|---|---|
-| CloudFormation is not exposed over HTTP; `create_stack` returns `ServiceNotAvailable` | `DetachedMode`'s bastion stack and six `ServerlessMode` tests that drive `cf_client` cannot run here. `tests/integration/test_serverless_mode_spot_fleet_integration.py` stays on moto for exactly this reason; real coverage is in `tests/aws/` | — |
+| CloudFormation is not exposed over HTTP; `create_stack` returns `ServiceNotAvailable` | `DetachedMode`'s bastion stack and six `ServerlessMode` tests that drive `cf_client` cannot run here. `tests/integration/test_serverless_mode_spot_fleet_integration.py` stays on moto for exactly this reason; real coverage is in `tests/aws/` | [substrate#483](https://github.com/scttfrdmn/substrate/issues/483) |
 | EventBridge is not emulated; `PutRule` returns `501 service not emulated: awsevents` | The spot-warning notifier's degradation path is testable *because* of this. The warning path itself is covered end to end by wiring an SQS queue directly, since the monitor only ever reads warnings through SQS | — |
-| IAM does not serve AWS-managed policies — `get_policy` on `arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore` returns `NoSuchEntity` (though `attach_role_policy` accepts it) | The unit suite keeps moto with `MOTO_IAM_LOAD_MANAGED_POLICIES=true`, which serves the real policy documents | — |
-| The instance-type catalog is partial — `t3.micro` resolves, `m5.xlarge` does not | `describe_instance_capacity` tests stay on moto, which knows the full catalog | — |
+| IAM does not serve AWS-managed policies — `get_policy` on `arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore` returns `NoSuchEntity` (though `attach_role_policy` accepts it) | The unit suite keeps moto with `MOTO_IAM_LOAD_MANAGED_POLICIES=true`, which serves the real policy documents | [substrate#484](https://github.com/scttfrdmn/substrate/issues/484) |
+| The instance-type catalog is partial — `t3.micro` resolves, `m5.xlarge` does not | `describe_instance_capacity` tests stay on moto, which knows the full catalog | [substrate#485](https://github.com/scttfrdmn/substrate/issues/485) |
+
+Not a gap this suite trips over, but recorded because it makes a substrate-backed
+assertion unable to fail: `describe_instance_type_offerings` ignores the
+`instance-type` filter, returning all eight catalog types for any value —
+including one that does not exist, where real AWS returns none. Filed as item 2
+of [substrate#485](https://github.com/scttfrdmn/substrate/issues/485). Do not
+write an offerings-based availability check against the emulator and read a pass
+as meaningful.
+
+CloudFormation is the one to read carefully before assuming it is simply absent:
+substrate *implements* it (`emulator/betty_cfn.go` and ~40
+`betty_cfn_v*_plugins.go` files, covering parameters, outputs, conditions, change
+sets and drift), but registers no `cloudformation` plugin — `/ready` lists 64
+plugins and none is CFN, and the similarly-named `cfPlugin` is CloudFront. The
+support is reachable only from Go, through the in-process `betty.Deploy` client,
+so no amount of boto3 configuration will find it.
 
 Fixed since, and no longer worked around anywhere:
 
