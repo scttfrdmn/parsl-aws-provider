@@ -181,6 +181,13 @@ def _load_in_child(endpoint_dir: Path, *, with_bootstrap: bool = True) -> dict:
         [sys.executable, "-c", _CHILD_LOADER],
         input=_render(endpoint_dir),
         env=env,
+        # The child really constructs the provider, and `state_file_path` defaults
+        # to a *relative* `ephemeral_aws_state.json`, so without this the state
+        # document lands in whatever cwd the test runner happened to have -- the
+        # checkout -- which `_no_default_state_file_left_behind` fails on. It is
+        # also the truer shape: the endpoint manager's exec'd child inherits the
+        # manager's working directory, never this repository.
+        cwd=str(endpoint_dir.parent),
         capture_output=True,
         text=True,
         timeout=180,
