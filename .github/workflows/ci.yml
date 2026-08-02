@@ -290,3 +290,36 @@ jobs:
         with:
           name: documentation
           path: docs/_build/html/
+      - name: Package for Pages
+        # Only on main: a PR must not publish. Uploaded as a *Pages* artifact,
+        # which is a distinct format from the plain artifact above -- that one
+        # stays, because it is how a PR author inspects a docs change before it
+        # ships.
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: docs/_build/html/
+
+  deploy-docs:
+    # #191: the `Documentation` URL in pyproject.toml pointed at a Read the Docs
+    # site that was never set up -- 404 under both the old and new package names.
+    # That URL is baked into wheel and sdist metadata, so it becomes one of three
+    # links on the PyPI landing page; publishing (#180) with it dead ships a
+    # prominent 404.
+    #
+    # Pages rather than RTD because the HTML already exists: the `docs` job has
+    # built it on every PR all along and simply never published it. This is a
+    # deploy step, where RTD would have meant a new external account and a
+    # `.readthedocs.yaml` duplicating the build this repo already does under uv.
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    needs: docs
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write         # deploy to the Pages site
+      id-token: write      # OIDC, which deploy-pages requires
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v5
