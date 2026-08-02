@@ -59,9 +59,10 @@ jobs:
       - name: Sync environment
         run: uv sync --locked --extra dev --extra test
       - name: Type check with mypy
-        # Reported, not gated: 125 pre-existing errors are being worked down under
-        # #81/#82. Drop continue-on-error once the count reaches zero, so this
-        # becomes a real gate rather than a signal.
+        # Reported, not gated: 76 pre-existing errors are being worked down under
+        # #81/#82, most of them in the unreachable modules #90 removes. Drop
+        # continue-on-error once the count reaches zero, so this becomes a real
+        # gate rather than a signal.
         continue-on-error: true
         run: uv run mypy parsl_aws_provider
 
@@ -176,8 +177,8 @@ jobs:
 
   aws-e2e-tests:
     # Real AWS: bills money and needs a pre-provisioned VPC/subnet/SG, so it is
-    # manual-only. #60 closed with 51 tests under tests/aws that no workflow ever
-    # referenced.
+    # manual-only. #60 closed with tests under tests/aws that no workflow ever
+    # referenced; there are 87 now.
     #
     # The `vars.AWS_TEST_REGION != ''` half of the gate is what makes an
     # unconfigured run a no-op (#161). Relying on conftest.py's skip was not

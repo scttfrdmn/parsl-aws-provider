@@ -1,4 +1,4 @@
-# Parsl Ephemeral AWS Provider Documentation
+# Parsl AWS Provider Documentation
 
 Sphinx sources for the project documentation. This file is not part of the built
 site — it is excluded in `conf.py`.

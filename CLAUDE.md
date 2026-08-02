@@ -369,12 +369,13 @@ The virtual environment is created at `.venv/` automatically by `uv sync`.
    Do not maintain separate `requirements.txt` or `requirements-dev.txt` files.
 
 3. **Linting and formatting**: `ruff` only — `flake8`, `black`, and `isort` are
-   not dependencies of this project. Scope to `parsl_aws_provider tests`, not
-   `.`: `tools/` carries pre-existing errors that #93 prunes in v0.8.0.
+   not dependencies of this project. Scope is `.`, the whole repository: the old
+   `parsl_aws_provider tests` narrowing existed because `tools/` carried
+   pre-existing errors, and #93/#165 pruned those in v0.8.0.
    ```bash
-   uv run ruff check parsl_aws_provider tests
-   uv run ruff format parsl_aws_provider
-   uv run mypy parsl_aws_provider
+   uv run ruff check .
+   uv run ruff format --check .
+   uv run mypy parsl_aws_provider     # 76-error baseline; do not add to it
    ```
    Or via the Makefile, which is what CI runs: `make lint-python type-check`.
 

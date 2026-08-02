@@ -139,9 +139,18 @@ def _iter_python_blocks(path: Path):
 
 
 def _markdown_files() -> List[Path]:
-    """Every markdown file whose Python blocks are meant to be runnable."""
+    """Every markdown file whose Python blocks are meant to be runnable.
+
+    ``SECURITY.md`` is in the list because it was not: its configuration example
+    passed four kwargs that have never existed (``encrypt_storage``,
+    ``enable_detailed_monitoring``, ``security_group_rules``, ``tags``), so the
+    one snippet in the security policy raised
+    ``ProviderConfigurationError`` — while ``docs/security.md``, which *was*
+    scanned, stayed correct throughout (#199).
+    """
     files = sorted(DOCS_DIR.glob("*.md"))
     files.append(REPO_ROOT / "README.md")
+    files.append(REPO_ROOT / "SECURITY.md")
     files.append(EXAMPLES_DIR / "README.md")
     return [f for f in files if f.is_file()]
 
