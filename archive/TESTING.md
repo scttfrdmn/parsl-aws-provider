@@ -86,19 +86,32 @@ Moto tests are marked to be skipped if the Moto library is not available:
 
 ```python
 try:
-    from moto import mock_ec2, mock_s3, mock_ssm, mock_iam, mock_lambda, mock_ecs, mock_cloudformation
+    from moto import (
+        mock_ec2,
+        mock_s3,
+        mock_ssm,
+        mock_iam,
+        mock_lambda,
+        mock_ecs,
+        mock_cloudformation,
+    )
+
     MOTO_AVAILABLE = True
 except ImportError:
     MOTO_AVAILABLE = False
+
     # Create placeholder decorators if moto is not available
     def mock_decorator(func):
         return pytest.mark.skip(reason="Moto library not available")(func)
-    mock_ec2 = mock_s3 = mock_ssm = mock_iam = mock_lambda = mock_ecs = mock_cloudformation = mock_decorator
+
+    mock_ec2 = mock_s3 = mock_ssm = mock_iam = mock_lambda = mock_ecs = (
+        mock_cloudformation
+    ) = mock_decorator
 
 # Mark tests as requiring moto
 pytestmark = pytest.mark.skipif(
     not MOTO_AVAILABLE,
-    reason="Moto library not available. Install with: pip install moto"
+    reason="Moto library not available. Install with: pip install moto",
 )
 ```
 

@@ -126,9 +126,9 @@ Lambda or ECS/Fargate, no EC2 instances. Lambda needs no network IDs at all.
 provider = EphemeralAWSProvider(
     mode="serverless",
     region="us-east-1",
-    compute_type="lambda",   # or "ecs", which does need subnet + security group
-    memory_size=1024,        # MB
-    timeout=300,             # seconds
+    compute_type="lambda",  # or "ecs", which does need subnet + security group
+    memory_size=1024,  # MB
+    timeout=300,  # seconds
     max_blocks=100,
 )
 ```
@@ -145,7 +145,7 @@ provider = EphemeralAWSProvider(
     security_group_id="sg-0123456789abcdef0",
     instance_type="t3.medium",
     use_spot=True,
-    spot_max_price_percentage=80,     # cap at 80% of on-demand
+    spot_max_price_percentage=80,  # cap at 80% of on-demand
     spot_interruption_handling=True,  # act on the two-minute warning
 )
 ```
@@ -159,7 +159,7 @@ instance already `shutting-down`.
 ```python
 provider = EphemeralAWSProvider(
     # ... network and compute options ...
-    min_blocks=0,     # no floor; nothing runs when nothing is queued
+    min_blocks=0,  # no floor; nothing runs when nothing is queued
     max_blocks=10,
     auto_shutdown=True,  # a worker terminates itself when its command finishes
 )
@@ -213,7 +213,7 @@ inferred from the type name.
 ```python
 provider = EphemeralAWSProvider(
     # ... network options ...
-    instance_type="c7g.large",   # arm64 AMI resolved automatically
+    instance_type="c7g.large",  # arm64 AMI resolved automatically
 )
 ```
 

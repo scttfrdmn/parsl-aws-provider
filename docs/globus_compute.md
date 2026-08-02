@@ -248,7 +248,7 @@ def square(x):
 
 
 with Executor(endpoint_id=ENDPOINT_ID) as ex:
-    print(ex.submit(square, 7).result())   # → 49
+    print(ex.submit(square, 7).result())  # → 49
 ```
 
 ### 5. Stop it

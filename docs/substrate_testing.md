@@ -108,15 +108,15 @@ vpc = ec2.create_vpc(CidrBlock="10.0.0.0/16")["Vpc"]["VpcId"]
 # Read the AZ rather than assuming f"{region}a": that guess is how the real-AWS
 # suite ended up pinned to a zone that does not offer t3.micro.
 az = ec2.describe_availability_zones()["AvailabilityZones"][0]["ZoneName"]
-subnet = ec2.create_subnet(
-    VpcId=vpc, CidrBlock="10.0.0.0/24", AvailabilityZone=az
-)["Subnet"]["SubnetId"]
+subnet = ec2.create_subnet(VpcId=vpc, CidrBlock="10.0.0.0/24", AvailabilityZone=az)[
+    "Subnet"
+]["SubnetId"]
 sg = ec2.create_security_group(
     GroupName="parsl-test", Description="Parsl test", VpcId=vpc
 )["GroupId"]
 
 provider = EphemeralAWSProvider(
-    image_id="ami-12345678",   # any value; the emulator does not resolve AMIs
+    image_id="ami-12345678",  # any value; the emulator does not resolve AMIs
     instance_type="t3.micro",
     region="us-east-1",
     vpc_id=vpc,
@@ -139,11 +139,11 @@ inside the shipped package, because no package code imports it — its predecess
 
 ```python
 from tests.substrate_support import (
-    get_substrate_session,     # boto3.Session pointed at the emulator
-    is_substrate_available,    # never raises; gate a module skip on this
-    reset_substrate_state,     # POST /v1/state/reset
-    setup_substrate_vpc,       # provision vpc + subnet + igw + route table + sg
-    cleanup_substrate_vpc,     # tear it down, dependents first
+    get_substrate_session,  # boto3.Session pointed at the emulator
+    is_substrate_available,  # never raises; gate a module skip on this
+    reset_substrate_state,  # POST /v1/state/reset
+    setup_substrate_vpc,  # provision vpc + subnet + igw + route table + sg
+    cleanup_substrate_vpc,  # tear it down, dependents first
 )
 ```
 

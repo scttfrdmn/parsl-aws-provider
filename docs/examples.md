@@ -146,7 +146,7 @@ provider = EphemeralAWSProvider(
     mode="serverless",
     compute_type="lambda",
     memory_size=1024,  # MB; Lambda CPU scales with memory
-    timeout=300,       # seconds
+    timeout=300,  # seconds
     max_blocks=50,
 )
 
@@ -267,10 +267,10 @@ provider = EphemeralAWSProvider(
     security_group_id="sg-0123456789abcdef0",
     mode="standard",
     max_blocks=10,
-    use_spot=True,                  # required: use_spot_fleet alone is ignored (#137)
+    use_spot=True,  # required: use_spot_fleet alone is ignored (#137)
     use_spot_fleet=True,
     instance_types=["m5.large", "m5a.large", "m6i.large", "c5.large"],
-    spot_max_price_percentage=80,   # cap at 80% of on-demand
+    spot_max_price_percentage=80,  # cap at 80% of on-demand
     spot_allocation_strategy="price-capacity-optimized",
 )
 ```
@@ -292,7 +292,7 @@ provider = EphemeralAWSProvider(
     vpc_id="vpc-0123456789abcdef0",
     subnet_id="subnet-0123456789abcdef0",
     security_group_id="sg-0123456789abcdef0",
-    instance_type="c7g.large",   # arm64 AMI resolved automatically
+    instance_type="c7g.large",  # arm64 AMI resolved automatically
     mode="standard",
     max_blocks=4,
 )
@@ -352,7 +352,7 @@ provider = EphemeralAWSProvider(
     instance_type="t3.micro",
     mode="standard",
     warm_pool_size=2,
-    warm_pool_ttl=300,                  # seconds held before termination
+    warm_pool_ttl=300,  # seconds held before termination
     auto_create_instance_profile=True,  # required: dispatch is over SSM
     max_blocks=10,
 )
@@ -378,7 +378,7 @@ provider = EphemeralAWSProvider(
     mode="standard",
     bake_ami=True,
     worker_init="dnf install -y python3.11 gcc gcc-c++ make\n"
-                "pip3.11 install --quiet parsl numpy scipy pandas\n",
+    "pip3.11 install --quiet parsl numpy scipy pandas\n",
     max_blocks=10,
 )
 ```
@@ -496,8 +496,8 @@ provider = EphemeralAWSProvider(
 for resource_type, entries in provider.list_resources().items():
     print(f"{resource_type}: {len(entries)}")
 
-provider.cleanup_all()   # terminate compute, keep the provider usable
-provider.shutdown()      # ...or tear everything down and delete the state
+provider.cleanup_all()  # terminate compute, keep the provider usable
+provider.shutdown()  # ...or tear everything down and delete the state
 ```
 
 Every resource is tagged `ParslResource=true` and
@@ -535,7 +535,7 @@ provider = EphemeralAWSProvider(
     key_name="my-key",
     state_file_path="ec2_state.json",
     use_spot=True,
-    spot_max_price="0.1",       # was spot_max_bid
+    spot_max_price="0.1",  # was spot_max_bid
     # New and required: this provider never creates network resources
     vpc_id="vpc-0123456789abcdef0",
     subnet_id="subnet-0123456789abcdef0",

@@ -144,7 +144,7 @@ provider = EphemeralAWSProvider(
     security_group_id="sg-0123456789abcdef0",
     instance_type="m5.large",
     bastion_instance_type="t3.micro",
-    state_store_type="parameter_store",   # readable by client and bastion alike
+    state_store_type="parameter_store",  # readable by client and bastion alike
     parameter_store_path="/parsl/my-workflow-state",
 )
 ```
@@ -154,9 +154,9 @@ provider = EphemeralAWSProvider(
 provider = EphemeralAWSProvider(
     mode="serverless",
     region="us-east-1",
-    compute_type="lambda",   # or "ecs"
-    memory_size=1024,        # MB
-    timeout=300,             # seconds
+    compute_type="lambda",  # or "ecs"
+    memory_size=1024,  # MB
+    timeout=300,  # seconds
     max_blocks=100,
 )
 ```
@@ -176,10 +176,10 @@ provider = EphemeralAWSProvider(
     subnet_id="subnet-0123456789abcdef0",
     security_group_id="sg-0123456789abcdef0",
     use_spot=True,
-    use_spot_fleet=True,   # both flags are required; see below
+    use_spot_fleet=True,  # both flags are required; see below
     instance_types=["c5.large", "c5a.large", "m5.large"],
-    spot_max_price_percentage=80,      # cap at 80% of on-demand
-    spot_interruption_handling=True,   # act on the two-minute warning
+    spot_max_price_percentage=80,  # cap at 80% of on-demand
+    spot_interruption_handling=True,  # act on the two-minute warning
 )
 ```
 

@@ -18,12 +18,16 @@ repos:
     -   id: mixed-line-ending
         args: ['--fix=lf']
 
-# Pinned to the same ruff that uv.lock resolves (0.15.4) and CI runs. At v0.2.2
+# Pinned to the same ruff that uv.lock resolves (0.16.1) and CI runs. At v0.2.2
 # the hook and `uv run ruff` disagreed on comprehension-conditional
 # parenthesization, so a pre-commit pass and a CI format check could each demand
-# the other's output be undone.
+# the other's output be undone. 0.16.0 makes that hazard sharper, not milder: it
+# stabilised Markdown formatting, which 0.15.4 refused without preview mode, so a
+# hook and a CI check on different sides of that line disagree about every fenced
+# Python block in the docs. Bump this rev and the `ruff` floor in pyproject.toml
+# together, never one alone.
 -   repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.15.4
+    rev: v0.16.1
     hooks:
     -   id: ruff
         args: [--fix, --exit-non-zero-on-fix]

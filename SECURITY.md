@@ -104,23 +104,19 @@ provider = EphemeralAWSProvider(
     # Network: pre-provisioned by you, and never modified by the provider.
     # It creates no VPC, subnet, or security group, and deletes none.
     vpc_id="vpc-...",
-    subnet_id="subnet-...",           # a private subnet, if your workers can use one
+    subnet_id="subnet-...",  # a private subnet, if your workers can use one
     security_group_id="sg-...",
-    use_public_ips=False,             # no public IP; reach instances over SSM instead
-
+    use_public_ips=False,  # no public IP; reach instances over SSM instead
     # Credentials on the instance: an instance profile, never static keys.
     # Supply your own ARN, or let the provider create a least-privilege role
     # carrying only AmazonSSMManagedInstanceCore. A profile it created is
     # deleted on shutdown; one you supplied is never touched.
     auto_create_instance_profile=True,
-
     # No SSH. Omitting key_name launches instances with no key pair, so the
     # only access path is SSM Session Manager, which is IAM-authorized and
     # CloudTrail-logged. Set key_name only if you need SSH.
-
     # Terminate rather than stop, so no EBS volume outlives the work.
     auto_shutdown=True,
-
     # Tags, for attribution and for the orphan sweep to find leftovers.
     additional_tags={
         "Environment": "Production",

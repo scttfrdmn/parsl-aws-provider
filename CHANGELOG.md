@@ -8,6 +8,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **`ruff` floor raised to `0.16.0`, and the lint rule selection made explicit.**
+  0.16.0 changed the *implicit* default rule set from 59 rules to 413, which is a
+  breaking change for any project that never wrote a `select` — and this was one.
+  0.16.0 reported **1,128 errors** here against 0.15.4's zero, every one of them a
+  newly-defaulted rule (`PLW1510`, `PLR2004`, and the rest) rather than a
+  regression in this code.
+
+  `.ruff.toml` now sets `select = ["E4", "E7", "E9", "F"]`, which reproduces the
+  previous default **exactly** — verified by diffing `ruff check --show-settings`'s
+  enabled-rule list between 0.15.4 with no `select` and 0.16.0 with this one:
+  identical, 57 rules. So the bump changes no lint outcome. Adopting any of the
+  354 newly-defaulted rules is a separate decision with its own diff, not
+  something to fold into a dependency bump.
+
+  0.16.0 also **stabilised Markdown formatting**, which 0.15.4 refused outright
+  ("Markdown formatting is experimental, enable preview mode"). Since CI runs
+  `ruff format --check .` across the whole repo, 12 Markdown files came into scope
+  and are now formatted: the changes are confined to fenced Python blocks and are
+  whitespace-only — aligned trailing comments collapsed to a single space, and two
+  call expressions rewrapped. `.pre-commit-config.yaml`'s `ruff-pre-commit` rev
+  moves to `v0.16.1` in the same commit, matching what `uv.lock` resolves; the
+  Markdown change makes that lockstep sharper, since a hook and a CI check on
+  opposite sides of it disagree about every fenced block in the docs.
+- **`pytest-cov` floor raised to `7.1.0`**, which makes the total coverage figure
+  independent of reporting options (pytest-cov#641). That is a correctness fix for
+  the thing this repo gates on — `--cov-fail-under=65` in CI and `=25` in
+  `[tool.pytest.ini_options]` were comparing against a total that could shift with
+  `--cov-report`. Measured total after the bump: **72.44%**.
 - **`generate_endpoint_config()` writes four files and returns a different one**
   (#196). It previously wrote `config.yaml` plus a `config.py` shim and returned
   the path to the YAML. It now writes `config.yaml`, a
@@ -163,6 +191,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   4.0.1).
 
 ### Fixed
+- **The declared build requirement could not build this package.**
+  `[build-system] requires` read `setuptools>=42`, but PEP 639 support — the
+  `license = "Apache-2.0"` SPDX string and `license-files = [...]` this project
+  adopted in #189 — landed only in setuptools 77.0. Verified: 76.0.0 rejects
+  `pyproject.toml` outright with *"project.license must be one of [{file},
+  {text}]"*, so `>=42` advertised a build that cannot happen. The floor is now
+  `>=77.0.1` (77.0.0 was yanked).
+
+  This mattered because it was invisible locally — every environment here resolves
+  a current setuptools — and becomes reachable precisely when an **sdist** is
+  published (#180) and a consumer builds it against a pinned older setuptools.
+  Dependabot's own suggestion of 83.0.0 would have hidden it: its advisory
+  (GHSA-h35f-9h28-mq5c, Unicode-normalisation in `MANIFEST.in` matching) does not
+  apply here, since this project has no `MANIFEST.in`, so raising to 83.0.0 would
+  have moved the floor for no reason while leaving the real defect in place.
 - **The generated Globus Compute endpoint config could never start** (#196).
   `globus-compute-endpoint start` classifies a config by a single key:
   `load_config_yaml()` pops `engine` and returns a `UserEndpointConfig` when it is
