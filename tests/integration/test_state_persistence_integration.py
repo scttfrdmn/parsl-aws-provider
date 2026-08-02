@@ -528,21 +528,26 @@ class TestS3StateIntegration:
         bucket created without it would be world-readable if any later policy
         allowed it.
 
-        ``xfail`` on substrate#446 rather than skip: ``?publicAccessBlock`` is
-        unrouted there, so ``PUT`` falls through to the ``CreateBucket`` handler
-        and answers ``BucketAlreadyExists`` for the bucket that was just made.
-        The provider wraps that as ``StateError: Failed to create S3 bucket``, so
-        the whole constructor fails. xfail keeps the test running -- it will
-        report ``XPASS`` the moment substrate routes the subresource, where a skip
-        would sit silently forever.
+        This passes as of substrate 0.85.0, which routes ``?publicAccessBlock``
+        (substrate#443's sibling, substrate#446). Before that the subresource was
+        unrouted, so ``PUT`` fell through to the ``CreateBucket`` handler and
+        answered ``BucketAlreadyExists`` for the bucket just made; the provider
+        wrapped that as ``StateError: Failed to create S3 bucket`` and the whole
+        constructor failed. The ``xfail`` that carried the test through that
+        period is gone -- keeping it would mean an ``XPASS`` on every run, which
+        reads as noise rather than as coverage.
 
-        Creation itself is covered under moto in
+        The ``except StateError`` branch below is kept deliberately: it names the
+        emulator gap that used to break this, so a regression in substrate's
+        routing fails here with that explanation rather than as a bare
+        constructor error.
+
+        Creation is also covered under moto in
         ``tests/unit/test_aws_mocking.py::test_bucket_is_created_when_requested``.
-        Nothing covers it against real S3: ``tests/aws`` pre-creates the bucket in
-        its ``s3_state_bucket`` fixture, so the provider takes the
+        It remains uncovered against *real* S3 -- ``tests/aws`` pre-creates the
+        bucket in its ``s3_state_bucket`` fixture, so the provider takes the
         already-exists branch there, and no E2E test passes
-        ``create_bucket_if_not_exists``. The public-access assertions below are
-        therefore unverified against AWS until substrate#446 lands.
+        ``create_bucket_if_not_exists`` (#166).
         """
         bucket_name = f"auto-create-bucket-{uuid.uuid4().hex[:16]}"
         s3_client = substrate_session.client("s3")
@@ -559,10 +564,11 @@ class TestS3StateIntegration:
             )
         except StateError as exc:
             if "BucketAlreadyExists" in str(exc):
-                pytest.xfail(
-                    "substrate#446: PUT ?publicAccessBlock is routed to "
-                    "CreateBucket, so the provider cannot lock down a bucket it "
-                    "just created."
+                pytest.fail(
+                    "substrate regressed on #446: PUT ?publicAccessBlock fell "
+                    "through to CreateBucket, so the provider could not lock "
+                    "down a bucket it had just made. Fixed in 0.85.0; check the "
+                    "pin in docker-compose.substrate.yml."
                 )
             raise
 

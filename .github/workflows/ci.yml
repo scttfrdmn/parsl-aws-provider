@@ -122,8 +122,11 @@ jobs:
       substrate:
         # Pinned rather than `latest`, matching docker-compose.substrate.yml: an
         # emulator that changes underneath CI turns an unrelated PR red. Bump the
-        # two together, deliberately.
-        image: ghcr.io/scttfrdmn/substrate:0.76.0
+        # two together, deliberately -- they had drifted, this pin sitting on
+        # 0.76.0 while compose moved to 0.82.0, so CI was validating against an
+        # emulator six releases older than the one developers ran. See that file
+        # for what 0.85.0 fixes.
+        image: ghcr.io/scttfrdmn/substrate:0.85.0
         ports:
           - 4566:4566
         # No `--health-cmd`. The image is Alpine and ships no curl, and GitHub
@@ -140,11 +143,12 @@ jobs:
       - name: Wait for substrate
         run: ./scripts/substrate-wait.sh
       - name: Run integration tests
-        # Not gating yet: 46 mode constructions across 9 files still omit the
-        # network IDs #69 made required, so the emulator-backed tests cannot pass
-        # until they are repaired (#92, v0.8.0). Gating here would make every PR
-        # red on known debt.
-        continue-on-error: true
+        # Now gating. This carried `continue-on-error: true` while #92's debt was
+        # outstanding -- 46 mode constructions omitted the network IDs #69 made
+        # required, so the suite could not pass and gating would have made every
+        # PR red. #92 closed in v0.8.0 and the suite is green (130 passed, 1
+        # skipped against substrate 0.85.0), so the exemption now only hides
+        # regressions.
         env:
           # Structural, not secret: substrate authenticates against nothing, but
           # botocore refuses to sign a request without credentials present.

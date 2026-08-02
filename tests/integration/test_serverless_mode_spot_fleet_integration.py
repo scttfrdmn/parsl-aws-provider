@@ -332,10 +332,18 @@ class TestServerlessModeSpotFleetIntegration:
         # and that tag is the only supported way to enumerate an instant fleet's
         # instances: DescribeFleetInstances rejects this fleet type outright, and
         # DescribeFleets reports the original launch without dropping instances
-        # that have since terminated. Neither moto nor substrate applies it
-        # (substrate#443), so it is set here -- otherwise the lookup comes back
-        # empty and a running fleet reports COMPLETED for want of a tag rather
-        # than for any behaviour of the code under test.
+        # that have since terminated. **moto** does not apply it, so it is set
+        # here -- otherwise the lookup comes back empty and a running fleet
+        # reports COMPLETED for want of a tag rather than for any behaviour of
+        # the code under test.
+        #
+        # This file stays on moto even though substrate now applies the tag
+        # itself (substrate#443, 0.85.0): six tests here drive `cf_client`, and
+        # substrate does not emulate CloudFormation. Note the workaround is only
+        # viable *because* it is moto -- substrate now enforces the real rule
+        # that `aws:` keys are reserved and rejects create_tags outright, which
+        # is why the substrate-backed copy of this pattern in
+        # test_spot_interruption_substrate.py had to drop it.
         instance_ids = [i for g in fleet["Instances"] for i in g["InstanceIds"]]
         assert instance_ids, "fleet launched nothing; nothing to assert about"
         ec2.create_tags(
@@ -386,7 +394,7 @@ class TestServerlessModeSpotFleetIntegration:
         )
         fleet_id = fleet["FleetId"]
         instance_ids = [i for g in fleet["Instances"] for i in g["InstanceIds"]]
-        ec2.create_tags(  # see substrate#443, above
+        ec2.create_tags(  # moto does not apply it; see above
             Resources=instance_ids,
             Tags=[{"Key": "aws:ec2:fleet-id", "Value": fleet_id}],
         )
