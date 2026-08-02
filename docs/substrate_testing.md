@@ -1,6 +1,6 @@
 # Testing with substrate
 
-This guide explains how to test the Parsl Ephemeral AWS Provider against
+This guide explains how to test the Parsl AWS Provider against
 [substrate](https://github.com/scttfrdmn/substrate), a local AWS emulator, without
 creating real AWS resources or incurring charges.
 

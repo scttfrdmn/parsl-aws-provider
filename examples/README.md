@@ -1,6 +1,6 @@
 # Examples
 
-Eight runnable scripts. Every one creates real AWS resources and costs real money.
+Nine runnable scripts. Every one creates real AWS resources and costs real money.
 
 All of them read the network IDs from the environment, because as of v0.7.0 the
 provider never creates network resources — see
@@ -25,6 +25,7 @@ accepts none.
 | Example | What it shows |
 |---|---|
 | [standard_mode.py](standard_mode.py) | The common case: EC2 workers connecting back to your client |
+| [one_shot_mode.py](one_shot_mode.py) | One command per instance over SSM — the only mode needing no inbound reachability |
 | [basic_usage.py](basic_usage.py) | The same provider configured for all three modes, side by side |
 | [parsl_aws_integration.py](parsl_aws_integration.py) | A full Parsl workflow, run from an EC2 driver in the same VPC |
 | [detached_mode.py](detached_mode.py) | A bastion owns the workers; also how reconnection works |
@@ -34,9 +35,9 @@ accepts none.
 | [serverless_spot_fleet_example.py](serverless_spot_fleet_example.py) | Serverless mode's fleet path — an unusual corner |
 
 Start with `standard_mode.py`. If your client is a laptop behind NAT, start with
-`detached_mode.py` instead, and read the "Workers launch but never register" section
-of [troubleshooting.md](../docs/troubleshooting.md) first — it is by far the most
-common failure and it is not an AWS problem.
+`detached_mode.py` or `one_shot_mode.py` instead, and read the "Workers launch but
+never register" section of [troubleshooting.md](../docs/troubleshooting.md) first —
+it is by far the most common failure and it is not an AWS problem.
 
 ## Two things every example does deliberately
 
@@ -44,6 +45,8 @@ common failure and it is not an AWS problem.
 certificates in the client's `run_dir`, which remote workers cannot read, so they
 fail to register with no useful error. Certificate distribution is
 [#62](https://github.com/scttfrdmn/parsl-aws-provider/issues/62).
+`one_shot_mode.py` is the exception: it builds no executor at all, because there is
+no interchange in that mode.
 
 **`provider.shutdown()` in a `finally`.** There is no `atexit` hook, and
 `parsl.clear()` releases Parsl's resources, not AWS ones. If an example is killed
@@ -53,7 +56,9 @@ hard, sweep for orphans:
 parsl-aws-cleanup --dry-run --region us-east-1
 ```
 
-It matches the `ParslResource=true` tag, so it finds resources no state file names.
+It matches by tag — `CreatedBy=ParslEphemeralAWSProvider` for standard mode and
+`ParslResource=true` for detached and serverless — so it finds resources no state
+file names.
 
 ## Options these examples do not use
 

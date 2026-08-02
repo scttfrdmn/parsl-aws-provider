@@ -151,12 +151,20 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
         Maximum number of blocks. Default is 10.
     worker_init : str, optional
         Initialization script for workers. Default is an empty script.
-    vpc_id : str, optional
-        Existing VPC ID to use. If not provided, a new VPC will be created.
-    subnet_id : str, optional
-        Existing subnet ID to use. If not provided, a new subnet will be created.
-    security_group_id : str, optional
-        Existing security group ID to use. If not provided, a new security group will be created.
+    vpc_id : str
+        Existing VPC ID to use. **Required**, and pre-provisioned outside the
+        provider: since #69 the provider creates no VPC, subnet, or security
+        group. Omitting any of the three raises ``ValueError``.
+    subnet_id : str
+        Existing subnet ID to use. Required; see ``vpc_id``.
+    security_group_id : str
+        Existing security group ID to use. Required; see ``vpc_id``. It is never
+        modified or deleted -- a caller-supplied group is not the provider's to
+        touch (#100).
+
+        The one exception to all three is ``mode="serverless"`` with
+        ``compute_type="lambda"``: functions run in the Lambda-managed VPC, so
+        there is nothing for the caller to pre-provision.
     key_name : str, optional
         EC2 key pair name for SSH access. If not provided, instances will be created without a key pair.
     profile_name : str, optional

@@ -57,6 +57,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   already-created resources in live accounts.
 
 ### Added
+- **`examples/one_shot_mode.py`, an example two other examples already pointed
+  at** (#199). `basic_usage.py` and `standard_mode.py` both referenced a file that
+  did not exist — and `standard_mode.py` cited it as one of the two answers for a
+  client behind NAT, which is the most common way this provider fails to work at
+  all. Writing it beat deleting the references: `one_shot=True` is real,
+  documented, and covered by `tests/aws/test_one_shot_e2e.py`. It is also the only
+  mode that builds no `HighThroughputExecutor`, because there is no interchange to
+  reach — so it is the one example exempt from the `encrypted=False` rule, and the
+  demonstration that a non-zero exit code surfaces as `FAILED`.
+- **Private vulnerability reporting is enabled on the repository** (#199).
+  `SECURITY.md` instructed reporters to "email the core maintainers" and gave no
+  address, so the documented disclosure channel was a dead end. It now points at
+  GitHub's private advisory form, which the file already cited as the announcement
+  mechanism.
 - **The documentation is actually published.** CI's `docs` job has built the
   Sphinx HTML on every PR since #124 and uploaded it as an artifact — a form only
   reachable by someone browsing a workflow run. It now deploys to GitHub Pages at
@@ -101,6 +115,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   legacy `{text = "Apache-2.0"}` table to the PEP 639 SPDX string, since the two
   forms cannot be mixed (#189).
 
+### Removed
+- **`docs/roadmap.md` and `docs/release_notes.md`, both published to the site**
+  (#199). CLAUDE.md's first rule prohibits standalone planning documents and status
+  reports, and these were both — but the reason to delete rather than update them
+  is that they were the only two pages contradicting the accurate ones:
+
+  - `roadmap.md` headed itself "Version 0.1.0 (Current)" against a shipping 0.8.0,
+    presented 0.2.0 as the "Next Release" and 0.3.0 as future when both had
+    shipped, and claimed "✅ VPC and networking management" — removed by #69.
+  - Both advertised MPI support. MPI **does not work**: `nodes_per_block` is fleet
+    capacity only and there is no launcher concept, which `docs/examples.md` states
+    outright. These two files were the only places contradicting it.
+  - `release_notes.md` was still headed "[0.1.0] - Unreleased", advertised "Python
+    3.8+ / Parsl 1.2.0+" against `requires-python = ">=3.10"` — the last place in
+    the repo naming 3.8 — claimed automatic VPC creation, and cited LocalStack,
+    retired in #125.
+
+  `CHANGELOG.md` already covers release history properly and GitHub milestones
+  cover the roadmap, so nothing was lost. Both were dropped from
+  `docs/index.rst`'s toctree.
+
 ### Security
 - **Dependency floors raised past three advisories, one HIGH.** `cryptography`
   `>=3.4.0` → `>=48.0.1` closes GHSA-537c-gmf6-5ccf (HIGH), the vulnerable
@@ -118,6 +153,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   4.0.1).
 
 ### Fixed
+- **`SECURITY.md`'s only code example was rejected outright, and its policy
+  covered a version that does not ship** (#199). Four of the five kwargs in the
+  security-configuration example have never existed — `encrypt_storage`,
+  `enable_detailed_monitoring`, `security_group_rules`, `tags` — so the snippet
+  raised `ProviderConfigurationError` before reaching AWS. `security_group_rules`
+  was doubly wrong: since #69 the provider creates no security group to configure.
+  The example is now built only from options that exist, and says where EBS and
+  state-store encryption actually live, since neither is a provider flag.
+
+  The supported-versions table read `0.1.x` against a shipping 0.8.0, so the policy
+  promised security support for no released version. It now tracks `0.8.x` and
+  states there are no backports. Two commitments a single maintainer cannot keep
+  were also removed: the 48-hour acknowledgement and the day-by-day disclosure
+  calendar.
+
+  **`SECURITY.md` was not in `test_docs_examples.py`'s scan list**, which is the
+  whole reason this survived while `docs/security.md` — which *is* scanned — stayed
+  correct throughout. It is in the list now.
+- **The published API reference told users the provider builds their network**
+  (#199). `EphemeralAWSProvider.__init__`'s docstring described `vpc_id`,
+  `subnet_id` and `security_group_id` as optional, each saying "If not provided, a
+  new VPC/subnet/security group will be created". All three are required and
+  omitting any raises `ValueError`; `api_reference.rst` autodocs this module, so
+  the site carried it. Corrected, including the one real exception — Lambda-only
+  serverless, whose functions run in the Lambda-managed VPC.
+- **`docs/ci_cd.md` misdescribed the pipeline it documents** (#199). Four
+  measurable errors, each verified against the workflow: lint is scoped to `.` and
+  not `parsl_aws_provider tests` (#93/#165 pruned the `tools/` errors that forced
+  the narrowing); integration tests **gate** as of #192; the E2E suite holds 87
+  tests across ten files, not 51; and the "88 of 295 tests" figure for the old
+  marker divergence is long stale — both selections now collect 1,211. The same
+  stale lint guidance in `CLAUDE.md` and two stale counts in `ci.yml`'s comments
+  (`51` E2E tests, a `125`-error mypy baseline that is 76) were corrected with it.
+- **Seven documentation titles still named the project "Parsl Ephemeral AWS
+  Provider"** (#199), including `docs/index.rst:1` — the published site's
+  `<title>`, and the first thing a visitor reads. Also `docs/architecture.md`'s
+  claim that the unreachable modules are "scheduled for removal in v0.8.0", which
+  shipped without them; #90 is v0.9.0, and it does not cover
+  `security/encryption.py`, which is exported and covered.
 - **The orphan sweep shipped in no artifact, and found nothing when it was
   reachable** (#198). Two independent defects in the one tool that bounds the bill
   after a crash. Nothing terminates instances automatically — Parsl never calls

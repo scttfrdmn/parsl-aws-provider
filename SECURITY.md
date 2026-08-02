@@ -6,7 +6,13 @@ The following versions of Parsl AWS Provider are currently being supported with 
 
 | Version | Supported          |
 | ------- | ------------------ |
-| 0.1.x   | :white_check_mark: |
+| 0.8.x   | :white_check_mark: |
+| < 0.8   | :x:                |
+
+The project is pre-1.0 and alpha: only the latest minor line receives security
+fixes, and there are no backports. Nothing has been published to PyPI yet
+([#180](https://github.com/scttfrdmn/parsl-aws-provider/issues/180)), so every
+existing install is from source.
 
 ## Reporting a Vulnerability
 
@@ -14,13 +20,19 @@ We take the security of the Parsl AWS Provider seriously. If you believe you've 
 
 1. **Do not disclose the vulnerability publicly** on the issue tracker, mailing lists, or social media.
 
-2. **Email the core maintainers** directly with details of the issue. Include the following information:
+2. **Report it privately through GitHub**, using
+   [Report a vulnerability](https://github.com/scttfrdmn/parsl-aws-provider/security/advisories/new)
+   under the repository's Security tab. That opens a private advisory visible only
+   to you and the maintainers. This replaces the previous "email the core
+   maintainers" instruction, which named no address and so left reporters with no
+   usable channel. Include:
    - A description of the vulnerability
    - Steps to reproduce the issue
    - Potential impact of the vulnerability
    - Any potential solutions you've identified
 
-3. **Allow time for response and assessment**. The maintainers will acknowledge your report within 48 hours and provide an estimated timeline for a fix.
+3. **Allow time for response and assessment**. This is a single-maintainer
+   project, so expect acknowledgement within a week rather than within hours.
 
 4. **Maintain confidentiality** until the vulnerability is fixed and announced. We will work with you to ensure proper credit for the discovery.
 
@@ -37,9 +49,15 @@ When using the Parsl AWS Provider, follow these security best practices:
 
 ### Network Configuration
 
-- Limit inbound security group rules to only necessary ports
-- Use private subnets for worker nodes when possible
-- Configure security groups to allow only necessary traffic
+The provider creates no VPC, subnet, or security group, and deletes none — you
+pre-provision all three and pass their IDs. That makes the network your
+responsibility rather than a default it picks for you:
+
+- Limit inbound rules to what the workers need. HTEX workers connect *outbound*
+  to the interchange, so they generally need no inbound rule at all
+- Omit `key_name` so no SSH key is installed, and reach instances over SSM
+  Session Manager instead — IAM-authorized and CloudTrail-logged, unlike SSH
+- Use private subnets for worker nodes when possible, with `use_public_ips=False`
 - Enable VPC flow logs for network monitoring
 
 ### Resource Isolation
@@ -58,56 +76,79 @@ When using the Parsl AWS Provider, follow these security best practices:
 
 ### Template Security
 
-- Review CloudFormation and Terraform templates for security issues
+The provider deploys CloudFormation stacks for the detached-mode bastion and for
+the serverless Lambda and ECS workers. The Terraform templates under
+`parsl_aws_provider/templates/terraform/` are referenced by no code path and
+deploy nothing.
+
+- Review the CloudFormation templates before running a mode that deploys them
 - Use AWS CloudFormation Guard or other policy-as-code tools
-- Validate templates before deployment
 - Keep infrastructure-as-code templates under version control
 
 ## Security Updates
 
-Security updates will be announced through:
+Security updates are announced through:
 
 1. GitHub security advisories
-2. Release notes
-3. Direct notification to users who have starred/watched the repository
+2. The `Security` section of `CHANGELOG.md`
 
 ## Security-related Configuration
 
-The Parsl AWS Provider includes several security-focused configuration options:
+Every option below is real. The provider rejects unknown keyword arguments
+outright rather than ignoring them, so a misspelling raises
+`ProviderConfigurationError` at construction — an option accepted but never read
+would be a silent false assurance.
 
 ```python
 provider = EphemeralAWSProvider(
-    # Security-related configuration options
-    use_public_ips=False,              # Use only private IPs when possible
-    encrypt_storage=True,              # Encrypt EBS volumes
-    enable_detailed_monitoring=True,   # Enable detailed CloudWatch monitoring
-    security_group_rules=[             # Customize security group rules
-        {
-            'IpProtocol': 'tcp',
-            'FromPort': 22,
-            'ToPort': 22,
-            'IpRanges': [{'CidrIp': '10.0.0.0/16'}]
-        }
-    ],
-    tags={                             # Tag resources for security tracking
-        'Environment': 'Production',
-        'SecurityContact': 'security@example.com'
-    }
+    # Network: pre-provisioned by you, and never modified by the provider.
+    # It creates no VPC, subnet, or security group, and deletes none.
+    vpc_id="vpc-...",
+    subnet_id="subnet-...",           # a private subnet, if your workers can use one
+    security_group_id="sg-...",
+    use_public_ips=False,             # no public IP; reach instances over SSM instead
+
+    # Credentials on the instance: an instance profile, never static keys.
+    # Supply your own ARN, or let the provider create a least-privilege role
+    # carrying only AmazonSSMManagedInstanceCore. A profile it created is
+    # deleted on shutdown; one you supplied is never touched.
+    auto_create_instance_profile=True,
+
+    # No SSH. Omitting key_name launches instances with no key pair, so the
+    # only access path is SSM Session Manager, which is IAM-authorized and
+    # CloudTrail-logged. Set key_name only if you need SSH.
+
+    # Terminate rather than stop, so no EBS volume outlives the work.
+    auto_shutdown=True,
+
+    # Tags, for attribution and for the orphan sweep to find leftovers.
+    additional_tags={
+        "Environment": "Production",
+        "SecurityContact": "security@example.com",
+    },
 )
 ```
 
-## Vulnerability Disclosure Timeline
+Two options deliberately absent from that list:
 
-Our typical vulnerability disclosure timeline is:
+- **EBS encryption** is not a provider option. Enable
+  [EC2 encryption by default](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/EBSEncryption.html#encryption-by-default)
+  at the account level, which covers every volume regardless of what launches it.
+- **State-store encryption** depends on the backend, not on a flag here. The S3
+  and Parameter Store backends inherit the bucket's or parameter's encryption; the
+  file backend writes plaintext JSON to local disk. Prefer S3 or Parameter Store
+  when the state is sensitive — see `docs/state_persistence.md`.
 
-1. **Day 0**: Report received, issue confirmed
-2. **Day 1-2**: Scope assessment and remediation planning
-3. **Day 3-14**: Fix development and testing
-4. **Day 15-21**: Release preparation
-5. **Day 22**: Fix released
-6. **Day 23+**: Public disclosure
+## Vulnerability Disclosure
 
-This timeline may vary based on the severity and complexity of the issue.
+The intended sequence is: report received and confirmed → scope assessed → fix
+developed and tested → release → public disclosure via a GitHub security
+advisory.
+
+No day-by-day schedule is promised. This is a single-maintainer alpha project,
+and a calendar that cannot be met is worse than none. If you need a disclosure
+deadline for your own process, say so in the report and it will be agreed
+explicitly.
 
 SPDX-License-Identifier: Apache-2.0
 SPDX-FileCopyrightText: 2025-2026 Scott Friedman and Project Contributors

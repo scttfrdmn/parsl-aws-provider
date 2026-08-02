@@ -1,7 +1,7 @@
 # CI/CD Pipeline
 
 This document describes the continuous integration and release pipeline for the
-Parsl Ephemeral AWS Provider.
+Parsl AWS Provider.
 
 The authoritative definitions are the workflow files themselves —
 [`.github/workflows/ci.yml`](../.github/workflows/ci.yml) and
@@ -31,10 +31,12 @@ checkout does.
 
 Two details worth knowing:
 
-* **Scope is `parsl_aws_provider tests`, not `.`** — `tools/` carries pre-existing
-  errors (bare excepts, unused imports) in one-off debug scripts that
-  [#93](https://github.com/scttfrdmn/parsl-aws-provider/issues/93) prunes in
-  v0.8.0. A `.`-scoped check could never pass.
+* **Scope is `.`, the whole repository.** It was once narrowed to
+  `parsl_aws_provider tests`, because `tools/` carried bare excepts and unused
+  imports in one-off debug scripts. [#93](https://github.com/scttfrdmn/parsl-aws-provider/issues/93)
+  and [#165](https://github.com/scttfrdmn/parsl-aws-provider/issues/165) pruned
+  those in v0.8.0, so the narrowing no longer protects anything and a `.`-scoped
+  check passes.
 * **ruff-format, not black.** `black` and `isort` are no longer dependencies. The
   repo formats with `ruff-format` at its default 88-character line length; the old
   `[tool.black] line-length = 100` disagreed with how every file was actually
@@ -60,9 +62,11 @@ matrix entries could not have installed the package at all.
 than a separate one.
 
 **Selection is by path, not `-m unit`.** That distinction caused a long-running
-divergence: the Makefile selected `-m unit`, which collected 88 of 295 tests and
-passed, while CI ran the unmarked set and failed. Selecting by path means a
-newly-added file without a marker still runs.
+divergence: the Makefile selected `-m unit` and collected only a fraction of the
+suite, passing, while CI ran the unmarked set and failed. Selecting by path means a
+newly-added file without a marker still runs — and the two now agree, because every
+file under `tests/unit` and `tests/security` carries the marker (1,211 collected
+either way).
 
 This job carries the project's real coverage gate, `--cov-fail-under=65`. The
 `--cov-fail-under` in `pyproject.toml` is a lower smoke floor because `addopts`
@@ -79,13 +83,14 @@ is end-of-life and its `latest` community tag now resolves to the Pro build, whi
 exits 55 without a license token -- before any step runs, and outside what
 `continue-on-error` covers.
 
-The integration suite itself is **not gated** (`continue-on-error: true`): now that
-an endpoint is present these tests actually execute rather than skipping, and 46 mode
-constructions across 9 files still omit the network IDs
-[#69](https://github.com/scttfrdmn/parsl-aws-provider/issues/69) made required
-([#92](https://github.com/scttfrdmn/parsl-aws-provider/issues/92), v0.8.0). Gating
-before that lands would make every PR red on known debt. The conformance step *is*
-gated, because it drives raw boto3 and cannot be tripped by that test-side debt.
+The integration suite **gates** as of
+[#192](https://github.com/scttfrdmn/parsl-aws-provider/issues/192). It carried
+`continue-on-error: true` for as long as 46 mode constructions across 9 files
+omitted the network IDs [#69](https://github.com/scttfrdmn/parsl-aws-provider/issues/69)
+made required, since gating before that was fixed would have turned every PR red on
+known debt. [#92](https://github.com/scttfrdmn/parsl-aws-provider/issues/92) closed
+in v0.8.0 and the suite is green, so the exemption could only have hidden a
+regression. Only the Codecov upload step remains non-gating.
 
 Note that a pytest marker only *selects* tests — it never skips them. Each
 emulator-backed file pairs its markers with a `skipif(not is_substrate_available())`
@@ -95,8 +100,8 @@ guard; without one, a plain `pytest tests/integration` errors instead of skippin
 
 The real-AWS E2E suite (`tests/aws`), **manual dispatch only** — it bills money
 and needs a pre-provisioned VPC, subnet, and security group.
-[#60](https://github.com/scttfrdmn/parsl-aws-provider/issues/60) closed with 51
-tests here that no workflow referenced.
+[#60](https://github.com/scttfrdmn/parsl-aws-provider/issues/60) closed with tests
+here that no workflow referenced; there are **87** now, across ten files.
 
 Credentials come from OIDC via `aws-actions/configure-aws-credentials`, so no
 long-lived access keys live in secrets. Configure:

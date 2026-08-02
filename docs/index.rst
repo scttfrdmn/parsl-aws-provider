@@ -1,5 +1,5 @@
-Parsl Ephemeral AWS Provider
-============================
+Parsl AWS Provider
+==================
 
 A provider for the `Parsl <https://parsl-project.org/>`_ parallel scripting library
 that runs workflows on ephemeral AWS resources: instances are created when work
@@ -123,5 +123,3 @@ SSM parameters for the region and architecture in use.
 
    substrate_testing
    ci_cd
-   roadmap
-   release_notes

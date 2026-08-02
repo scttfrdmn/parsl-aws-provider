@@ -1,10 +1,10 @@
-# Parsl Ephemeral AWS Provider Architecture
+# Parsl AWS Provider Architecture
 
-This document provides an overview of the architecture and design of the Parsl Ephemeral AWS Provider.
+This document provides an overview of the architecture and design of the Parsl AWS Provider.
 
 ## Overview
 
-The Parsl Ephemeral AWS Provider runs Parsl workflows on AWS compute that is
+The Parsl AWS Provider runs Parsl workflows on AWS compute that is
 created when work arrives and destroyed when it finishes.
 
 **Networking is not ephemeral.** Since v0.7.0 the VPC, subnet, and security group
@@ -43,9 +43,11 @@ parsl_aws_provider/
 └── templates/cloudformation/   # bastion, ec2_worker, lambda_worker, ecs_worker
 ```
 
-`network/`, `compute/ec2.py`, `utils/logging.py`, `security/encryption.py`, and
-`templates/terraform/` are not reachable from any live path; they are scheduled
-for removal in v0.8.0 ([#90](https://github.com/scttfrdmn/parsl-aws-provider/issues/90)).
+`network/`, `compute/ec2.py`, `utils/logging.py`, and `templates/terraform/` are
+not reachable from any live path; they are scheduled for removal in v0.9.0
+([#90](https://github.com/scttfrdmn/parsl-aws-provider/issues/90)).
+`security/encryption.py` is *not* among them — it is exported from
+`security/__init__.py` and covered, so #90's original body was wrong to list it.
 
 ## Operating modes
 
@@ -131,7 +133,8 @@ v0.6.0 defect that leaked baked AMIs and lost `job_map`). See
 CloudFormation templates ship inside the wheel and are loaded with
 `get_cf_template()`, not by filesystem path — a wheel install has no source tree.
 The Terraform modules under `templates/terraform/` are referenced by nothing and
-are slated for removal in v0.8.0.
+are slated for removal in v0.9.0
+([#90](https://github.com/scttfrdmn/parsl-aws-provider/issues/90)).
 
 ## Error handling and recovery
 
