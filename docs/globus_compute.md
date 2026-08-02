@@ -229,9 +229,11 @@ To reuse a UUID you already have, pass it on the first start:
 uv run globus-compute-endpoint start my_aws_endpoint --endpoint-uuid <uuid>
 ```
 
-There is no config key for it: `BaseConfig` rejects `endpoint_id`, so writing it
-into `config.yaml` makes the config unloadable. If you passed `endpoint_id=` to the
-constructor, the generated `config.yaml` carries the flag to use as a comment.
+There is no *top-level* config key for it, in either file: `BaseConfig` raises
+`Unexpected keyword argument` and the config becomes unloadable. Under
+`engine.provider` it is legal — that is a `GlobusComputeProvider` kwarg, not an
+endpoint one — so `endpoint_id=` reaches the template there, and `config.yaml`
+additionally carries the `--endpoint-uuid` invocation as a comment.
 
 ### 4. Submit from anywhere
 
@@ -511,20 +513,23 @@ It is waiting for a worker. Beyond the above:
   and `ec2messages` VPC endpoints, plus a route to whatever package index
   `worker_init` uses.
 - **AMI**: resolved from SSM for the region and architecture, and only emitted
-  into `config.yaml` when you passed it explicitly. A custom `image_id` must exist
-  in the target region.
+  into `user_config_template.yaml.j2` when you passed it explicitly. A custom
+  `image_id` must exist in the target region.
 
 ### `ResourceNotFoundException` on start
 
-The UUID in `~/.globus_compute/<name>/` no longer exists in the service. Delete
-the directory and re-register:
+The UUID in `~/.globus_compute/<name>/endpoint.json` no longer exists in the
+service. Delete the directory and let the next start register a fresh one:
 
 ```bash
 rm -rf ~/.globus_compute/my_aws_endpoint
-uv run globus-compute-endpoint configure my_aws_endpoint
 ```
 
-Regenerate the config afterwards — `configure` writes a default one.
+Then re-run `generate_endpoint_config()` and start again. Do **not** use
+`globus-compute-endpoint configure` to recreate it — that writes its own
+`config.yaml`, which this package's generator then has to overwrite, and an
+operator who forgets the second step is left with a default endpoint that runs
+nothing on AWS.
 
 ### `TaskExecutionFailed`
 
