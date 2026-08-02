@@ -80,8 +80,17 @@ SSM (required)
     ssm:GetParameter (resolves the current Amazon Linux 2023 AMI),
     ssm:SendCommand, ssm:GetCommandInvocation,
     ssm:DescribeInstanceInformation (warm-pool and one-shot dispatch),
-    ssm:StartSession, ssm:TerminateSession, ssm:ResumeSession,
-    ssm:DescribeSessions, ssm:GetConnectionStatus (Session Manager tunnels)
+    ssm:PutParameter, ssm:DeleteParameter, ssm:DeleteParameters
+    (``state_store_type="parameter_store"``)
+
+    No Session Manager grants. ssm:StartSession, TerminateSession,
+    ResumeSession, DescribeSessions and GetConnectionStatus were listed here for
+    "Session Manager tunnels", but no such transport exists in this package and
+    nothing calls them (#195).
+
+STS (always required)
+    sts:GetCallerIdentity -- ``create_session()`` verifies every session with it,
+    so this is the first AWS call the provider makes.
 
 EventBridge + SQS (required when use_spot and spot_interruption_handling)
     events:PutRule, events:PutTargets, events:RemoveTargets,
@@ -92,18 +101,25 @@ EventBridge + SQS (required when use_spot and spot_interruption_handling)
 IAM (required when auto_create_instance_profile=True)
     iam:CreateRole, iam:GetRole, iam:AttachRolePolicy,
     iam:CreateInstanceProfile, iam:GetInstanceProfile,
-    iam:AddRoleToInstanceProfile, iam:PassRole
+    iam:AddRoleToInstanceProfile, iam:PassRole,
+    iam:RemoveRoleFromInstanceProfile, iam:DeleteInstanceProfile,
+    iam:ListAttachedRolePolicies, iam:DetachRolePolicy, iam:DeleteRole
+
+    The teardown half is required, not optional: ``cleanup_infrastructure()``
+    deletes the pair it created (#132), and cleanup logs rather than raises, so
+    a missing delete grant leaks a standing privileged principal silently
+    (#195).
 
 ECR (only when container_image references an ECR repository)
     ecr:GetAuthorizationToken, ecr:BatchGetImage,
     ecr:GetDownloadUrlForLayer, ecr:BatchCheckLayerAvailability
 
-Not covered by ``minimum_iam_policy()``: the non-default state backends
-(``state_store_type="s3"`` needs S3 object access, ``"parameter_store"`` needs
-``ssm:PutParameter``/``GetParameter``/``DeleteParameter``/
-``GetParametersByPath``), ``mode="detached"`` (CloudFormation stack and SSM
-Parameter Store access), and ``mode="serverless"`` (Lambda, ECS, CloudWatch
-Logs, and IAM role lifecycle).
+Not covered by ``minimum_iam_policy()``: ``state_store_type="s3"`` (needs S3
+object access), ``mode="detached"`` (CloudFormation stack management), and
+``mode="serverless"`` (Lambda, ECS, CloudWatch Logs, and IAM role lifecycle).
+The Parameter Store backend *is* covered now -- it was listed here as uncovered
+while the policy also omitted the actions, so the omission read as deliberate
+(#195).
 
 SPDX-License-Identifier: Apache-2.0
 SPDX-FileCopyrightText: 2025-2026 Scott Friedman and Project Contributors
@@ -567,14 +583,21 @@ class GlobusComputeProvider(EphemeralAWSProvider):
         ``AmazonSSMManagedInstanceCore``, which
         ``auto_create_instance_profile=True`` attaches for them.
 
-        Scope: the ``mode="standard"`` path with file-backed state, which is
-        what a generated endpoint config uses. Actions were derived from the
-        package's actual API calls, so the set is narrower than it was before
-        v0.7.0 -- network resources are caller-supplied since #69, so no
-        VPC/subnet/security-group/NAT/gateway create or delete grant appears,
-        and Spot Fleet was replaced by EC2 Fleet in #86. See the module
-        docstring for what is deliberately *not* covered (the S3 and Parameter
-        Store state backends, and detached and serverless modes).
+        Scope: the ``mode="standard"`` path, which is what a generated endpoint
+        config uses, with either file-backed or Parameter Store state. Actions
+        were derived from the package's actual API calls, so the set is narrower
+        than it was before v0.7.0 -- network resources are caller-supplied since
+        #69, so no VPC/subnet/security-group/NAT/gateway create or delete grant
+        appears, and Spot Fleet was replaced by EC2 Fleet in #86. See the module
+        docstring for what is deliberately *not* covered (the S3 state backend,
+        and detached and serverless modes).
+
+        Every action here has a call site in the package, and the teardown
+        actions matter as much as the create ones: cleanup logs rather than
+        raises, so a missing delete permission leaks resources silently. That is
+        what #195 found -- this method granted ``iam:CreateRole`` and
+        ``iam:CreateInstanceProfile`` with no corresponding deletes, so a user on
+        this policy reproduced the very leak #132 had just fixed.
 
         Parameters
         ----------
@@ -628,13 +651,23 @@ class GlobusComputeProvider(EphemeralAWSProvider):
             "ssm:SendCommand",
             "ssm:GetCommandInvocation",
             "ssm:DescribeInstanceInformation",
-            # Session Manager tunnels to reach workers in a private subnet
-            "ssm:StartSession",
-            "ssm:TerminateSession",
-            "ssm:ResumeSession",
-            "ssm:DescribeSessions",
-            "ssm:GetConnectionStatus",
+            # state_store_type="parameter_store", which detached mode needs so
+            # the client and the bastion can read the same state. Both the
+            # singular and plural deletes appear because they are distinct IAM
+            # actions and the code calls both: delete_parameter() per key, and
+            # delete_parameters() for the batched cleanup (#195).
+            "ssm:PutParameter",
+            "ssm:DeleteParameter",
+            "ssm:DeleteParameters",
         ]
+        # Deliberately absent: ssm:StartSession, TerminateSession,
+        # ResumeSession, DescribeSessions, GetConnectionStatus. These were
+        # granted for "Session Manager tunnels to reach workers in a private
+        # subnet", but no such transport exists in this package -- grep finds no
+        # call to any of them, and the bastion is an autonomous orchestrator
+        # rather than a network tunnel. Granting a session-opening permission
+        # nothing uses is exactly the over-grant this method exists to avoid
+        # (#195).
 
         # The advance spot-interruption warning (#86) is delivered by an
         # EventBridge rule into an SQS queue the provider creates and polls.
@@ -658,9 +691,17 @@ class GlobusComputeProvider(EphemeralAWSProvider):
             "sqs:DeleteQueue",
         ]
 
-        # Only needed for auto_create_instance_profile=True. No delete actions:
-        # the provider does not tear the profile down (#132), so granting them
-        # would permit more than it performs.
+        # Only needed for auto_create_instance_profile=True.
+        #
+        # The deletes are load-bearing, not symmetry for its own sake. This list
+        # once ended at PassRole, on the rationale that "the provider does not
+        # tear the profile down (#132)". v0.8.0's #132 fix made that false: the
+        # teardown in utils/aws.py runs on every cleanup_infrastructure(). And
+        # because cleanup logs rather than raises, an AccessDenied there is
+        # silent -- so a user on this policy leaked exactly the roles and
+        # profiles #132 was filed to stop, the failure that accumulated 94
+        # orphaned roles and 94 orphaned profiles in a real account. The policy
+        # was quietly reverting the fix (#195).
         iam_actions = [
             "iam:CreateRole",
             "iam:GetRole",
@@ -669,9 +710,30 @@ class GlobusComputeProvider(EphemeralAWSProvider):
             "iam:GetInstanceProfile",
             "iam:AddRoleToInstanceProfile",
             "iam:PassRole",
+            # Teardown, in the order IAM requires -- it rejects any other.
+            "iam:RemoveRoleFromInstanceProfile",
+            "iam:DeleteInstanceProfile",
+            # The teardown detaches whatever is actually attached rather than
+            # assuming only AmazonSSMManagedInstanceCore, since delete_role
+            # refuses while any policy remains.
+            "iam:ListAttachedRolePolicies",
+            "iam:DetachRolePolicy",
+            "iam:DeleteRole",
         ]
 
         statements = [
+            {
+                # First, because it is the first call the provider makes:
+                # create_session() verifies the session with
+                # sts:GetCallerIdentity unconditionally, on the construction
+                # path. Omitting it meant a user on this exact policy failed at
+                # `EphemeralAWSProvider(...)` before reaching any AWS work
+                # (#195).
+                "Sid": "SessionValidation",
+                "Effect": "Allow",
+                "Action": ["sts:GetCallerIdentity"],
+                "Resource": "*",
+            },
             {
                 "Sid": "EC2Management",
                 "Effect": "Allow",
@@ -679,7 +741,10 @@ class GlobusComputeProvider(EphemeralAWSProvider):
                 "Resource": "*",
             },
             {
-                "Sid": "SSMTunneling",
+                # Not "SSMTunneling", which this was called: nothing here opens
+                # a tunnel. SSM is used for AMI resolution, command dispatch,
+                # and the Parameter Store state backend (#195).
+                "Sid": "SSMCommandsAndParameters",
                 "Effect": "Allow",
                 "Action": ssm_actions,
                 "Resource": "*",

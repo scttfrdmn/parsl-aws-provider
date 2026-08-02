@@ -33,29 +33,33 @@ PyPI/package mirrors).  No inbound rules are required by the provider itself.
 
 ## Minimum IAM Permissions
 
-The provider's EC2 instances need SSM access (for warm-pool dispatch and
-connectivity via Session Manager):
+Do not copy a policy out of a document — this one had drifted into being
+unusable. Generate the current policy for the principal that *runs* the
+provider:
 
-```json
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Effect": "Allow",
-      "Action": [
-        "ec2:RunInstances",
-        "ec2:DescribeInstances",
-        "ec2:TerminateInstances",
-        "ec2:CreateTags",
-        "ssm:SendCommand",
-        "ssm:GetCommandInvocation",
-        "ssm:DescribeInstanceInformation"
-      ],
-      "Resource": "*"
-    }
-  ]
-}
+```python
+import json
+
+from parsl_aws_provider import GlobusComputeProvider
+
+print(json.dumps(GlobusComputeProvider.minimum_iam_policy(), indent=2))
 ```
+
+It is a `@staticmethod`, so no provider instance is needed, and it describes the
+base `EphemeralAWSProvider` just as well despite living on the Globus subclass.
+Every action it grants has a call site in the package, and a unit test asserts
+that in both directions.
+
+The seven-action policy previously printed here failed at **construction**:
+`__init__` ends by calling `initialize()`, which resolves the AMI from SSM and
+creates a launch template, so it needed `ssm:GetParameter`,
+`ec2:CreateLaunchTemplate`, `ec2:DescribeInstanceTypes`, `ec2:DescribeVpcs`, and
+`sts:GetCallerIdentity` — none of which it granted
+([#195](https://github.com/scttfrdmn/parsl-aws-provider/issues/195)).
+
+The **workers** are separate and need much less: attaching the AWS-managed
+`AmazonSSMManagedInstanceCore` to the instance profile is the whole requirement,
+which `auto_create_instance_profile=True` does for you.
 
 ---
 

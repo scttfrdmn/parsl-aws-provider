@@ -93,9 +93,10 @@ The provider creates and manages:
 - **Compute**: EC2 instances, EC2 Fleets, Lambda functions, ECS tasks
 - **Launch templates**: one per provider, carrying IMDSv2, shutdown behaviour,
   and the instance profile
-- **IAM instance profile and role**: only when `auto_create_instance_profile=True`
-  (note: not yet deleted on shutdown —
-  [#132](https://github.com/scttfrdmn/parsl-aws-provider/issues/132))
+- **IAM instance profile and role**: only when `auto_create_instance_profile=True`,
+  and deleted on shutdown since v0.8.0
+  ([#132](https://github.com/scttfrdmn/parsl-aws-provider/issues/132)). A profile
+  you supply through `iam_instance_profile_arn` is never touched.
 - **CloudFormation stacks**: bastion (detached), Lambda and ECS workers
   (serverless)
 - **State storage**: a local file, an S3 object, or an SSM parameter
@@ -148,9 +149,13 @@ their own polling loops instead; keeping both is tracked as
 - No long-lived credentials on instances — workers use an instance profile
 - Resource isolation by provider ID in tags and state keys
 
-Instance profiles created with `auto_create_instance_profile=True` are not deleted
-on shutdown ([#132](https://github.com/scttfrdmn/parsl-aws-provider/issues/132));
-supply `iam_instance_profile_arn` if you need to control that lifecycle yourself.
+Instance profiles created with `auto_create_instance_profile=True` are deleted on
+shutdown since v0.8.0
+([#132](https://github.com/scttfrdmn/parsl-aws-provider/issues/132)). Deletion is
+gated on ownership, so a profile supplied through `iam_instance_profile_arn`
+survives — supply your own ARN to control that lifecycle yourself. Grant the
+teardown actions in your IAM policy, or cleanup fails silently and the roles
+accumulate ([#195](https://github.com/scttfrdmn/parsl-aws-provider/issues/195)).
 
 ## Testing with a local AWS emulator
 

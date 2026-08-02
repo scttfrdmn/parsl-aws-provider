@@ -410,9 +410,13 @@ Two things to know specifically:
   `warm_pool_ttl` seconds per idle period. Native ASG warm pools, which hold
   instances `Stopped`, are
   [#130](https://github.com/scttfrdmn/parsl-aws-provider/issues/130).
-- **A role created by `auto_create_instance_profile=True` is not deleted** on
-  shutdown ([#132](https://github.com/scttfrdmn/parsl-aws-provider/issues/132)).
-  It costs nothing, but it accumulates.
+- **A role created by `auto_create_instance_profile=True`** is deleted on shutdown
+  since v0.8.0 ([#132](https://github.com/scttfrdmn/parsl-aws-provider/issues/132)).
+  If you still see them accumulating, your IAM policy is missing the teardown
+  actions: cleanup logs rather than raises, so `AccessDenied` there is silent
+  ([#195](https://github.com/scttfrdmn/parsl-aws-provider/issues/195)). Generate a
+  current policy with `GlobusComputeProvider.minimum_iam_policy()`, and reap
+  existing orphans with `tools/cleanup_aws_resources.py`.
 
 ### Stopped instances with billed EBS volumes
 
