@@ -19,10 +19,12 @@ SPDX-FileCopyrightText: 2025-2026 Scott Friedman and Project Contributors
 """
 
 import ast
+import importlib
+import importlib.util
 import inspect
 import re
 from pathlib import Path
-from typing import List, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 import pytest
 
@@ -53,6 +55,17 @@ _FENCE = re.compile(r"^```(\w*)\s*$")
 # Fences whose contents are Python and should parse.
 _PYTHON_LANGS = {"python", "py"}
 
+# Classes whose *construction* has to be traceable to something importable. The
+# kwarg check above can only inspect names it recognises, so it said nothing at
+# all about a call to a class that does not exist -- see
+# test_documented_provider_classes_resolve.
+_CONSTRUCTED_CLASS = re.compile(r"(Provider|Executor)$")
+
+# Modules a reader is expected to install themselves, imported inside app bodies
+# to show what a worker needs rather than what the driver does. Anything else
+# must resolve in this environment.
+_READER_INSTALLED_MODULES = {"numpy", "scipy", "pandas", "sklearn"}
+
 
 def _own_kwargs(cls) -> Set[str]:
     """Keyword names declared by one class's own __init__."""
@@ -76,6 +89,30 @@ def _accepted_kwargs(target) -> Set[str]:
     forward through it to the base, so the accepted set is the union over the MRO.
     """
     return set().union(*(_own_kwargs(cls) for cls in inspect.getmro(target)))
+
+
+def _known_classes() -> Dict[str, type]:
+    """Every provider/executor class importable from the packages the docs use.
+
+    A doc fragment often constructs `EphemeralAWSProvider(...)` without repeating
+    the import, because the surrounding prose established it. That is fine to
+    read, so an unbound name is resolved against this registry rather than
+    treated as a failure — but a name in *neither* the block's imports nor here is
+    fiction.
+    """
+    registry: Dict[str, type] = {}
+    for module_name in (
+        "parsl_aws_provider",
+        "parsl.executors",
+        "parsl.providers",
+        "parsl.config",
+    ):
+        module = importlib.import_module(module_name)
+        for name in dir(module):
+            attr = getattr(module, name)
+            if not name.startswith("_") and isinstance(attr, type):
+                registry.setdefault(name, attr)
+    return registry
 
 
 def _iter_python_blocks(path: Path):
@@ -131,8 +168,12 @@ def _bad_kwargs(source: str) -> List[Tuple[int, str, str]]:
             name = node.func.attr
         else:
             continue
-        target = CHECKED_CALLABLES.get(name)
+        target = CHECKED_CALLABLES.get(name) or _known_classes().get(name)
         if target is None:
+            # Still skipped, but no longer the whole story: a fictional class name
+            # used to end here silently, which is how the README's
+            # `AWSProvider(enable_ssm_tunneling=...)` survived (#197).
+            # test_documented_provider_classes_resolve now fails on those.
             continue
         accepted = _accepted_kwargs(target)
         for kw in node.keywords:
@@ -186,6 +227,113 @@ def test_doc_configurations_use_real_options(path: Path):
                 f"{callable_name}({kwarg}=...) — not accepted"
             )
     assert not failures, "Options that do not exist:\n" + "\n".join(failures)
+
+
+def _module_level_imports(source: str):
+    """Yield (line, module) for every absolute import anywhere in a block.
+
+    Imports inside a function body are included deliberately: a Parsl app body
+    runs on the *worker*, so `import numpy` there is a statement about what
+    `worker_init` must install. `_READER_INSTALLED_MODULES` carries those; anything
+    else has to resolve here.
+    """
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                yield node.lineno, alias.name.split(".")[0]
+        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+            yield node.lineno, node.module.split(".")[0]
+
+
+def _unresolvable_imports(source: str) -> List[Tuple[int, str]]:
+    return [
+        (line, module)
+        for line, module in _module_level_imports(source)
+        if module not in _READER_INSTALLED_MODULES
+        and importlib.util.find_spec(module) is None
+    ]
+
+
+def _resolve_constructed(source: str) -> List[Tuple[int, str, Optional[type], str]]:
+    """Resolve every `SomethingProvider(...)`/`SomethingExecutor(...)` call.
+
+    Returns (line, name, resolved class or None, reason) tuples. Resolution prefers
+    an import in the same file, falling back to `_known_classes()`.
+    """
+    tree = ast.parse(source)
+    bindings: Dict[str, str] = {}
+    calls: List[Tuple[int, str]] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+            for alias in node.names:
+                bindings.setdefault(alias.asname or alias.name, node.module)
+        elif isinstance(node, ast.Call):
+            name = getattr(node.func, "id", None)
+            if name and _CONSTRUCTED_CLASS.search(name):
+                calls.append((node.lineno, name))
+
+    registry = _known_classes()
+    resolved = []
+    for line, name in calls:
+        module = bindings.get(name)
+        if module is None:
+            target = registry.get(name)
+            reason = "" if target else "not imported here, and not a known class"
+        elif importlib.util.find_spec(module.split(".")[0]) is None:
+            target, reason = None, f"imported from {module!r}, which does not exist"
+        else:
+            target = getattr(importlib.import_module(module), name, None)
+            reason = "" if target else f"{module} has no attribute {name!r}"
+        resolved.append((line, name, target, reason))
+    return resolved
+
+
+@pytest.mark.parametrize("path", _markdown_files(), ids=lambda p: p.name)
+def test_documented_imports_resolve(path: Path):
+    """Every module a doc imports really exists.
+
+    The gap this closes: the README's quick starts opened
+    `from phase15_enhanced import AWSProvider` and
+    `from container_executor import ContainerHighThroughputExecutor`. Neither module
+    has ever existed in this repository or on PyPI, so both blocks died on line one
+    — and because the README is `readme = "README.md"` in pyproject.toml, they were
+    also the first code on the PyPI landing page (#197).
+    """
+    failures = []
+    for block_line, source in _iter_python_blocks(path):
+        try:
+            findings = _unresolvable_imports(source)
+        except SyntaxError:
+            continue  # reported by test_doc_python_blocks_parse
+        for rel_line, module in findings:
+            failures.append(
+                f"{path.name}:{block_line + rel_line - 1}: "
+                f"import {module} — no such module"
+            )
+    assert not failures, "Imports that cannot resolve:\n" + "\n".join(failures)
+
+
+@pytest.mark.parametrize("path", _markdown_files(), ids=lambda p: p.name)
+def test_documented_provider_classes_resolve(path: Path):
+    """Every provider/executor a doc constructs is a real class, with real options.
+
+    `test_doc_configurations_use_real_options` could not catch this: it looks each
+    call site's name up in `CHECKED_CALLABLES` and *skips* what it does not
+    recognise, so a fictional `AWSProvider(enable_ssm_tunneling=True, ...)` was
+    passed over in silence while `docs/` stayed clean. That silent skip is why the
+    README could rot through six releases of a green suite.
+    """
+    failures = []
+    for block_line, source in _iter_python_blocks(path):
+        try:
+            resolved = _resolve_constructed(source)
+        except SyntaxError:
+            continue
+        for rel_line, name, target, reason in resolved:
+            line = block_line + rel_line - 1
+            if target is None:
+                failures.append(f"{path.name}:{line}: {name} — {reason}")
+    assert not failures, "Classes that do not exist:\n" + "\n".join(failures)
 
 
 # ---------------------------------------------------------------------------

@@ -118,6 +118,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   4.0.1).
 
 ### Fixed
+- **The README was fiction, and it is the PyPI landing page.** Both quick starts
+  opened on modules that have never existed in this repository or on PyPI —
+  `from phase15_enhanced import AWSProvider` and
+  `from container_executor import ContainerHighThroughputExecutor` — so the first
+  code a reader copied died on line one with `ModuleNotFoundError`. Every
+  configuration example then passed options the provider rejects
+  (`enable_ssm_tunneling`, `ami_id`, `python_version`), which since #105 is a
+  `ProviderConfigurationError` rather than something ignored.
+
+  `readme = "README.md"` in `pyproject.toml` makes this file the
+  `long_description`, verified in the built wheel's `METADATA`, so those examples
+  were also the landing page for publishing (#180). Rewritten from
+  `docs/getting_started.md`, which was accurate all along.
+
+  Four further claims were not merely stale but inverted. "Deploy from behind any
+  firewall or NAT", "zero configuration required", and a "Confirmed Working From"
+  list naming hotel WiFi described the opposite of how the provider works: HTEX
+  workers dial **outbound** to an interchange next to the client, so in standard
+  mode the client must accept **inbound** TCP on 54000–55000, and a NAT'd laptop
+  cannot. That is now stated above the fold as a prerequisite, with detached mode
+  and Globus Compute named as the two ways around it. The "SSH reverse tunneling
+  over AWS SSM" architecture section went with them: no such transport exists in
+  the package — `grep` finds no `StartSession` on any worker path — and neither
+  does the container executor its diagram depicts.
+
+  Also removed: performance figures presented as validated (`2,031,877
+  ops/second`, `163,949 records/second`, `~50ms` tunnel latency) that no benchmark
+  in the repository produces; a `cost_examples` dict of invented dollar amounts;
+  and use-case narratives about 50TB of satellite data and drug-discovery
+  pipelines that never ran. The hand-written IAM policy is replaced by the
+  `minimum_iam_policy()` call that generates the real one, since a copied policy
+  drifts and this one had. Two `your-org` placeholder URLs pointed the clone
+  command and the issue tracker at a nonexistent account.
+
+  Every link is absolute for the same reason the file is being fixed at all: PyPI
+  resolves a relative `docs/getting_started.md` against `pypi.org`, so all 26 of
+  them would have 404'd on the landing page while working on GitHub. Documentation
+  links point at the Pages site published in #191 — each target confirmed `200` —
+  and file links at `blob/main` (closes #197).
+- **A fictional class name silently passed the docs test.**
+  `tests/unit/test_docs_examples.py` checked keyword arguments by looking each call
+  site's name up in `CHECKED_CALLABLES` and `continue`ing on a miss, so
+  `AWSProvider(enable_ssm_tunneling=True)` was skipped rather than flagged — the
+  suite verified `docs/` thoroughly while the README rotted for six releases with
+  every check green. Two new checks close it: every module a documented block
+  imports must resolve, and every `*Provider(...)`/`*Executor(...)` call must
+  resolve to a real class, via the block's own imports or a registry of the classes
+  these docs legitimately construct without re-importing. The kwarg check now also
+  covers any real class the registry knows, not just the four hard-coded ones.
+  Verified by running the new tests against the old README: three failures, naming
+  every fictional module and class.
 - **The documented install command could not work.** `docs/getting_started.md`
   opened with `uv add parsl-ephemeral-aws`, but the package has never been
   published — `pypi.org/pypi/parsl-ephemeral-aws/json` returns 404, because
