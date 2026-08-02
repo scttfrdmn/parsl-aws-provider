@@ -264,7 +264,7 @@ Recommended values for a Globus Compute deployment:
 | `max_blocks` | `4`–`20` | Hard ceiling on concurrent instances |
 | `use_spot` | `True` | Large saving for fault-tolerant functions; set `max_retries_on_system_failure` on the engine |
 | `auto_create_instance_profile` | `True` | Creates a role with `AmazonSSMManagedInstanceCore` |
-| `auto_shutdown` + `max_idle_time` | `True`, `300` | Reclaim idle instances |
+| `auto_shutdown` | `True` | A worker terminates itself when its command finishes |
 | `bake_ami` | `True` | Runs `worker_init` once into an AMI instead of on every launch |
 
 `mode="serverless"` is not useful here — Lambda and Fargate cannot run the

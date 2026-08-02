@@ -118,6 +118,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   4.0.1).
 
 ### Fixed
+- **`max_idle_time` terminated busy workers, so the provider-side reap is gone**
+  (#194). `_cleanup_resources()` reclaimed a `RUNNING` resource once
+  `time.time() - resource["timestamp"] > max_idle_time`, but `"timestamp"` is
+  stamped once at submit and never refreshed. The expression was therefore
+  wall-clock age since submission with no idleness component at all, despite a log
+  line reading "has been idle for N seconds" — so **any task running longer than
+  the limit was killed mid-flight**, at the 300-second default. Not a corner:
+  `_cleanup_resources()` is called unconditionally from `cancel()`, which Parsl
+  invokes on every scale-in.
+
+  It cannot be repaired at this layer. Idleness means "holding no tasks", and a
+  provider never sees task state; Parsl's interchange does, and
+  `HighThroughputExecutor.scale_in` already reaps on it, selecting blocks where
+  `idle > max_idletime and tasks == 0` from per-manager counts. So the branch is
+  removed rather than rewritten, and callers wanting idle reclamation set
+  `max_idletime` on their Parsl `Config`.
+
+  Nothing leaks as a result. The branch only ever fired when `auto_shutdown` was
+  set, and that same flag already appends `shutdown -h now` to the worker's
+  UserData with `InstanceInitiatedShutdownBehavior=terminate` — a worker that
+  finishes its command terminates itself, and the existing `COMPLETED` branch
+  collects the record.
+
+  `max_idle_time` is still accepted, still persisted, and still forwarded to the
+  modes, so state files and generated Globus endpoint configs from earlier
+  versions keep loading; it is simply read by nothing. Passing a non-default value
+  now raises a `DeprecationWarning`, because silently ignoring a tuned value is
+  the worse failure here — the option used to terminate running work, so somebody
+  may have raised it as a workaround and would otherwise never learn it no longer
+  applies.
+
+  Six regression tests were added, each verified to fail against the previous
+  code, and eleven documentation and example references were corrected. Three of
+  those had documented the defect as though it were the intent
+  (`docs/getting_started.md`, `docs/operating_modes.md`, `docs/troubleshooting.md`
+  all described reclaiming a "long-`RUNNING`" resource), and
+  `docs/architecture.md` separately attributed the bastion's own shutdown to
+  `max_idle_time` when it uses `idle_timeout`.
 - **The README was fiction, and it is the PyPI landing page.** Both quick starts
   opened on modules that have never existed in this repository or on PyPI —
   `from phase15_enhanced import AWSProvider` and

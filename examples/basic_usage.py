@@ -57,8 +57,10 @@ def standard_mode_provider() -> EphemeralAWSProvider:
         state_store_type="file",
         state_file_path="basic_usage_standard.json",
         auto_create_instance_profile=True,
+        # A worker terminates itself when its command finishes. To reclaim
+        # workers that are idle but still up, set max_idletime on the Parsl
+        # Config -- the provider cannot see task occupancy (#194).
         auto_shutdown=True,
-        max_idle_time=300,
         additional_tags={"Project": "ParslExample", "Mode": "standard"},
         **_network(),
     )

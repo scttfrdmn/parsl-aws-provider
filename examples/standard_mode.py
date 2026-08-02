@@ -76,8 +76,10 @@ def main() -> int:
         init_blocks=1,
         # image_id is omitted, so an Amazon Linux 2023 AMI matching the
         # instance type's architecture is resolved from SSM.
+        # A worker terminates itself when its command finishes. Reclaiming
+        # idle-but-running workers is Parsl's max_idletime, not a provider
+        # option -- only the interchange knows a worker's task count (#194).
         auto_shutdown=True,
-        max_idle_time=300,
         auto_create_instance_profile=True,
         state_store_type="file",
         state_file_path="standard_mode_state.json",

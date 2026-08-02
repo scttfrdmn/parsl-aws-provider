@@ -488,7 +488,6 @@ provider = EphemeralAWSProvider(
     min_blocks=0,
     max_blocks=5,
     auto_shutdown=True,
-    max_idle_time=300,
     additional_tags={"Project": "parsl-demo", "CostCenter": "research"},
 )
 
