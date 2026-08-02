@@ -299,7 +299,16 @@ class TestEveryParameterSurvivesTheRoundTrip:
             ),
             pytest.param({"baked_ami_id": "ami-0bakedbakedbaked0"}, id="baked-ami"),
             pytest.param({"key_name": "mykey", "use_public_ips": False}, id="access"),
-            pytest.param({"auto_shutdown": False, "max_idle_time": 900}, id="idle"),
+            # max_idle_time is deprecated and ignored (#194), but it is still
+            # persisted and forwarded, so it must still survive the round trip --
+            # that is exactly what this class asserts. The warning is expected.
+            pytest.param(
+                {"auto_shutdown": False, "max_idle_time": 900},
+                id="idle",
+                marks=pytest.mark.filterwarnings(
+                    "ignore:max_idle_time is deprecated:DeprecationWarning"
+                ),
+            ),
             pytest.param({"profile_name": "aws"}, id="profile"),
         ],
     )
@@ -399,6 +408,12 @@ class TestEveryParameterSurvivesTheRoundTrip:
 
         assert loaded.image_id == "ami-0123456789abcdef0"
 
+    @pytest.mark.filterwarnings(
+        # The sample below sets every accepted parameter, including the
+        # deprecated max_idle_time (#194), which is the point: a deprecated
+        # option must still be emitted or a loaded config would silently differ.
+        "ignore:max_idle_time is deprecated:DeprecationWarning"
+    )
     def test_emitted_set_is_derived_from_the_signature(self, tmp_path):
         """The property that keeps this fixed: no hand-maintained list.
 

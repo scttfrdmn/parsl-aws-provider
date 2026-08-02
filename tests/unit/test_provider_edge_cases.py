@@ -10,6 +10,7 @@ import os
 import tempfile
 import time
 import uuid
+import warnings
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -23,6 +24,7 @@ from parsl_aws_provider.constants import (
     DEFAULT_ECS_CPU,
     DEFAULT_ECS_MEMORY,
     DEFAULT_LAMBDA_RUNTIME,
+    DEFAULT_MAX_IDLE_TIME,
     DEFAULT_PRESERVE_BASTION,
     DEFAULT_WARM_POOL_SIZE,
     DEFAULT_WARM_POOL_TTL,
@@ -1573,3 +1575,135 @@ class TestSpotInterruptionStatus:
         mode.cleanup_resources.assert_called_once_with(["i-001"])
         assert "i-001" not in mode._warm_instances
         assert "i-001" not in provider.resources
+
+
+@pytest.mark.unit
+class TestRunningResourcesSurviveCleanup:
+    """A RUNNING resource is never reaped by age (#194).
+
+    The removed branch compared ``time.time() - resource["timestamp"]`` against
+    ``max_idle_time``, but "timestamp" is stamped once at submit and never
+    refreshed. That made it age-since-submission, so any task running longer
+    than the limit was terminated mid-flight. These cases pin the absence of
+    that branch; each one fails against the old code.
+    """
+
+    @pytest.fixture
+    def tmp_dir(self):
+        with tempfile.TemporaryDirectory() as d:
+            yield d
+
+    def test_a_long_running_job_is_not_terminated(self, tmp_dir):
+        """The regression itself: busy work, far past the limit, left alone."""
+        provider, mode = _make_provider(tmp_dir, auto_shutdown=True)
+        # Submitted an hour ago and still running -- a perfectly healthy job
+        # for any real workload, and 12x the old 300s default.
+        provider.resources["i-busy"] = {
+            "job_id": "j-busy",
+            "status": "RUNNING",
+            "timestamp": time.time() - 3600,
+        }
+        provider.job_map["j-busy"] = {"resource_id": "i-busy", "status": "RUNNING"}
+
+        provider._cleanup_resources()
+
+        mode.cleanup_resources.assert_not_called()
+        assert "i-busy" in provider.resources
+        assert provider.resources["i-busy"]["status"] == "RUNNING"
+
+    def test_age_does_not_reap_even_at_the_extreme(self, tmp_dir):
+        """No threshold survives: a timestamp of 0 is maximally "old"."""
+        provider, mode = _make_provider(tmp_dir, auto_shutdown=True)
+        provider.resources["i-ancient"] = {
+            "job_id": "j-ancient",
+            "status": "RUNNING",
+            "timestamp": 0,
+        }
+        provider.job_map["j-ancient"] = {
+            "resource_id": "i-ancient",
+            "status": "RUNNING",
+        }
+
+        provider._cleanup_resources()
+
+        mode.cleanup_resources.assert_not_called()
+        assert "i-ancient" in provider.resources
+
+    def test_a_pending_resource_is_also_left_alone(self, tmp_dir):
+        """A slow-booting instance must not be reclaimed before it registers."""
+        provider, mode = _make_provider(tmp_dir, auto_shutdown=True)
+        provider.resources["i-booting"] = {
+            "job_id": "j-booting",
+            "status": "PENDING",
+            "timestamp": time.time() - 3600,
+        }
+        provider.job_map["j-booting"] = {
+            "resource_id": "i-booting",
+            "status": "PENDING",
+        }
+
+        provider._cleanup_resources()
+
+        mode.cleanup_resources.assert_not_called()
+        assert "i-booting" in provider.resources
+
+    def test_terminal_resources_are_still_collected(self, tmp_dir):
+        """Removing the age branch must not stop real cleanup.
+
+        Guards against "fixing" the reap by disabling ``_cleanup_resources``
+        altogether, which would leak every finished instance's record.
+        """
+        provider, mode = _make_provider(tmp_dir, auto_shutdown=True)
+        for idx, status in enumerate(
+            ["COMPLETED", "FAILED", "CANCELED", STATUS_INTERRUPTED]
+        ):
+            rid = f"i-{idx}"
+            provider.resources[rid] = {
+                "job_id": f"j-{idx}",
+                "status": status,
+                "timestamp": time.time(),
+            }
+            provider.job_map[f"j-{idx}"] = {"resource_id": rid, "status": status}
+
+        provider._cleanup_resources()
+
+        mode.cleanup_resources.assert_called_once()
+        assert sorted(mode.cleanup_resources.call_args[0][0]) == [
+            "i-0",
+            "i-1",
+            "i-2",
+            "i-3",
+        ]
+        assert provider.resources == {}
+
+    def test_setting_max_idle_time_warns_that_it_is_ignored(self, tmp_dir):
+        """Silently ignoring a tuned value would be the worse failure.
+
+        The option used to terminate running work, so somebody may have raised
+        it as a workaround; they need to learn it no longer applies.
+        """
+        with pytest.warns(DeprecationWarning, match="max_idle_time is deprecated"):
+            provider, mode = _make_provider(tmp_dir, max_idle_time=900)
+
+        # Still recorded: it is persisted in the state document and forwarded to
+        # every mode, so dropping the attribute would break older state files.
+        assert provider.max_idle_time == 900
+
+        provider.resources["i-busy"] = {
+            "job_id": "j-busy",
+            "status": "RUNNING",
+            "timestamp": time.time() - 9000,  # 10x the value that was set
+        }
+        provider.job_map["j-busy"] = {"resource_id": "i-busy", "status": "RUNNING"}
+
+        provider._cleanup_resources()
+
+        mode.cleanup_resources.assert_not_called()
+
+    def test_leaving_max_idle_time_at_its_default_is_silent(self, tmp_dir):
+        """Warning on a value nobody set would be noise on every construction."""
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", DeprecationWarning)
+            provider, _ = _make_provider(tmp_dir)
+
+        assert provider.max_idle_time == DEFAULT_MAX_IDLE_TIME

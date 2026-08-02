@@ -566,5 +566,8 @@ def ephemeral_provider_config():
         "max_blocks": 2,
         "debug": True,
         "auto_shutdown": True,
-        "max_idle_time": 60,  # 1 minute for faster tests
+        # max_idle_time deliberately omitted: it is deprecated and ignored, and
+        # setting it to anything but the default now raises a
+        # DeprecationWarning (#194). It shortened nothing here anyway -- nothing
+        # ever read it.
     }

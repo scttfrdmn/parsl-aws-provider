@@ -54,7 +54,7 @@ The option does not exist. Common renames:
 | `state_bucket` | `s3_bucket` |
 | `state_file` / `state_directory` | `state_file_path` |
 | `worker_type` | `compute_type` |
-| `idle_timeout_minutes` | `max_idle_time` (**seconds**) |
+| `idle_timeout_minutes` | `idle_timeout` (minutes, detached mode's bastion) |
 | `create_vpc` / `use_existing_vpc` | removed — the network is always yours (#69) |
 
 Eight options that were unreachable before v0.8.0 are now accepted:
@@ -369,8 +369,9 @@ for the SSM agent to register — a private subnet requires a NAT gateway or the
 That is deliberate: the bastion is preserved so you can reconnect. Call
 `provider.shutdown()` when the workflow is genuinely over, or pass
 `preserve_bastion=False` so shutdown terminates it. Its own idle-shutdown timer
-is `idle_timeout` (minutes, default 30); `max_idle_time` is unrelated — that
-governs when the *provider* reclaims a long-`RUNNING` resource.
+is `idle_timeout` (minutes, default 30). The provider's `max_idle_time` is
+unrelated, and is deprecated and ignored
+([#194](https://github.com/scttfrdmn/parsl-aws-provider/issues/194)).
 
 ## Cost
 
@@ -396,7 +397,8 @@ The provider has no cost monitoring — `max_cost_per_hour` and
 
 - `min_blocks=0` so nothing runs when nothing is queued
 - `max_blocks` as a hard ceiling
-- `auto_shutdown=True` with `max_idle_time` (seconds) to reclaim idle resources
+- `auto_shutdown=True` so a worker terminates itself once its command finishes
+- `max_idletime` on your Parsl `Config` to reclaim workers that are idle but up
 - `use_spot=True`, optionally with `spot_max_price_percentage`
 
 Set AWS Budgets and a CloudWatch billing alarm; tag with `additional_tags` for

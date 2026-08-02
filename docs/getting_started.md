@@ -161,13 +161,27 @@ provider = EphemeralAWSProvider(
     # ... network and compute options ...
     min_blocks=0,     # no floor; nothing runs when nothing is queued
     max_blocks=10,
-    auto_shutdown=True,
-    max_idle_time=300,  # seconds a RUNNING resource may sit before reclaim
+    auto_shutdown=True,  # a worker terminates itself when its command finishes
 )
 ```
 
 `max_blocks` also caps concurrent submissions — a job past the limit raises
 rather than queueing.
+
+To reclaim instances that are up but *idle*, use Parsl's `max_idletime`, not a
+provider option — only Parsl's interchange knows how many tasks a worker holds:
+
+```python
+from parsl.config import Config
+
+config = Config(executors=[...], max_idletime=300.0)
+```
+
+`HighThroughputExecutor.scale_in` applies it to blocks that are both idle past
+the limit and holding zero tasks. The provider's own `max_idle_time` is
+deprecated and ignored: it compared against a timestamp taken at submission, so
+it terminated any task that simply ran longer than the limit
+([#194](https://github.com/scttfrdmn/parsl-aws-provider/issues/194)).
 
 ### Multiple instance types
 

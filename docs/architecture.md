@@ -74,7 +74,7 @@ behind NAT.
 2. The bastion polls for pending jobs, launches workers, tracks status, and
    handles cancellations.
 3. The client may disconnect; the workflow continues.
-4. The bastion shuts down after `max_idle_time` with no work.
+4. The bastion shuts down after `idle_timeout` minutes with no work.
 
 The bastion is an autonomous orchestrator, not a network tunnel — which is why an
 EC2 Instance Connect Endpoint cannot replace it

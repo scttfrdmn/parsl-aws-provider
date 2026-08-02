@@ -370,8 +370,9 @@ implemented.
 - **CloudTrail** records every API call the provider makes, including each
   `StartSession`. This is your real audit trail.
 - **Budgets and CloudWatch alarms** on EC2 spend are worth setting up: the
-  provider has no cost controls of its own beyond `max_blocks`,
-  `max_idle_time`, and the warm-pool cap.
+  provider has no cost controls of its own beyond `max_blocks`, `auto_shutdown`,
+  and the warm-pool cap. Reclaiming idle-but-running instances is Parsl's
+  `max_idletime`, not a provider setting.
 - **CloudWatch Logs** hold cloud-init output only if you configure the agent in
   `worker_init`; the provider does not install it.
 

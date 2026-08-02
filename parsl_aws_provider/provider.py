@@ -12,6 +12,7 @@ import logging
 import threading
 import time
 import uuid
+import warnings
 from enum import Enum
 from typing import Any, Dict, List, Optional, Sequence
 
@@ -197,9 +198,27 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
     additional_tags : Dict[str, str], optional
         Additional tags to apply to AWS resources.
     auto_shutdown : bool, optional
-        Whether to automatically shut down idle resources. Default is True.
+        Whether a worker terminates itself once its command finishes. Default is
+        True, which appends ``shutdown -h now`` to the worker's UserData; the
+        instance launches with ``InstanceInitiatedShutdownBehavior=terminate``,
+        so it is terminated rather than stopped with a billed EBS volume. Set
+        False only if you intend to keep instances after their work completes.
     max_idle_time : int, optional
-        Maximum idle time in seconds before shutdown. Default is 300 (5 minutes).
+        Deprecated and ignored; accepted only so existing configurations keep
+        loading. Default is 300.
+
+        This never measured idleness. It was compared against a timestamp
+        stamped once at submit, making it wall-clock age since submission, so it
+        terminated any task that ran longer than the limit (#194). A provider
+        cannot compute idleness -- that needs per-manager task counts only
+        Parsl's interchange has. Use Parsl's own ``max_idletime``, which
+        ``HighThroughputExecutor.scale_in`` applies to genuinely idle blocks:
+
+        .. code-block:: python
+
+            from parsl.config import Config
+
+            config = Config(executors=[...], max_idletime=300.0)
     compute_type : str, optional
         Type of compute resource when using serverless mode ('ec2', 'lambda', or 'ecs').
         Default is 'ec2'.
@@ -451,7 +470,25 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
         self.spot_max_price_percentage = spot_max_price_percentage
         self.additional_tags = additional_tags or {}
         self.auto_shutdown = auto_shutdown
+        # Retained as an attribute because it is persisted in the state document
+        # and forwarded to every mode, so dropping it would break state files
+        # written by earlier versions. Nothing reads it (#194).
         self.max_idle_time = max_idle_time
+        if max_idle_time != DEFAULT_MAX_IDLE_TIME:
+            # Warn only when it was set deliberately. Silently ignoring a
+            # tuned value is the worse failure here: the option used to
+            # terminate running work, so somebody may have raised it as a
+            # workaround and would otherwise never learn it no longer applies.
+            warnings.warn(
+                "max_idle_time is deprecated and ignored: it measured age since "
+                "submission rather than idleness, and terminated tasks that ran "
+                "longer than it (#194). A provider cannot see task occupancy. "
+                "Set max_idletime on your Parsl Config instead, which "
+                "HighThroughputExecutor.scale_in applies to genuinely idle "
+                "blocks.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
         self.compute_type = ComputeType(compute_type.lower())
         self.bastion_instance_type = bastion_instance_type
         self.idle_timeout = idle_timeout
@@ -1425,17 +1462,30 @@ class EphemeralAWSProvider(ExecutionProvider, RepresentationMixin):
                 # cost leak (#137).
                 if status in ["COMPLETED", "FAILED", "CANCELED", STATUS_INTERRUPTED]:
                     resources_to_cleanup.append(resource_id)
-                elif (
-                    self.auto_shutdown
-                    and status == "RUNNING"
-                    and time.time() - resource.get("timestamp", 0) > self.max_idle_time
-                ):
-                    logger.info(
-                        f"Resource {resource_id} has been idle for "
-                        f"{time.time() - resource.get('timestamp', 0):.0f} seconds, "
-                        f"exceeding max_idle_time {self.max_idle_time}"
-                    )
-                    resources_to_cleanup.append(resource_id)
+
+                # A RUNNING resource is never reaped here. There used to be a
+                # branch that terminated one once
+                # `time.time() - resource["timestamp"] > max_idle_time`, but
+                # "timestamp" is stamped once at submit and never refreshed, so
+                # that expression measured wall-clock age since submission and
+                # had no idleness component at all -- it killed any task that
+                # simply ran longer than the limit, mid-flight (#194).
+                #
+                # It cannot be repaired at this layer: idleness means "no tasks
+                # assigned", and a provider never sees task state. Parsl does,
+                # and already reaps on it -- HighThroughputExecutor.scale_in
+                # selects blocks with `idle > max_idletime and tasks == 0` from
+                # per-manager `idle_duration` and `tasks` counts that only the
+                # interchange has. Set `max_idletime` on the Parsl config to
+                # tune it.
+                #
+                # Nothing is leaked by dropping this. Whenever auto_shutdown is
+                # set -- the only case the old branch fired in -- the worker's
+                # UserData ends in `shutdown -h now`
+                # (modes/standard.py:_generate_init_script) with
+                # InstanceInitiatedShutdownBehavior=terminate, so a worker that
+                # finishes its command terminates itself, and the COMPLETED
+                # branch above collects the record.
 
         # Process COMPLETED → WARM transitions
         state_dirty = False

@@ -135,9 +135,11 @@ class StandardMode(OperatingMode):
         additional_tags : Optional[Dict[str, str]], optional
             Tags to apply to created resources, by default None
         auto_shutdown : bool, optional
-            Whether to automatically shut down idle resources, by default True
+            Whether a worker terminates itself once its command finishes, by
+            default True. Appends ``shutdown -h now`` to the worker's UserData.
         max_idle_time : int, optional
-            Maximum idle time in seconds before shutdown, by default 300
+            Deprecated and ignored, by default 300. Use Parsl's own
+            ``max_idletime`` to reclaim idle blocks (#194).
         use_public_ips : bool, optional
             Whether to assign public IPs to instances, by default True
         custom_ami : bool, optional

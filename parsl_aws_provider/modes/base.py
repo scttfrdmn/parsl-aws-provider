@@ -64,9 +64,9 @@ class OperatingMode(abc.ABC):
     additional_tags : Dict[str, str]
         Tags to apply to created resources
     auto_shutdown : bool
-        Whether to automatically shut down idle resources
+        Whether a worker terminates itself once its command finishes
     max_idle_time : int
-        Maximum idle time in seconds before shutdown
+        Deprecated and ignored; retained so older state files still load (#194)
     use_public_ips : bool
         Whether to assign public IPs to instances
     custom_ami : bool
@@ -139,9 +139,12 @@ class OperatingMode(abc.ABC):
         additional_tags : Optional[Dict[str, str]], optional
             Tags to apply to created resources, by default None
         auto_shutdown : bool, optional
-            Whether to automatically shut down idle resources, by default True
+            Whether a worker terminates itself once its command finishes, by
+            default True
         max_idle_time : int, optional
-            Maximum idle time in seconds before shutdown, by default 300
+            Deprecated and ignored, by default 300. Nothing reads it; it is kept
+            so state files written by earlier versions still load. Use Parsl's
+            own ``max_idletime`` to reclaim idle blocks (#194).
         use_public_ips : bool, optional
             Whether to assign public IPs to instances, by default True
         custom_ami : bool, optional

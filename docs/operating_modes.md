@@ -54,7 +54,6 @@ provider = EphemeralAWSProvider(
     use_public_ips=True,     # False if reaching the subnet over VPN/Direct Connect
     key_name="your-key-pair",  # optional; SSM Session Manager needs no key
     use_spot=True,
-    max_idle_time=600,       # seconds a RUNNING resource may sit before reclaim
 )
 ```
 
@@ -172,9 +171,10 @@ These are accepted only on `mode="detached"`; setting one on another mode raises
 detached branch only and they would otherwise appear configured while having no
 effect.
 
-Note `max_idle_time` is a *provider*-level setting and is unrelated: it governs
-when the provider reclaims a resource that has been `RUNNING` longer than the
-limit, not when the bastion shuts down.
+Note `idle_timeout` governs only the bastion. It is unrelated to the provider's
+`max_idle_time`, which is deprecated and ignored
+([#194](https://github.com/scttfrdmn/parsl-aws-provider/issues/194)) — to reclaim
+idle workers, set `max_idletime` on your Parsl `Config`.
 
 ### When to use
 
