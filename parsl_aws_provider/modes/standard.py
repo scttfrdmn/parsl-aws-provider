@@ -795,32 +795,53 @@ class StandardMode(OperatingMode):
         if self.initialized:
             return
 
-        # Resolve the SSM instance profile before either path below, so a
-        # resumed provider gets an ARN too — it is not persisted in state.
-        self._resolve_instance_profile()
-
-        # Confirm the caller-supplied network resources exist. This runs on both
-        # paths: verification used to sit inside the resume branch only, so a
-        # first-run provider — the common case — never checked at all, and a
-        # mistyped or cross-region ID surfaced much later as an opaque
-        # InvalidParameterValue from inside run_instances.
-        self._verify_resources()
-
-        # Try to load state first
-        if self.load_state():
-            logger.debug("Loaded state, resources already verified")
-            # A state document written before #85, or one whose template
-            # creation failed, carries no template ID. Build one now rather
-            # than leaving a resumed provider permanently on the fallback path.
-            if not self._launch_template_id:
-                self._create_launch_template()
-                self.save_state()
-            return
-
-        logger.debug("Initializing standard mode infrastructure")
-
-        # Create AWS resources
+        # This span used to sit *outside* any teardown: the try/except that calls
+        # cleanup_infrastructure() began below, after the instance profile had
+        # been created and the network verified. So a failure in between left the
+        # IAM role and instance profile standing with nothing tracking them --
+        # the #132 pathology, reachable on nothing more exotic than a mistyped
+        # subnet ID. #196 found it from the Globus side, where a config load that
+        # ends in an error message is the normal debugging loop and every attempt
+        # leaked another pair.
+        #
+        # The exception is re-raised unchanged rather than wrapped: #77 requires
+        # that a bad network ID surface as a ResourceNotFoundError naming the ID,
+        # and burying it in a ResourceCreationError would send the caller looking
+        # for a provisioning problem instead of their own typo.
         try:
+            # Resolve the SSM instance profile before either path below, so a
+            # resumed provider gets an ARN too — it is not persisted in state.
+            self._resolve_instance_profile()
+
+            # Confirm the caller-supplied network resources exist. This runs on
+            # both paths: verification used to sit inside the resume branch only,
+            # so a first-run provider — the common case — never checked at all,
+            # and a mistyped or cross-region ID surfaced much later as an opaque
+            # InvalidParameterValue from inside run_instances.
+            self._verify_resources()
+        except Exception:
+            self.cleanup_infrastructure()
+            raise
+
+        try:
+            # Try to load state first
+            if self.load_state():
+                logger.debug("Loaded state, resources already verified")
+                # A state document written before #85, or one whose template
+                # creation failed, carries no template ID. Build one now rather
+                # than leaving a resumed provider permanently on the fallback
+                # path.
+                if not self._launch_template_id:
+                    self._create_launch_template()
+                    self.save_state()
+                # State written before this line existed -- or by any version that
+                # persisted initialized=False -- would otherwise leave a resumed
+                # mode rejecting every submit_job as uninitialized.
+                self.initialized = True
+                return
+
+            logger.debug("Initializing standard mode infrastructure")
+
             # AMI baking: snapshot worker_init into a custom AMI
             if self.bake_ami and not self._baked_ami_id:
                 ami_id = self._bake_ami()

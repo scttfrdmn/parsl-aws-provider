@@ -16,6 +16,7 @@ import pytest
 from botocore.exceptions import ClientError
 from moto import mock_aws
 
+from parsl_aws_provider.exceptions import ResourceNotFoundError
 from parsl_aws_provider.modes.standard import StandardMode
 from parsl_aws_provider.utils.aws import (
     _wait_for_instance_profile,
@@ -621,3 +622,43 @@ class TestStandardModeProfileOwnership:
 
         # And the ARN is dropped either way: it no longer names anything usable.
         assert mode.iam_instance_profile_arn is None
+
+    def test_a_failed_verification_still_deletes_the_pair(
+        self, mock_session, mock_state_store
+    ):
+        """The remaining leak after #132: initialize() failing before its own teardown.
+
+        ``_resolve_instance_profile`` creates the pair; ``_verify_resources`` runs
+        next and raises on a network ID that does not resolve. Both used to sit
+        *above* the try/except that calls ``cleanup_infrastructure``, so a mistyped
+        subnet ID -- an ordinary typo, and one you make repeatedly while debugging
+        -- leaked a role and a profile on every attempt. #196 hit this from the
+        Globus side, where each rejected config load was another pair.
+        """
+        ec2 = MagicMock()
+        mock_session.client.return_value = ec2
+        ec2.describe_subnets.side_effect = ClientError(
+            {"Error": {"Code": "InvalidSubnetID.NotFound", "Message": "nope"}},
+            "DescribeSubnets",
+        )
+
+        mode = self._mode(
+            mock_session,
+            mock_state_store,
+            one_shot=True,
+            auto_create_instance_profile=True,
+        )
+
+        with (
+            patch(
+                "parsl_aws_provider.modes.standard.get_or_create_ssm_instance_profile",
+                return_value="arn:aws:iam::1:instance-profile/auto",
+            ),
+            patch(
+                "parsl_aws_provider.modes.standard.delete_ssm_instance_profile"
+            ) as delete,
+            pytest.raises(ResourceNotFoundError, match="subnet-12345"),
+        ):
+            mode.initialize()
+
+        delete.assert_called_once_with(mock_session, "test-provider")

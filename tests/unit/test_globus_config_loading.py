@@ -1,11 +1,24 @@
-"""Regression test for #87: a generated endpoint config must actually load.
+"""Regression tests for #87 and #196: a generated config must actually start.
 
 Every other test in `test_globus_compute_provider.py` asserts on the *text* of
-the generated files, which is exactly the blind spot that let #87 ship: the old
-`config.yaml` was well-formed, internally consistent, and unloadable. The only
-assertion that would have caught it is the one made here -- hand the generated
-directory to `globus_compute_endpoint`'s own `get_config()` and see what comes
-back.
+the generated files, which is exactly the blind spot that let both issues ship:
+the old `config.yaml` was well-formed, internally consistent, loadable -- and
+unstartable. The only assertions that catch that are the ones made here: hand the
+generated directory to `globus_compute_endpoint`'s own loader and check the
+*class* that comes back, then follow the second half of the path the daemon
+actually takes.
+
+That path has two stages, and a test that stops after the first proves nothing:
+
+1. `get_config(endpoint_dir)` reads `config.yaml`. `start` accepts the result only
+   if it is a `ManagerEndpointConfig`, which `load_config_yaml` returns only when
+   there is no top-level `engine:` key. That is #196.
+2. The manager renders `user_config_template.yaml.j2`, forks, and `execvpe`s a
+   *fresh interpreter* that reads the rendered config from stdin. Nothing in that
+   child ever imports this package, so `getattr(parsl.providers, ...)` fails
+   there even though it succeeds in-process. The `sitecustomize` bootstrap on
+   `PYTHONPATH` is what fixes it, and only a subprocess can test it -- this
+   process has already imported the package.
 
 These tests are skipped when `globus-compute-endpoint` is not installed
 (`uv sync --extra globus`), so they do not gate a default `uv sync` run. They
@@ -16,20 +29,36 @@ SPDX-License-Identifier: Apache-2.0
 SPDX-FileCopyrightText: 2025-2026 Scott Friedman and Project Contributors
 """
 
+import os
+import pwd
+import subprocess
+import sys
 import uuid
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
+import yaml
 
 from parsl_aws_provider import GlobusComputeProvider
 from parsl_aws_provider.provider import EphemeralAWSProvider
 from parsl_aws_provider.state.file import FileStateStore
 
-get_config = pytest.importorskip(
+_config_utils = pytest.importorskip(
     "globus_compute_endpoint.endpoint.config.utils",
     reason="globus-compute-endpoint not installed (uv sync --extra globus)",
-).get_config
+)
+get_config = _config_utils.get_config
+load_user_config_template = _config_utils.load_user_config_template
+render_config_user_template = _config_utils.render_config_user_template
+
+from globus_compute_endpoint.endpoint.config import (  # noqa: E402
+    ManagerEndpointConfig,
+    UserEndpointConfig,
+)
+from globus_compute_endpoint.endpoint.identity_mapper import (  # noqa: E402
+    MappedPosixIdentity,
+)
 
 pytestmark = pytest.mark.unit
 
@@ -37,6 +66,32 @@ pytestmark = pytest.mark.unit
 VPC_ID = "vpc-0123456789abcdef0"
 SUBNET_ID = "subnet-0123456789abcdef0"
 SG_ID = "sg-0123456789abcdef0"
+
+# Run in the exec'd child. Deliberately never names `parsl_aws_provider`:
+# `patch("parsl_aws_provider.provider.create_session")` would *import* the
+# package by name, which is the very thing the negative control has to rule out.
+# Patching botocore instead keeps the AWS calls in the constructor mocked without
+# touching the import under test.
+_CHILD_LOADER = r"""
+import json, sys
+from unittest.mock import MagicMock, patch
+from globus_compute_endpoint.endpoint.config.utils import load_config_yaml
+
+out = {"sitecustomize_ran": "sitecustomize" in sys.modules,
+       "package_imported": "parsl_aws_provider" in sys.modules}
+with patch("boto3.Session", MagicMock()), patch("botocore.session.Session", MagicMock()):
+    try:
+        cfg = load_config_yaml(sys.stdin.read())
+    except Exception as exc:
+        out["error"] = f"{type(exc).__name__}: {exc}"
+    else:
+        out["config_class"] = type(cfg).__name__
+        out["provider_class"] = type(cfg.engine.provider).__name__
+        out["region"] = cfg.engine.provider.region
+        out["encrypted"] = cfg.engine.encrypted
+        cfg.engine.shutdown()
+print("RESULT " + json.dumps(out))
+"""
 
 
 def _make_provider(tmp_path, **extra_kwargs) -> GlobusComputeProvider:
@@ -76,16 +131,82 @@ def _make_provider(tmp_path, **extra_kwargs) -> GlobusComputeProvider:
         )
 
 
-def _load(endpoint_dir: Path):
-    """Load a generated endpoint directory through Globus Compute's own loader.
+def _load_manager(endpoint_dir: Path) -> ManagerEndpointConfig:
+    """Load `config.yaml` the way `start` does, via Globus Compute's loader.
 
-    The loader really does construct the provider named in the YAML, so the AWS
-    session has to be mocked for the duration -- `EphemeralAWSProvider.__init__`
-    calls `GetCallerIdentity`, which fails against the synthetic credentials the
-    non-`aws` suites run under. Everything under test happens before that point:
-    the dispatcher's `getattr(parsl.providers, ...)` lookup, the YAML parse, and
-    the binding of the YAML keys to constructor kwargs.
+    No AWS mocking is needed and none is done, which is itself the point: since
+    #196 moved the `engine:` block out of this file, loading it constructs no
+    provider and so reaches no AWS API. Before the fix, every rejected load
+    created an IAM role and instance profile on the way to failing.
     """
+    return get_config(endpoint_dir)
+
+
+def _render(endpoint_dir: Path) -> str:
+    """Render `user_config_template.yaml.j2` as the endpoint manager would."""
+    template_path = endpoint_dir / "user_config_template.yaml.j2"
+    return render_config_user_template(
+        parent_config=_load_manager(endpoint_dir),
+        user_config_template=load_user_config_template(template_path),
+        user_config_template_path=template_path,
+        mapped_identity=MappedPosixIdentity(
+            local_user_record=pwd.getpwuid(os.getuid()),
+            matched_identity=uuid.UUID(int=0),
+            globus_identity_candidates=[],
+        ),
+    )
+
+
+def _load_in_child(endpoint_dir: Path, *, with_bootstrap: bool = True) -> dict:
+    """Load the rendered template in a fresh interpreter, as the manager does.
+
+    `endpoint_manager` forks and `execvpe`s `globus-compute-endpoint
+    _start-user-endpoint`, which reads its config from stdin; the only seam into
+    that child's environment is `user_environment.yaml`, which the manager merges
+    into `env` immediately before the exec. This reproduces that shape exactly.
+
+    A subprocess is not incidental here. This process imported
+    `parsl_aws_provider` at module scope, so `parsl.providers` already carries the
+    class and any in-process assertion is answering the wrong question.
+    """
+    env = dict(os.environ)
+    env.pop("AWS_PROFILE", None)  # the child must not resolve a named profile
+    if with_bootstrap:
+        data = yaml.safe_load((endpoint_dir / "user_environment.yaml").read_text())
+        env.update({k: str(v) for k, v in (data or {}).items()})
+    else:
+        env.pop("PYTHONPATH", None)
+
+    completed = subprocess.run(
+        [sys.executable, "-c", _CHILD_LOADER],
+        input=_render(endpoint_dir),
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+    for line in completed.stdout.splitlines():
+        if line.startswith("RESULT "):
+            import json
+
+            return json.loads(line[len("RESULT ") :])
+    raise AssertionError(
+        f"child produced no result\nstdout:\n{completed.stdout}\n"
+        f"stderr:\n{completed.stderr[-2000:]}"
+    )
+
+
+def _load(endpoint_dir: Path):
+    """Load the rendered user config in-process, for parameter round-tripping.
+
+    The provider really is constructed, so the AWS session has to be mocked --
+    `EphemeralAWSProvider.__init__` calls `GetCallerIdentity`, which fails against
+    the synthetic credentials the non-`aws` suites run under. Everything the
+    parameter tests care about happens before that: the dispatcher's
+    `getattr(parsl.providers, ...)` lookup, the YAML parse, and the binding of the
+    YAML keys to constructor kwargs.
+    """
+    rendered = _render(endpoint_dir)
     with (
         patch("parsl_aws_provider.provider.create_session") as mock_session,
         patch.object(
@@ -95,7 +216,7 @@ def _load(endpoint_dir: Path):
         ),
     ):
         mock_session.return_value = MagicMock()
-        config = get_config(endpoint_dir)
+        config = _config_utils.load_config_yaml(rendered)
 
     # An engine holds a live ZMQ-bound HighThroughputEngine; shut it down so the
     # test does not leak sockets or a process into the rest of the session.
@@ -105,8 +226,125 @@ def _load(endpoint_dir: Path):
     return config
 
 
+class TestManagerConfigIsStartable:
+    """#196: `start` accepts one class, and the old output was the other one.
+
+    `load_config_yaml` pops `engine` and returns `ManagerEndpointConfig` when it is
+    absent, `UserEndpointConfig` when present. `_start_endpoint_manager` then
+    refuses anything that is not the former, and `start` routes there
+    unconditionally. So the whole blocker reduces to which class comes back --
+    which is what these assert, rather than the text that produced it.
+    """
+
+    def test_manager_config_is_the_class_start_accepts(self, tmp_path):
+        provider = _make_provider(tmp_path)
+        provider.generate_endpoint_config(str(tmp_path / "ep"))
+
+        config = _load_manager(tmp_path / "ep")
+
+        assert isinstance(config, ManagerEndpointConfig)
+        assert not isinstance(config, UserEndpointConfig)
+
+    def test_display_name_survives_to_the_manager(self, tmp_path):
+        """The one value the manager config carries has to arrive."""
+        provider = _make_provider(tmp_path, display_name="Manager Named")
+        provider.generate_endpoint_config(str(tmp_path / "ep"))
+
+        assert _load_manager(tmp_path / "ep").display_name == "Manager Named"
+
+    def test_template_path_resolves_from_a_foreign_cwd(self, tmp_path, monkeypatch):
+        """Why `user_config_template_path` is deliberately not emitted.
+
+        Its setter resolves the value against the process working directory and
+        raises if the result does not exist, so emitting a relative path makes
+        `start` work from the endpoint directory and fail from anywhere else.
+        Omitting it lets `Endpoint.user_config_template_path()` derive the path
+        from the endpoint directory, which is correct from any cwd.
+        """
+        provider = _make_provider(tmp_path)
+        provider.generate_endpoint_config(str(tmp_path / "ep"))
+
+        monkeypatch.chdir(tmp_path.parent)
+        config = _load_manager(tmp_path / "ep")
+
+        assert config.user_config_template_path is None
+
+    def test_loading_the_manager_config_creates_no_provider(self, tmp_path):
+        """The IAM leak, fixed structurally rather than by better teardown.
+
+        Before #196 the `engine:` block sat in `config.yaml`, so *every* load --
+        including the ones that went on to be rejected -- constructed a provider,
+        and `EphemeralAWSProvider.__init__` calls `initialize()`, which creates an
+        IAM role and instance profile. A rejected config now creates nothing
+        because nothing is constructed: note that this test mocks no AWS at all
+        and still passes.
+        """
+        provider = _make_provider(tmp_path)
+        provider.generate_endpoint_config(str(tmp_path / "ep"))
+
+        config = _load_manager(tmp_path / "ep")
+
+        assert getattr(config, "engine", None) is None
+
+
+class TestUserEndpointLoadsInAForkedInterpreter:
+    """The second half of #196: the fix must reach the process that execs.
+
+    Moving the engine block to the template is only half a fix. The template is
+    loaded by a fresh interpreter that reads its config from stdin, so the
+    `config.py` shim -- which only `get_config()` honours -- can never run there.
+    Without the `sitecustomize` bootstrap this change would push every endpoint
+    into the #133 failure instead of the #196 one.
+    """
+
+    def test_rendered_template_loads_in_the_child(self, tmp_path):
+        provider = _make_provider(tmp_path)
+        provider.generate_endpoint_config(str(tmp_path / "ep"))
+
+        result = _load_in_child(tmp_path / "ep")
+
+        assert "error" not in result, result.get("error")
+        assert result["config_class"] == "UserEndpointConfig"
+        assert result["provider_class"] == "GlobusComputeProvider"
+        assert result["region"] == "us-east-1"
+        assert result["encrypted"] is False
+
+    def test_the_package_is_imported_before_any_user_code(self, tmp_path):
+        """`sitecustomize` runs during `site` initialisation, which is why this works.
+
+        A later hook would be too late: the dispatcher's `getattr` happens while
+        the config is being parsed, before anything the endpoint owner controls.
+        """
+        provider = _make_provider(tmp_path)
+        provider.generate_endpoint_config(str(tmp_path / "ep"))
+
+        result = _load_in_child(tmp_path / "ep")
+
+        assert result["sitecustomize_ran"] is True
+        assert result["package_imported"] is True
+
+    def test_without_the_bootstrap_the_child_cannot_resolve_the_provider(
+        self, tmp_path
+    ):
+        """Negative control: the bootstrap is load-bearing, not incidental.
+
+        This is the #133 failure, and it is what the generated output would hit if
+        `user_environment.yaml` were dropped as an implementation detail.
+        `ProviderDispatcher` does `getattr(parsl.providers, type_name, None)` and
+        `parsl.providers` has no module `__getattr__`, so a name nothing
+        registered simply is not there.
+        """
+        provider = _make_provider(tmp_path)
+        provider.generate_endpoint_config(str(tmp_path / "ep"))
+
+        result = _load_in_child(tmp_path / "ep", with_bootstrap=False)
+
+        assert result["package_imported"] is False
+        assert "not a valid provider" in result.get("error", "")
+
+
 class TestGeneratedConfigLoads:
-    """The generated pair loads, and the provider is the class we registered."""
+    """The rendered template loads, and the provider is the class we registered."""
 
     def test_config_loads(self, tmp_path):
         provider = _make_provider(tmp_path, endpoint_id=str(uuid.uuid4()))
@@ -138,76 +376,13 @@ class TestGeneratedConfigLoads:
         )
         provider.generate_endpoint_config(str(tmp_path / "ep"))
 
-        config = _load(tmp_path / "ep")
+        assert _load_manager(tmp_path / "ep").display_name == "Round Trip Endpoint"
 
-        assert config.display_name == "Round Trip Endpoint"
-        assert config.engine.provider.region == "us-east-1"
-        assert config.engine.provider.instance_type == "t3.micro"
-        assert config.engine.provider.max_blocks == 7
-        assert config.engine.provider.use_spot is True
-
-    def test_yaml_alone_does_not_load(self, tmp_path):
-        """Negative control: without the shim the load fails as it did in #87.
-
-        This is what makes the passing tests above meaningful -- it shows the
-        shim is load-bearing and not incidental. `get_config()` prefers
-        `config.py`, so deleting it falls back to the bare `config.yaml`, which
-        is the pre-fix state: nothing has imported this package, so
-        `getattr(parsl.providers, "GlobusComputeProvider", None)` is None.
-        """
-        import parsl.providers
-
-        provider = _make_provider(tmp_path)
-        provider.generate_endpoint_config(str(tmp_path / "ep"))
-        (tmp_path / "ep" / "config.py").unlink()
-
-        # Un-register for the duration: this process has already imported the
-        # package, whereas the endpoint daemon never does.
-        delattr(parsl.providers, "GlobusComputeProvider")
-        try:
-            with pytest.raises(Exception, match="not a valid provider"):
-                _load(tmp_path / "ep")
-        finally:
-            from parsl_aws_provider.globus_compute import (
-                _register_with_parsl_providers,
-            )
-
-            _register_with_parsl_providers()
-
-
-class TestMultiUserLimitation:
-    """Pin the known #133 gap so a future change to it is a deliberate one.
-
-    Multi-user endpoints render `user_config_template.yaml.j2` to a string and
-    call `load_config_yaml()` on it in a forked process -- `get_config()` is
-    never reached, so the `config.py` shim does not apply. This test asserts the
-    *mechanism*, not the failure: if upstream adds dotted-path resolution, or we
-    ship a `.pth`, this is the test that should start failing and be rewritten.
-    """
-
-    def test_load_config_yaml_needs_prior_registration(self, tmp_path):
-        import parsl.providers
-        from globus_compute_endpoint.endpoint.config.utils import load_config_yaml
-
-        from parsl_aws_provider.globus_compute import _register_with_parsl_providers
-
-        rendered = (
-            "engine:\n"
-            "  type: GlobusComputeEngine\n"
-            "  provider:\n"
-            "    type: GlobusComputeProvider\n"
-            "    region: us-east-1\n"
-            f"    vpc_id: {VPC_ID}\n"
-            f"    subnet_id: {SUBNET_ID}\n"
-            f"    security_group_id: {SG_ID}\n"
-        )
-
-        delattr(parsl.providers, "GlobusComputeProvider")
-        try:
-            with pytest.raises(Exception, match="not a valid provider"):
-                load_config_yaml(rendered)
-        finally:
-            _register_with_parsl_providers()
+        engine = _load(tmp_path / "ep").engine
+        assert engine.provider.region == "us-east-1"
+        assert engine.provider.instance_type == "t3.micro"
+        assert engine.provider.max_blocks == 7
+        assert engine.provider.use_spot is True
 
 
 class TestEveryParameterSurvivesTheRoundTrip:
@@ -335,27 +510,50 @@ class TestEveryParameterSurvivesTheRoundTrip:
         """The four `GlobusComputeProvider` params, which the signature loop misses.
 
         `_provider_params_yaml` walks `EphemeralAWSProvider.__init__`, so these
-        need naming individually -- and they land in three different places:
-        `display_name` at the top level, `encrypted` and `container_uri` on the
-        engine, `endpoint_id` and `container_image` on the provider. Asserting
-        after a real load is what proves each one reached a key its consumer
-        actually reads.
+        need naming individually -- and since #196 they land in three different
+        places across *two* files: `display_name` in the manager `config.yaml`,
+        `encrypted` and `container_uri` on the engine in the template, and
+        `container_image` on the provider. Asserting after a real load is what
+        proves each one reached a key its consumer actually reads.
+
+        `endpoint_id` is the exception and is checked separately below: it is not a
+        config key in any file, because `BaseConfig` rejects it.
         """
-        endpoint_id = str(uuid.uuid4())
         provider = _make_provider(
             tmp_path,
-            endpoint_id=endpoint_id,
+            endpoint_id=str(uuid.uuid4()),
             container_image="python:3.11-slim",
             display_name="Subclass Params",
         )
         provider.generate_endpoint_config(str(tmp_path / "ep"))
 
-        config = _load(tmp_path / "ep")
+        assert _load_manager(tmp_path / "ep").display_name == "Subclass Params"
 
-        assert config.display_name == "Subclass Params"
-        assert config.engine.container_uri == "python:3.11-slim"
-        assert config.engine.provider.endpoint_id == endpoint_id
-        assert config.engine.provider.container_image == "python:3.11-slim"
+        engine = _load(tmp_path / "ep").engine
+        assert engine.container_uri == "python:3.11-slim"
+        assert engine.provider.container_image == "python:3.11-slim"
+
+    def test_endpoint_id_reaches_the_provider_but_not_the_manager(self, tmp_path):
+        """Both halves, each asserted after a real load.
+
+        Nested under `engine.provider` it binds to a `GlobusComputeProvider` kwarg
+        and survives. At the top level of `config.yaml` it would raise `Unexpected
+        keyword argument` from `BaseConfig` -- which is what the old output's `TODO`
+        told the reader to do. The manager writes the real UUID to `endpoint.json`;
+        the way to supply one is `start --endpoint-uuid`.
+        """
+        endpoint_id = str(uuid.uuid4())
+        provider = _make_provider(tmp_path, endpoint_id=endpoint_id)
+        provider.generate_endpoint_config(str(tmp_path / "ep"))
+
+        assert _load(tmp_path / "ep").engine.provider.endpoint_id == endpoint_id
+
+        # Reachable in the manager config as guidance, not as a key -- so the load
+        # that would have failed succeeds.
+        manager_text = (tmp_path / "ep" / "config.yaml").read_text()
+        assert endpoint_id in manager_text
+        assert "endpoint_id" not in yaml.safe_load(manager_text)
+        assert isinstance(_load_manager(tmp_path / "ep"), ManagerEndpointConfig)
 
     def test_resolved_ami_is_not_pinned_into_the_config(self, tmp_path):
         """The emitter keys on what the caller passed, not on what differs.
@@ -393,7 +591,7 @@ class TestEveryParameterSurvivesTheRoundTrip:
                 security_group_id=SG_ID,
             )
 
-        assert "image_id" not in provider._build_config_yaml()
+        assert "image_id" not in provider._build_user_config_template()
 
     def test_explicit_image_id_is_emitted(self, tmp_path):
         """The other half: an AMI the caller chose must survive.
@@ -462,7 +660,7 @@ class TestEveryParameterSurvivesTheRoundTrip:
             "use_spot": True,
         }
         provider = _make_provider(tmp_path, **sample)
-        yaml_text = provider._build_config_yaml()
+        yaml_text = provider._build_user_config_template()
 
         missing = [
             name
@@ -476,4 +674,4 @@ class TestEveryParameterSurvivesTheRoundTrip:
         one_shot = _make_provider(
             tmp_path, one_shot=True, auto_create_instance_profile=True
         )
-        assert "    one_shot:" in one_shot._build_config_yaml()
+        assert "    one_shot:" in one_shot._build_user_config_template()

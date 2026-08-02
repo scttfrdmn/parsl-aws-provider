@@ -8,6 +8,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **`generate_endpoint_config()` writes four files and returns a different one**
+  (#196). It previously wrote `config.yaml` plus a `config.py` shim and returned
+  the path to the YAML. It now writes `config.yaml`, a
+  `user_config_template.yaml.j2` holding the `engine:` block, a
+  `user_environment.yaml`, and a `_bootstrap/sitecustomize.py`; the return value
+  is the **template** path, since that is the file an operator edits. Any stale
+  `config.py` in the target directory is removed, because Globus Compute would
+  otherwise still load it and reintroduce the failure. **Regenerate any endpoint
+  directory created by an earlier version** — the old two-file layout could never
+  start.
 - **substrate pinned to `0.85.0`, and CI's pin realigned with compose's.** The two
   pins had drifted: `.github/workflows/ci.yml` sat on `0.76.0` while
   `docker-compose.substrate.yml` had moved to `0.82.0`, so CI validated against an
@@ -153,6 +163,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   4.0.1).
 
 ### Fixed
+- **The generated Globus Compute endpoint config could never start** (#196).
+  `globus-compute-endpoint start` classifies a config by a single key:
+  `load_config_yaml()` pops `engine` and returns a `UserEndpointConfig` when it is
+  present, and `cli.py` then refuses the endpoint with *"contains an `engine`
+  field; endpoint will not start"*. The generated `config.yaml` carried `engine:`,
+  so every endpoint this provider produced hit that gate. The `engine:` block now
+  lives in `user_config_template.yaml.j2`, which is where the multi-user endpoint
+  expects it, and `config.yaml` holds only `display_name`.
+
+  `user_config_template_path` is deliberately **omitted** from `config.yaml`. Its
+  setter resolves a relative path against the *process* working directory and
+  raises if the file is missing, so writing it made the endpoint startable only
+  from the directory it was generated in. Omitting it lets Globus Compute fall
+  back to `endpoint_dir / "user_config_template.yaml.j2"`, which is correct from
+  any cwd.
+- **A rejected Globus config leaked an IAM role and instance profile on every
+  attempt** (#196). Two independent causes, both fixed:
+
+  - `StandardMode.initialize()` created the instance profile and verified the
+    network *outside* any teardown — the `try` that calls
+    `cleanup_infrastructure()` began below both. So any failure in between left
+    the role and profile standing with nothing tracking them, which is the #132
+    pathology reachable on nothing more exotic than a mistyped subnet ID. The
+    teardown boundary now opens above `_resolve_instance_profile()`. The
+    exception is re-raised **unchanged** rather than wrapped, because #77 requires
+    a bad network ID to surface as `ResourceNotFoundError` naming the ID —
+    burying it in a `ResourceCreationError` would send the caller looking for a
+    provisioning fault instead of their own typo.
+  - Moving the `engine:` block out of `config.yaml` removes the cause
+    structurally: loading the manager config now constructs no provider at all,
+    so a config the endpoint is about to reject cannot reach AWS in the first
+    place. `test_loading_the_manager_config_creates_no_provider` mocks no AWS
+    whatsoever and passes, which is the assertion form of that claim.
+
+  This mattered more than a single leaked pair suggests: a config load that ends
+  in an error message is the normal Globus debugging loop, and each iteration left
+  another standing principal with `AmazonSSMManagedInstanceCore` attached.
+- **The forked user-endpoint process could not resolve
+  `GlobusComputeProvider`** (#196). A multi-user endpoint forks and `execvpe`s a
+  fresh interpreter that reads its config from stdin as JSON, so the `config.py`
+  shim — which only `get_config()` honours — never runs there, and Globus
+  Compute's attribute lookup on `parsl.providers` fails on a class this package
+  never registered. The generated `user_environment.yaml` now puts a
+  `_bootstrap/` directory on the child's `PYTHONPATH`; its `sitecustomize.py`
+  imports `parsl_aws_provider` during `site` initialisation, before any config is
+  parsed. It swallows its own `ImportError` after writing a diagnostic to stderr,
+  since raising there would break every interpreter the endpoint starts.
+
+  This is a workaround, not the fix — #133 tracks teaching Globus Compute to
+  resolve a dotted path, which would make the bootstrap unnecessary. Note that
+  generation works anywhere but `start` is Linux-only: `pyprctl` has no macOS
+  wheel, so `start` fails earlier and for an unrelated reason there.
 - **`SECURITY.md`'s only code example was rejected outright, and its policy
   covered a version that does not ship** (#199). Four of the five kwargs in the
   security-configuration example have never existed — `encrypt_storage`,
