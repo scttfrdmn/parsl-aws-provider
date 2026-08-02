@@ -2,7 +2,15 @@
 # SPDX-FileCopyrightText: 2025-2026 Scott Friedman and Project Contributors
 
 [build-system]
-requires = ["setuptools>=42", "wheel"]
+# 77.0.1, not the inherited 42: PEP 639 support -- the `license = "Apache-2.0"`
+# SPDX string and `license-files` below -- landed in setuptools 77.0. Anything
+# older rejects this file outright; 76.0.0 fails validation with "project.license
+# must be one of [{file}, {text}]". So `>=42` advertised a build that cannot
+# happen. It went unnoticed because every environment here resolves something
+# current, and only a consumer pinning an old setuptools would have hit it --
+# which is exactly what publishing an sdist to PyPI invites (#180). 77.0.0 was
+# yanked, so 77.0.1 is the lowest installable release that works.
+requires = ["setuptools>=77.0.1", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
@@ -68,13 +76,18 @@ dev = [
     # 9.0.3 fixes GHSA-6w46-j5rx-g56g, insecure tmpdir handling. Dev-only, so the
     # exposure is a developer's own machine rather than a consumer's.
     "pytest>=9.0.3",
-    "pytest-cov>=2.12.0",
+    # 7.1.0 makes the total coverage figure independent of reporting options
+    # (pytest-cov#641). That is a correctness fix for the thing this repo gates
+    # on: `--cov-fail-under=65` in CI and `=25` in `[tool.pytest.ini_options]`
+    # were comparing against a total that could shift with `--cov-report`.
+    "pytest-cov>=7.1.0",
     "pytest-mock>=3.0.0",
     "coverage>=6.0",
     # Floor matches the ruff-pre-commit pin so the hook and `uv run ruff` cannot
     # disagree on formatting; at 0.2.x they differed on comprehension-conditional
-    # parenthesization and each would undo the other's output.
-    "ruff>=0.15.4",
+    # parenthesization and each would undo the other's output. Both move together
+    # or neither does -- see .pre-commit-config.yaml.
+    "ruff>=0.16.0",
     "mypy>=0.812",
     "bandit>=1.7.0",
     "pre-commit>=2.15.0",

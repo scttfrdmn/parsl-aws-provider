@@ -44,15 +44,12 @@ provider = EphemeralAWSProvider(
     vpc_id="vpc-0123456789abcdef0",
     subnet_id="subnet-0123456789abcdef0",
     security_group_id="sg-0123456789abcdef0",
-
     use_spot=True,
     use_spot_fleet=True,
     instance_types=["m5.large", "m5a.large", "m6i.large", "c5.large"],
-
-    nodes_per_block=2,             # instances per fleet
+    nodes_per_block=2,  # instances per fleet
     spot_max_price_percentage=80,  # cap at 80% of on-demand
     spot_allocation_strategy="price-capacity-optimized",  # the default
-
     mode="standard",
     max_blocks=4,
 )
@@ -100,7 +97,7 @@ Choose types yourself. Effective pools share a size and mix families and
 generations:
 
 ```python
-instance_types=["m5.xlarge", "m5a.xlarge", "m5n.xlarge", "m6i.xlarge"]
+instance_types = ["m5.xlarge", "m5a.xlarge", "m5n.xlarge", "m6i.xlarge"]
 ```
 
 Keep vCPU and memory comparable across the list, since Parsl sizes its worker pool

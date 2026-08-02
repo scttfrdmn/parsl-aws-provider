@@ -51,7 +51,7 @@ provider = EphemeralAWSProvider(
     instance_type="t3.medium",
     min_blocks=0,
     max_blocks=4,
-    use_public_ips=True,     # False if reaching the subnet over VPN/Direct Connect
+    use_public_ips=True,  # False if reaching the subnet over VPN/Direct Connect
     key_name="your-key-pair",  # optional; SSM Session Manager needs no key
     use_spot=True,
 )
@@ -144,7 +144,7 @@ provider = EphemeralAWSProvider(
     bastion_instance_type="t3.micro",
     min_blocks=0,
     max_blocks=10,
-    state_store_type="parameter_store",   # readable by client and bastion alike
+    state_store_type="parameter_store",  # readable by client and bastion alike
     parameter_store_path="/parsl/my-workflow-state",
 )
 ```
@@ -226,8 +226,8 @@ provider = EphemeralAWSProvider(
     mode="serverless",
     region="us-west-2",
     compute_type="lambda",
-    memory_size=1024,    # MB
-    timeout=300,         # seconds; Lambda's own ceiling is 900
+    memory_size=1024,  # MB
+    timeout=300,  # seconds; Lambda's own ceiling is 900
     min_blocks=0,
     max_blocks=100,
 )
@@ -274,7 +274,9 @@ provider = EphemeralAWSProvider(
     ecs_container_image="123456789012.dkr.ecr.us-east-1.amazonaws.com/my-worker:latest",
     ecs_task_cpu=2048,
     ecs_task_memory=4096,
-    vpc_id="vpc-...", subnet_id="subnet-...", security_group_id="sg-...",
+    vpc_id="vpc-...",
+    subnet_id="subnet-...",
+    security_group_id="sg-...",
 )
 ```
 

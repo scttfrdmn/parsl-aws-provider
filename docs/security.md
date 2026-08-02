@@ -410,8 +410,8 @@ If your workflows touch regulated data:
 To tear down everything a provider owns:
 
 ```python
-provider.cleanup_all()   # terminate compute, keep the provider usable
-provider.shutdown()      # ...and delete the launch template, AMI, and state
+provider.cleanup_all()  # terminate compute, keep the provider usable
+provider.shutdown()  # ...and delete the launch template, AMI, and state
 ```
 
 Neither takes a `force` argument. To reach the resources of a workflow started by

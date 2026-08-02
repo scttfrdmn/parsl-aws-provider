@@ -26,7 +26,7 @@ provider = EphemeralAWSProvider(
     vpc_id="vpc-0123456789abcdef0",
     subnet_id="subnet-0123456789abcdef0",
     security_group_id="sg-0123456789abcdef0",
-    state_store_type="file",                      # "file" | "s3" | "parameter_store"
+    state_store_type="file",  # "file" | "s3" | "parameter_store"
     state_file_path="./aws_provider_state.json",  # used by "file"
 )
 ```

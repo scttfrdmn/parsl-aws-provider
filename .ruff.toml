@@ -1,6 +1,19 @@
 # Ruff configuration for Parsl AWS Provider
 
 [lint]
+# Explicit because ruff 0.16.0 changed the *implicit* default from 59 rules to
+# 413, which is a breaking change for any project that never wrote a `select`.
+# This repo was one: 0.16.0 reported 1,128 errors here against 0.15.4's zero, all
+# from newly-defaulted rules (PLW1510, PLR2004, and the rest), none of them a
+# regression in this code.
+#
+# `["E4", "E7", "E9", "F"]` is the previous default reproduced exactly -- verified
+# by diffing `ruff check --show-settings`'s enabled-rule list between 0.15.4 with
+# no select and 0.16.0 with this one: identical, 57 rules. So the bump changes no
+# lint outcome, which is the point. Adopting any of the 354 new rules is a
+# separate decision with its own diff, not something to smuggle in on a
+# dependabot PR.
+select = ["E4", "E7", "E9", "F"]
 extend-ignore = [
     # F821: Undefined name - ignore in template strings where variables are defined in generated code
     "F821",
