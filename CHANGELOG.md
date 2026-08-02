@@ -33,8 +33,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   CloudFormation still is not a moto replacement, and #183 stays open for it.
   substrate does not resolve YAML short-form intrinsics — `!Sub`, `!Ref`, `!If`
   are stripped and the raw scalar used literally, while the `Fn::` long forms are
-  correct — and `StackDeployer.dispatch` writes resources as account
-  `123456789012` while the caller is `000000000000`. Every template in
+  correct ([substrate#516](https://github.com/scttfrdmn/substrate/issues/516)) —
+  and `StackDeployer.dispatch` writes resources as account `123456789012` while
+  the caller is `000000000000`
+  ([substrate#517](https://github.com/scttfrdmn/substrate/issues/517)). Every template in
   `parsl_aws_provider/templates/cloudformation/` uses the short forms, so a stack
   reaches `CREATE_COMPLETE` having created nothing the caller can query.
   `docs/substrate_testing.md` records both, with the evidence.

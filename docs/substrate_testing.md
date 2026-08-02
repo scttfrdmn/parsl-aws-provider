@@ -188,7 +188,7 @@ row is a gap this project turns to its advantage rather than one it works around
 
 | Gap | Effect | Upstream |
 |---|---|---|
-| CloudFormation stacks reach `CREATE_COMPLETE` having created nothing the caller can find — see below, this is two distinct defects | `tests/integration/test_serverless_mode_spot_fleet_integration.py` and `test_detached_mode_spot_fleet_integration.py` stay on moto; real coverage is in `tests/aws/` | [substrate#483](https://github.com/scttfrdmn/substrate/issues/483) reopened the door; the remainder is unfiled |
+| CloudFormation stacks reach `CREATE_COMPLETE` having created nothing the caller can find — see below, this is two distinct defects | `tests/integration/test_serverless_mode_spot_fleet_integration.py` and `test_detached_mode_spot_fleet_integration.py` stay on moto; real coverage is in `tests/aws/` | [substrate#483](https://github.com/scttfrdmn/substrate/issues/483) reopened the door; the remainder is [substrate#516](https://github.com/scttfrdmn/substrate/issues/516) and [substrate#517](https://github.com/scttfrdmn/substrate/issues/517) |
 | EventBridge is not emulated; `PutRule` returns `501 service not emulated: awsevents` | The spot-warning notifier's degradation path is testable *because* of this. The warning path itself is covered end to end by wiring an SQS queue directly, since the monitor only ever reads warnings through SQS | — |
 
 ### CloudFormation
@@ -208,9 +208,10 @@ with `Outputs`, `describe_stack_resources`, `delete_stack`, both waiters,
 ([substrate#501](https://github.com/scttfrdmn/substrate/issues/501)) but nothing
 here calls it.
 
-Two defects behind that surface are why moto stays. Neither is filed upstream yet.
+Two defects behind that surface are why moto stays.
 
-**YAML short-form intrinsics are not resolved.** `!Sub`, `!Ref`, `!If`, `!GetAtt`
+**YAML short-form intrinsics are not resolved**
+([substrate#516](https://github.com/scttfrdmn/substrate/issues/516)). `!Sub`, `!Ref`, `!If`, `!GetAtt`
 are stripped and the raw scalar used as a literal, while the `Fn::`-prefixed long
 forms are correct — `Fn::Sub: 'x-${P}'` substitutes, `Fn::If` picks the right
 branch on both true and false conditions, but `!Sub 'x-${P}'` yields the physical
@@ -222,7 +223,14 @@ embeds an unevaluated condition array:
 arn:aws:ecs:us-east-1:123456789012:task-definition/["HasTaskFamily","TaskFamily","parsl-task-${WorkflowId}-${JobId}"]:1
 ```
 
-**Resources are written to a different account than the caller reads.**
+The cause is upstream of the intrinsics engine, which is why the long forms are
+unaffected: `parseCFNTemplate` (`emulator/betty_cfn.go:3358`) unmarshals directly
+into its template struct with `go.yaml.in/yaml/v3`, and that library has no notion
+of the CloudFormation tag shorthands — it discards the tag and keeps the node value,
+so nothing downstream can tell a `!Sub` string from a literal one.
+
+**Resources are written to a different account than the caller reads**
+([substrate#517](https://github.com/scttfrdmn/substrate/issues/517)).
 `StackDeployer.dispatch` (`emulator/betty_cfn.go:2847`) synthesises its
 `RequestContext` from the constants `testAccountID` (`123456789012`) and
 `defaultRegion` rather than threading the inbound request's identity. The caller is
