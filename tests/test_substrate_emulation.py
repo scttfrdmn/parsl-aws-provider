@@ -199,15 +199,19 @@ def test_ssm_parameter_store(ssm_client):
     # Delete parameter
     ssm_client.delete_parameter(Name=parameter_name)
 
-    # Verify deletion. The assertion is on *what raised*, not on the error code:
-    # substrate returns Error.Code == "404" where AWS returns "ParameterNotFound"
-    # (substrate#392). That gap is not cosmetic here --
-    # ParameterStoreState.save_state() branches on exactly that code to decide
-    # between put-with-Overwrite and create-with-Tags, so its create path cannot be
-    # covered against this emulator. tests/aws/test_state_backends_e2e.py covers it
-    # against real AWS. Tighten this to the symbolic code once substrate#392 lands.
+    # Verify deletion. Asserted on the symbolic code now that substrate#392 has
+    # landed -- it used to return Error.Code == "404" where AWS returns
+    # "ParameterNotFound", and this assertion could only check the HTTP status.
+    #
+    # The code is what matters, not just the failure:
+    # ParameterStoreState.save_state() branches on exactly "ParameterNotFound" to
+    # choose between put-with-Overwrite and create-with-Tags, so under the old
+    # behaviour its create path could not be covered against this emulator at
+    # all. The HTTP status is still asserted alongside, since that is what the
+    # 0.84.0-and-earlier gap showed up as.
     with pytest.raises(ClientError) as excinfo:
         ssm_client.get_parameter(Name=parameter_name)
+    assert excinfo.value.response["Error"]["Code"] == "ParameterNotFound"
     assert excinfo.value.response["ResponseMetadata"]["HTTPStatusCode"] == 404
 
 
@@ -324,9 +328,12 @@ def handler(event, context):
     # rather than on 'Hello from Lambda!'. LambdaManager reads StatusCode and
     # FunctionError to decide job state, and those are what this covers.
     #
-    # Truthiness, not `"FunctionError" not in response`: substrate sets the key to
-    # "" on success where AWS omits it (substrate#393). Both spellings agree that
-    # the invocation did not error, and `.get()` is what lambda_func.py:458 uses.
+    # Truthiness via `.get()`, which is also what lambda_func.py:458 does, so
+    # this covers the provider's own spelling. Substrate omits the key entirely
+    # on success now, matching AWS -- it used to set it to "" (substrate#393),
+    # which is why the assertion was written to accept either. Both spellings
+    # agree that the invocation did not error, so the looser form is kept
+    # deliberately rather than tightened to `not in response`.
     assert not response.get("FunctionError")
 
     lambda_client.delete_function(FunctionName=function_name)

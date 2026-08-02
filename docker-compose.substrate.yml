@@ -19,12 +19,33 @@ services:
     # Pinned, not `latest`: an emulator that silently changes under CI turns an
     # unrelated PR red. Bump deliberately.
     #
-    # 0.82.0 is the first release with an EC2 `CreateFleet` handler (substrate
-    # #387), which is what lets the spot-fleet suite run against an endpoint
+    # 0.82.0 was the first release with an EC2 `CreateFleet` handler (substrate
+    # #387), which is what let the spot-fleet suite run against an endpoint
     # instead of moto. `RequestSpotFleet`/`RequestSpotInstances` are still
     # unimplemented and are not coming back here -- #86 moved this provider onto
     # CreateFleet, so nothing calls them.
-    image: ghcr.io/scttfrdmn/substrate:0.82.0
+    #
+    # 0.85.0 is the first release carrying four fixes this suite waited on
+    # (#183). Three land in 0.84.0 and one only in 0.85.0, so 0.84.0 is not
+    # enough:
+    #
+    #   substrate#392 symbolic error codes -- `ParameterNotFound` instead of
+    #     "404", which is the code ParameterStoreState.save_state() branches on
+    #     to choose put-with-Overwrite vs create-with-Tags.
+    #   substrate#443 `tag:aws:ec2:fleet-id` is set on fleet instances, so the
+    #     hand-applied tag workaround in the spot-fleet integration test is gone.
+    #   substrate#391 an unknown instance ID raises InvalidInstanceID.NotFound
+    #     instead of returning 200 + an empty list -- it had silently defeated
+    #     the #69 network guard, so _verify_resources never raised.
+    #   substrate#446 (0.85.0 only) `?publicAccessBlock` is routed, so PUT no
+    #     longer reaches CreateBucket and DELETE no longer deletes the bucket.
+    #     That unblocks S3State(create_bucket_if_not_exists=True), which was
+    #     xfailed and verified nowhere (#166).
+    #
+    # Verify a bump reaches the image, not just the git tag: substrate cuts
+    # release commits, so a merged fix sits on `main` after the newest tag and is
+    # invisible to this pin. `git tag --contains <sha>` is the check.
+    image: ghcr.io/scttfrdmn/substrate:0.85.0
     container_name: parsl-substrate
     ports:
       - "4566:4566"

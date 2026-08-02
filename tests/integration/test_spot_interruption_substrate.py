@@ -177,25 +177,55 @@ class TestSpotInterruptionSubstrate:
         assert remaining.get("Messages", []) == []
 
     def test_a_fleet_instance_warning_reaches_the_fleet_handler(
-        self, substrate_session, warning_queue
+        self, substrate_session, substrate_network, warning_queue
     ):
         """A warning names an instance; the handler owed it may own the fleet.
 
         The link is the reserved ``aws:ec2:fleet-id`` tag EC2 stamps on every
         fleet-launched instance -- the only workable route, since
         ``describe_fleet_instances`` rejects an instant fleet outright (#86).
-        Substrate serves both ``create_tags`` and the tag filter, so the lookup
-        is exercised for real here rather than mocked.
+
+        The fleet is created for real and the tag is *not* applied here.
+        Substrate stamps it itself as of 0.85.0 (substrate#443), so this now
+        covers the whole chain the provider depends on -- fleet launch, EC2
+        applying the reserved tag, and the tag-filtered lookup -- where the
+        earlier version asserted only the last link against a synthetic fleet ID
+        and a tag the test had written itself.
+
+        Hand-applying it is no longer merely redundant, it fails: substrate now
+        enforces the real rule that ``aws:``-prefixed keys are reserved, and
+        ``create_tags`` answers ``InvalidParameterValue``.
         """
         ec2 = substrate_session.client("ec2")
-        fleet_id = f"fleet-{uuid.uuid4().hex[:12]}"
-        instance_id = ec2.run_instances(
-            ImageId="ami-12345678", MinCount=1, MaxCount=1, InstanceType="t3.micro"
-        )["Instances"][0]["InstanceId"]
-        ec2.create_tags(
-            Resources=[instance_id],
-            Tags=[{"Key": "aws:ec2:fleet-id", "Value": fleet_id}],
+        template = ec2.create_launch_template(
+            LaunchTemplateName=f"parsl-warning-template-{uuid.uuid4().hex[:8]}",
+            LaunchTemplateData={"ImageId": "ami-12345678", "InstanceType": "t3.micro"},
+        )["LaunchTemplate"]
+        fleet = ec2.create_fleet(
+            Type="instant",
+            LaunchTemplateConfigs=[
+                {
+                    "LaunchTemplateSpecification": {
+                        "LaunchTemplateId": template["LaunchTemplateId"],
+                        "Version": str(template["LatestVersionNumber"]),
+                    },
+                    "Overrides": [
+                        {
+                            "InstanceType": "t3.micro",
+                            "SubnetId": substrate_network["subnet_id"],
+                        }
+                    ],
+                }
+            ],
+            TargetCapacitySpecification={
+                "TotalTargetCapacity": 1,
+                "DefaultTargetCapacityType": "spot",
+            },
         )
+        fleet_id = fleet["FleetId"]
+        instance_ids = [i for g in fleet["Instances"] for i in g["InstanceIds"]]
+        assert instance_ids, "fleet launched nothing; nothing to assert about"
+        instance_id = instance_ids[0]
 
         monitor = SpotInterruptionMonitor(session=substrate_session, check_interval=1)
         monitor.warning_queue_url = warning_queue
@@ -220,4 +250,7 @@ class TestSpotInterruptionSubstrate:
             assert instance_ids == [instance_id]
             assert event["FleetRequestId"] == fleet_id
         finally:
-            ec2.terminate_instances(InstanceIds=[instance_id])
+            ec2.terminate_instances(InstanceIds=instance_ids)
+            ec2.delete_launch_template(
+                LaunchTemplateId=template["LaunchTemplateId"],
+            )

@@ -37,10 +37,22 @@ any step ran.
 The compose file is pinned to a specific image tag, deliberately — an emulator that
 silently changes under CI turns an unrelated PR red.
 
-Do not try to confirm the pin from `/health`: released images report
-`"version":"dev"` whatever their tag ([substrate#402](https://github.com/scttfrdmn/substrate/issues/402)).
-Use `podman image inspect ghcr.io/scttfrdmn/substrate:0.76.0 --format '{{.Digest}}'`
+`/health` reports the real version as of 0.85.0 — `{"status":"ok","version":"v0.85.0"}` —
+so `make substrate-status` is enough to confirm the pin. Released images used to
+report `"version":"dev"` whatever their tag
+([substrate#402](https://github.com/scttfrdmn/substrate/issues/402)); against an
+older image, use
+`podman image inspect ghcr.io/scttfrdmn/substrate:0.85.0 --format '{{.Digest}}'`
 instead.
+
+When bumping the pin, change it in **two** places — `docker-compose.substrate.yml`
+and the `services.substrate.image` in `.github/workflows/ci.yml`. They drifted
+once (CI on 0.76.0, compose on 0.82.0), which meant CI validated against an
+emulator six releases behind the one developers ran locally.
+
+Note also that a merged substrate fix is not a released one: substrate cuts
+release commits, so a fix merged to `main` lands *after* the newest tag and is
+invisible to an image pin. `git tag --contains <sha>` is the check.
 
 ```bash
 make substrate-up      # start and wait for /health
@@ -170,17 +182,30 @@ provider.
 
 ## Known gaps
 
-Verified against substrate `0.76.0`. None of these block the current suite, but
-they shape what can be tested where:
+Verified by probing substrate `0.85.0` directly, not read off the milestones.
+Only two gaps remain, and both are why part of the suite still uses moto:
 
 | Gap | Effect | Upstream |
 |---|---|---|
-| `describe_instances`/`describe_vpcs` with an unknown ID return HTTP 200 and an empty list instead of `Invalid*ID.NotFound` | `modes/base.py::_verify_resources` never raises, so the whole #69 network-validation guard is silently skipped and the test still reports green | [substrate#391](https://github.com/scttfrdmn/substrate/issues/391) |
-| `Error.Code` carries the HTTP status (`"404"`) rather than the symbolic code for SSM/Lambda not-found; IAM returns `NoSuchEntityException` where the wire code is `NoSuchEntity`; `s3.get_object` reports `NoSuchKey` for a missing *bucket* | `ParameterStoreState.save_state()` branches on `Code == "ParameterNotFound"` to choose between put-with-Overwrite and create-with-Tags, so its create path cannot be covered here | [substrate#392](https://github.com/scttfrdmn/substrate/issues/392) |
-| `lambda.invoke` sets `FunctionError` to `""` on success, where AWS omits the key | Cosmetic. `compute/lambda_func.py` reads it with `.get()`, so a falsy value behaves correctly | [substrate#393](https://github.com/scttfrdmn/substrate/issues/393) |
-| CloudFormation is not exposed over HTTP; `create_stack` returns `ServiceNotAvailable` | `DetachedMode`'s bastion stack cannot be exercised here. The one test that touches it patches `_create_cloudformation_stack` out; real coverage is in `tests/aws/` | — |
-| `RequestSpotFleet`, `RequestSpotInstances`, and `CreateFleet` are unimplemented | No impact: every spot-fleet test uses moto rather than an endpoint | — |
-| Released images report `"version":"dev"` from `/health` regardless of tag | The image pin cannot be confirmed from the running emulator; verify with `podman image inspect` instead | [substrate#402](https://github.com/scttfrdmn/substrate/issues/402) |
+| CloudFormation is not exposed over HTTP; `create_stack` returns `ServiceNotAvailable` | `DetachedMode`'s bastion stack and six `ServerlessMode` tests that drive `cf_client` cannot run here. `tests/integration/test_serverless_mode_spot_fleet_integration.py` stays on moto for exactly this reason; real coverage is in `tests/aws/` | — |
+| EventBridge is not emulated; `PutRule` returns `501 service not emulated: awsevents` | The spot-warning notifier's degradation path is testable *because* of this. The warning path itself is covered end to end by wiring an SQS queue directly, since the monitor only ever reads warnings through SQS | — |
+| IAM does not serve AWS-managed policies — `get_policy` on `arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore` returns `NoSuchEntity` (though `attach_role_policy` accepts it) | The unit suite keeps moto with `MOTO_IAM_LOAD_MANAGED_POLICIES=true`, which serves the real policy documents | — |
+| The instance-type catalog is partial — `t3.micro` resolves, `m5.xlarge` does not | `describe_instance_capacity` tests stay on moto, which knows the full catalog | — |
+
+Fixed since, and no longer worked around anywhere:
+
+| Was | Now | Upstream |
+|---|---|---|
+| Unknown instance/VPC IDs returned HTTP 200 + empty list, silently skipping the whole #69 network-validation guard | Raises `InvalidInstanceID.NotFound`, so `_verify_resources` is genuinely exercised | [substrate#391](https://github.com/scttfrdmn/substrate/issues/391) |
+| `Error.Code` carried the HTTP status (`"404"`) rather than the symbolic code | `ParameterNotFound`, `NoSuchEntity`, `NoSuchBucket` all correct, so `ParameterStoreState.save_state()`'s create-path branch is coverable | [substrate#392](https://github.com/scttfrdmn/substrate/issues/392) |
+| `lambda.invoke` set `FunctionError` to `""` on success where AWS omits it | Key omitted, matching AWS | [substrate#393](https://github.com/scttfrdmn/substrate/issues/393) |
+| `CreateFleet` unimplemented | Implemented; an instant fleet launches its full `TotalTargetCapacity` | [substrate#387](https://github.com/scttfrdmn/substrate/issues/387) |
+| Fleet instances carried no `aws:ec2:fleet-id` tag, so tests hand-applied it | Substrate stamps it, and now *rejects* manual `aws:`-prefixed keys as reserved — so the old workaround is an error, not merely redundant | [substrate#443](https://github.com/scttfrdmn/substrate/issues/443) |
+| `?publicAccessBlock` was unrouted: `PUT` hit `CreateBucket`, `DELETE` **deleted the bucket** | Routed, so `S3State(create_bucket_if_not_exists=True)` is covered instead of xfailed | [substrate#446](https://github.com/scttfrdmn/substrate/issues/446) |
+| `/health` reported `"version":"dev"` regardless of tag | Reports the real version | [substrate#402](https://github.com/scttfrdmn/substrate/issues/402) |
+
+`RequestSpotFleet` and `RequestSpotInstances` are still unimplemented and are not
+coming back here: #86 moved this provider onto `CreateFleet`, so nothing calls them.
 
 Substrate does emulate two things LocalStack did not, and both are load-bearing
 here: EC2 instance state actually transitions to `terminated` (which

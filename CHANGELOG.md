@@ -8,6 +8,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **substrate pinned to `0.85.0`, and CI's pin realigned with compose's.** The two
+  pins had drifted: `.github/workflows/ci.yml` sat on `0.76.0` while
+  `docker-compose.substrate.yml` had moved to `0.82.0`, so CI validated against an
+  emulator six releases older than the one developers ran locally. Both now read
+  `0.85.0`, which is the first release carrying all four emulator fixes this suite
+  was waiting on — three land in `0.84.0` and one only in `0.85.0`, so `0.84.0`
+  would not have been enough (refs #183):
+
+  - substrate#392 — symbolic error codes, so `Error.Code` is `ParameterNotFound`
+    rather than `"404"`. That is the exact string
+    `ParameterStoreState.save_state()` branches on to choose put-with-`Overwrite`
+    against create-with-`Tags`, so its create path was uncoverable here before.
+  - substrate#443 — `aws:ec2:fleet-id` is stamped on fleet-launched instances.
+  - substrate#391 — an unknown instance ID raises `InvalidInstanceID.NotFound`
+    instead of answering 200 with an empty list. That had silently defeated the #69
+    network guard: `_verify_resources` never raised, so the guard was asserted
+    against nothing.
+  - substrate#446 (`0.85.0` only) — `?publicAccessBlock` is routed, so `PUT` no
+    longer falls through to `CreateBucket` and `DELETE` no longer deletes the
+    bucket.
+
+  A merged substrate fix is not a released one — substrate cuts release commits, so
+  a fix merged to `main` lands *after* the newest tag and is invisible to an image
+  pin. `git tag --contains <sha>` is the check, and it is now written down in
+  `docs/substrate_testing.md` alongside the reminder that the pin lives in two
+  places.
+- **CI's integration-tests step now gates.** It carried `continue-on-error: true`
+  while #92's debt was outstanding — 46 mode constructions omitted the network IDs
+  #69 made required, so the suite could not pass and gating would have turned every
+  PR red. #92 closed in v0.8.0 and the suite is green, so the exemption had stopped
+  protecting anything and could only hide a regression.
 - **Renamed to `parsl-aws-provider`.** The distribution, the import package, and
   the repository now agree: `parsl-ephemeral-aws` → `parsl-aws-provider`, and
   `import parsl_ephemeral_aws` → `import parsl_aws_provider`. **Breaking for
@@ -26,6 +57,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   would strand already-created resources in live accounts.
 
 ### Added
+- **`S3State(create_bucket_if_not_exists=True)` is now covered.** #166 recorded it
+  as verified nowhere, and it was: the integration test for it was `xfail`ed,
+  because substrate left `?publicAccessBlock` unrouted, so the `PUT` that locks
+  down a freshly-created bucket fell through to `CreateBucket` and answered
+  `BucketAlreadyExists`. Fixed upstream in substrate 0.85.0, so the test asserts
+  outright — an `xfail` kept past its cause reads as coverage while producing an
+  `XPASS` on every run. The escape hatch became a regression guard that names the
+  upstream issue and the pin to check.
+
+  Still unverified against **real** S3; the gap #166 tracks narrows rather than
+  closes (refs #166).
 - **Independent-project disclaimer and a `NOTICE` file.** The README badges AWS,
   Parsl, and Globus Compute, and the repository carried no non-endorsement text
   at all. `NOTICE` now records that this is unaffiliated community work and
