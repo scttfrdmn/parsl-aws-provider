@@ -122,7 +122,18 @@ docs = [
 [project.urls]
 "Homepage" = "https://github.com/scttfrdmn/parsl-aws-provider"
 "Bug Tracker" = "https://github.com/scttfrdmn/parsl-aws-provider/issues"
-"Documentation" = "https://parsl-aws-provider.readthedocs.io"
+# GitHub Pages, not Read the Docs. This read
+# `https://parsl-aws-provider.readthedocs.io` and 404'd -- as did the old name,
+# so it was a pre-existing dead link the #189 rename carried forward rather than
+# fallout from it. RTD was never configured: no `.readthedocs.yaml`, no project
+# under either name.
+#
+# These URLs are baked into wheel and sdist metadata and become the links on the
+# PyPI landing page, so this had to resolve before the first publish (#180) or be
+# dropped. CI's `docs` job had been building the HTML on every PR all along and
+# never publishing it; `deploy-docs` now ships it on pushes to main (#191).
+"Documentation" = "https://scttfrdmn.github.io/parsl-aws-provider/"
+"Changelog" = "https://github.com/scttfrdmn/parsl-aws-provider/blob/main/CHANGELOG.md"
 
 # [tool.uv] conflicts removed with the localstack dependency (#125). The pin
 # existed because globus-compute-sdk requires dill==0.3.9 while localstack<4.10

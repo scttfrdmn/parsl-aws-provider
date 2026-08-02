@@ -57,6 +57,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   would strand already-created resources in live accounts.
 
 ### Added
+- **The documentation is actually published.** CI's `docs` job has built the
+  Sphinx HTML on every PR since #124 and uploaded it as an artifact — a form only
+  reachable by someone browsing a workflow run. It now deploys to GitHub Pages at
+  <https://scttfrdmn.github.io/parsl-aws-provider/> on pushes to `main`, and the
+  `Documentation` entry in `[project.urls]` points there instead of at a Read the
+  Docs site that never existed.
+
+  That URL returned **404**, and so did the old name's, so it was a pre-existing
+  dead link the rename carried forward rather than fallout from it. It mattered
+  because `[project.urls]` is baked into wheel and sdist metadata and becomes the
+  links on the PyPI landing page — publishing (#180) as-is would have shipped a
+  prominent 404. Pages rather than RTD because the HTML already existed; RTD would
+  have meant a new external account and a `.readthedocs.yaml` duplicating the
+  build this repo already does under `uv`.
+
+  Deployment is gated on `refs/heads/main` **and** a `push` event, so a pull
+  request cannot publish. The plain artifact upload stays, since that is how a PR
+  author reviews a documentation change before it ships. A `Changelog` URL was
+  added while there (closes #191).
 - **`S3State(create_bucket_if_not_exists=True)` is now covered.** #166 recorded it
   as verified nowhere, and it was: the integration test for it was `xfail`ed,
   because substrate left `?publicAccessBlock` unrouted, so the `PUT` that locks
