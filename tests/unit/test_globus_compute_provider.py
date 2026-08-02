@@ -445,7 +445,7 @@ class TestMinimumIamPolicy:
     def test_ssm_statement_present(self):
         policy = GlobusComputeProvider.minimum_iam_policy()
         sids = {s["Sid"] for s in policy["Statement"]}
-        assert "SSMTunneling" in sids
+        assert "SSMCommandsAndParameters" in sids
 
     def test_iam_statement_present(self):
         policy = GlobusComputeProvider.minimum_iam_policy()
@@ -504,16 +504,168 @@ class TestMinimumIamPolicy:
         assert "ec2:DescribeSpotFleetRequests" not in actions
         assert "ec2:CreateFleet" in actions
 
-    def test_iam_delete_actions_absent(self):
-        """No teardown grants while the provider performs no teardown (#132)."""
+    def test_iam_delete_actions_present(self):
+        """The teardown #132 added must be permitted, or the leak returns (#195).
+
+        This test asserted the *opposite* until #195 -- it pinned "no teardown
+        grants while the provider performs no teardown (#132)", which stopped
+        being true when v0.8.0's #132 fix shipped the teardown. So CI stayed
+        green over a policy that silently reverted that fix: cleanup logs rather
+        than raises, so the AccessDenied never surfaced and the roles simply
+        accumulated, 94 of them in a real account.
+        """
         actions = _all_actions(GlobusComputeProvider.minimum_iam_policy())
         for action in (
-            "iam:DeleteRole",
-            "iam:DeleteInstanceProfile",
             "iam:RemoveRoleFromInstanceProfile",
+            "iam:DeleteInstanceProfile",
+            "iam:ListAttachedRolePolicies",
             "iam:DetachRolePolicy",
+            "iam:DeleteRole",
+        ):
+            assert action in actions
+
+    def test_session_validation_present(self):
+        """create_session() calls this before anything else (#195).
+
+        Omitting it failed the user at ``EphemeralAWSProvider(...)`` itself --
+        the first AWS call the package makes, on the construction path.
+        """
+        actions = _all_actions(GlobusComputeProvider.minimum_iam_policy())
+        assert "sts:GetCallerIdentity" in actions
+
+    def test_parameter_store_write_actions_present(self):
+        """Detached mode needs Parameter Store state, so writes must be granted.
+
+        Both deletes appear because they are distinct IAM actions and the
+        backend calls both: delete_parameter() per key and delete_parameters()
+        for the batched cleanup.
+        """
+        actions = _all_actions(GlobusComputeProvider.minimum_iam_policy())
+        for action in ("ssm:PutParameter", "ssm:DeleteParameter"):
+            assert action in actions
+        assert "ssm:DeleteParameters" in actions
+
+    def test_unused_session_manager_actions_absent(self):
+        """There is no SSH-over-SSM tunnel in this package (#195).
+
+        Five session actions were granted for "Session Manager tunnels to reach
+        workers in a private subnet". No such transport exists -- nothing calls
+        any of them, and the bastion is an autonomous orchestrator rather than a
+        network tunnel. StartSession in particular is a shell on the instance.
+        """
+        actions = _all_actions(
+            GlobusComputeProvider.minimum_iam_policy(include_ecr=True)
+        )
+        for action in (
+            "ssm:StartSession",
+            "ssm:TerminateSession",
+            "ssm:ResumeSession",
+            "ssm:DescribeSessions",
+            "ssm:GetConnectionStatus",
         ):
             assert action not in actions
+
+    def test_every_granted_action_has_a_call_site(self):
+        """The property that keeps this honest, rather than a curated list.
+
+        Hand-maintained policies drift: #195 found this one granting five
+        actions nothing called while omitting nine the code did. Deriving the
+        check from the package's own source means a newly granted action must
+        point at real code, and a newly *called* API is not silently missing --
+        the companion test below covers that direction.
+
+        boto3 method names are snake_case of the IAM action, with a handful of
+        irregular pairs, so the mapping is computed rather than listed.
+        """
+        import re
+        from pathlib import Path
+
+        pkg = Path(GlobusComputeProvider.__module__.split(".")[0])
+        source = "\n".join(
+            p.read_text() for p in Path(pkg.name).rglob("*.py") if p.is_file()
+        )
+
+        def boto_name(action: str) -> str:
+            return re.sub(r"(?<!^)(?=[A-Z])", "_", action.split(":", 1)[1]).lower()
+
+        # Actions with no single boto3 call of their own name.
+        exempt = {
+            # Granted on the resource, not called: RunInstances/CreateFleet
+            # perform the pass, and CreateTags covers TagSpecifications.
+            "iam:PassRole",
+            # Read-only existence checks reached via waiters and describe_*.
+            "ec2:DescribeTags",
+            # Required implicitly by put_rule(Tags=...) rather than by a
+            # tag_resource() call of its own -- IAM authorizes the tagging half
+            # of a create-with-tags separately, so omitting this fails put_rule
+            # itself whenever additional_tags is set.
+            "events:TagResource",
+        }
+
+        missing = []
+        for action in _all_actions(
+            GlobusComputeProvider.minimum_iam_policy(include_ecr=True)
+        ):
+            if action in exempt or action.startswith("ecr:"):
+                continue
+            if f".{boto_name(action)}(" not in source:
+                missing.append(action)
+
+        assert not missing, f"granted with no call site in the package: {missing}"
+
+    def test_iam_and_sts_calls_are_all_granted(self):
+        """The direction #195 actually failed in: called but not granted.
+
+        Scoped to IAM and STS rather than every service, because those are where
+        a missing grant is both silent and expensive -- the teardown logs instead
+        of raising, so AccessDenied leaks a standing privileged principal, and
+        the STS check fails construction outright. Serverless and detached modes
+        add calls this policy deliberately does not cover, so a whole-package
+        sweep would assert against a scope this method never claimed.
+        """
+        import re
+        from pathlib import Path
+
+        pkg = Path(GlobusComputeProvider.__module__.split(".")[0]).name
+        source = "\n".join(
+            p.read_text() for p in Path(pkg).rglob("*.py") if p.is_file()
+        )
+        granted = _all_actions(GlobusComputeProvider.minimum_iam_policy())
+
+        # The calls this policy's scope reaches: instance-profile creation and
+        # teardown, plus the session check. Derived from the client each is made
+        # on, so a call added to either path shows up here.
+        expected = {
+            "iam": [
+                "create_role",
+                "get_role",
+                "attach_role_policy",
+                "create_instance_profile",
+                "get_instance_profile",
+                "add_role_to_instance_profile",
+                "remove_role_from_instance_profile",
+                "delete_instance_profile",
+                "list_attached_role_policies",
+                "detach_role_policy",
+                "delete_role",
+            ],
+            "sts": ["get_caller_identity"],
+        }
+
+        ungranted = []
+        for service, methods in expected.items():
+            for method in methods:
+                if f".{method}(" not in source:
+                    continue  # not called; nothing to grant
+                action = f"{service}:" + "".join(
+                    part.title() for part in method.split("_")
+                )
+                # PassRole is authorized on RunInstances, not by a method call.
+                action = re.sub(r"^iam:Sts", "sts:", action)
+                if action not in granted:
+                    ungranted.append(action)
+
+        assert not ungranted, f"called by the package but not granted: {ungranted}"
 
     def test_launch_template_actions_present(self):
         """Every launch path goes through a launch template since #85."""

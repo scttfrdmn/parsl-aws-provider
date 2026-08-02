@@ -39,14 +39,25 @@ print(json.dumps(GlobusComputeProvider.minimum_iam_policy(include_ecr=True), ind
 This is a `@staticmethod` — you do not need to construct a provider to call it,
 and it applies to `EphemeralAWSProvider` just as much as to the Globus subclass.
 
-It returns four statements: `EC2Management`, `SSMTunneling`,
-`SpotInterruptionWarning`, and `IAMInstanceProfile`, plus `ECRContainerImages`
-when `include_ecr=True`.
+It returns five statements: `SessionValidation`, `EC2Management`,
+`SSMCommandsAndParameters`, `SpotInterruptionWarning`, and `IAMInstanceProfile`,
+plus `ECRContainerImages` when `include_ecr=True`.
 
 Note what it does **not** grant: no `ec2:CreateVpc`, `CreateSubnet`,
 `CreateSecurityGroup`, `CreateNatGateway`, or `RequestSpotFleet`. Older versions
 of this document asked for all of them. The provider creates no network resources
-(#69) and uses `CreateFleet` rather than the legacy Spot Fleet API (#86).
+(#69) and uses `CreateFleet` rather than the legacy Spot Fleet API (#86). Nor any
+Session Manager action — `ssm:StartSession` and its four companions were granted
+for a tunnel this package does not have, and were removed in
+[#195](https://github.com/scttfrdmn/parsl-aws-provider/issues/195).
+
+The IAM statement grants **both halves** of the instance-profile lifecycle. The
+teardown grants are not symmetry for its own sake: `cleanup_infrastructure()`
+deletes the role and profile it created (#132), and cleanup logs rather than
+raises, so a policy granting only the creates leaks a standing privileged
+principal on every run without ever reporting an error. That is exactly how 94
+orphaned roles accumulated in a real account, and the policy reproduced it until
+#195.
 
 Every statement uses `Resource: "*"`. Most of these EC2 and IAM actions do not
 support resource-level permissions, but you should scope what you can with
@@ -184,9 +195,13 @@ provider = EphemeralAWSProvider(
 Attach `AmazonSSMManagedInstanceCore` as well if you use the warm pool or one-shot
 mode.
 
-**A role created with `auto_create_instance_profile=True` is not deleted on
-shutdown** ([#132](https://github.com/scttfrdmn/parsl-aws-provider/issues/132)).
-Supply your own ARN if you need to control that lifecycle.
+**A role created with `auto_create_instance_profile=True` is deleted on shutdown**
+since v0.8.0 ([#132](https://github.com/scttfrdmn/parsl-aws-provider/issues/132)),
+along with its instance profile. Deletion is gated on ownership, so a profile you
+supplied through `iam_instance_profile_arn` is never deleted. Your policy must
+grant the teardown actions listed above — cleanup logs rather than raises, so
+without them the roles accumulate silently
+([#195](https://github.com/scttfrdmn/parsl-aws-provider/issues/195)).
 
 ### Bastion instance profile (detached mode)
 
@@ -368,7 +383,8 @@ implemented.
 ### CloudTrail and CloudWatch
 
 - **CloudTrail** records every API call the provider makes, including each
-  `StartSession`. This is your real audit trail.
+  `RunInstances`, `SendCommand`, and IAM role creation and deletion. This is your
+  real audit trail.
 - **Budgets and CloudWatch alarms** on EC2 spend are worth setting up: the
   provider has no cost controls of its own beyond `max_blocks`, `auto_shutdown`,
   and the warm-pool cap. Reclaiming idle-but-running instances is Parsl's

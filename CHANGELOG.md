@@ -118,6 +118,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   4.0.1).
 
 ### Fixed
+- **`minimum_iam_policy()` granted creates without deletes, silently re-creating
+  the #132 leak** (#195). The policy carried `iam:CreateRole`,
+  `iam:CreateInstanceProfile`, `iam:AddRoleToInstanceProfile`,
+  `iam:AttachRolePolicy` and `iam:PassRole` with **no IAM delete action at all**,
+  on the rationale that "the provider does not tear the profile down (#132), so
+  granting them would permit more than it performs".
+
+  That rationale stopped being true when v0.8.0 shipped the #132 fix: the teardown
+  in `utils/aws.py` now runs on every `cleanup_infrastructure()`. Because cleanup
+  logs rather than raises, the resulting `AccessDenied` was invisible — so a user
+  on this exact policy reproduced the leak #132 was filed to stop, the failure
+  that accumulated 94 orphaned roles and 94 orphaned instance profiles in a real
+  account. The policy was quietly reverting the fix.
+
+  Added, each verified against a real call site: `iam:RemoveRoleFromInstanceProfile`,
+  `iam:DeleteInstanceProfile`, `iam:ListAttachedRolePolicies`,
+  `iam:DetachRolePolicy`, `iam:DeleteRole`, and `sts:GetCallerIdentity` —
+  the last being the *first* AWS call the package makes, since `create_session()`
+  validates every session with it, so a user on this policy previously failed at
+  `EphemeralAWSProvider(...)` before reaching any AWS work. Also added
+  `ssm:PutParameter`, `ssm:DeleteParameter` and `ssm:DeleteParameters` for
+  `state_store_type="parameter_store"`; both deletes appear because they are
+  distinct IAM actions and the backend calls both.
+
+  **Removed** five actions granted for a transport that does not exist:
+  `ssm:StartSession`, `TerminateSession`, `ResumeSession`, `DescribeSessions` and
+  `GetConnectionStatus`, listed under "Session Manager tunnels to reach workers in
+  a private subnet". Nothing in the package calls any of them — the bastion is an
+  autonomous orchestrator, not a network tunnel — and `StartSession` in particular
+  grants an interactive shell on the instance. The statement `Sid` is renamed
+  `SSMTunneling` → `SSMCommandsAndParameters` accordingly. `ec2:DescribeInstanceStatus`
+  and `ec2:DescribeLaunchTemplates`, which #195 also proposed adding, are
+  deliberately *not* added: neither has a call site.
+
+  Two tests now enforce this in both directions, deriving from the package's own
+  source rather than a curated list — every granted action must have a call site,
+  and every IAM or STS call the policy's scope reaches must be granted. The old
+  suite had a `test_iam_delete_actions_absent` asserting the *opposite*, which is
+  why CI stayed green over the defect; it is inverted to
+  `test_iam_delete_actions_present`.
+
+  The hand-written policy in `docs/network-prerequisites.md` is replaced by the
+  generator too. Its seven actions had drifted the opposite way — granting
+  `ec2:CreateSecurityGroup` and `AuthorizeSecurityGroupIngress`, removed by #69,
+  while omitting `ssm:GetParameter`, `ec2:CreateLaunchTemplate`,
+  `ec2:DescribeInstanceTypes`, `ec2:DescribeVpcs` and `sts:GetCallerIdentity`, so
+  a user following it failed at construction, where `initialize()` resolves the
+  AMI from SSM and creates a launch template.
+
+  **Correcting the released changelog:** the v0.8.0 entry for #87 states "No IAM
+  delete actions are granted, because the provider performs no instance-profile
+  teardown (#132)". That was accurate when written and was made false by #132
+  landing in the same release. Released sections are not edited, so the correction
+  is recorded here. Four documentation claims that the profile is "not deleted on
+  shutdown" are corrected in place (`docs/architecture.md` ×2, `docs/security.md`,
+  `docs/troubleshooting.md`), as is a `docs/security.md` line citing a
+  CloudTrail-recorded `StartSession` that never occurs.
 - **`max_idle_time` terminated busy workers, so the provider-side reap is gone**
   (#194). `_cleanup_resources()` reclaimed a `RUNNING` resource once
   `time.time() - resource["timestamp"] > max_idle_time`, but `"timestamp"` is
