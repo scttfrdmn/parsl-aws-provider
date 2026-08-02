@@ -61,8 +61,9 @@ services:
     # CFN is still not a moto replacement, for two reasons worth knowing before
     # you try: substrate does not resolve YAML short-form intrinsics (`!Sub`,
     # `!Ref`, `!If` are stripped and the raw scalar used literally, while the
-    # `Fn::` long forms work), and StackDeployer.dispatch writes resources as
-    # account 123456789012 while the caller is 000000000000. A stack built from
+    # `Fn::` long forms work -- substrate#516), and StackDeployer.dispatch writes
+    # resources as account 123456789012 while the caller is 000000000000
+    # (substrate#517). A stack built from
     # any template in templates/cloudformation/ therefore reaches CREATE_COMPLETE
     # having created nothing the caller can find. See docs/substrate_testing.md.
     #
