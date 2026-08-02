@@ -118,7 +118,7 @@ IDs from another region otherwise surface minutes in, from deep inside
 `RunInstances`, after instances have been billed. Pick a subnet in an AZ that
 offers your instance type (`us-east-1e` does not offer `t3.micro`).
 
-A final `always()` step runs `tools/cleanup_aws_resources.py --dry-run` to report
+A final `always()` step runs `parsl-aws-cleanup --dry-run` to report
 orphans, since a failed test is exactly when instances are most likely to be left
 running. It reports without deleting, so CI never mutates a shared account. The
 script takes credentials from the boto3 chain — the OIDC credentials the earlier

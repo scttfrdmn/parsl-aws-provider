@@ -217,7 +217,7 @@ This drains pending functions and scales the provider's blocks in. It does not
 call `provider.shutdown()`, so sweep for leftovers if the daemon died uncleanly:
 
 ```bash
-uv run python tools/cleanup_aws_resources.py --dry-run --region us-east-1
+parsl-aws-cleanup --dry-run --region us-east-1
 ```
 
 ## Configuration reference
@@ -475,7 +475,7 @@ The worker ran your function and it raised. Read
 `provider.shutdown()`, and there is no `atexit` hook. Sweep by tag:
 
 ```bash
-uv run python tools/cleanup_aws_resources.py --region us-east-1   # --dry-run first
+parsl-aws-cleanup --region us-east-1   # --dry-run first
 ```
 
 ### SSM reports the instance as unreachable

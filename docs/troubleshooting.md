@@ -304,7 +304,7 @@ If you have a stale `ephemeral_aws_state.json` from an older version, deleting i
 is safe once you have confirmed the resources it names are gone:
 
 ```bash
-python tools/cleanup_aws_resources.py --dry-run --region us-east-1
+parsl-aws-cleanup --dry-run --region us-east-1
 ```
 
 ### `StateStoreError` on the file backend
@@ -384,11 +384,13 @@ unrelated, and is deprecated and ignored
 To find orphans from a crash:
 
 ```bash
-python tools/cleanup_aws_resources.py --dry-run --region us-east-1   # then without --dry-run
+parsl-aws-cleanup --dry-run --region us-east-1   # then without --dry-run
 ```
 
-It sweeps by the `ParslResource=true` tag, so it finds resources the state file no
-longer names.
+It sweeps by tag — both `CreatedBy=ParslEphemeralAWSProvider` (standard mode) and
+`ParslResource=true` (detached and serverless) — so it finds resources the state
+file no longer names. It ships with the package, so it is on `PATH` after any
+install, not only in a git clone.
 
 ### The bill is higher than expected
 
@@ -416,7 +418,7 @@ Two things to know specifically:
   actions: cleanup logs rather than raises, so `AccessDenied` there is silent
   ([#195](https://github.com/scttfrdmn/parsl-aws-provider/issues/195)). Generate a
   current policy with `GlobusComputeProvider.minimum_iam_policy()`, and reap
-  existing orphans with `tools/cleanup_aws_resources.py`.
+  existing orphans with `parsl-aws-cleanup`.
 
 ### Stopped instances with billed EBS volumes
 

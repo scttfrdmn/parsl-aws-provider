@@ -226,7 +226,7 @@ construction (`provider.state_store = MyCustomStateStore(...)`) before the first
   resources.
 - Parameter Store operations emit `STATE_ACCESS` audit events when the provider
   has an `audit_logger`.
-- After any crash, run `tools/cleanup_aws_resources.py --dry-run --region <region>`
+- After any crash, run `parsl-aws-cleanup --dry-run --region <region>`
   to check for resources the state no longer names.
 
 SPDX-License-Identifier: Apache-2.0

@@ -434,7 +434,7 @@ provider.shutdown()
 If the state is gone, sweep by tag instead:
 
 ```bash
-python tools/cleanup_aws_resources.py --region us-east-1            # --dry-run first
+parsl-aws-cleanup --region us-east-1            # --dry-run first
 ```
 
 ## Reporting a vulnerability

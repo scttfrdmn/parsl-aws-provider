@@ -224,7 +224,7 @@ export AWS_TEST_VPC_ID=vpc-… AWS_TEST_SUBNET_ID=subnet-… AWS_TEST_SG_ID=sg-�
 uv run pytest tests/aws -m aws -v --no-cov
 ```
 
-These create billable resources. `tools/cleanup_aws_resources.py --dry-run`
+These create billable resources. `parsl-aws-cleanup --dry-run`
 reports anything left behind.
 
 ## Troubleshooting

@@ -119,6 +119,15 @@ docs = [
     "myst-parser>=2.0.0",
 ]
 
+[project.scripts]
+# The orphan sweep has to be reachable from an installed wheel. It used to live at
+# `tools/cleanup_aws_resources.py`, which ships in neither the wheel nor the sdist,
+# so every `python tools/cleanup_aws_resources.py` line in the docs worked only
+# inside a git clone (#198). Nothing terminates instances automatically -- Parsl
+# never calls provider.shutdown() -- so this is the tool that bounds the bill after
+# a crash, and it was the one thing not distributed.
+parsl-aws-cleanup = "parsl_aws_provider.cleanup:main"
+
 [project.urls]
 "Homepage" = "https://github.com/scttfrdmn/parsl-aws-provider"
 "Bug Tracker" = "https://github.com/scttfrdmn/parsl-aws-provider/issues"

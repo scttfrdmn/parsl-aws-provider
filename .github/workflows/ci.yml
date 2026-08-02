@@ -224,7 +224,7 @@ jobs:
         if: always()
         env:
           AWS_TEST_REGION: ${{ vars.AWS_TEST_REGION }}
-        run: uv run python tools/cleanup_aws_resources.py --dry-run --region "${AWS_TEST_REGION}"
+        run: uv run parsl-aws-cleanup --dry-run --region "${AWS_TEST_REGION}"
 
   test-bats:
     runs-on: ubuntu-latest

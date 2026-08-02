@@ -100,6 +100,16 @@ def main() -> int:
         min_blocks=0,
         max_blocks=4,
         use_public_ips=True,
+        # numpy is imported inside compute_intensive, which runs on the fleet
+        # instance rather than here, so this is where it has to be installed --
+        # the default worker_init installs Parsl alone. Serverless mode dropped
+        # worker_init on the fleet path until #198, which is why this example
+        # previously had nowhere to declare it.
+        worker_init=(
+            "dnf install -y python3.11 python3.11-pip\n"
+            "ln -sf /usr/bin/python3.11 /usr/bin/python3\n"
+            "pip3.11 install --quiet --upgrade parsl numpy\n"
+        ),
         state_store_type="parameter_store",
         parameter_store_path="/parsl/serverless-spot-fleet",
         additional_tags={

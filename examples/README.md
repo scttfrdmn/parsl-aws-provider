@@ -50,7 +50,7 @@ fail to register with no useful error. Certificate distribution is
 hard, sweep for orphans:
 
 ```bash
-uv run python tools/cleanup_aws_resources.py --dry-run --region us-east-1
+parsl-aws-cleanup --dry-run --region us-east-1
 ```
 
 It matches the `ParslResource=true` tag, so it finds resources no state file names.

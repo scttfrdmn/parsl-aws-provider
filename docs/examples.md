@@ -505,7 +505,7 @@ Every resource is tagged `ParslResource=true` and
 anything a crash left behind:
 
 ```bash
-python tools/cleanup_aws_resources.py --dry-run --region us-east-1
+parsl-aws-cleanup --dry-run --region us-east-1
 ```
 
 ## Migrating from Parsl's `AWSProvider`
