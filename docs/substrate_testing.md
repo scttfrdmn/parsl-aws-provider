@@ -77,6 +77,16 @@ design: a fixed resource name collides with `ResourceConflictException` on a sec
 run against a long-lived emulator, so tests that create named resources should
 suffix them with `uuid.uuid4().hex[:8]` or call `make substrate-reset` between runs.
 
+**Put the random part first, not last.** The provider truncates the IDs it embeds in
+resource names — `parsl-bastion-{workflow_id[:8]}` (`modes/detached.py:458`),
+`parsl-{ecs,lambda}-{job_id[:8]}` (`modes/serverless.py:564,717`),
+`parsl-lambda-code-{provider_id[:8]}` (`:645`) — so `f"test-job-{uuid…}"` yields the
+single name `test-job` for every test that uses it. #183 found four such collisions.
+This is the failure mode moto structurally hid: a fresh mock per test meant a
+same-named resource never met its predecessor. It is also a real provider constraint
+rather than a test artefact — two live workflows whose IDs share eight characters
+collide on one stack.
+
 ## Pointing the provider at substrate
 
 There is no `use_substrate=` or `endpoint_url=` provider argument, and there never
@@ -160,8 +170,9 @@ real AWS and everything else to substrate.
 
 Two pytest markers are relevant:
 
-- `integration` — lives in `tests/integration/`. A subset is pure-moto and needs no
-  endpoint at all.
+- `integration` — lives in `tests/integration/`. Every file there needs a running
+  emulator as of #183; moto is gone from this directory. It is still a dependency,
+  and still used by `tests/unit/`, which must stay container-free.
 - `substrate` — requires a running emulator. Pair it with a
   `skipif(not is_substrate_available())`: a marker only *selects* tests, it never
   skips them, so a marker alone leaves the test erroring rather than skipping when
@@ -184,13 +195,16 @@ provider.
 
 Verified by probing substrate `0.88.0` directly, not read off the milestones.
 **`0.88.0` closed the four gaps that kept `ecs_worker.yml` on moto** — see the
-resolved list below — so `DeleteStack` is the only CloudFormation row left, and it
-is a teardown-assertion hazard rather than a blocker. The EventBridge row is a gap
-this project turns to its advantage rather than one it works around.
+resolved list below. What remains is three CloudFormation rows, none of them a
+blocker: each is a hazard to what a *teardown or assertion* can be trusted to prove.
+The EventBridge row is a gap this project turns to its advantage rather than one it
+works around.
 
 | Gap | Effect | Upstream |
 |---|---|---|
 | `DeleteStack` does not delete the stack's resources | The stack record goes and `describe_stacks` then raises `ValidationError` correctly, but an S3 bucket and an IAM role both outlive their stack. A teardown assertion that only checks the stack passes for the wrong reason. Re-probed against `0.88.0`: a CFN-created bucket is still listed after `DeleteStack` | [substrate#518](https://github.com/scttfrdmn/substrate/issues/518) |
+| Neither `DeleteStack` nor `DescribeStacks` resolves a stack **ARN**, only a name | `delete_stack(StackName=<arn>)` returns **HTTP 200 and leaves the stack standing**; `describe_stacks(StackName=<arn>)` raises `ValidationError … does not exist`. Real CloudFormation accepts either form. This bites teardown directly: `DetachedMode.cleanup_infrastructure()` deletes by `self.bastion_id`, which *is* an ARN, so bastion teardown silently no-ops and the next test in the file meets `AlreadyExists`. Found while moving `test_detached_mode_spot_fleet_integration.py` off moto in #183 | not yet filed |
+| A CFN-deployed `AWS::Lambda::Function` reports `CodeSize: 0` | A direct `create_function` reports the true size; only the CloudFormation path zeroes it, and `invoke` still returns 200. So `CodeSize` cannot be used to prove a stack staged real code — which is why `test_submit_lambda_job_stages_a_real_zip_in_s3` asserts on the `DescribeStacks` parameter echo instead. That is the better assertion regardless: #116's actual symptom was an unparseable parameter echo, not a wrong size | not yet filed |
 | EventBridge is not emulated; `PutRule` returns `501 service not emulated: awsevents` | The spot-warning notifier's degradation path is testable *because* of this. The warning path itself is covered end to end by wiring an SQS queue directly, since the monitor only ever reads warnings through SQS | — |
 
 ### Closed in `0.88.0`
@@ -251,8 +265,10 @@ it.** The full template deploys against `0.87.1`: `AWS::EC2::Instance` resolves 
 `AWS::EC2::Instance` reads `properties["ImageId"]` directly
 (`moto/ec2/models/instances.py:400`) and resolves no launch template, so it raises
 `KeyError: 'ImageId'` on a stack real CloudFormation accepts. That is why
-`test_detached_mode_spot_fleet_integration.py` passes `bastion_host_type="direct"`;
-the CloudFormation bastion path is a candidate to move onto substrate now.
+`test_detached_mode_spot_fleet_integration.py` used to pass
+`bastion_host_type="direct"`. It no longer does: #183 moved that file onto substrate
+and onto the **default** `cloudformation` bastion path, so the tests now exercise
+what users get rather than a fallback chosen to route around a simulator gap.
 
 Two related fixes shipped in `0.87.1` alongside those, both found upstream while
 fixing #516 and each worth knowing:
