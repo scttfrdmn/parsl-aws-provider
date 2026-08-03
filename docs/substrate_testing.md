@@ -37,12 +37,12 @@ any step ran.
 The compose file is pinned to a specific image tag, deliberately — an emulator that
 silently changes under CI turns an unrelated PR red.
 
-`/health` reports the real version since 0.85.0 — `{"status":"ok","version":"v0.87.1"}` —
+`/health` reports the real version since 0.85.0 — `{"status":"ok","version":"v0.88.0"}` —
 so `make substrate-status` is enough to confirm the pin. Released images used to
 report `"version":"dev"` whatever their tag
 ([substrate#402](https://github.com/scttfrdmn/substrate/issues/402)); against an
 older image, use
-`podman image inspect ghcr.io/scttfrdmn/substrate:0.87.1 --format '{{.Digest}}'`
+`podman image inspect ghcr.io/scttfrdmn/substrate:0.88.0 --format '{{.Digest}}'`
 instead.
 
 When bumping the pin, change it in **two** places — `docker-compose.substrate.yml`
@@ -182,19 +182,30 @@ provider.
 
 ## Known gaps
 
-Verified by probing substrate `0.87.1` directly, not read off the milestones.
-The remaining CloudFormation rows are why one file still uses moto (#183); the
-EventBridge row is a gap this project turns to its advantage rather than one it
-works around.
+Verified by probing substrate `0.88.0` directly, not read off the milestones.
+**`0.88.0` closed the four gaps that kept `ecs_worker.yml` on moto** — see the
+resolved list below — so `DeleteStack` is the only CloudFormation row left, and it
+is a teardown-assertion hazard rather than a blocker. The EventBridge row is a gap
+this project turns to its advantage rather than one it works around.
 
 | Gap | Effect | Upstream |
 |---|---|---|
-| `Fn::Split` resolves to its first element only | `ecs_worker.yml:208` uses `!Split [',', !Ref Command]` for a container command, so a multi-element command silently loses everything after the first item | [substrate#521](https://github.com/scttfrdmn/substrate/issues/521) |
-| An intrinsic nested inside a structured property is never resolved | The same `Command`, nested in `ContainerDefinitions`, is not walked into. `AWS::EC2::LaunchTemplate` resolves nested intrinsics because its deploy path enumerates them explicitly, so this is per-property rather than general | [substrate#526](https://github.com/scttfrdmn/substrate/issues/526) |
-| A CFN-deployed task definition's `ContainerDefinitions` keep CloudFormation's PascalCase keys | `describe_task_definition` returns `containerDefinitions: [{}]` — family, revision, cpu, memory and the ARN are all correct, only the container list reads empty | [substrate#527](https://github.com/scttfrdmn/substrate/issues/527) |
-| CloudWatch Logs read operations return PascalCase members | `describe_log_groups`, `describe_log_streams` and `get_log_events` put `LogGroupName`/`ARN`/`CreationTime` on the wire where the JSON 1.1 API uses `logGroupName`/`arn`/`creationTime`, so botocore parses every field to `None` and a caller sees `[{}]` — with HTTP 200 and no error. `filter_log_events` is correct, which makes it an inconsistency inside one plugin. Affects a directly-created group too, so it is not CFN-specific. Blocks *verifying* `compute/ecs.py`'s log-group create (`:377`) and cleanup (`:829`), both of which work — a cleanup assertion can only check the returned count, which passes for the wrong reason. `PutRetentionPolicy` is unimplemented, noted on the same issue | [substrate#528](https://github.com/scttfrdmn/substrate/issues/528) |
-| `DeleteStack` does not delete the stack's resources | The stack record goes and `describe_stacks` then raises `ValidationError` correctly, but an S3 bucket and an IAM role both outlive their stack. A teardown assertion that only checks the stack passes for the wrong reason | [substrate#518](https://github.com/scttfrdmn/substrate/issues/518) |
+| `DeleteStack` does not delete the stack's resources | The stack record goes and `describe_stacks` then raises `ValidationError` correctly, but an S3 bucket and an IAM role both outlive their stack. A teardown assertion that only checks the stack passes for the wrong reason. Re-probed against `0.88.0`: a CFN-created bucket is still listed after `DeleteStack` | [substrate#518](https://github.com/scttfrdmn/substrate/issues/518) |
 | EventBridge is not emulated; `PutRule` returns `501 service not emulated: awsevents` | The spot-warning notifier's degradation path is testable *because* of this. The warning path itself is covered end to end by wiring an SQS queue directly, since the monitor only ever reads warnings through SQS | — |
+
+### Closed in `0.88.0`
+
+All four were filed from this repository and each was re-probed against the image
+before this list was written — a closed issue is not the same as a released fix, and
+substrate cuts release commits, so a merged fix can sit on `main` past the newest
+tag.
+
+| Was | Now | Upstream |
+|---|---|---|
+| `Fn::Split` resolved to its first element only, so `ecs_worker.yml:208`'s `!Split [',', !Ref Command]` silently lost everything after the first item | An `Fn::Select` of index 2 over a three-element split returns the third element | [substrate#521](https://github.com/scttfrdmn/substrate/issues/521) |
+| An intrinsic nested inside a structured property was never resolved — the same `Command`, nested in `ContainerDefinitions`, was not walked into | An `Fn::Sub` inside a `ContainerDefinitions` entry resolves | [substrate#526](https://github.com/scttfrdmn/substrate/issues/526) |
+| A CFN-deployed task definition's `ContainerDefinitions` kept CloudFormation's PascalCase keys, so `describe_task_definition` returned `containerDefinitions: [{}]` | The container list parses to camelCase and reads back complete | [substrate#527](https://github.com/scttfrdmn/substrate/issues/527) |
+| CloudWatch Logs read operations returned PascalCase members, so botocore parsed every field to `None` and a caller saw `[{}]` with HTTP 200 and no error | `describe_log_groups` and `get_log_events` round-trip correctly, which unblocks *verifying* `compute/ecs.py`'s log-group create (`:377`) and cleanup (`:829`) rather than asserting on a count that passed for the wrong reason. `PutRetentionPolicy` was noted on the same issue — check it before relying on it | [substrate#528](https://github.com/scttfrdmn/substrate/issues/528) |
 
 ### CloudFormation
 

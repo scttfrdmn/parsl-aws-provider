@@ -8,6 +8,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **The substrate emulator pin moves `0.87.1` → `0.88.0`**, in
+  `docker-compose.substrate.yml` and `.github/workflows/ci.yml` together. This
+  closes the last four emulation gaps filed from this repository, each verified
+  against the image rather than read from the changelog:
+
+  - [substrate#521](https://github.com/scttfrdmn/substrate/issues/521) —
+    `Fn::Split` yielded only its first element, silently dropping the rest. An
+    `Fn::Select` of index 2 over a three-element split now returns the third.
+  - [substrate#526](https://github.com/scttfrdmn/substrate/issues/526) — an
+    intrinsic nested inside a structured property was never resolved. An
+    `Fn::Sub` within a `ContainerDefinitions` entry now resolves.
+  - [substrate#527](https://github.com/scttfrdmn/substrate/issues/527) — a
+    CloudFormation-deployed task definition kept CloudFormation's PascalCase
+    keys, so `describe_task_definition` returned `[{}]`. It now parses to
+    camelCase.
+  - [substrate#528](https://github.com/scttfrdmn/substrate/issues/528) — Logs
+    returned PascalCase members, so an SDK parsed every field to `null`.
+
+  The first three are the `ecs_worker.yml` path, which is what #183 was waiting
+  on. Suite counts are unchanged — integration **131 passed**, conformance
+  **5 passed**, unit and security **1202 passed / 3 skipped** — so this is a
+  substrate capability gain, not a test-behaviour change.
+
+  Worth recording for the next bump: substrate#446, the issue the v0.9.0 hold was
+  placed on, actually shipped in **0.85.0** rather than in the release that closed
+  its issue. `git tag --contains <sha>` on the fixing commit is the reliable
+  check; the issue's close date is not.
 - **The substrate emulator pin moves `0.85.0` → `0.87.1`**, in
   `docker-compose.substrate.yml` and `.github/workflows/ci.yml` together. 0.87.0
   carries all three fixes filed from this repo while probing 0.85.0, and the

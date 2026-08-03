@@ -127,7 +127,7 @@ jobs:
         # 0.76.0 while compose moved to 0.82.0, so CI was validating against an
         # emulator six releases older than the one developers ran. See that file
         # for what each release fixes.
-        image: ghcr.io/scttfrdmn/substrate:0.87.1
+        image: ghcr.io/scttfrdmn/substrate:0.88.0
         ports:
           - 4566:4566
         # No `--health-cmd`. The image is Alpine and ships no curl, and GitHub
