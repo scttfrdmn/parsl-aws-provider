@@ -12,10 +12,15 @@ Two things about the file's history are worth stating, because both hid bugs:
    a single ``mock_aws``. moto was installed and working the whole time, so the
    guard silently skipped all 12 tests on every run.
 2. Underneath the skips, the tests called constructors and methods that no
-   commit has ever produced -- ``VPCManager(session=, region=)``,
-   ``create_instances()``, ``LambdaManager.invoke_lambda_function()``, and so on.
-   Every manager takes ``__init__(self, provider)`` and reads its configuration
-   off that object. These tests now use the real surface.
+   commit has ever produced -- ``create_instances()``,
+   ``LambdaManager.invoke_lambda_function()``, and so on. Every manager takes
+   ``__init__(self, provider)`` and reads its configuration off that object.
+   These tests now use the real surface.
+
+The ``VPCManager``, ``SecurityGroupManager`` and ``EC2Manager`` classes went with
+#90: nothing in the package imported them, so their tests were coverage of dead
+code. The managers that remain here are the ones the modes actually route
+through.
 
 SPDX-License-Identifier: Apache-2.0
 SPDX-FileCopyrightText: 2025-2026 Scott Friedman and Project Contributors
@@ -31,7 +36,6 @@ import pytest
 
 from moto import mock_aws
 
-from parsl_ephemeral_provider.compute.ec2 import EC2Manager
 from parsl_ephemeral_provider.compute.ecs import ECSManager
 from parsl_ephemeral_provider.compute.lambda_func import LambdaManager
 from parsl_ephemeral_provider.compute.spot_fleet import SpotFleetManager
@@ -40,8 +44,6 @@ from parsl_ephemeral_provider.constants import (
     TAG_MANAGED,
     TAG_WORKFLOW_ID,
 )
-from parsl_ephemeral_provider.network.security import SecurityGroupManager
-from parsl_ephemeral_provider.network.vpc import VPCManager
 from parsl_ephemeral_provider.state.parameter_store import ParameterStoreState
 from parsl_ephemeral_provider.state.s3 import S3State
 
@@ -147,196 +149,6 @@ def tag_dict(tags):
     keys = [tag["Key"] for tag in tags]
     assert len(keys) == len(set(keys)), f"duplicate tag key: {keys}"
     return {tag["Key"]: tag["Value"] for tag in tags}
-
-
-class TestVPCWithMoto:
-    """``VPCManager`` builds and tears down a full network."""
-
-    @mock_aws
-    def test_network_lifecycle(self, moto_session):
-        """Create VPC, subnet, gateway, and route table, then clean up.
-
-        ``create_vpc`` takes only ``cidr_block`` (tags come from the provider),
-        ``create_subnet`` takes ``(cidr_block, availability_zone, is_public)`` and
-        uses the VPC the manager is already tracking, and deletion is
-        ``cleanup_subnet``/``delete_vpc()`` -- the latter taking no argument.
-        """
-        manager = VPCManager(make_provider())
-        ec2 = moto_session.client("ec2")
-
-        vpc_id = manager.create_vpc(cidr_block="10.0.0.0/16")
-        vpc = ec2.describe_vpcs(VpcIds=[vpc_id])["Vpcs"][0]
-        assert vpc["CidrBlock"] == "10.0.0.0/16"
-
-        tags = tag_dict(vpc["Tags"])
-        assert tags[TAG_MANAGED] == "true"
-        assert tags[TAG_WORKFLOW_ID] == manager.provider.workflow_id
-        assert tags["Name"].endswith(manager.provider.workflow_id)
-        # Provider tags are applied on top via CreateTags.
-        assert tags["TestTag"] == "TestValue"
-
-        subnet_id = manager.create_subnet(
-            cidr_block="10.0.1.0/24", availability_zone="us-east-1a", is_public=True
-        )
-        subnet = ec2.describe_subnets(SubnetIds=[subnet_id])["Subnets"][0]
-        assert subnet["VpcId"] == vpc_id
-        assert subnet["MapPublicIpOnLaunch"] is True
-        assert tag_dict(subnet["Tags"])["IsPublic"] == "true"
-
-        igw_id = manager.create_internet_gateway()
-        igw = ec2.describe_internet_gateways(InternetGatewayIds=[igw_id])[
-            "InternetGateways"
-        ][0]
-        assert [a["VpcId"] for a in igw["Attachments"]] == [vpc_id]
-
-        route_table_id = manager.create_route_table(subnet_id, is_public=True)
-        routes = ec2.describe_route_tables(RouteTableIds=[route_table_id])[
-            "RouteTables"
-        ][0]["Routes"]
-        assert any(r.get("GatewayId") == igw_id for r in routes)
-
-        manager.cleanup_network_resources()
-
-        assert manager.vpc_id is None
-        with pytest.raises(ec2.exceptions.ClientError, match="InvalidVpcID.NotFound"):
-            ec2.describe_vpcs(VpcIds=[vpc_id])
-        with pytest.raises(
-            ec2.exceptions.ClientError, match="InvalidSubnetID.NotFound"
-        ):
-            ec2.describe_subnets(SubnetIds=[subnet_id])
-
-    @mock_aws
-    def test_cleanup_subnet_tolerates_missing_subnet(self, moto_session):
-        """Cleanup is idempotent: an already-deleted subnet is not an error."""
-        manager = VPCManager(make_provider())
-        manager.create_vpc()
-        subnet_id = manager.create_subnet(cidr_block="10.0.1.0/24")
-
-        manager.cleanup_subnet(subnet_id)
-        manager.cleanup_subnet(subnet_id)  # must not raise
-
-        assert subnet_id not in manager.subnet_ids
-
-
-class TestSecurityGroupWithMoto:
-    """``SecurityGroupManager`` manages groups and rules."""
-
-    @mock_aws
-    def test_security_group_lifecycle(self, moto_session):
-        """Create a group, add and revoke a rule, then delete it.
-
-        ``create_security_group`` is ``(vpc_id, name=None, description=None)``
-        positionally on ``vpc_id``, and ingress takes ``cidr_blocks`` (a list),
-        not ``cidr_ip``.
-        """
-        provider = make_provider()
-        vpc_manager = VPCManager(provider)
-        vpc_id = vpc_manager.create_vpc()
-
-        manager = SecurityGroupManager(provider)
-        ec2 = moto_session.client("ec2")
-
-        sg_id = manager.create_security_group(
-            vpc_id, name="test-sg", description="Test security group"
-        )
-        group = ec2.describe_security_groups(GroupIds=[sg_id])["SecurityGroups"][0]
-        assert group["GroupName"] == "test-sg"
-        assert group["VpcId"] == vpc_id
-        assert tag_dict(group["Tags"])[TAG_MANAGED] == "true"
-
-        manager.add_ingress_rule(
-            sg_id, "tcp", 22, 22, cidr_blocks=["10.0.0.0/8"], description="ssh"
-        )
-        permissions = ec2.describe_security_groups(GroupIds=[sg_id])["SecurityGroups"][
-            0
-        ]["IpPermissions"]
-        assert len(permissions) == 1
-        assert permissions[0]["FromPort"] == 22
-        assert permissions[0]["IpRanges"][0]["CidrIp"] == "10.0.0.0/8"
-
-        manager.revoke_ingress_rule(sg_id, "tcp", 22, 22, cidr_blocks=["10.0.0.0/8"])
-        assert (
-            ec2.describe_security_groups(GroupIds=[sg_id])["SecurityGroups"][0][
-                "IpPermissions"
-            ]
-            == []
-        )
-
-        manager.delete_security_group(sg_id)
-        with pytest.raises(ec2.exceptions.ClientError, match="InvalidGroup.NotFound"):
-            ec2.describe_security_groups(GroupIds=[sg_id])
-
-    @mock_aws
-    def test_duplicate_ingress_rule_is_tolerated(self, moto_session):
-        """Re-adding a rule must not raise: the duplicate is benign."""
-        provider = make_provider()
-        vpc_id = VPCManager(provider).create_vpc()
-        manager = SecurityGroupManager(provider)
-        sg_id = manager.create_security_group(vpc_id)
-
-        manager.add_ingress_rule(sg_id, "tcp", 443, 443, cidr_blocks=["10.0.0.0/8"])
-        manager.add_ingress_rule(sg_id, "tcp", 443, 443, cidr_blocks=["10.0.0.0/8"])
-
-    @mock_aws
-    def test_find_workflow_security_groups(self, moto_session):
-        """Groups are discoverable by their workflow tag, for cleanup."""
-        provider = make_provider()
-        vpc_id = VPCManager(provider).create_vpc()
-        manager = SecurityGroupManager(provider)
-        sg_id = manager.create_security_group(vpc_id)
-
-        assert manager.find_workflow_security_groups() == [sg_id]
-
-
-class TestEC2WithMoto:
-    """``EC2Manager`` provisions blocks of instances."""
-
-    @mock_aws
-    def test_block_lifecycle(self, moto_session):
-        """``create_blocks(count)`` is the whole entry point.
-
-        There is no ``create_instance``/``create_instances``: the manager reads
-        the AMI, instance type, and ``nodes_per_block`` off the provider and
-        resolves its own network.
-        """
-        manager = EC2Manager(make_provider(nodes_per_block=2))
-        ec2 = moto_session.client("ec2")
-
-        blocks = manager.create_blocks(1)
-        assert len(blocks) == 1
-
-        block_id, block = next(iter(blocks.items()))
-        assert len(block["instance_ids"]) == 2
-
-        instance_id = block["instance_ids"][0]
-        assert manager.get_instance_status(instance_id) == "running"
-
-        instance = ec2.describe_instances(InstanceIds=[instance_id])["Reservations"][0][
-            "Instances"
-        ][0]
-        tags = tag_dict(instance["Tags"])
-        assert tags[TAG_MANAGED] == "true"
-        assert tags[TAG_WORKFLOW_ID] == manager.provider.workflow_id
-        # The descriptive Name must survive; while the marker was also keyed
-        # "Name" the marker's "true" overwrote it (#109).
-        assert tags["Name"].startswith("parsl-ephemeral-node-")
-
-        manager.terminate_block(block_id)
-        assert manager.get_instance_status(instance_id) in (
-            "shutting-down",
-            "terminated",
-        )
-
-    @mock_aws
-    def test_spot_instances_are_requested_when_configured(self, moto_session):
-        """``use_spot_instances`` routes through the spot request path."""
-        manager = EC2Manager(make_provider(use_spot_instances=True))
-        ec2 = moto_session.client("ec2")
-
-        manager.create_blocks(1)
-
-        requests = ec2.describe_spot_instance_requests()["SpotInstanceRequests"]
-        assert len(requests) == 1
 
 
 class TestSpotFleetWithMoto:

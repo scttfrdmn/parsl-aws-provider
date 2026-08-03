@@ -8,8 +8,8 @@ import pytest
 from unittest.mock import MagicMock, patch
 from botocore.exceptions import ClientError
 
-from parsl_ephemeral_provider.compute.ec2 import EC2Manager
 from parsl_ephemeral_provider.compute.ecs import ECSManager
+from parsl_ephemeral_provider.compute.lambda_func import LambdaManager
 from parsl_ephemeral_provider.compute.spot_fleet import SpotFleetManager
 from parsl_ephemeral_provider.error_handling import ErrorContext, RobustErrorHandler
 from parsl_ephemeral_provider.exceptions import (
@@ -32,9 +32,15 @@ pytestmark = pytest.mark.integration
 class TestErrorHandlingIntegration:
     """Test integration of error handling framework with compute modules."""
 
-    def test_ec2_manager_error_handler_initialization(self):
-        """Test EC2Manager initializes error handler correctly."""
-        manager = make_manager(EC2Manager, "ec2")
+    def test_lambda_manager_error_handler_initialization(self):
+        """Test LambdaManager initializes error handler correctly.
+
+        Retargeted from ``EC2Manager`` when #90 removed it. ``LambdaManager``
+        declares the identical ``max_attempts=5, base_delay=2.0``
+        (``compute/lambda_func.py:57``), so the assertions carry over unchanged
+        onto a manager the modes actually route through.
+        """
+        manager = make_manager(LambdaManager, "lambda_func")
 
         # Verify error handler is initialized
         assert hasattr(manager, "error_handler")
@@ -67,27 +73,33 @@ class TestErrorHandlingIntegration:
         assert manager.error_handler.retry_config.base_delay == 3.0  # Longer delay
         assert manager.error_handler.retry_config.max_delay == 60.0  # Spot-specific cap
 
-    def test_ec2_network_setup_error_handling(self):
-        """Test error handling in EC2 network setup."""
-        # Mock EC2 client to raise an error
-        ec2_client = MagicMock()
-        ec2_client.create_vpc.side_effect = ClientError(
-            error_response={
-                "Error": {"Code": "InternalError", "Message": "Server error"}
-            },
-            operation_name="CreateVpc",
+    def test_network_setup_rejects_a_missing_id_by_name(self):
+        """Incomplete caller-supplied network is refused, naming what is absent.
+
+        Rewritten when #90 removed ``EC2Manager``. The old test made
+        ``create_vpc`` fail and asserted the error reached ``error_history`` --
+        but no surviving manager calls ``create_vpc`` at all: #69 made the caller
+        provision the network, so ``_setup_network_resources``
+        (``compute/spot_fleet.py:280``) validates the three IDs rather than
+        creating anything. Asserting on a ``CreateVpc`` failure was therefore
+        testing a path that no longer exists.
+
+        The message must name each missing ID: this is a configuration mistake a
+        user has to correct, and "requires pre-provisioned network resources"
+        alone does not say which one is absent.
+        """
+        manager = make_manager(
+            SpotFleetManager, "spot_fleet", subnet_id=None, security_group_id=None
         )
 
-        manager = make_manager(EC2Manager, "ec2", client=ec2_client)
-
-        # Verify that error is handled and recorded
-        with pytest.raises(ResourceCreationError):
+        with pytest.raises(ResourceCreationError) as excinfo:
             manager._setup_network_resources()
 
-        # Check that error was recorded in the error handler
-        assert len(manager.error_handler.error_history) > 0
-        error_record = manager.error_handler.error_history[-1]
-        assert "InternalError" in str(error_record.exception)
+        message = str(excinfo.value)
+        assert "subnet_id" in message
+        assert "security_group_id" in message
+        # vpc_id was supplied, so it must not be reported as missing.
+        assert "vpc_id" not in message
 
     @staticmethod
     def _translate(manager, code, message):
@@ -133,6 +145,11 @@ class TestErrorHandlingIntegration:
             ("InsufficientInstanceCapacity", SpotFleetError),
             ("InvalidFleetConfig", SpotFleetRequestError),
             ("MaxSpotInstanceCountExceeded", SpotFleetRequestError),
+            # The other half of the same quota branch (compute/spot_fleet.py:409).
+            # Its only coverage used to be TestEC2ManagerQuotaErrors, which #90
+            # deleted along with EC2Manager -- so without this row the branch would
+            # have gone untested while the diff read as removing dead code.
+            ("VcpuLimitExceeded", SpotFleetRequestError),
             ("Throttling", SpotFleetThrottlingError),
             ("InternalError", SpotFleetError),  # the unrecognized fallthrough
         ],
@@ -182,7 +199,7 @@ class TestErrorHandlingIntegration:
 
     def test_error_statistics_collection(self):
         """Test that error statistics are properly collected across modules."""
-        ec2_manager = make_manager(EC2Manager, "ec2")
+        manager = make_manager(LambdaManager, "lambda_func")
 
         # Simulate some errors
         from parsl_ephemeral_provider.error_handling import ErrorContext
@@ -195,11 +212,11 @@ class TestErrorHandlingIntegration:
         error1 = ValueError("Test error 1")
         error2 = ConnectionError("Test error 2")
 
-        ec2_manager.error_handler.handle_error(error1, context)
-        ec2_manager.error_handler.handle_error(error2, context)
+        manager.error_handler.handle_error(error1, context)
+        manager.error_handler.handle_error(error2, context)
 
         # Get statistics
-        stats = ec2_manager.error_handler.get_error_statistics()
+        stats = manager.error_handler.get_error_statistics()
 
         assert stats["total_errors"] == 2
         assert stats["error_rate"] > 0
