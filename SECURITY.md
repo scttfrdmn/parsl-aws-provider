@@ -6,8 +6,8 @@ The following versions of Parsl Ephemeral Provider are currently being supported
 
 | Version | Supported          |
 | ------- | ------------------ |
-| 0.8.x   | :white_check_mark: |
-| < 0.8   | :x:                |
+| 0.9.x   | :white_check_mark: |
+| < 0.9   | :x:                |
 
 The project is pre-1.0 and alpha: only the latest minor line receives security
 fixes, and there are no backports. Nothing has been published to PyPI yet
