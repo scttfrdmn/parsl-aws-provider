@@ -1,4 +1,4 @@
-"""Unit tests for the ``parsl-aws-cleanup`` orphan sweep.
+"""Unit tests for the ``parsl-ephemeral-cleanup`` orphan sweep.
 
 This tool is the only thing that bounds the bill after a crash. Parsl never
 calls ``provider.shutdown()``, ``HighThroughputExecutor.shutdown()`` documents
@@ -24,7 +24,7 @@ import boto3
 import pytest
 from moto import mock_aws
 
-from parsl_aws_provider.cleanup import (
+from parsl_ephemeral_provider.cleanup import (
     _INSTANCE_TAG_FILTERS,
     _SECURITY_GROUP_NAME_PATTERNS,
     AWSResourceCleaner,
@@ -40,7 +40,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 # silently moving both sides together.
 STANDARD_MODE_TAGS = [
     {"Key": "Name", "Value": "parsl-worker-abc12345"},
-    {"Key": "CreatedBy", "Value": "ParslEphemeralAWSProvider"},
+    {"Key": "CreatedBy", "Value": "ParslEphemeralProvider"},
     {"Key": "ProviderId", "Value": "prov-1"},
 ]
 DETACHED_MODE_TAGS = [
@@ -51,6 +51,15 @@ DETACHED_MODE_TAGS = [
 UNRELATED_TAGS = [
     {"Key": "Name", "Value": "someone-elses-instance"},
     {"Key": "CreatedBy", "Value": "Terraform"},
+]
+# The pre-#213 value, still live on instances in real accounts. The rename that
+# dropped `AWS` from every identifier took this tag value with it, and a sweep
+# narrowed to the new value alone would leave those instances running and
+# invisible -- which is the opposite of what this tool is for.
+LEGACY_STANDARD_MODE_TAGS = [
+    {"Key": "Name", "Value": "parsl-worker-9f3c1a70"},
+    {"Key": "CreatedBy", "Value": "ParslEphemeralAWSProvider"},
+    {"Key": "ProviderId", "Value": "prov-legacy"},
 ]
 
 
@@ -89,7 +98,7 @@ class TestInstanceDiscovery:
     """The sweep has to find what every mode leaves behind."""
 
     def test_standard_mode_tags_are_found(self, aws):
-        """``CreatedBy=ParslEphemeralAWSProvider`` -- what StandardMode writes."""
+        """``CreatedBy=ParslEphemeralProvider`` -- what StandardMode writes."""
         instance_id = _launch(aws, STANDARD_MODE_TAGS)
 
         cleaner = AWSResourceCleaner(region="us-east-1")
@@ -105,6 +114,37 @@ class TestInstanceDiscovery:
         found = {inst["id"] for inst in cleaner.get_parsl_instances()}
 
         assert instance_id in found
+
+    def test_the_pre_rename_created_by_value_is_still_found(self, aws):
+        """``CreatedBy=ParslEphemeralAWSProvider`` -- what StandardMode wrote before #213.
+
+        The rename dropped ``AWS`` from every identifier, this tag value included.
+        Instances launched by an earlier version are still running in real
+        accounts, and this is the tool that bounds the bill after a crash, so the
+        old value has to stay in the sweep rather than be replaced by the new one.
+        """
+        instance_id = _launch(aws, LEGACY_STANDARD_MODE_TAGS)
+
+        cleaner = AWSResourceCleaner(region="us-east-1")
+        found = {inst["id"] for inst in cleaner.get_parsl_instances()}
+
+        assert instance_id in found
+
+    def test_both_created_by_values_are_found_in_one_sweep(self, aws):
+        """The new value does not shadow the old one, or vice versa.
+
+        Both live in the ``Values`` list of a *single* EC2 filter, which is what
+        makes this work: EC2 ORs the values within one filter and ANDs separate
+        filters, so splitting them into two filters would match only an instance
+        carrying both values at once -- that is, nothing.
+        """
+        current = _launch(aws, STANDARD_MODE_TAGS)
+        legacy = _launch(aws, LEGACY_STANDARD_MODE_TAGS)
+
+        cleaner = AWSResourceCleaner(region="us-east-1")
+        found = {inst["id"] for inst in cleaner.get_parsl_instances()}
+
+        assert {current, legacy} <= found
 
     def test_both_conventions_are_found_together(self, aws):
         """Neither convention shadows the other.
@@ -215,7 +255,7 @@ class TestFiltersMatchThePackage:
     """
 
     def _package_source(self) -> str:
-        modes = (REPO_ROOT / "parsl_aws_provider" / "modes").glob("*.py")
+        modes = (REPO_ROOT / "parsl_ephemeral_provider" / "modes").glob("*.py")
         return "\n".join(path.read_text(encoding="utf-8") for path in modes)
 
     def test_every_instance_tag_filter_is_written_by_some_mode(self):
@@ -240,7 +280,7 @@ class TestFiltersMatchThePackage:
         Pinned to the constant rather than the literal, so renaming the default
         without updating the sweep fails here instead of silently narrowing it.
         """
-        from parsl_aws_provider.constants import DEFAULT_SECURITY_GROUP_NAME
+        from parsl_ephemeral_provider.constants import DEFAULT_SECURITY_GROUP_NAME
 
         assert any(
             re.fullmatch(pattern.replace("*", ".*"), DEFAULT_SECURITY_GROUP_NAME)
@@ -252,7 +292,7 @@ class TestFiltersMatchThePackage:
 
 
 class TestEntryPoint:
-    """``parsl-aws-cleanup`` is a console script, so ``main`` is the contract."""
+    """``parsl-ephemeral-cleanup`` is a console script, so ``main`` is the contract."""
 
     def test_dry_run_on_an_empty_account_succeeds(self, aws):
         """Exit status 0 and nothing deleted."""
@@ -286,7 +326,7 @@ class TestEntryPoint:
 
         The module moved into the installed package, so configuring the root
         logger at import would hijack logging for anyone who merely imports
-        ``parsl_aws_provider``.
+        ``parsl_ephemeral_provider``.
         """
         import logging
         import subprocess
@@ -296,7 +336,7 @@ class TestEntryPoint:
             [
                 sys.executable,
                 "-c",
-                "import logging, parsl_aws_provider.cleanup; "
+                "import logging, parsl_ephemeral_provider.cleanup; "
                 "print(len(logging.getLogger().handlers))",
             ],
             capture_output=True,

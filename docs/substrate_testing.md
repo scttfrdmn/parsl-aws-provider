@@ -1,6 +1,6 @@
 # Testing with substrate
 
-This guide explains how to test the Parsl AWS Provider against
+This guide explains how to test the Parsl Ephemeral Provider against
 [substrate](https://github.com/scttfrdmn/substrate), a local AWS emulator, without
 creating real AWS resources or incurring charges.
 
@@ -100,7 +100,7 @@ Since #69 the provider creates no network resources, so `vpc_id`, `subnet_id`, a
 
 ```python
 import boto3
-from parsl_aws_provider import EphemeralAWSProvider
+from parsl_ephemeral_provider import EphemeralProvider
 
 ec2 = boto3.client("ec2")
 vpc = ec2.create_vpc(CidrBlock="10.0.0.0/16")["Vpc"]["VpcId"]
@@ -115,7 +115,7 @@ sg = ec2.create_security_group(
     GroupName="parsl-test", Description="Parsl test", VpcId=vpc
 )["GroupId"]
 
-provider = EphemeralAWSProvider(
+provider = EphemeralProvider(
     image_id="ami-12345678",  # any value; the emulator does not resolve AMIs
     instance_type="t3.micro",
     region="us-east-1",
@@ -135,7 +135,7 @@ provider.cancel([job_id])
 
 `tests/substrate_support.py` holds the helpers. It lives under `tests/` rather than
 inside the shipped package, because no package code imports it — its predecessor,
-`parsl_aws_provider/utils/localstack.py`, shipped to users who had no use for it.
+`parsl_ephemeral_provider/utils/localstack.py`, shipped to users who had no use for it.
 
 ```python
 from tests.substrate_support import (
@@ -293,7 +293,7 @@ export AWS_TEST_VPC_ID=vpc-… AWS_TEST_SUBNET_ID=subnet-… AWS_TEST_SG_ID=sg-�
 uv run pytest tests/aws -m aws -v --no-cov
 ```
 
-These create billable resources. `parsl-aws-cleanup --dry-run`
+These create billable resources. `parsl-ephemeral-cleanup --dry-run`
 reports anything left behind.
 
 ## Troubleshooting

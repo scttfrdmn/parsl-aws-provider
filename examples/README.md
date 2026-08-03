@@ -27,7 +27,7 @@ accepts none.
 | [standard_mode.py](standard_mode.py) | The common case: EC2 workers connecting back to your client |
 | [one_shot_mode.py](one_shot_mode.py) | One command per instance over SSM — the only mode needing no inbound reachability |
 | [basic_usage.py](basic_usage.py) | The same provider configured for all three modes, side by side |
-| [parsl_aws_integration.py](parsl_aws_integration.py) | A full Parsl workflow, run from an EC2 driver in the same VPC |
+| [parsl_integration.py](parsl_integration.py) | A full Parsl workflow, run from an EC2 driver in the same VPC |
 | [detached_mode.py](detached_mode.py) | A bastion owns the workers; also how reconnection works |
 | [serverless_mode.py](serverless_mode.py) | Lambda functions or Fargate tasks instead of instances |
 | [spot_fleet_example.py](spot_fleet_example.py) | An EC2 Fleet across several instance types |
@@ -44,7 +44,7 @@ it is by far the most common failure and it is not an AWS problem.
 **`encrypted=False` on the executor.** With encryption on, Parsl generates CurveZMQ
 certificates in the client's `run_dir`, which remote workers cannot read, so they
 fail to register with no useful error. Certificate distribution is
-[#62](https://github.com/scttfrdmn/parsl-aws-provider/issues/62).
+[#62](https://github.com/scttfrdmn/parsl-ephemeral-provider/issues/62).
 `one_shot_mode.py` is the exception: it builds no executor at all, because there is
 no interchange in that mode.
 
@@ -53,17 +53,17 @@ no interchange in that mode.
 hard, sweep for orphans:
 
 ```bash
-parsl-aws-cleanup --dry-run --region us-east-1
+parsl-ephemeral-cleanup --dry-run --region us-east-1
 ```
 
-It matches by tag — `CreatedBy=ParslEphemeralAWSProvider` for standard mode and
+It matches by tag — `CreatedBy=ParslEphemeralProvider` for standard mode and
 `ParslResource=true` for detached and serverless — so it finds resources no state
 file names.
 
 ## Options these examples do not use
 
 The provider rejects unknown keyword arguments since
-[#105](https://github.com/scttfrdmn/parsl-aws-provider/issues/105), so a stale
+[#105](https://github.com/scttfrdmn/parsl-ephemeral-provider/issues/105), so a stale
 configuration raises at construction rather than being silently ignored:
 
 ```
@@ -81,7 +81,7 @@ credentials. See the rename table in
 
 - [Documentation index](../docs/README.md)
 - [Getting started](../docs/getting_started.md)
-- [GitHub repository](https://github.com/scttfrdmn/parsl-aws-provider)
+- [GitHub repository](https://github.com/scttfrdmn/parsl-ephemeral-provider)
 
 SPDX-License-Identifier: Apache-2.0
 SPDX-FileCopyrightText: 2025-2026 Scott Friedman and Project Contributors

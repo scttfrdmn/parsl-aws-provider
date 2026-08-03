@@ -6,7 +6,7 @@ failing when your one chosen type is exhausted.
 
 As of v0.7.0 this uses the **EC2 Fleet** API (`CreateFleet`), not Spot Fleet.
 AWS describes Spot Fleet as "a legacy API with no planned investment"
-([#86](https://github.com/scttfrdmn/parsl-aws-provider/issues/86)). The option is
+([#86](https://github.com/scttfrdmn/parsl-ephemeral-provider/issues/86)). The option is
 still spelled `use_spot_fleet` for compatibility.
 
 ## What changed with EC2 Fleet
@@ -37,9 +37,9 @@ resources.
 ## Configuration
 
 ```python
-from parsl_aws_provider import EphemeralAWSProvider
+from parsl_ephemeral_provider import EphemeralProvider
 
-provider = EphemeralAWSProvider(
+provider = EphemeralProvider(
     region="us-east-1",
     vpc_id="vpc-0123456789abcdef0",
     subnet_id="subnet-0123456789abcdef0",
@@ -59,7 +59,7 @@ provider = EphemeralAWSProvider(
 gate that builds the fleet manager reads `use_spot and use_spot_fleet`
 (`modes/standard.py:233`), so with `use_spot` unset no manager exists, the launch
 falls through to a single on-demand instance, and nothing reports it
-([#137](https://github.com/scttfrdmn/parsl-aws-provider/issues/137)). With both
+([#137](https://github.com/scttfrdmn/parsl-ephemeral-provider/issues/137)). With both
 set, the fleet path takes precedence over the single-spot-instance path.
 
 ## Parameters
@@ -112,7 +112,7 @@ provider creates a rule matching the *EC2 Spot Instance Interruption Warning*
 event with an SQS queue target, which it polls.
 
 ```python
-provider = EphemeralAWSProvider(
+provider = EphemeralProvider(
     # ... network options ...
     use_spot=True,
     use_spot_fleet=True,
@@ -135,7 +135,7 @@ and it is the correct one: Parsl stops dispatching to a failed block and re-runs
 its tasks elsewhere under `retries`. **Set `retries` on the Parsl `Config`** — the
 provider cannot checkpoint a task itself, because a Parsl provider is never told
 which tasks a block is running; it is handed a command and returns a block ID
-([#137](https://github.com/scttfrdmn/parsl-aws-provider/issues/137)).
+([#137](https://github.com/scttfrdmn/parsl-ephemeral-provider/issues/137)).
 
 The block is marked for the *whole fleet*, not just the reclaimed instance, since
 the fleet is what carries a Parsl job ID. Note the marker is deliberately sticky:
@@ -163,7 +163,7 @@ by `cleanup_resources()` and `cleanup_infrastructure()`.
 import parsl
 from parsl.config import Config
 from parsl.executors import HighThroughputExecutor
-from parsl_aws_provider import EphemeralAWSProvider
+from parsl_ephemeral_provider import EphemeralProvider
 
 
 @parsl.python_app
@@ -173,7 +173,7 @@ def hello(name):
     return f"Hello, {name} from {platform.node()}"
 
 
-provider = EphemeralAWSProvider(
+provider = EphemeralProvider(
     region="us-east-1",
     vpc_id="vpc-0123456789abcdef0",
     subnet_id="subnet-0123456789abcdef0",

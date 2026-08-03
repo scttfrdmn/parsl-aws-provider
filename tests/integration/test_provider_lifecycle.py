@@ -1,6 +1,6 @@
 """Integration tests for provider lifecycle.
 
-These tests drive ``EphemeralAWSProvider`` through construction, submit, status,
+These tests drive ``EphemeralProvider`` through construction, submit, status,
 cancel and shutdown against the substrate emulator, with the operating mode
 replaced by a double so no instances are launched.
 
@@ -31,12 +31,12 @@ from unittest.mock import MagicMock, patch
 import pytest
 from parsl.jobs.states import JobState
 
-from parsl_aws_provider.exceptions import ProviderConfigurationError
-from parsl_aws_provider.modes.detached import DetachedMode
-from parsl_aws_provider.modes.serverless import ServerlessMode
-from parsl_aws_provider.modes.standard import StandardMode
-from parsl_aws_provider.provider import EphemeralAWSProvider
-from parsl_aws_provider.state.file import FileStateStore
+from parsl_ephemeral_provider.exceptions import ProviderConfigurationError
+from parsl_ephemeral_provider.modes.detached import DetachedMode
+from parsl_ephemeral_provider.modes.serverless import ServerlessMode
+from parsl_ephemeral_provider.modes.standard import StandardMode
+from parsl_ephemeral_provider.provider import EphemeralProvider
+from parsl_ephemeral_provider.state.file import FileStateStore
 from tests.substrate_support import get_substrate_endpoint, is_substrate_available
 
 # Skip all tests if the substrate emulator is not available
@@ -71,14 +71,12 @@ def build_provider(mode_spec, state_file, network, **config):
     store = FileStateStore(file_path=str(state_file), provider_id=provider_id)
 
     with (
+        patch.object(EphemeralProvider, "_initialize_state_store", return_value=store),
         patch.object(
-            EphemeralAWSProvider, "_initialize_state_store", return_value=store
-        ),
-        patch.object(
-            EphemeralAWSProvider, "_initialize_operating_mode", return_value=mode
+            EphemeralProvider, "_initialize_operating_mode", return_value=mode
         ),
     ):
-        provider = EphemeralAWSProvider(
+        provider = EphemeralProvider(
             provider_id=provider_id,
             region="us-east-1",
             endpoint_url=get_substrate_endpoint(),
@@ -213,14 +211,14 @@ class TestProviderLifecycle:
             "security_group_id": substrate_network["security_group_id"],
         }
         with pytest.raises(ProviderConfigurationError, match=expected_message):
-            EphemeralAWSProvider(**{**base, **config})
+            EphemeralProvider(**{**base, **config})
 
     def test_network_ids_are_required(self, substrate_network):
         """Omitting the network IDs is refused (#69 removed VPC creation)."""
         with pytest.raises(
             ValueError, match="vpc_id, subnet_id, and security_group_id"
         ):
-            EphemeralAWSProvider(
+            EphemeralProvider(
                 region="us-east-1",
                 instance_type="t3.micro",
                 image_id="ami-12345678",

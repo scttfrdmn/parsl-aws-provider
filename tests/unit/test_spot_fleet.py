@@ -11,12 +11,12 @@ import logging
 
 import pytest
 
-from parsl_aws_provider.compute.spot_fleet import SpotFleetManager
-from parsl_aws_provider.constants import (
+from parsl_ephemeral_provider.compute.spot_fleet import SpotFleetManager
+from parsl_ephemeral_provider.constants import (
     EC2_FLEET_DEFAULT_ALLOCATION_STRATEGY,
     TAG_PREFIX,
 )
-from parsl_aws_provider.exceptions import SpotFleetThrottlingError
+from parsl_ephemeral_provider.exceptions import SpotFleetThrottlingError
 
 pytestmark = pytest.mark.unit
 
@@ -89,7 +89,7 @@ class TestSpotFleetManager(unittest.TestCase):
         # Re-enable logging
         logging.disable(logging.NOTSET)
 
-    @patch("parsl_aws_provider.compute.spot_fleet.CredentialManager")
+    @patch("parsl_ephemeral_provider.compute.spot_fleet.CredentialManager")
     def test_initialization(self, mock_credential_manager_cls):
         """Test SpotFleetManager initialization.
 
@@ -167,7 +167,7 @@ class TestSpotFleetManager(unittest.TestCase):
     # ``test_fleet_request_carries_no_iam_fleet_role`` and
     # ``test_legacy_iam_fleet_role_is_still_cleaned_up`` below.
 
-    @patch("parsl_aws_provider.compute.spot_fleet.CredentialManager")
+    @patch("parsl_ephemeral_provider.compute.spot_fleet.CredentialManager")
     def test_throttling_error_handling(self, mock_credential_manager_cls):
         """A throttled ``CreateFleet`` must surface as SpotFleetThrottlingError.
 
@@ -204,7 +204,7 @@ class TestSpotFleetManager(unittest.TestCase):
         mock_ec2_client.delete_launch_template.assert_called_once()
         self.assertEqual(manager.launch_templates, {})
 
-    @patch("parsl_aws_provider.compute.spot_fleet.CredentialManager")
+    @patch("parsl_ephemeral_provider.compute.spot_fleet.CredentialManager")
     def test_no_duplicate_tag_keys_in_fleet_request(self, mock_credential_manager_cls):
         """No TagSpecification may repeat a tag key (#109).
 
@@ -243,7 +243,7 @@ class TestSpotFleetManager(unittest.TestCase):
             name = next(tag["Value"] for tag in spec["Tags"] if tag["Key"] == "Name")
             self.assertTrue(name.startswith(TAG_PREFIX))
 
-    @patch("parsl_aws_provider.compute.spot_fleet.CredentialManager")
+    @patch("parsl_ephemeral_provider.compute.spot_fleet.CredentialManager")
     def test_fleet_request_carries_no_iam_fleet_role(self, mock_credential_manager_cls):
         """``CreateFleet`` has no ``IamFleetRole``, so none may be sent (#86).
 
@@ -272,7 +272,7 @@ class TestSpotFleetManager(unittest.TestCase):
         # The legacy API must not be called either.
         mock_ec2_client.request_spot_fleet.assert_not_called()
 
-    @patch("parsl_aws_provider.compute.spot_fleet.CredentialManager")
+    @patch("parsl_ephemeral_provider.compute.spot_fleet.CredentialManager")
     @patch("time.sleep", return_value=None)  # skip the propagation waits
     def test_legacy_iam_fleet_role_is_still_cleaned_up(
         self, mock_sleep, mock_credential_manager_cls
@@ -344,7 +344,7 @@ class TestSpotFleetManager(unittest.TestCase):
         SpotFleetManager(provider)._create_fleet("block-123", self.NETWORK, 1)
         return mock_ec2_client.create_fleet.call_args.kwargs["SpotOptions"]
 
-    @patch("parsl_aws_provider.compute.spot_fleet.CredentialManager")
+    @patch("parsl_ephemeral_provider.compute.spot_fleet.CredentialManager")
     def test_configured_allocation_strategy_reaches_the_api(
         self, mock_credential_manager_cls
     ):
@@ -366,7 +366,7 @@ class TestSpotFleetManager(unittest.TestCase):
         # the wrong one.
         self.assertEqual(spot_options["AllocationStrategy"], "capacity-optimized")
 
-    @patch("parsl_aws_provider.compute.spot_fleet.CredentialManager")
+    @patch("parsl_ephemeral_provider.compute.spot_fleet.CredentialManager")
     def test_allocation_strategy_defaults_when_provider_omits_it(
         self, mock_credential_manager_cls
     ):

@@ -46,7 +46,7 @@ import logging
 import pytest
 from botocore.exceptions import ClientError
 
-from parsl_aws_provider.constants import LAUNCH_TEMPLATE_NAME_PREFIX
+from parsl_ephemeral_provider.constants import LAUNCH_TEMPLATE_NAME_PREFIX
 
 logger = logging.getLogger(__name__)
 
@@ -121,7 +121,7 @@ class TestLaunchTemplateCreation:
 
         tags = {t["Key"]: t["Value"] for t in described.get("Tags", [])}
         assert tags.get("ProviderId") == aws_provider.provider_id
-        assert tags.get("CreatedBy") == "ParslEphemeralAWSProvider"
+        assert tags.get("CreatedBy") == "ParslEphemeralProvider"
         # additional_tags must reach the template too, or the E2E sweep and any
         # account-level cost allocation cannot see it.
         assert tags.get("E2ETestRunId") == test_run_id

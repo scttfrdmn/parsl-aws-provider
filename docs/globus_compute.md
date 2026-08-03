@@ -8,10 +8,10 @@ routers.
 ```{note}
 Before v0.9.0 the generated `config.yaml` put the `engine:` block at the top level,
 which makes `globus-compute-endpoint start` refuse it outright
-([#196](https://github.com/scttfrdmn/parsl-aws-provider/issues/196)); before v0.8.0
+([#196](https://github.com/scttfrdmn/parsl-ephemeral-provider/issues/196)); before v0.8.0
 it also dropped `worker_init`, hardcoded `encrypted: true`, and omitted 37 of 52
 provider parameters
-([#138](https://github.com/scttfrdmn/parsl-aws-provider/issues/138)). Generated
+([#138](https://github.com/scttfrdmn/parsl-ephemeral-provider/issues/138)). Generated
 configs are now startable and complete, unedited. **Regenerate any endpoint
 directory created by an earlier version.** Read
 [Known limitations](#known-limitations) before deploying.
@@ -33,7 +33,7 @@ Your machine (any network)        Globus Compute service        AWS EC2
 └──────────────────────┘          └──────────────────┘      └──────────────────┘
                                             ▲
                                    globus-compute-endpoint
-                                   daemon + GlobusComputeProvider
+                                   daemon + EphemeralComputeProvider
                                    (launches and terminates EC2)
 ```
 
@@ -65,10 +65,12 @@ policy from the code rather than transcribing one:
 ```python
 import json
 
-from parsl_aws_provider import GlobusComputeProvider
+from parsl_ephemeral_provider import EphemeralComputeProvider
 
-print(json.dumps(GlobusComputeProvider.minimum_iam_policy(), indent=2))
-print(json.dumps(GlobusComputeProvider.minimum_iam_policy(include_ecr=True), indent=2))
+print(json.dumps(EphemeralComputeProvider.minimum_iam_policy(), indent=2))
+print(
+    json.dumps(EphemeralComputeProvider.minimum_iam_policy(include_ecr=True), indent=2)
+)
 ```
 
 It grants no network-creation actions, which is deliberate — see
@@ -97,9 +99,9 @@ Tokens cache in `~/.globus_compute/storage.db` and refresh automatically.
 ### 1. Generate the config
 
 ```python
-from parsl_aws_provider import GlobusComputeProvider
+from parsl_ephemeral_provider import EphemeralComputeProvider
 
-provider = GlobusComputeProvider(
+provider = EphemeralComputeProvider(
     region="us-east-1",
     vpc_id="vpc-0123456789abcdef0",
     subnet_id="subnet-0123456789abcdef0",
@@ -131,17 +133,17 @@ anything that is not a `ManagerEndpointConfig`, and the only other entry point,
 `_start-user-endpoint`, is invoked solely by a running manager. So a `config.yaml`
 carrying a top-level `engine:` block cannot be started at all — which is what the
 generator used to emit
-([#196](https://github.com/scttfrdmn/parsl-aws-provider/issues/196)). Upstream's
+([#196](https://github.com/scttfrdmn/parsl-ephemeral-provider/issues/196)). Upstream's
 own packaged `default_config.yaml` is the single line `display_name: null`, with
 the engine in the template, for the same reason.
 
 **Why the bootstrap.** Globus Compute resolves a provider's `type:` key by
 `getattr(parsl.providers, type_name, None)` and raises when that is `None`, so a
 class Parsl does not ship is unreachable — and `getattr` cannot walk a dotted
-path, so `type: parsl_aws_provider.globus_compute.GlobusComputeProvider` can never
+path, so `type: parsl_ephemeral_provider.globus_compute.EphemeralComputeProvider` can never
 resolve either
-([#87](https://github.com/scttfrdmn/parsl-aws-provider/issues/87)). Importing
-`parsl_aws_provider` assigns the class onto `parsl.providers`, but the process
+([#87](https://github.com/scttfrdmn/parsl-ephemeral-provider/issues/87)). Importing
+`parsl_ephemeral_provider` assigns the class onto `parsl.providers`, but the process
 that loads the template never imports this package: the manager forks and
 `execvpe`s a *fresh interpreter*, which reads its rendered config from stdin. The
 one seam into that child is `user_environment.yaml`, which the manager merges into
@@ -149,7 +151,7 @@ its environment immediately before the exec. Pointing `PYTHONPATH` at a director
 holding `sitecustomize.py` makes Python run that import during `site`
 initialisation — before any user code, and so before the config is parsed.
 
-If [#133](https://github.com/scttfrdmn/parsl-aws-provider/issues/133) lands
+If [#133](https://github.com/scttfrdmn/parsl-ephemeral-provider/issues/133) lands
 upstream (dotted-path provider resolution), the bootstrap becomes unnecessary and
 `type:` can name the class directly.
 
@@ -172,7 +174,7 @@ engine:
   # worker cannot read -- see #62. Set true once that is distributed.
   encrypted: false
   provider:
-    type: GlobusComputeProvider
+    type: EphemeralComputeProvider
     region: us-east-1
     worker_init: "dnf install -y python3.11 python3.11-pip\nln -sf /usr/bin/python3.11 /usr/bin/python3\npip3.11 install --quiet globus-compute-endpoint\n"
     # ... every parameter you passed to the constructor ...
@@ -186,7 +188,7 @@ globus-compute-endpoint python-exec parsl.executors.high_throughput.process_work
 ```
 
 so `globus-compute-endpoint` must be on the worker's `PATH`, and nothing but
-`worker_init` puts it there. `GlobusComputeProvider` therefore overrides the
+`worker_init` puts it there. `EphemeralComputeProvider` therefore overrides the
 inherited default — which installs `parsl` alone — with one that installs both,
 and emits it unconditionally so it travels with the config. Pass your own
 `worker_init` to replace it; it must still install `globus-compute-endpoint`.
@@ -200,7 +202,7 @@ resolved.
 **on the endpoint host** and passes that path to workers as `--cert_dir`. An EC2
 worker has no such path and dies with `FileNotFoundError` before registering.
 Same-VPC deployments rely on VPC isolation instead; certificate distribution is
-[#62](https://github.com/scttfrdmn/parsl-aws-provider/issues/62). Pass
+[#62](https://github.com/scttfrdmn/parsl-ephemeral-provider/issues/62). Pass
 `encrypted=True` to override, once you have a way to distribute the certificates.
 
 ```{note}
@@ -231,7 +233,7 @@ uv run globus-compute-endpoint start my_aws_endpoint --endpoint-uuid <uuid>
 
 There is no *top-level* config key for it, in either file: `BaseConfig` raises
 `Unexpected keyword argument` and the config becomes unloadable. Under
-`engine.provider` it is legal — that is a `GlobusComputeProvider` kwarg, not an
+`engine.provider` it is legal — that is a `EphemeralComputeProvider` kwarg, not an
 endpoint one — so `endpoint_id=` reaches the template there, and `config.yaml`
 additionally carries the `--endpoint-uuid` invocation as a comment.
 
@@ -261,12 +263,12 @@ This drains pending functions and scales the provider's blocks in. It does not
 call `provider.shutdown()`, so sweep for leftovers if the daemon died uncleanly:
 
 ```bash
-parsl-aws-cleanup --dry-run --region us-east-1
+parsl-ephemeral-cleanup --dry-run --region us-east-1
 ```
 
 ## Configuration reference
 
-`GlobusComputeProvider` accepts every `EphemeralAWSProvider` parameter plus four
+`EphemeralComputeProvider` accepts every `EphemeralProvider` parameter plus four
 of its own:
 
 | Parameter | Type | Default | Description |
@@ -274,15 +276,15 @@ of its own:
 | `endpoint_id` | `str \| None` | `None` | Endpoint UUID. Emitted as a provider key in the template, and as the `--endpoint-uuid` reminder in `config.yaml`. |
 | `container_image` | `str \| None` | `None` | Image URI. Sets `container_type: docker` and `container_uri` under `engine`. |
 | `display_name` | `str` | `"Ephemeral AWS Endpoint"` | Label shown in the Globus Compute web console. The one key in `config.yaml`. |
-| `encrypted` | `bool` | `False` | CurveZMQ encryption on the engine. `True` needs [#62](https://github.com/scttfrdmn/parsl-aws-provider/issues/62) — see step 2. |
+| `encrypted` | `bool` | `False` | CurveZMQ encryption on the engine. `True` needs [#62](https://github.com/scttfrdmn/parsl-ephemeral-provider/issues/62) — see step 2. |
 
-`worker_init` also differs from the base class: `GlobusComputeProvider` defaults
+`worker_init` also differs from the base class: `EphemeralComputeProvider` defaults
 it to a script that installs `globus-compute-endpoint`, not just `parsl`.
 
 **Which parameters reach the template.** Every parameter you pass, plus
 `region`, `instance_type`, `mode`, `max_blocks`, and `worker_init` whether you
 pass them or not. The list comes from `inspect.signature`, so a parameter added to
-`EphemeralAWSProvider` is emitted without anyone updating the generator — the
+`EphemeralProvider` is emitted without anyone updating the generator — the
 hand-maintained list that preceded it covered 15 of 52 (#138).
 
 Two parameters are deliberately never emitted:
@@ -291,7 +293,7 @@ Two parameters are deliberately never emitted:
   process that generated the config, instead of adopting whatever is already
   persisted at the state location.
 - **`image_id`, unless you passed it** — it is resolved from SSM to the current
-  Amazon Linux 2023 AMI at construction ([#84](https://github.com/scttfrdmn/parsl-aws-provider/issues/84)),
+  Amazon Linux 2023 AMI at construction ([#84](https://github.com/scttfrdmn/parsl-ephemeral-provider/issues/84)),
   and writing that resolved value in would freeze the endpoint on whichever AMI
   was current the day you generated the file. An `image_id` you chose is emitted.
 
@@ -319,9 +321,9 @@ long-lived `globus-compute-endpoint` worker process the engine expects.
 ### Spot endpoint
 
 ```python
-from parsl_aws_provider import GlobusComputeProvider
+from parsl_ephemeral_provider import EphemeralComputeProvider
 
-provider = GlobusComputeProvider(
+provider = EphemeralComputeProvider(
     region="us-east-1",
     vpc_id="vpc-0123456789abcdef0",
     subnet_id="subnet-0123456789abcdef0",
@@ -352,13 +354,13 @@ engine:
 This is not a limitation to work around; it is the division of labour. A detected
 reclaim marks the block failed, and re-running the functions that were on it is
 the engine's job — the provider is never told which functions a block is running
-([#137](https://github.com/scttfrdmn/parsl-aws-provider/issues/137)). So leave
+([#137](https://github.com/scttfrdmn/parsl-ephemeral-provider/issues/137)). So leave
 `max_retries_on_system_failure` at a non-zero value whenever `use_spot=True`.
 
 ### Container endpoint
 
 ```python
-provider = GlobusComputeProvider(
+provider = EphemeralComputeProvider(
     region="us-west-2",
     vpc_id="vpc-0123456789abcdef0",
     subnet_id="subnet-0123456789abcdef0",
@@ -396,7 +398,7 @@ NETWORK = {
 
 for region, name in [("us-east-1", "aws-us-east"), ("eu-west-1", "aws-eu-west")]:
     vpc_id, subnet_id, security_group_id = NETWORK[region]
-    GlobusComputeProvider(
+    EphemeralComputeProvider(
         region=region,
         vpc_id=vpc_id,
         subnet_id=subnet_id,
@@ -427,14 +429,14 @@ start`.
 ## Known limitations
 
 - **CurveZMQ encryption cannot be enabled** for EC2 workers until certificate
-  distribution exists ([#62](https://github.com/scttfrdmn/parsl-aws-provider/issues/62)),
+  distribution exists ([#62](https://github.com/scttfrdmn/parsl-ephemeral-provider/issues/62)),
   so `encrypted` defaults to `False` and High-Assurance endpoints — which reject
   that — cannot use this provider.
 - **The bootstrap is a workaround, not the fix.** Resolving the provider inside
   the forked user-endpoint process depends on a `PYTHONPATH`/`sitecustomize` hook
   rather than on anything Globus Compute supports for this. Dotted-path provider
   resolution upstream
-  ([#133](https://github.com/scttfrdmn/parsl-aws-provider/issues/133)) would let
+  ([#133](https://github.com/scttfrdmn/parsl-ephemeral-provider/issues/133)) would let
   `type:` name the class directly and make `user_environment.yaml` and
   `_bootstrap/` unnecessary. Until then, if you hand-edit those two away, the
   endpoint fails with "not a valid provider".
@@ -482,7 +484,7 @@ In order of likelihood:
 3. **The daemon host is not reachable from the subnet.** Workers connect back to
    it over ZMQ. Check the daemon host's own security group, not the workers'.
 
-### `'GlobusComputeProvider' is not a valid provider`
+### `'EphemeralComputeProvider' is not a valid provider`
 
 `user_environment.yaml` or `_bootstrap/sitecustomize.py` is missing, or
 `PYTHONPATH` in the former no longer points at the latter — that pair is what
@@ -492,13 +494,13 @@ imports this package in the forked user-endpoint process. Regenerate with
 If both are present, the package is not installed in the interpreter the endpoint
 runs under. `sitecustomize.py` prints the underlying `ImportError` to stderr rather
 than raising, so check the endpoint log for a
-`parsl-aws-provider: could not import parsl_aws_provider` line.
+`parsl-ephemeral-provider: could not import parsl_ephemeral_provider` line.
 
 ### `contains an 'engine' field; endpoint will not start`
 
 A `config.yaml` with a top-level `engine:` block, which is what this package
 generated before v0.9.0
-([#196](https://github.com/scttfrdmn/parsl-aws-provider/issues/196)). Regenerate:
+([#196](https://github.com/scttfrdmn/parsl-ephemeral-provider/issues/196)). Regenerate:
 the engine block now belongs in `user_config_template.yaml.j2`, and
 `generate_endpoint_config()` also deletes any stale `config.py`, which would
 otherwise win over `config.yaml` and reinstate the old shape.
@@ -542,7 +544,7 @@ The worker ran your function and it raised. Read
 `provider.shutdown()`, and there is no `atexit` hook. Sweep by tag:
 
 ```bash
-parsl-aws-cleanup --region us-east-1   # --dry-run first
+parsl-ephemeral-cleanup --region us-east-1   # --dry-run first
 ```
 
 ### SSM reports the instance as unreachable

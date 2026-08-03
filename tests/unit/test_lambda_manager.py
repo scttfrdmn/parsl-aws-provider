@@ -14,8 +14,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from parsl_aws_provider.compute.lambda_func import LambdaManager
-from parsl_aws_provider.security.credential_manager import CredentialConfiguration
+from parsl_ephemeral_provider.compute.lambda_func import LambdaManager
+from parsl_ephemeral_provider.security.credential_manager import CredentialConfiguration
 
 
 pytestmark = pytest.mark.unit

@@ -31,19 +31,19 @@ import pytest
 
 from moto import mock_aws
 
-from parsl_aws_provider.compute.ec2 import EC2Manager
-from parsl_aws_provider.compute.ecs import ECSManager
-from parsl_aws_provider.compute.lambda_func import LambdaManager
-from parsl_aws_provider.compute.spot_fleet import SpotFleetManager
-from parsl_aws_provider.constants import (
+from parsl_ephemeral_provider.compute.ec2 import EC2Manager
+from parsl_ephemeral_provider.compute.ecs import ECSManager
+from parsl_ephemeral_provider.compute.lambda_func import LambdaManager
+from parsl_ephemeral_provider.compute.spot_fleet import SpotFleetManager
+from parsl_ephemeral_provider.constants import (
     STATUS_CANCELLED,
     TAG_MANAGED,
     TAG_WORKFLOW_ID,
 )
-from parsl_aws_provider.network.security import SecurityGroupManager
-from parsl_aws_provider.network.vpc import VPCManager
-from parsl_aws_provider.state.parameter_store import ParameterStoreState
-from parsl_aws_provider.state.s3 import S3State
+from parsl_ephemeral_provider.network.security import SecurityGroupManager
+from parsl_ephemeral_provider.network.vpc import VPCManager
+from parsl_ephemeral_provider.state.parameter_store import ParameterStoreState
+from parsl_ephemeral_provider.state.s3 import S3State
 
 pytestmark = pytest.mark.unit
 
@@ -418,7 +418,7 @@ class TestSpotFleetWithMoto:
     @mock_aws
     def test_missing_network_is_rejected(self, moto_session):
         """Without pre-provisioned IDs the manager refuses to create blocks."""
-        from parsl_aws_provider.exceptions import ResourceCreationError
+        from parsl_ephemeral_provider.exceptions import ResourceCreationError
 
         manager = SpotFleetManager(make_provider())
 

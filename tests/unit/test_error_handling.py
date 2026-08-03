@@ -13,22 +13,22 @@ from unittest.mock import MagicMock, patch
 from botocore.exceptions import ClientError, NoCredentialsError, ProfileNotFound
 from parsl.jobs.states import JobState
 
-from parsl_aws_provider.provider import EphemeralAWSProvider
-from parsl_aws_provider.compute.ec2 import EC2Manager
-from parsl_aws_provider.modes.standard import StandardMode
-from parsl_aws_provider.modes.detached import DetachedMode
-from parsl_aws_provider.modes.serverless import ServerlessMode
-from parsl_aws_provider.compute.spot_fleet import SpotFleetManager
-from parsl_aws_provider.compute.lambda_func import LambdaManager
-from parsl_aws_provider.compute.ecs import ECSManager
-from parsl_aws_provider.constants import (
+from parsl_ephemeral_provider.provider import EphemeralProvider
+from parsl_ephemeral_provider.compute.ec2 import EC2Manager
+from parsl_ephemeral_provider.modes.standard import StandardMode
+from parsl_ephemeral_provider.modes.detached import DetachedMode
+from parsl_ephemeral_provider.modes.serverless import ServerlessMode
+from parsl_ephemeral_provider.compute.spot_fleet import SpotFleetManager
+from parsl_ephemeral_provider.compute.lambda_func import LambdaManager
+from parsl_ephemeral_provider.compute.ecs import ECSManager
+from parsl_ephemeral_provider.constants import (
     STATUS_CANCELLED,
     STATUS_FAILED,
     STATUS_PENDING,
     STATUS_SUCCEEDED,
     STATUS_UNKNOWN,
 )
-from parsl_aws_provider.exceptions import (
+from parsl_ephemeral_provider.exceptions import (
     AWSAuthenticationError,
     AWSConnectionError,
     JobSubmissionError,
@@ -79,7 +79,7 @@ class TestAWSConnectionErrors:
             {"Error": {"Code": error_code, "Message": "m"}}, "GetCallerIdentity"
         )
         with patch("boto3.Session", return_value=mock_session):
-            return EphemeralAWSProvider(**provider_config)
+            return EphemeralProvider(**provider_config)
 
     def test_no_credentials_error(self, provider_config):
         """Absent credentials are an authentication failure, not a connection one.
@@ -91,13 +91,13 @@ class TestAWSConnectionErrors:
         """
         with patch("boto3.Session", side_effect=NoCredentialsError()):
             with pytest.raises(AWSAuthenticationError):
-                EphemeralAWSProvider(**provider_config)
+                EphemeralProvider(**provider_config)
 
     def test_unknown_profile_is_an_authentication_error(self, provider_config):
         """A mistyped profile name must not read as a connectivity fault."""
         with patch("boto3.Session", side_effect=ProfileNotFound(profile="nope")):
             with pytest.raises(AWSAuthenticationError):
-                EphemeralAWSProvider(**provider_config)
+                EphemeralProvider(**provider_config)
 
     @pytest.mark.parametrize(
         "error_code",
@@ -152,7 +152,7 @@ class TestAWSConnectionErrors:
         mock_session.client.return_value = MagicMock()
 
         with patch("boto3.Session", return_value=mock_session):
-            provider = EphemeralAWSProvider(**provider_config)
+            provider = EphemeralProvider(**provider_config)
 
         provider.job_map["job-1"] = {"resource_id": "resource-1", "status": "RUNNING"}
         throttle = ClientError(
@@ -178,7 +178,7 @@ class TestAWSConnectionErrors:
         mock_session.client.return_value = MagicMock()
 
         with patch("boto3.Session", return_value=mock_session):
-            provider = EphemeralAWSProvider(**provider_config)
+            provider = EphemeralProvider(**provider_config)
 
         statuses = provider.status(["never-submitted"])
 
@@ -917,7 +917,7 @@ class TestECSManagerErrors:
         session.client.return_value = ecs_client
         session.region_name = "us-east-1"
 
-        with patch("parsl_aws_provider.compute.ecs.CredentialManager") as mock_cm:
+        with patch("parsl_ephemeral_provider.compute.ecs.CredentialManager") as mock_cm:
             mock_cm.return_value.create_boto3_session.return_value = session
             with pytest.raises(ResourceCreationError):
                 ECSManager(provider=provider)
@@ -1017,7 +1017,7 @@ class TestProviderConfigurationErrors:
     def _construct(self, config):
         """Construct a provider with boto3 fully mocked out."""
         with patch("boto3.Session", return_value=self._mock_session()):
-            return EphemeralAWSProvider(**config)
+            return EphemeralProvider(**config)
 
     def test_invalid_mode(self, provider_config):
         """An unknown operating mode is rejected by name."""
@@ -1425,7 +1425,7 @@ class TestEC2ManagerQuotaErrors:
         mock_session.resource.return_value = MagicMock()
         mock_session.region_name = "us-east-1"
 
-        with patch("parsl_aws_provider.compute.ec2.CredentialManager") as mock_cm:
+        with patch("parsl_ephemeral_provider.compute.ec2.CredentialManager") as mock_cm:
             mock_cm.return_value.create_boto3_session.return_value = mock_session
             manager = EC2Manager(provider=mock_provider)
         manager.ec2_client = mock_ec2

@@ -1,4 +1,4 @@
-# Parsl AWS Provider Documentation
+# Parsl Ephemeral Provider Documentation
 
 Sphinx sources for the project documentation. This file is not part of the built
 site — it is excluded in `conf.py`.
@@ -24,7 +24,7 @@ hid ~65 toctree entries pointing at pages nobody had written (#124).
 - `*.md` — the content pages, rendered through MyST
 
 Every page in `index.rst`'s toctree exists, and every configuration example is
-checked against the real `EphemeralAWSProvider` signature by
+checked against the real `EphemeralProvider` signature by
 `tests/unit/test_docs_examples.py`. The provider rejects unknown keyword
 arguments (#105), so a stale option in an example is a crash, not a nitpick — add
 new options to the tests along with the docs.

@@ -32,7 +32,7 @@ import pytest
 from parsl.config import Config
 from parsl.executors import HighThroughputExecutor
 
-from parsl_aws_provider import EphemeralAWSProvider, GlobusComputeProvider
+from parsl_ephemeral_provider import EphemeralProvider, EphemeralComputeProvider
 
 pytestmark = pytest.mark.unit
 
@@ -44,8 +44,8 @@ EXAMPLES_DIR = REPO_ROOT / "examples"
 # site. Both Parsl classes are included because a doc that gets the provider right
 # and `max_workers` wrong is still a doc that does not run.
 CHECKED_CALLABLES = {
-    "EphemeralAWSProvider": EphemeralAWSProvider,
-    "GlobusComputeProvider": GlobusComputeProvider,
+    "EphemeralProvider": EphemeralProvider,
+    "EphemeralComputeProvider": EphemeralComputeProvider,
     "HighThroughputExecutor": HighThroughputExecutor,
     "Config": Config,
 }
@@ -86,7 +86,7 @@ def _accepted_kwargs(target) -> Set[str]:
 
     ``**kwargs`` is *not* treated as "accepts anything" here, because on this
     provider it is the opposite: it exists only so unknown options can be caught
-    and rejected with a useful message (#105). But `GlobusComputeProvider` does
+    and rejected with a useful message (#105). But `EphemeralComputeProvider` does
     forward through it to the base, so the accepted set is the union over the MRO.
     """
     return set().union(*(_own_kwargs(cls) for cls in inspect.getmro(target)))
@@ -95,7 +95,7 @@ def _accepted_kwargs(target) -> Set[str]:
 def _known_classes() -> Dict[str, type]:
     """Every provider/executor class importable from the packages the docs use.
 
-    A doc fragment often constructs `EphemeralAWSProvider(...)` without repeating
+    A doc fragment often constructs `EphemeralProvider(...)` without repeating
     the import, because the surrounding prose established it. That is fine to
     read, so an unbound name is resolved against this registry rather than
     treated as a failure — but a name in *neither* the block's imports nor here is
@@ -103,7 +103,7 @@ def _known_classes() -> Dict[str, type]:
     """
     registry: Dict[str, type] = {}
     for module_name in (
-        "parsl_aws_provider",
+        "parsl_ephemeral_provider",
         "parsl.executors",
         "parsl.providers",
         "parsl.config",
@@ -382,8 +382,8 @@ def test_example_passes_mode_as_string(path: Path):
         if not isinstance(node, ast.Call):
             continue
         if getattr(node.func, "id", None) not in (
-            "EphemeralAWSProvider",
-            "GlobusComputeProvider",
+            "EphemeralProvider",
+            "EphemeralComputeProvider",
         ):
             continue
         for kw in node.keywords:
@@ -467,7 +467,7 @@ def test_example_shuts_the_provider_down(path: Path):
     constructs = any(
         isinstance(node, ast.Call)
         and getattr(node.func, "id", None)
-        in ("EphemeralAWSProvider", "GlobusComputeProvider")
+        in ("EphemeralProvider", "EphemeralComputeProvider")
         for node in ast.walk(tree)
     )
     if not constructs:
@@ -486,7 +486,7 @@ def test_network_ids_are_required_parameters():
     Every doc asserts the caller must supply them (#69). If a future change gives
     them a default value, the docs are wrong and this fails.
     """
-    params = inspect.signature(EphemeralAWSProvider.__init__).parameters
+    params = inspect.signature(EphemeralProvider.__init__).parameters
     for name in ("vpc_id", "subnet_id", "security_group_id"):
         assert name in params, f"{name} is no longer a provider option"
         assert params[name].default is None, (
@@ -500,7 +500,7 @@ def test_documented_renames_do_not_resolve():
     If one is ever reinstated, the table telling readers to stop using it becomes
     misleading.
     """
-    params = inspect.signature(EphemeralAWSProvider.__init__).parameters
+    params = inspect.signature(EphemeralProvider.__init__).parameters
     removed = [
         "use_spot_instances",
         "spot_max_bid",
@@ -533,7 +533,7 @@ def test_the_mode_options_docs_promise_are_reachable():
     #105 an option absent from the signature is rejected outright, so were one
     dropped the docs would be promising a `ProviderConfigurationError`.
     """
-    params = inspect.signature(EphemeralAWSProvider.__init__).parameters
+    params = inspect.signature(EphemeralProvider.__init__).parameters
     expected = [
         "idle_timeout",
         "preserve_bastion",
@@ -560,7 +560,7 @@ def test_no_default_pins_an_unsupported_python():
     package requires Python >= 3.10, so a 3.9 default could not run the same code
     as the driver either.
     """
-    from parsl_aws_provider.constants import (
+    from parsl_ephemeral_provider.constants import (
         DEFAULT_ECS_CONTAINER_IMAGE,
         DEFAULT_LAMBDA_RUNTIME,
     )
@@ -580,12 +580,12 @@ def test_the_lambda_runtime_default_is_one_cloudformation_allows():
 
     template = (
         Path(__file__).resolve().parents[2]
-        / "parsl_aws_provider"
+        / "parsl_ephemeral_provider"
         / "templates"
         / "cloudformation"
         / "lambda_worker.yml"
     ).read_text(encoding="utf-8")
-    from parsl_aws_provider.constants import DEFAULT_LAMBDA_RUNTIME
+    from parsl_ephemeral_provider.constants import DEFAULT_LAMBDA_RUNTIME
 
     allowed = re.findall(r"'(python3\.\d+)'", template)
     assert DEFAULT_LAMBDA_RUNTIME in allowed, (
@@ -596,12 +596,12 @@ def test_the_lambda_runtime_default_is_one_cloudformation_allows():
 def test_globus_only_options_are_globus_only():
     """The Globus-specific options are on the subclass, not the base.
 
-    docs/globus_compute.md documents them as the whole of what GlobusComputeProvider
+    docs/globus_compute.md documents them as the whole of what EphemeralComputeProvider
     adds. ``encrypted`` joined them in #138: it configures the engine rather than
     the provider, which is why it does not belong on the base.
     """
-    base = _accepted_kwargs(EphemeralAWSProvider)
-    globus = _own_kwargs(GlobusComputeProvider)
+    base = _accepted_kwargs(EphemeralProvider)
+    globus = _own_kwargs(EphemeralComputeProvider)
     assert globus - base == {
         "endpoint_id",
         "container_image",
@@ -616,7 +616,7 @@ def test_compute_type_has_no_auto() -> None:
     Several docs make the point that there is no provider-level "auto", which is
     only worth saying while it stays true.
     """
-    from parsl_aws_provider.provider import ComputeType
+    from parsl_ephemeral_provider.provider import ComputeType
 
     assert {c.value for c in ComputeType} == {"ec2", "lambda", "ecs"}
 
@@ -627,7 +627,7 @@ def test_no_atexit_hook_is_registered() -> None:
     If a hook is ever added, docs/troubleshooting.md and every example's `finally`
     rationale need revisiting — so make that a deliberate change, not a silent one.
     """
-    import parsl_aws_provider.provider as provider_module
+    import parsl_ephemeral_provider.provider as provider_module
 
     source = inspect.getsource(provider_module)
     assert "atexit" not in source, (
@@ -642,7 +642,7 @@ def test_default_worker_init_matches_docs() -> None:
     docs/getting_started.md and docs/troubleshooting.md both describe it as
     installing Python 3.11 and Parsl, which is the basis of the slow-startup advice.
     """
-    from parsl_aws_provider.constants import DEFAULT_WORKER_INIT
+    from parsl_ephemeral_provider.constants import DEFAULT_WORKER_INIT
 
     assert "python3.11" in DEFAULT_WORKER_INIT
     assert "parsl" in DEFAULT_WORKER_INIT

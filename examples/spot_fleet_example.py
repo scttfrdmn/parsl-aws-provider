@@ -34,7 +34,7 @@ from parsl.addresses import address_by_route
 from parsl.config import Config
 from parsl.executors import HighThroughputExecutor
 
-from parsl_aws_provider import EphemeralAWSProvider
+from parsl_ephemeral_provider import EphemeralProvider
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("spot-fleet")
@@ -90,7 +90,7 @@ def main() -> int:
         logger.error("Missing required environment variable: %s", exc)
         return 2
 
-    provider = EphemeralAWSProvider(
+    provider = EphemeralProvider(
         mode="standard",
         # Both flags are required for the fleet path (#137).
         use_spot=True,

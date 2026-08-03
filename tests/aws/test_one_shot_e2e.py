@@ -27,7 +27,7 @@ import time
 import pytest
 from parsl.jobs.states import JobState
 
-from parsl_aws_provider.provider import EphemeralAWSProvider
+from parsl_ephemeral_provider.provider import EphemeralProvider
 
 logger = logging.getLogger(__name__)
 
@@ -84,7 +84,7 @@ def one_shot_provider(tmp_path, test_run_id, aws_region, network_ids):
     through SSM ``SendCommand``, which needs the instance to carry a profile
     holding ``AmazonSSMManagedInstanceCore``.
     """
-    provider = EphemeralAWSProvider(
+    provider = EphemeralProvider(
         region=aws_region,
         instance_type="t3.micro",
         mode="standard",
@@ -241,7 +241,7 @@ class TestOneShotConfiguration:
     ):
         """SSM dispatch is impossible without a profile, so fail at construction."""
         with pytest.raises(ValueError, match="one_shot=True requires"):
-            EphemeralAWSProvider(
+            EphemeralProvider(
                 region=aws_region,
                 mode="standard",
                 one_shot=True,

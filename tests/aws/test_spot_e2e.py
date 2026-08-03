@@ -24,7 +24,7 @@ import pytest
 
 from parsl.jobs.states import JobState
 
-from parsl_aws_provider.provider import EphemeralAWSProvider
+from parsl_ephemeral_provider.provider import EphemeralProvider
 
 logger = logging.getLogger(__name__)
 
@@ -307,10 +307,10 @@ class TestSpotInterruptionMonitor:
 
     def _make_interruption_provider(
         self, tmp_path, aws_session, test_run_id, aws_region
-    ) -> EphemeralAWSProvider:
+    ) -> EphemeralProvider:
         """Helper: create a provider with interruption handling enabled."""
         state_file = str(tmp_path / f"state-int-{test_run_id}.json")
-        provider = EphemeralAWSProvider(
+        provider = EphemeralProvider(
             region=aws_region,
             instance_type="t3.micro",
             mode="standard",

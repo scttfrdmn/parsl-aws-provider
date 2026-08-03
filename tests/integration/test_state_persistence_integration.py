@@ -28,11 +28,11 @@ import tempfile
 from types import SimpleNamespace
 from botocore.exceptions import ClientError
 
-from parsl_aws_provider.exceptions import StateError
-from parsl_aws_provider.state.base import STATE_KEY_PROVIDER
-from parsl_aws_provider.state.file import FileStateStore
-from parsl_aws_provider.state.parameter_store import ParameterStoreState
-from parsl_aws_provider.state.s3 import S3State
+from parsl_ephemeral_provider.exceptions import StateError
+from parsl_ephemeral_provider.state.base import STATE_KEY_PROVIDER
+from parsl_ephemeral_provider.state.file import FileStateStore
+from parsl_ephemeral_provider.state.parameter_store import ParameterStoreState
+from parsl_ephemeral_provider.state.s3 import S3State
 from tests.substrate_support import is_substrate_available
 
 

@@ -39,7 +39,7 @@ log = logging.getLogger("launch-driver")
 DEFAULT_REGION = os.environ.get("AWS_TEST_REGION", "us-west-2")
 AWS_PROFILE = os.environ.get("AWS_TEST_PROFILE", "aws")
 
-# Amazon Linux 2023 AMIs per region (from parsl_aws_provider/constants.py)
+# Amazon Linux 2023 AMIs per region (from parsl_ephemeral_provider/constants.py)
 AL2023_AMI = {
     "us-east-1": "ami-080e1f13689e07408",
     "us-east-2": "ami-03d21eed81858c120",
@@ -63,10 +63,10 @@ set -euo pipefail
 dnf install -y git python3.11 python3.11-pip
 ln -sf /usr/bin/python3.11 /usr/bin/python3
 cd /home/ec2-user
-git clone https://github.com/scttfrdmn/parsl-aws-provider.git
-cd parsl-aws-provider
+git clone https://github.com/scttfrdmn/parsl-ephemeral-provider.git
+cd parsl-ephemeral-provider
 pip3.11 install --quiet -e '.[test]'
-chown -R ec2-user:ec2-user /home/ec2-user/parsl-aws-provider
+chown -R ec2-user:ec2-user /home/ec2-user/parsl-ephemeral-provider
 echo "DRIVER_READY" >> /var/log/driver-setup.log
 """
 
@@ -281,8 +281,8 @@ def run_integration_test(region: str, instance_id: str) -> int:
         "--parameters",
         (
             "commands=["
-            "'cd /home/ec2-user/parsl-aws-provider',"
-            f"'AWS_TEST_REGION={region} python3 examples/parsl_aws_integration.py'"
+            "'cd /home/ec2-user/parsl-ephemeral-provider',"
+            f"'AWS_TEST_REGION={region} python3 examples/parsl_integration.py'"
             "]"
         ),
         "--timeout-seconds",
@@ -378,9 +378,9 @@ def main() -> int:
             )
             log.info("")
             log.info("  Inside the session:")
-            log.info("  cd /home/ec2-user/parsl-aws-provider")
+            log.info("  cd /home/ec2-user/parsl-ephemeral-provider")
             log.info(
-                "  AWS_TEST_REGION=%s python3 examples/parsl_aws_integration.py", region
+                "  AWS_TEST_REGION=%s python3 examples/parsl_integration.py", region
             )
             log.info("=" * 60)
             log.info("Press Ctrl-C to terminate the driver instance when done.")

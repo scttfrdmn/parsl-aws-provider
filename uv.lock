@@ -1472,7 +1472,7 @@ wheels = [
 ]
 
 [[package]]
-name = "parsl-aws-provider"
+name = "parsl-ephemeral-provider"
 version = "0.8.0"
 source = { editable = "." }
 dependencies = [

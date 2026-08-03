@@ -9,8 +9,8 @@ import uuid
 
 import pytest
 
-from parsl_aws_provider.exceptions import StateError
-from parsl_aws_provider.utils.serialization import (
+from parsl_ephemeral_provider.exceptions import StateError
+from parsl_ephemeral_provider.utils.serialization import (
     deserialize_state,
     serialize_state,
 )

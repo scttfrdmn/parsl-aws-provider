@@ -35,8 +35,8 @@ try:
 except ImportError:
     MOTO_AVAILABLE = False
 
-from parsl_aws_provider.modes.serverless import ServerlessMode
-from parsl_aws_provider.constants import (
+from parsl_ephemeral_provider.modes.serverless import ServerlessMode
+from parsl_ephemeral_provider.constants import (
     RESOURCE_TYPE_ECS_TASK,
     RESOURCE_TYPE_LAMBDA_FUNCTION,
     WORKER_TYPE_ECS,
@@ -450,7 +450,7 @@ class TestServerlessModeSpotFleetIntegration:
             cf.describe_stacks(StackName=stack_name)
 
     @patch(
-        "parsl_aws_provider.compute.spot_fleet_cleanup.cleanup_all_spot_fleet_resources"
+        "parsl_ephemeral_provider.compute.spot_fleet_cleanup.cleanup_all_spot_fleet_resources"
     )
     def test_cleanup_infrastructure_spares_the_callers_network(
         self, mock_cleanup_spot_fleet, aws_session, network
@@ -494,7 +494,7 @@ class TestServerlessModeSpotFleetIntegration:
         create time, so this deploys the real template with the full parameter
         set the spot fleet path would send.
         """
-        from parsl_aws_provider.utils.aws import get_cf_template
+        from parsl_ephemeral_provider.utils.aws import get_cf_template
 
         cf = serverless_mode.cf_client
         params = {

@@ -1,6 +1,6 @@
 """AWS-specific fixtures for real-AWS E2E tests.
 
-These fixtures create and tear down a real EphemeralAWSProvider backed by
+These fixtures create and tear down a real EphemeralProvider backed by
 actual AWS infrastructure.  They are only activated when the test is marked
 with @pytest.mark.aws and requires the 'aws' profile to be configured in
 ~/.aws/credentials.
@@ -16,8 +16,8 @@ import uuid
 import boto3
 import pytest
 
-from parsl_aws_provider import GlobusComputeProvider
-from parsl_aws_provider.provider import EphemeralAWSProvider
+from parsl_ephemeral_provider import EphemeralComputeProvider
+from parsl_ephemeral_provider.provider import EphemeralProvider
 
 logger = logging.getLogger(__name__)
 
@@ -110,7 +110,7 @@ def test_run_id() -> str:
 
 @pytest.fixture
 def aws_provider(tmp_path, aws_session, test_run_id, aws_region, network_ids):
-    """Create and initialize a real EphemeralAWSProvider.
+    """Create and initialize a real EphemeralProvider.
 
     Yields a fully initialised provider and tears it down afterwards.
     The teardown is best-effort; the ``cleanup_stray_instances`` autouse
@@ -118,7 +118,7 @@ def aws_provider(tmp_path, aws_session, test_run_id, aws_region, network_ids):
     """
     state_file = str(tmp_path / f"state-{test_run_id}.json")
 
-    provider = EphemeralAWSProvider(
+    provider = EphemeralProvider(
         region=aws_region,
         instance_type="t3.micro",
         mode="standard",
@@ -197,7 +197,7 @@ def spot_provider(tmp_path, aws_session, test_run_id, aws_region, network_ids):
     """
     state_file = str(tmp_path / f"state-{test_run_id}.json")
 
-    provider = EphemeralAWSProvider(
+    provider = EphemeralProvider(
         region=aws_region,
         instance_type="t3.micro",
         mode="standard",
@@ -238,7 +238,7 @@ def serverless_provider(tmp_path, aws_session, test_run_id, aws_region, network_
     """Provider configured for serverless (auto worker_type) mode."""
     state_file = str(tmp_path / f"state-{test_run_id}.json")
 
-    provider = EphemeralAWSProvider(
+    provider = EphemeralProvider(
         region=aws_region,
         mode="serverless",
         state_store_type="file",
@@ -303,7 +303,7 @@ def detached_provider(tmp_path, aws_session, test_run_id, aws_region, network_id
     """Provider configured for detached (bastion host) mode."""
     state_file = str(tmp_path / f"state-{test_run_id}.json")
 
-    provider = EphemeralAWSProvider(
+    provider = EphemeralProvider(
         region=aws_region,
         instance_type="t3.micro",
         mode="detached",
@@ -341,7 +341,7 @@ def detached_provider(tmp_path, aws_session, test_run_id, aws_region, network_id
 @pytest.fixture
 def parameter_store_provider(aws_session, test_run_id, aws_region, network_ids):
     """Provider using AWS Parameter Store as the state backend."""
-    provider = EphemeralAWSProvider(
+    provider = EphemeralProvider(
         region=aws_region,
         instance_type="t3.micro",
         mode="standard",
@@ -406,7 +406,7 @@ def s3_state_bucket(aws_session, test_run_id, aws_region):
 @pytest.fixture
 def s3_provider(aws_session, test_run_id, aws_region, s3_state_bucket, network_ids):
     """Provider using S3 as the state backend."""
-    provider = EphemeralAWSProvider(
+    provider = EphemeralProvider(
         region=aws_region,
         instance_type="t3.micro",
         mode="standard",
@@ -447,7 +447,7 @@ def globus_compute_provider(
     """Provider configured for Globus Compute endpoint config generation."""
     state_file = str(tmp_path / f"state-gc-{test_run_id}.json")
 
-    provider = GlobusComputeProvider(
+    provider = EphemeralComputeProvider(
         region=aws_region,
         instance_type="t3.small",
         mode="standard",

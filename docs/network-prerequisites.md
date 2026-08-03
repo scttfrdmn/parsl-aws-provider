@@ -1,6 +1,6 @@
 # Network Prerequisites
 
-Starting with v0.7.0, `EphemeralAWSProvider` no longer creates VPC, subnet, or
+Starting with v0.7.0, `EphemeralProvider` no longer creates VPC, subnet, or
 security-group resources.  You must provision these before instantiating the
 provider and pass their IDs as required constructor arguments.
 
@@ -40,13 +40,13 @@ provider:
 ```python
 import json
 
-from parsl_aws_provider import GlobusComputeProvider
+from parsl_ephemeral_provider import EphemeralComputeProvider
 
-print(json.dumps(GlobusComputeProvider.minimum_iam_policy(), indent=2))
+print(json.dumps(EphemeralComputeProvider.minimum_iam_policy(), indent=2))
 ```
 
 It is a `@staticmethod`, so no provider instance is needed, and it describes the
-base `EphemeralAWSProvider` just as well despite living on the Globus subclass.
+base `EphemeralProvider` just as well despite living on the Globus subclass.
 Every action it grants has a call site in the package, and a unit test asserts
 that in both directions.
 
@@ -55,7 +55,7 @@ The seven-action policy previously printed here failed at **construction**:
 creates a launch template, so it needed `ssm:GetParameter`,
 `ec2:CreateLaunchTemplate`, `ec2:DescribeInstanceTypes`, `ec2:DescribeVpcs`, and
 `sts:GetCallerIdentity` — none of which it granted
-([#195](https://github.com/scttfrdmn/parsl-aws-provider/issues/195)).
+([#195](https://github.com/scttfrdmn/parsl-ephemeral-provider/issues/195)).
 
 The **workers** are separate and need much less: attaching the AWS-managed
 `AmazonSSMManagedInstanceCore` to the instance profile is the whole requirement,
@@ -181,9 +181,9 @@ Outputs:
 ## Using the IDs with the Provider
 
 ```python
-from parsl_aws_provider import EphemeralAWSProvider
+from parsl_ephemeral_provider import EphemeralProvider
 
-provider = EphemeralAWSProvider(
+provider = EphemeralProvider(
     region="us-east-1",
     instance_type="t3.small",
     vpc_id="vpc-0abc1234",

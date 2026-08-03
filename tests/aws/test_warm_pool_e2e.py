@@ -39,8 +39,8 @@ import time
 import pytest
 from parsl.jobs.states import JobState
 
-from parsl_aws_provider.constants import STATUS_WARM
-from parsl_aws_provider.provider import EphemeralAWSProvider
+from parsl_ephemeral_provider.constants import STATUS_WARM
+from parsl_ephemeral_provider.provider import EphemeralProvider
 
 logger = logging.getLogger(__name__)
 
@@ -186,7 +186,7 @@ def warm_pool_providers(tmp_path, test_run_id, aws_region, network_ids):
         warm_pool_ttl: int = 600,
         state_file: str = None,
         **overrides,
-    ) -> EphemeralAWSProvider:
+    ) -> EphemeralProvider:
         kwargs = dict(
             region=aws_region,
             instance_type="t3.micro",
@@ -206,7 +206,7 @@ def warm_pool_providers(tmp_path, test_run_id, aws_region, network_ids):
             **network_ids,
         )
         kwargs.update(overrides)
-        provider = EphemeralAWSProvider(**kwargs)
+        provider = EphemeralProvider(**kwargs)
         created.append(provider)
         return provider
 
@@ -572,7 +572,7 @@ class TestWarmPoolConfiguration:
         submit() terminates the instance it just paid to boot.
         """
         with pytest.raises(ValueError, match="warm_pool_size > 0 requires"):
-            EphemeralAWSProvider(
+            EphemeralProvider(
                 region=aws_region,
                 mode="standard",
                 warm_pool_size=1,

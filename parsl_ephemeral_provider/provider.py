@@ -1,0 +1,1761 @@
+"""
+Parsl Ephemeral Provider implementation.
+
+This module implements the main provider class that conforms to the Parsl
+execution provider interface.
+
+SPDX-License-Identifier: Apache-2.0
+SPDX-FileCopyrightText: 2025-2026 Scott Friedman and Project Contributors
+"""
+
+import logging
+import threading
+import time
+import uuid
+import warnings
+from enum import Enum
+from typing import Any, Dict, List, Optional, Sequence
+
+import botocore.session
+from parsl.jobs.states import JobState, JobStatus
+from parsl.providers.base import ExecutionProvider
+from parsl.utils import RepresentationMixin
+from typeguard import typechecked
+
+from parsl_ephemeral_provider.constants import (
+    DEFAULT_BAKE_AMI,
+    DEFAULT_BASTION_HOST_TYPE,
+    DEFAULT_BASTION_IDLE_TIMEOUT,
+    DEFAULT_ECS_CONTAINER_IMAGE,
+    DEFAULT_ECS_CPU,
+    DEFAULT_ECS_MEMORY,
+    DEFAULT_INSTANCE_TYPE,
+    DEFAULT_LAMBDA_RUNTIME,
+    DEFAULT_MAX_BLOCKS,
+    DEFAULT_MAX_IDLE_TIME,
+    DEFAULT_MIN_BLOCKS,
+    DEFAULT_MODE,
+    DEFAULT_ONE_SHOT,
+    DEFAULT_PRESERVE_BASTION,
+    DEFAULT_REGION,
+    DEFAULT_SPOT_ALLOCATION_STRATEGY,
+    DEFAULT_WARM_POOL_SIZE,
+    DEFAULT_WARM_POOL_TTL,
+    DEFAULT_WORKER_INIT,
+    MAX_WARM_POOL_SIZE,
+    STATUS_INTERRUPTED,
+    STATUS_WARM,
+)
+from parsl_ephemeral_provider.exceptions import (
+    ProviderConfigurationError,
+    ProviderError,
+)
+from parsl_ephemeral_provider.modes.base import OperatingMode
+from parsl_ephemeral_provider.modes.detached import DetachedMode
+from parsl_ephemeral_provider.modes.serverless import ServerlessMode
+from parsl_ephemeral_provider.modes.standard import StandardMode
+from parsl_ephemeral_provider.state.base import (
+    STATE_KEY_MODE,
+    STATE_KEY_PROVIDER,
+    StateStore,
+)
+from parsl_ephemeral_provider.state.file import FileStateStore
+from parsl_ephemeral_provider.state.parameter_store import ParameterStoreStateStore
+from parsl_ephemeral_provider.state.s3 import S3StateStore
+from parsl_ephemeral_provider.utils.aws import (
+    architecture_for_instance_type,
+    create_session,
+    describe_instance_capacity,
+    get_default_ami,
+)
+
+
+logger = logging.getLogger(__name__)
+
+
+# Map internal string status names to Parsl JobState values.
+_STRING_TO_JOB_STATE: Dict[str, JobState] = {
+    "PENDING": JobState.PENDING,
+    "RUNNING": JobState.RUNNING,
+    "COMPLETED": JobState.COMPLETED,
+    "FAILED": JobState.FAILED,
+    "CANCELED": JobState.CANCELLED,
+    "CANCELLED": JobState.CANCELLED,
+    "UNKNOWN": JobState.UNKNOWN,
+    # WARM = instance idle in warm pool; the JOB is done so Parsl sees RUNNING
+    # (prevents premature cancellation while we reuse the instance).
+    "WARM": JobState.RUNNING,
+    # INTERRUPTED = AWS has issued the two-minute spot reclaim warning. FAILED
+    # rather than COMPLETED because the block did not finish its work: FAILED is
+    # what stops the executor dispatching to it and lets Parsl's own `retries`
+    # re-run the lost tasks (#137). Kept distinct as a string so state files and
+    # logs record the cause.
+    "INTERRUPTED": JobState.FAILED,
+}
+
+# Job states that are terminal (Parsl will not re-submit once in these states)
+_TERMINAL_STATES: frozenset = frozenset(
+    {"COMPLETED", "FAILED", "CANCELED", "CANCELLED", "INTERRUPTED"}
+)
+
+
+class OperatingModeType(str, Enum):
+    """Supported operating modes for the provider."""
+
+    STANDARD = "standard"
+    DETACHED = "detached"
+    SERVERLESS = "serverless"
+
+
+class StateStoreType(str, Enum):
+    """Supported state persistence options."""
+
+    FILE = "file"
+    PARAMETER_STORE = "parameter_store"
+    S3 = "s3"
+
+
+class ComputeType(str, Enum):
+    """Supported compute resource types."""
+
+    EC2 = "ec2"
+    LAMBDA = "lambda"
+    ECS = "ecs"
+
+
+@typechecked
+class EphemeralProvider(ExecutionProvider, RepresentationMixin):
+    """Ephemeral AWS Provider for Parsl.
+
+    The Ephemeral AWS Provider allows Parsl to execute tasks on ephemeral
+    AWS resources that are created on-demand and automatically cleaned up
+    when no longer needed.
+
+    Parameters
+    ----------
+    image_id : str, optional
+        EC2 AMI ID to use for instances. When omitted, the latest Amazon Linux
+        2023 AMI matching ``instance_type``'s architecture is resolved from AWS's
+        public SSM parameters. Supply one explicitly for a custom image, or for
+        an instance family AL2023 does not cover (``mac*.metal``).
+    instance_type : str, optional
+        EC2 instance type. Default is 't3.micro'. Graviton (arm64) families are
+        supported; the matching arm64 AMI is selected automatically.
+    region : str, optional
+        AWS region. Default is 'us-east-1'.
+    mode : str, optional
+        Operating mode ('standard', 'detached', or 'serverless'). Default is 'standard'.
+    min_blocks : int, optional
+        Minimum number of blocks. Default is 0.
+    max_blocks : int, optional
+        Maximum number of blocks. Default is 10.
+    worker_init : str, optional
+        Initialization script for workers. Default is an empty script.
+    vpc_id : str
+        Existing VPC ID to use. **Required**, and pre-provisioned outside the
+        provider: since #69 the provider creates no VPC, subnet, or security
+        group. Omitting any of the three raises ``ValueError``.
+    subnet_id : str
+        Existing subnet ID to use. Required; see ``vpc_id``.
+    security_group_id : str
+        Existing security group ID to use. Required; see ``vpc_id``. It is never
+        modified or deleted -- a caller-supplied group is not the provider's to
+        touch (#100).
+
+        The one exception to all three is ``mode="serverless"`` with
+        ``compute_type="lambda"``: functions run in the Lambda-managed VPC, so
+        there is nothing for the caller to pre-provision.
+    key_name : str, optional
+        EC2 key pair name for SSH access. If not provided, instances will be created without a key pair.
+    profile_name : str, optional
+        AWS profile name to use. If not provided, the default profile will be used.
+    endpoint_url : str, optional
+        Override the endpoint every AWS client uses. Set this for VPC interface
+        endpoints, FIPS endpoints, or to point the provider at an emulator such
+        as substrate. Applies to clients the operating modes and compute managers
+        build from the session too, not just the provider's own. A caller that
+        needs one service elsewhere can still override it per client.
+    state_store_type : str, optional
+        Type of state store to use ('file', 'parameter_store', or 's3'). Default is 'file'.
+    state_file_path : str, optional
+        Path to state file when using 'file' state store. Default is 'ephemeral_aws_state.json'.
+    s3_bucket : str, optional
+        S3 bucket name when using 's3' state store.
+    s3_key : str, optional
+        S3 key name when using 's3' state store. Default is 'ephemeral_aws_state.json'.
+    parameter_store_path : str, optional
+        Parameter Store path when using 'parameter_store' state store.
+        Default is '/parsl/ephemeral_aws_state'.
+    use_spot : bool, optional
+        Whether to use spot instances. Default is False.
+    spot_max_price : str, optional
+        Maximum price for spot instances. Default is on-demand price.
+    spot_allocation_strategy : str, optional
+        Allocation strategy for spot instances, in kebab-case: one of
+        'price-capacity-optimized' (the default, and AWS's recommendation),
+        'capacity-optimized', 'capacity-optimized-prioritized', 'diversified',
+        or 'lowest-price'. Converted to the camelCase spelling Spot Fleet
+        requires at the API boundary.
+    spot_interruption_handling : bool, optional
+        Whether to detect spot interruptions. Default is False. When enabled, an
+        interrupted block is reported to Parsl as FAILED rather than COMPLETED,
+        so the executor stops dispatching to it and re-runs the lost tasks under
+        its own ``retries`` setting. No checkpointing is performed: a provider
+        never sees task state, so re-running is the only recovery available at
+        this layer. Set ``retries`` on your Parsl config to make use of it.
+    additional_tags : Dict[str, str], optional
+        Additional tags to apply to AWS resources.
+    auto_shutdown : bool, optional
+        Whether a worker terminates itself once its command finishes. Default is
+        True, which appends ``shutdown -h now`` to the worker's UserData; the
+        instance launches with ``InstanceInitiatedShutdownBehavior=terminate``,
+        so it is terminated rather than stopped with a billed EBS volume. Set
+        False only if you intend to keep instances after their work completes.
+    max_idle_time : int, optional
+        Deprecated and ignored; accepted only so existing configurations keep
+        loading. Default is 300.
+
+        This never measured idleness. It was compared against a timestamp
+        stamped once at submit, making it wall-clock age since submission, so it
+        terminated any task that ran longer than the limit (#194). A provider
+        cannot compute idleness -- that needs per-manager task counts only
+        Parsl's interchange has. Use Parsl's own ``max_idletime``, which
+        ``HighThroughputExecutor.scale_in`` applies to genuinely idle blocks:
+
+        .. code-block:: python
+
+            from parsl.config import Config
+
+            config = Config(executors=[...], max_idletime=300.0)
+    compute_type : str, optional
+        Type of compute resource when using serverless mode ('ec2', 'lambda', or 'ecs').
+        Default is 'ec2'.
+    bastion_instance_type : str, optional
+        Instance type for bastion host when using detached mode. Default is 't3.micro'.
+    idle_timeout : int, optional
+        Minutes of inactivity before the bastion shuts itself down. Default is 30.
+        ``mode="detached"`` only.
+    preserve_bastion : bool, optional
+        Whether ``cleanup_infrastructure()`` leaves the bastion running so a later
+        session can adopt it. Default is True, which means the bastion **survives
+        shutdown and keeps billing** — set False to have it torn down.
+        ``mode="detached"`` only.
+    bastion_host_type : str, optional
+        How the bastion is deployed: ``'cloudformation'`` (the default) or
+        ``'direct'`` for a plain ``RunInstances`` call.  ``mode="detached"`` only.
+    workflow_id : str, optional
+        Workflow identifier used in bastion state paths and resource tags. Default
+        is a UUID generated by the mode. Supply the same value to reconnect to an
+        existing workflow's bastion.  ``mode="detached"`` only.
+    memory_size : int, optional
+        Memory size in MB for Lambda functions. Default is 1024.
+    timeout : int, optional
+        Timeout in seconds for Lambda functions. Default is 300.
+    lambda_runtime : str, optional
+        Runtime identifier for Lambda functions. Default is ``'python3.12'``. Must
+        be one of the ``Runtime`` values allowed by
+        ``templates/cloudformation/lambda_worker.yml``.  ``mode="serverless"`` only.
+    ecs_task_cpu : int, optional
+        Fargate CPU units per task. Default is 1024 (1 vCPU).
+        ``mode="serverless"`` only.
+    ecs_task_memory : int, optional
+        Fargate memory per task in MB. Default is 2048. Must be a combination
+        Fargate accepts for the chosen ``ecs_task_cpu``.  ``mode="serverless"``
+        only.
+    ecs_container_image : str, optional
+        Container image for Fargate tasks. Default is ``'python:3.12-slim'``. Set
+        this to your own image to run a workload with its own dependencies —
+        without it every task runs the stock image and can only use the standard
+        library.  ``mode="serverless"`` only.
+    debug : bool, optional
+        Whether to enable debug logging. Default is False.
+    use_public_ips : bool, optional
+        Whether to assign public IPs to instances. Default is True.
+    custom_ami : bool, optional
+        Whether image_id refers to a custom AMI. Default is False.
+    provider_id : str, optional
+        Provider ID for distinguishing between multiple providers. Default is a UUID.
+    iam_instance_profile_arn : str, optional
+        ARN of an existing IAM instance profile to attach to EC2 instances.
+        Required for SSM connectivity when using Session Manager tunneling.
+    auto_create_instance_profile : bool, optional
+        When True, automatically create an IAM role and instance profile with
+        AmazonSSMManagedInstanceCore permissions if one does not already exist.
+        Default is False.
+    status_polling_interval : int, optional
+        Interval in seconds between status polls. Default is 60.
+    waiter_delay : int, optional
+        Seconds between waiter attempts when polling for resource state changes.
+        Default is 5.
+    waiter_max_attempts : int, optional
+        Maximum number of waiter attempts before raising an error.
+        Default is 60 (5 minutes at the default delay).
+    warm_pool_size : int, optional
+        Maximum number of instances to keep warm after their job finishes,
+        ready for immediate reuse without re-running worker_init.
+        Requires ``auto_create_instance_profile=True`` or
+        ``iam_instance_profile_arn`` (SSM SendCommand needs an IAM role).
+        Default is 0 (disabled).  ``mode="standard"`` only.
+
+        **This costs money while idle.** A warm instance is left *Running*, not
+        Stopped, so it bills at the full instance rate for up to
+        ``warm_pool_ttl`` seconds after its job finishes — ``warm_pool_size``
+        instances × ``warm_pool_ttl`` seconds of instance time per idle period,
+        whether or not another job ever arrives to use them. Capped at
+        ``MAX_WARM_POOL_SIZE`` (20). Instances must stay Running because
+        dispatch is SSM ``SendCommand`` and a Stopped instance runs no SSM
+        agent; issue #130 tracks moving to a pull model so the pool can be
+        Stopped instead.
+    warm_pool_ttl : int, optional
+        Seconds a warm *running* instance stays alive before being terminated.
+        Default is 120 (2 minutes); this was 600 in v0.6.0 and was reduced
+        because the instance bills for the whole window.  ``mode="standard"``
+        only.
+    bake_ami : bool, optional
+        When True, run ``worker_init`` on a builder instance during
+        ``initialize()``, snapshot it into a custom AMI, and use that AMI for
+        all subsequent instance launches.  Eliminates the per-boot install
+        overhead for new instances.  Default is False.
+        ``mode="standard"`` only.
+    baked_ami_id : str, optional
+        Pre-existing baked AMI ID to use instead of baking a new one.  When
+        supplied, ``initialize()`` skips the baking step and uses this AMI
+        directly for all instance launches.  ``mode="standard"`` only.
+    one_shot : bool, optional
+        When True, each instance runs a single command over SSM and then
+        terminates, so the command's exit code determines the job status.
+        Default is False.  ``mode="standard"`` only.
+
+    Raises
+    ------
+    ProviderConfigurationError
+        If ``warm_pool_size``, ``warm_pool_ttl``, ``bake_ami``,
+        ``baked_ami_id``, or ``one_shot`` is set on any mode other than
+        ``"standard"`` — no other mode implements them.
+
+        If ``idle_timeout``, ``preserve_bastion``, ``bastion_host_type``, or
+        ``workflow_id`` is set on any mode other than ``"detached"``, or
+        ``lambda_runtime``, ``ecs_task_cpu``, ``ecs_task_memory``, or
+        ``ecs_container_image`` on any mode other than ``"serverless"`` — each is
+        forwarded from one mode's branch only, so it would silently have no
+        effect.
+    """
+
+    @typechecked
+    def __init__(
+        self,
+        image_id: Optional[str] = None,
+        instance_type: str = DEFAULT_INSTANCE_TYPE,
+        region: str = DEFAULT_REGION,
+        mode: str = DEFAULT_MODE,
+        min_blocks: int = DEFAULT_MIN_BLOCKS,
+        max_blocks: int = DEFAULT_MAX_BLOCKS,
+        init_blocks: int = 0,
+        nodes_per_block: int = 1,
+        worker_init: str = DEFAULT_WORKER_INIT,
+        vpc_id: Optional[str] = None,
+        subnet_id: Optional[str] = None,
+        security_group_id: Optional[str] = None,
+        key_name: Optional[str] = None,
+        profile_name: Optional[str] = None,
+        endpoint_url: Optional[str] = None,
+        state_store_type: str = StateStoreType.FILE,
+        state_file_path: str = "ephemeral_aws_state.json",
+        s3_bucket: Optional[str] = None,
+        s3_key: str = "ephemeral_aws_state.json",
+        parameter_store_path: str = "/parsl/ephemeral_aws_state",
+        use_spot: bool = False,
+        spot_max_price: Optional[str] = None,
+        spot_allocation_strategy: str = DEFAULT_SPOT_ALLOCATION_STRATEGY,
+        spot_interruption_handling: bool = False,
+        use_spot_fleet: bool = False,
+        instance_types: Optional[List[str]] = None,
+        spot_max_price_percentage: Optional[int] = None,
+        additional_tags: Optional[Dict[str, str]] = None,
+        auto_shutdown: bool = True,
+        max_idle_time: int = DEFAULT_MAX_IDLE_TIME,
+        compute_type: str = ComputeType.EC2,
+        bastion_instance_type: str = "t3.micro",
+        idle_timeout: int = DEFAULT_BASTION_IDLE_TIMEOUT,
+        preserve_bastion: bool = DEFAULT_PRESERVE_BASTION,
+        bastion_host_type: str = DEFAULT_BASTION_HOST_TYPE,
+        workflow_id: Optional[str] = None,
+        memory_size: int = 1024,
+        timeout: int = 300,
+        lambda_runtime: str = DEFAULT_LAMBDA_RUNTIME,
+        ecs_task_cpu: int = DEFAULT_ECS_CPU,
+        ecs_task_memory: int = DEFAULT_ECS_MEMORY,
+        ecs_container_image: str = DEFAULT_ECS_CONTAINER_IMAGE,
+        debug: bool = False,
+        use_public_ips: bool = True,
+        custom_ami: bool = False,
+        provider_id: Optional[str] = None,
+        iam_instance_profile_arn: Optional[str] = None,
+        auto_create_instance_profile: bool = False,
+        status_polling_interval: int = 60,
+        waiter_delay: int = 5,
+        waiter_max_attempts: int = 60,
+        warm_pool_size: int = DEFAULT_WARM_POOL_SIZE,
+        warm_pool_ttl: int = DEFAULT_WARM_POOL_TTL,
+        bake_ami: bool = DEFAULT_BAKE_AMI,
+        baked_ami_id: Optional[str] = None,
+        one_shot: bool = DEFAULT_ONE_SHOT,
+        cores_per_node: Optional[int] = None,
+        mem_per_node: Optional[float] = None,
+        **kwargs: Any,
+    ) -> None:
+        """Initialize the Ephemeral AWS Provider."""
+        # Initialize the base provider
+        super().__init__()
+
+        # Configure logging
+        if debug:
+            logger.setLevel(logging.DEBUG)
+
+        # Reject options this provider does not recognise. **kwargs used to
+        # absorb them in silence: use_spot_fleet and instance_types were
+        # documented across a dozen files and two examples yet landed here and
+        # were never read, so the entire Spot Fleet path was unreachable and
+        # nothing said so (#105). A typo deserves the same treatment.
+        if kwargs:
+            raise ProviderConfigurationError(
+                f"Unknown configuration option(s): {', '.join(sorted(kwargs))}. "
+                "Check the spelling against EphemeralProvider.__init__; an "
+                "option accepted here but never read would be silently ignored."
+            )
+
+        # Validate configuration
+        self._validate_config(
+            image_id=image_id,
+            mode=mode,
+            compute_type=compute_type,
+            state_store_type=state_store_type,
+            s3_bucket=s3_bucket,
+            region=region,
+            min_blocks=min_blocks,
+            max_blocks=max_blocks,
+            init_blocks=init_blocks,
+        )
+
+        # image_id is genuinely optional: serverless needs no AMI, and
+        # auto-detection can fail, in which case the mode raises at
+        # initialize() instead. Resolution itself is deferred until after
+        # self.session exists, below -- it now queries SSM, and must do so with
+        # the caller's profile and endpoint rather than a bare default session.
+        self.image_id: Optional[str] = image_id
+        # The AMI must match the instance type's architecture, or the launch
+        # fails: arm64 was unusable before #84 because only x86_64 AMIs existed
+        # anywhere in the package. This lookup is pure string parsing, so it is
+        # safe this early.
+        self.architecture = architecture_for_instance_type(instance_type)
+        self.instance_type = instance_type
+        self.region = region
+        self.mode_type = OperatingModeType(mode.lower())
+        self.min_blocks = min_blocks
+        self.max_blocks = max_blocks
+        self.init_blocks = init_blocks
+        self.nodes_per_block = nodes_per_block
+        self.parallelism = 1.0
+        self.script_dir: Optional[str] = None
+        self.worker_init = worker_init
+        self.vpc_id = vpc_id
+        self.subnet_id = subnet_id
+        self.security_group_id = security_group_id
+        self.key_name = key_name
+        self.profile_name = profile_name
+        self.endpoint_url = endpoint_url
+        self.state_store_type = StateStoreType(state_store_type.lower())
+        self.state_file_path = state_file_path
+        self.s3_bucket = s3_bucket
+        self.s3_key = s3_key
+        self.parameter_store_path = parameter_store_path
+        self.use_spot = use_spot
+        self.spot_max_price = spot_max_price
+        self.spot_allocation_strategy = spot_allocation_strategy
+        self.spot_interruption_handling = spot_interruption_handling
+        self.use_spot_fleet = use_spot_fleet
+        self.instance_types = instance_types or []
+        self.spot_max_price_percentage = spot_max_price_percentage
+        self.additional_tags = additional_tags or {}
+        self.auto_shutdown = auto_shutdown
+        # Retained as an attribute because it is persisted in the state document
+        # and forwarded to every mode, so dropping it would break state files
+        # written by earlier versions. Nothing reads it (#194).
+        self.max_idle_time = max_idle_time
+        if max_idle_time != DEFAULT_MAX_IDLE_TIME:
+            # Warn only when it was set deliberately. Silently ignoring a
+            # tuned value is the worse failure here: the option used to
+            # terminate running work, so somebody may have raised it as a
+            # workaround and would otherwise never learn it no longer applies.
+            warnings.warn(
+                "max_idle_time is deprecated and ignored: it measured age since "
+                "submission rather than idleness, and terminated tasks that ran "
+                "longer than it (#194). A provider cannot see task occupancy. "
+                "Set max_idletime on your Parsl Config instead, which "
+                "HighThroughputExecutor.scale_in applies to genuinely idle "
+                "blocks.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+        self.compute_type = ComputeType(compute_type.lower())
+        self.bastion_instance_type = bastion_instance_type
+        self.idle_timeout = idle_timeout
+        self.preserve_bastion = preserve_bastion
+        self.bastion_host_type = bastion_host_type
+        self.workflow_id = workflow_id
+        self.memory_size = memory_size
+        self.timeout = timeout
+        self.lambda_runtime = lambda_runtime
+        self.ecs_task_cpu = ecs_task_cpu
+        self.ecs_task_memory = ecs_task_memory
+        self.ecs_container_image = ecs_container_image
+        self.debug = debug
+        self.use_public_ips = use_public_ips
+        self.custom_ami = custom_ami
+        self.provider_id = provider_id or str(uuid.uuid4())
+        self.iam_instance_profile_arn = iam_instance_profile_arn
+        self.auto_create_instance_profile = auto_create_instance_profile
+        self._status_polling_interval = status_polling_interval
+        self.waiter_delay = waiter_delay
+        self.waiter_max_attempts = waiter_max_attempts
+        self.warm_pool_size = warm_pool_size
+        self.warm_pool_ttl = warm_pool_ttl
+        self.bake_ami = bake_ami
+        self.baked_ami_id = baked_ami_id
+        self.one_shot = one_shot
+
+        # Guard: network IDs are required (provider no longer creates VPC/subnet/SG).
+        # Lambda-only serverless is the one exception: functions run in the
+        # Lambda-managed VPC, so there is nothing for the caller to pre-provision.
+        lambda_only = (
+            self.mode_type == OperatingModeType.SERVERLESS
+            and self.compute_type == ComputeType.LAMBDA
+        )
+        if not lambda_only and (not vpc_id or not subnet_id or not security_group_id):
+            raise ValueError(
+                "vpc_id, subnet_id, and security_group_id are required. "
+                "Pre-provision network resources outside the provider."
+            )
+
+        # Guard: the warm pool, AMI baking, and one-shot dispatch are implemented
+        # only by StandardMode, and _initialize_operating_mode() forwards them
+        # only on that branch. The provider itself, however, acts on them
+        # regardless of mode: it tags resources warm_pool=True, takes the
+        # warm-pool branch in _cleanup_resources(), and reports STATUS_WARM. No
+        # other mode's get_job_status() knows that status, so those instances are
+        # never cleaned up and leak with no error or warning. Refuse the
+        # combination rather than silently half-honouring it.
+        standard_only = [
+            name
+            for name, value, default in (
+                ("warm_pool_size", warm_pool_size, DEFAULT_WARM_POOL_SIZE),
+                ("warm_pool_ttl", warm_pool_ttl, DEFAULT_WARM_POOL_TTL),
+                ("bake_ami", bake_ami, DEFAULT_BAKE_AMI),
+                ("baked_ami_id", baked_ami_id, None),
+                ("one_shot", one_shot, DEFAULT_ONE_SHOT),
+            )
+            if value != default
+        ]
+        if standard_only and self.mode_type != OperatingModeType.STANDARD:
+            raise ProviderConfigurationError(
+                f"{', '.join(standard_only)} "
+                f"{'are' if len(standard_only) > 1 else 'is'} supported only by "
+                f"mode='standard', not mode='{self.mode_type.value}'. "
+                "The option would be silently ignored by the mode while the "
+                "provider still acted on it, leaking instances that no mode "
+                "would clean up."
+            )
+
+        # Guards: the same reasoning for the detached-only and serverless-only
+        # options (#136). Each is forwarded from exactly one branch of
+        # _initialize_operating_mode(), so setting one on another mode cannot take
+        # effect. Refusing is what distinguishes "you asked for a 5-minute idle
+        # timeout and got 30" from a config error you can see -- and cost
+        # controls (preserve_bastion, idle_timeout) and correctness settings
+        # (ecs_container_image) are exactly the wrong things to honour silently
+        # at their defaults.
+        #
+        # Scoped to the options this change makes reachable. bastion_instance_type,
+        # compute_type, memory_size, and timeout are mode-specific in the same way
+        # but were already accepted, so guarding them now would break callers who
+        # pass them harmlessly today; #155 tracks that separately.
+        self._reject_wrong_mode_options(
+            OperatingModeType.DETACHED,
+            (
+                ("idle_timeout", idle_timeout, DEFAULT_BASTION_IDLE_TIMEOUT),
+                ("preserve_bastion", preserve_bastion, DEFAULT_PRESERVE_BASTION),
+                ("bastion_host_type", bastion_host_type, DEFAULT_BASTION_HOST_TYPE),
+                ("workflow_id", workflow_id, None),
+            ),
+        )
+        self._reject_wrong_mode_options(
+            OperatingModeType.SERVERLESS,
+            (
+                ("lambda_runtime", lambda_runtime, DEFAULT_LAMBDA_RUNTIME),
+                ("ecs_task_cpu", ecs_task_cpu, DEFAULT_ECS_CPU),
+                ("ecs_task_memory", ecs_task_memory, DEFAULT_ECS_MEMORY),
+                (
+                    "ecs_container_image",
+                    ecs_container_image,
+                    DEFAULT_ECS_CONTAINER_IMAGE,
+                ),
+            ),
+        )
+
+        # Guard: cap the warm pool. Every warm instance is a *running* instance,
+        # billing for up to warm_pool_ttl seconds after its job ends, so an
+        # oversized pool is a silent cost rather than an error -- EC2 refuses
+        # nothing and no quota is necessarily reached.
+        if warm_pool_size < 0:
+            raise ValueError(
+                f"warm_pool_size must be >= 0, got {warm_pool_size} "
+                "(0 disables the warm pool)"
+            )
+        if warm_pool_size > MAX_WARM_POOL_SIZE:
+            raise ValueError(
+                f"warm_pool_size={warm_pool_size} exceeds the maximum of "
+                f"{MAX_WARM_POOL_SIZE}. Warm instances are held Running, not "
+                "Stopped, so each one bills at the full instance rate for up to "
+                "warm_pool_ttl seconds per idle period. If you need more than "
+                f"{MAX_WARM_POOL_SIZE} instances ready, raise init_blocks "
+                "instead so they are actually running work."
+            )
+        if warm_pool_ttl < 0:
+            raise ValueError(f"warm_pool_ttl must be >= 0, got {warm_pool_ttl}")
+
+        # A warm pool is a cost the caller may not have registered from the
+        # kwarg name alone, so state it once at construction with the actual
+        # numbers rather than only in the docstring.
+        if warm_pool_size > 0:
+            logger.warning(
+                f"Warm pool enabled: up to {warm_pool_size} instance(s) will be "
+                f"left RUNNING for {warm_pool_ttl}s after each job completes, "
+                f"billing for that whole window even when idle (up to "
+                f"{warm_pool_size * warm_pool_ttl}s of instance time per idle "
+                "period). Set warm_pool_size=0 to disable."
+            )
+
+        # Guard: one_shot is incompatible with warm pool (instances are terminated immediately)
+        if one_shot and warm_pool_size > 0:
+            raise ValueError(
+                "one_shot=True is incompatible with warm_pool_size > 0: "
+                "one-shot instances are terminated immediately and cannot be reused"
+            )
+
+        # Guard: the warm pool and one-shot mode both dispatch over SSM
+        # SendCommand, which needs the instance to carry an IAM instance profile
+        # holding AmazonSSMManagedInstanceCore. Without one the agent never
+        # registers and the command is never delivered.
+        needs_ssm = warm_pool_size > 0 or one_shot
+        if (
+            needs_ssm
+            and not auto_create_instance_profile
+            and not iam_instance_profile_arn
+        ):
+            trigger = "warm_pool_size > 0" if warm_pool_size > 0 else "one_shot=True"
+            raise ValueError(
+                f"{trigger} requires either auto_create_instance_profile=True "
+                "or iam_instance_profile_arn to be set (SSM SendCommand needs IAM permissions)"
+            )
+
+        # Initialize state
+        self.session = create_session(
+            region=self.region,
+            profile_name=self.profile_name,
+            endpoint_url=self.endpoint_url,
+        )
+
+        # Resolve the AMI now that a credentialed session exists. Deferred from
+        # the attribute block above because get_default_ami() queries SSM (#84).
+        if (
+            self.image_id is None
+            and self.mode_type
+            in (OperatingModeType.STANDARD, OperatingModeType.DETACHED)
+            and self.compute_type == ComputeType.EC2
+        ):
+            try:
+                self.image_id = get_default_ami(
+                    self.region, self.architecture, session=self.session
+                )
+                logger.info(
+                    f"Auto-detected {self.architecture} AMI {self.image_id} for "
+                    f"region {self.region}"
+                )
+            except Exception as e:
+                logger.warning(
+                    f"Failed to auto-detect AMI: {e}. Will need to be set later."
+                )
+                self.image_id = None
+
+        self.state_store = self._initialize_state_store()
+
+        # cores_per_node / mem_per_node are declared by Parsl's
+        # ExecutionProvider so an executor can size its worker pool -- HTEX
+        # divides them by its per-worker requirements, and guesses 1 worker per
+        # node when both are None. EC2 knows the real figures for the chosen
+        # instance type, so resolve them unless the caller said otherwise. The
+        # lookup is best-effort: it must not stop the provider constructing.
+        if cores_per_node is not None or mem_per_node is not None:
+            self.cores_per_node = cores_per_node
+            self.mem_per_node = mem_per_node
+        elif self.mode_type == OperatingModeType.SERVERLESS:
+            # Lambda and Fargate have no "node" to describe; memory_size is the
+            # per-invocation allocation, which is not the same concept.
+            self.cores_per_node = None
+            self.mem_per_node = None
+        else:
+            self.cores_per_node, self.mem_per_node = describe_instance_capacity(
+                self.session, self.instance_type
+            )
+
+        # Adopt any provider_id already recorded at this state location, before
+        # the operating mode is built with it.
+        if provider_id is None:
+            self._adopt_persisted_provider_id()
+
+        self.operating_mode = self._initialize_operating_mode()
+        # ``Dict[object, Any]`` is the type the base class declares. Keys are
+        # always the mode's string resource IDs in practice; the wider
+        # annotation exists so the attribute is a valid override.
+        self.resources: Dict[object, Any] = {}
+        self.job_map: Dict[str, Dict[str, Any]] = {}
+        # Re-entrant lock so cancel() → _cleanup_resources() doesn't deadlock
+        self._lock = threading.RLock()
+
+        # Restore whatever was persisted at this state location. Safe only now
+        # that the provider and its mode write separate keys (#78) — before
+        # that, loading here would have activated the mutual clobbering.
+        self._load_state()
+
+        logger.info(f"Initialized EphemeralProvider in {self.mode_type.value} mode")
+
+        # Auto-initialize the operating mode so the provider is ready for
+        # submit() immediately after construction (matches Parsl's
+        # ExecutionProvider contract — no separate initialize() call required).
+        self.operating_mode.initialize()
+
+    def _reject_wrong_mode_options(
+        self,
+        owning_mode: "OperatingModeType",
+        options: Sequence[tuple],
+    ) -> None:
+        """Raise if any *options* is set but the active mode is not *owning_mode*.
+
+        Each entry is ``(name, value, default)``. "Set" means differing from the
+        default, which is why the defaults are named constants rather than
+        literals: a guard comparing against a copied-out number stops firing the
+        moment the real default changes.
+
+        Refusing beats accepting-and-ignoring because these options are only
+        forwarded from one branch of ``_initialize_operating_mode()``. Silently
+        applying the default instead of the requested value is how a caller ends
+        up paying for a bastion they asked to have torn down (#136).
+        """
+        if self.mode_type == owning_mode:
+            return
+
+        misplaced = [name for name, value, default in options if value != default]
+        if not misplaced:
+            return
+
+        raise ProviderConfigurationError(
+            f"{', '.join(misplaced)} "
+            f"{'are' if len(misplaced) > 1 else 'is'} supported only by "
+            f"mode='{owning_mode.value}', not mode='{self.mode_type.value}'. "
+            f"The option is forwarded only on the {owning_mode.value} branch, so "
+            "it would have no effect while appearing to be configured."
+        )
+
+    def _validate_config(
+        self,
+        image_id: Optional[str],
+        mode: str,
+        compute_type: str,
+        state_store_type: str,
+        s3_bucket: Optional[str],
+        region: str,
+        min_blocks: int,
+        max_blocks: int,
+        init_blocks: int,
+    ) -> None:
+        """Validate the configuration parameters.
+
+        Parameters
+        ----------
+        image_id : Optional[str]
+            EC2 AMI ID to use for instances.
+        mode : str
+            Operating mode.
+        compute_type : str
+            Type of compute resource.
+        state_store_type : str
+            Type of state store to use.
+        s3_bucket : Optional[str]
+            S3 bucket name when using 's3' state store.
+        region : str
+            AWS region name.
+        min_blocks : int
+            Minimum number of blocks to maintain.
+        max_blocks : int
+            Maximum number of blocks to provision.
+        init_blocks : int
+            Number of blocks to provision at start.
+
+        Raises
+        ------
+        ProviderConfigurationError
+            If the configuration is invalid.
+
+        Notes
+        -----
+        ``instance_type`` is deliberately not validated. There are thousands of
+        names and AWS adds more continually, so any local check would either
+        reject valid new families or wave through typos; ``RunInstances``
+        rejects a bad one authoritatively. ``image_id`` is likewise not
+        required — omitting it selects a per-region default.
+        """
+        # Validate operating mode
+        try:
+            mode_type = OperatingModeType(mode.lower())
+        except ValueError:
+            raise ProviderConfigurationError(
+                f"Invalid operating mode: {mode}. Must be one of: "
+                f"{', '.join([m.value for m in OperatingModeType])}"
+            )
+
+        # Validate the region against botocore's shipped endpoint data. This is
+        # offline and self-maintaining. Without it an unknown region surfaces
+        # much later as an opaque EndpointConnectionError from whichever AWS
+        # call happens to run first — in standard mode that is inside
+        # initialize(), after the state store has already been created.
+        self._validate_region(region)
+
+        # Note: image_id validation removed - it will be auto-detected if not provided
+
+        # Validate state store type
+        try:
+            store_type = StateStoreType(state_store_type.lower())
+        except ValueError:
+            raise ProviderConfigurationError(
+                f"Invalid state store type: {state_store_type}. Must be one of: "
+                f"{', '.join([s.value for s in StateStoreType])}"
+            )
+
+        # Validate S3 bucket when using S3 state store
+        if store_type == StateStoreType.S3 and not s3_bucket:
+            raise ProviderConfigurationError(
+                "s3_bucket is required when using 's3' state store"
+            )
+
+        # Validate compute type
+        try:
+            ComputeType(compute_type.lower())
+        except ValueError:
+            raise ProviderConfigurationError(
+                f"Invalid compute type: {compute_type}. Must be one of: "
+                f"{', '.join([c.value for c in ComputeType])}"
+            )
+
+        self._validate_block_counts(min_blocks, max_blocks, init_blocks)
+
+    @staticmethod
+    def _validate_block_counts(
+        min_blocks: int, max_blocks: int, init_blocks: int
+    ) -> None:
+        """Check that the three block counts describe a reachable range (#108).
+
+        Parsl's scaling strategy reads ``min_blocks``/``max_blocks`` straight off
+        the provider (``parsl/jobs/strategy.py:207``) and validates neither. With
+        ``min_blocks > max_blocks`` the executor is pinned: case 1a
+        (``active_blocks <= min_blocks``) holds at every reachable count so idle
+        scale-in never happens, while case 2a (``active_blocks >= max_blocks``)
+        refuses to scale out — it cannot grow to the minimum it is told to hold
+        and will not shrink because it believes it is already there. Negative
+        counts are nonsense outright, and since ``max_blocks`` doubles as the
+        submit-time capacity limit, a negative one rejects every job.
+
+        This check existed at ``f32eb23:232`` and was lost in the ``cc4a240``
+        rewrite.
+        """
+        negative = [
+            name
+            for name, value in (
+                ("min_blocks", min_blocks),
+                ("max_blocks", max_blocks),
+                ("init_blocks", init_blocks),
+            )
+            if value < 0
+        ]
+        if negative:
+            raise ProviderConfigurationError(f"{', '.join(negative)} must be >= 0")
+
+        if max_blocks < min_blocks:
+            raise ProviderConfigurationError(
+                f"max_blocks ({max_blocks}) cannot be less than min_blocks "
+                f"({min_blocks}): no block count satisfies both, and Parsl's "
+                "scaling strategy would refuse to scale out or in."
+            )
+
+        if not min_blocks <= init_blocks <= max_blocks:
+            raise ProviderConfigurationError(
+                f"init_blocks ({init_blocks}) must be between min_blocks "
+                f"({min_blocks}) and max_blocks ({max_blocks})"
+            )
+
+    # Every partition botocore ships endpoint data for. The commercial
+    # partition alone would reject GovCloud and China regions, which are
+    # perfectly usable here.
+    _AWS_PARTITIONS = ("aws", "aws-cn", "aws-us-gov", "aws-iso", "aws-iso-b")
+
+    @classmethod
+    def _known_regions(cls) -> set:
+        """Return every EC2 region botocore knows, across all partitions.
+
+        Reads the packaged endpoint data through ``botocore.session`` rather
+        than ``boto3.Session``: this is an offline table lookup, not an AWS
+        call, and going through boto3 would make the result depend on whether a
+        caller happens to have patched ``boto3.Session`` — which every test in
+        this suite does.
+        """
+        known: set = set()
+        session = botocore.session.get_session()
+        for partition in cls._AWS_PARTITIONS:
+            try:
+                known.update(
+                    session.get_available_regions("ec2", partition_name=partition)
+                )
+            except Exception as e:  # pragma: no cover - packaged data
+                logger.debug(f"No endpoint data for partition {partition}: {e}")
+        return known
+
+    @classmethod
+    def _validate_region(cls, region: str) -> None:
+        """Reject a region name botocore does not know about.
+
+        Raises
+        ------
+        ProviderConfigurationError
+            If ``region`` is not a known EC2 region.
+        """
+        known = cls._known_regions()
+        if not known:  # pragma: no cover - packaged data
+            # Never let unreadable endpoint data block construction; a bad
+            # region still fails at the first AWS call.
+            logger.debug("Could not load the botocore region list, skipping check")
+            return
+
+        if region not in known:
+            raise ProviderConfigurationError(
+                f"Invalid region: {region}. Must be one of: {', '.join(sorted(known))}"
+            )
+
+    def _parameter_store_prefix(self) -> str:
+        """Return the SSM parameter prefix the state keys hang off.
+
+        Each state key becomes ``{prefix}/{key}``, so two providers sharing a
+        path share a slot — the same semantics as two ``FileStateStore``
+        instances on one file path, which is what makes state hand-off between
+        provider instances possible.
+        """
+        return self.parameter_store_path.rstrip("/")
+
+    def _s3_key_prefix(self) -> str:
+        """Return the S3 key prefix the state keys hang off.
+
+        ``s3_key`` predates state keys and defaults to a file name, which would
+        yield the odd ``ephemeral_aws_state.json/provider``. A ``.json`` suffix
+        is dropped so the prefix reads as the directory it now is.
+        """
+        prefix = self.s3_key.rstrip("/")
+        if prefix.endswith(".json"):
+            prefix = prefix[: -len(".json")]
+        return prefix
+
+    def _initialize_state_store(self) -> StateStore:
+        """Initialize the state store based on configuration.
+
+        Returns
+        -------
+        StateStore
+            The initialized state store.
+        """
+        if self.state_store_type == StateStoreType.FILE:
+            return FileStateStore(
+                file_path=self.state_file_path, provider_id=self.provider_id
+            )
+        elif self.state_store_type == StateStoreType.PARAMETER_STORE:
+            # The AWS stores take the provider itself: they read its region and
+            # credentials, and Parameter Store also reads its audit_logger.
+            return ParameterStoreStateStore(
+                provider=self,
+                prefix=self._parameter_store_prefix(),
+            )
+        elif self.state_store_type == StateStoreType.S3:
+            if not self.s3_bucket:
+                raise ProviderConfigurationError(
+                    "s3_bucket is required when using 's3' state store"
+                )
+            return S3StateStore(
+                provider=self,
+                bucket_name=self.s3_bucket,
+                key_prefix=self._s3_key_prefix(),
+            )
+        else:
+            raise ProviderConfigurationError(
+                f"Unsupported state store type: {self.state_store_type}"
+            )
+
+    def _initialize_operating_mode(self) -> OperatingMode:
+        """Initialize the operating mode based on configuration.
+
+        Returns
+        -------
+        OperatingMode
+            The initialized operating mode.
+        """
+        common_params = {
+            "provider_id": self.provider_id,
+            "session": self.session,
+            "state_store": self.state_store,
+            "image_id": self.image_id,
+            "instance_type": self.instance_type,
+            "worker_init": self.worker_init,
+            "vpc_id": self.vpc_id,
+            "subnet_id": self.subnet_id,
+            "security_group_id": self.security_group_id,
+            "key_name": self.key_name,
+            "use_spot": self.use_spot,
+            "spot_max_price": self.spot_max_price,
+            "spot_allocation_strategy": self.spot_allocation_strategy,
+            "spot_interruption_handling": self.spot_interruption_handling,
+            # All three modes accept these; without the forwarding the whole
+            # Spot Fleet path was unreachable through the provider (#105).
+            "use_spot_fleet": self.use_spot_fleet,
+            "instance_types": self.instance_types,
+            "spot_max_price_percentage": self.spot_max_price_percentage,
+            "nodes_per_block": self.nodes_per_block,
+            "additional_tags": self.additional_tags,
+            "auto_shutdown": self.auto_shutdown,
+            "max_idle_time": self.max_idle_time,
+            "use_public_ips": self.use_public_ips,
+            "custom_ami": self.custom_ami,
+            "debug": self.debug,
+            "region": self.region,
+        }
+
+        if self.mode_type == OperatingModeType.STANDARD:
+            return StandardMode(
+                iam_instance_profile_arn=self.iam_instance_profile_arn,
+                auto_create_instance_profile=self.auto_create_instance_profile,
+                warm_pool_size=self.warm_pool_size,
+                warm_pool_ttl=self.warm_pool_ttl,
+                bake_ami=self.bake_ami,
+                baked_ami_id=self.baked_ami_id,
+                one_shot=self.one_shot,
+                **common_params,
+            )
+        elif self.mode_type == OperatingModeType.DETACHED:
+            return DetachedMode(
+                bastion_instance_type=self.bastion_instance_type,
+                # Unreachable before #136: the mode accepted all four and read
+                # them, but nothing forwarded them, so the defaults always won.
+                idle_timeout=self.idle_timeout,
+                preserve_bastion=self.preserve_bastion,
+                bastion_host_type=self.bastion_host_type,
+                # DetachedMode substitutes a fresh UUID when this is None, which
+                # is why it is forwarded as-is rather than defaulted here.
+                workflow_id=self.workflow_id,
+                **common_params,
+            )
+        elif self.mode_type == OperatingModeType.SERVERLESS:
+            return ServerlessMode(
+                compute_type=self.compute_type,
+                memory_size=self.memory_size,
+                timeout=self.timeout,
+                # Unreachable before #136. ecs_container_image is the consequential
+                # one: without it every Fargate task ran the same fixed image, so
+                # serverless mode could not run a workload with its own
+                # dependencies -- the usual reason to choose Fargate over Lambda.
+                lambda_runtime=self.lambda_runtime,
+                ecs_task_cpu=self.ecs_task_cpu,
+                ecs_task_memory=self.ecs_task_memory,
+                ecs_container_image=self.ecs_container_image,
+                **common_params,
+            )
+        else:
+            raise ProviderConfigurationError(
+                f"Unsupported operating mode: {self.mode_type}"
+            )
+
+    def submit(
+        self, command: str, tasks_per_node: int, job_name: str = "parsl.auto"
+    ) -> str:
+        """Submit a job to execute the specified command.
+
+        Parameters
+        ----------
+        command : str
+            Command to execute.
+        tasks_per_node : int
+            Number of tasks to run per node.
+        job_name : str
+            Human-friendly name for the job request. Defaults to Parsl's
+            ``"parsl.auto"`` sentinel, which is replaced with a unique
+            generated name.
+
+        Returns
+        -------
+        str
+            Job ID for tracking status.
+        """
+        # ``"parsl.auto"`` is the base class's default, and `None` was this
+        # provider's own former default; both mean "no caller-chosen name".
+        if not job_name or job_name == "parsl.auto":
+            job_name = f"parsl-job-{str(uuid.uuid4())[:8]}"
+        job_id = f"{self.provider_id}-{str(uuid.uuid4())}"
+
+        # Check if we have capacity (lock protects len(self.resources))
+        with self._lock:
+            if len(self.resources) >= self.max_blocks:
+                logger.warning(
+                    f"Cannot submit job {job_name}, already at max_blocks = {self.max_blocks}"
+                )
+                raise ProviderError(
+                    f"Cannot submit job, already at max_blocks = {self.max_blocks}"
+                )
+
+        # Submit the job to the operating mode (outside the lock — may be slow)
+        try:
+            resource_id = self.operating_mode.submit_job(
+                job_id=job_id,
+                command=command,
+                tasks_per_node=tasks_per_node,
+                job_name=job_name,
+            )
+
+            # Record the job in our internal maps (lock protects dict writes)
+            with self._lock:
+                self.resources[resource_id] = {
+                    "job_id": job_id,
+                    "job_name": job_name,
+                    "status": "PENDING",
+                    "tasks_per_node": tasks_per_node,
+                    "command": command,
+                    "timestamp": time.time(),
+                }
+                if self.warm_pool_size > 0:
+                    self.resources[resource_id]["warm_pool"] = True
+
+                self.job_map[job_id] = {
+                    "resource_id": resource_id,
+                    "job_name": job_name,
+                    "status": "PENDING",
+                }
+
+            # Update the state store
+            self._save_state()
+
+            logger.info(f"Submitted job {job_name} with ID {job_id}")
+            return job_id
+
+        except Exception as e:
+            logger.error(f"Failed to submit job {job_name}: {e}")
+            raise ProviderError(f"Failed to submit job: {e}")
+
+    def status(self, job_ids: Sequence[object]) -> List[JobStatus]:
+        """Get the status of a list of jobs.
+
+        Parameters
+        ----------
+        job_ids : Sequence[object]
+            Job identifiers as returned by :meth:`submit`. Typed as ``object``
+            to match Parsl's ``ExecutionProvider``, which treats job IDs as
+            opaque; this provider issues strings, so anything else resolves to
+            ``JobState.UNKNOWN`` rather than raising.
+
+        Returns
+        -------
+        List[JobStatus]
+            List of JobStatus objects corresponding to each job_id.
+        """
+        # Narrow each opaque ID to the string key ``job_map`` uses, once, so the
+        # internal map stays string-keyed. An ID this provider never issued — or
+        # one that is not a string at all — narrows to None and falls through to
+        # UNKNOWN rather than raising.
+        job_keys = [jid if isinstance(jid, str) else None for jid in job_ids]
+
+        # Statuses are collected by *position*, not by ID. ``Sequence[object]``
+        # permits unhashable IDs, so keying this by the ID itself would raise
+        # ``TypeError: unhashable type`` on e.g. a list — and the return value is
+        # positional regardless, so duplicate IDs also stay correct.
+        internal_statuses: Dict[int, str] = {}
+
+        try:
+            # Short-circuit jobs already in a terminal state — avoids stale
+            # re-queries when an instance has been reused for a different job.
+            with self._lock:
+                for i, key in enumerate(job_keys):
+                    if key is not None and key in self.job_map:
+                        cached = self.job_map[key].get("status", "UNKNOWN")
+                        if cached in _TERMINAL_STATES:
+                            internal_statuses[i] = cached
+
+                # Only poll for non-terminal jobs
+                resource_ids = [
+                    self.job_map[key]["resource_id"]
+                    for key in job_keys
+                    if key is not None
+                    and key in self.job_map
+                    and self.job_map[key].get("status") not in _TERMINAL_STATES
+                ]
+
+            # Fetch status outside lock (may involve network calls)
+            status_map = (
+                self.operating_mode.get_job_status(resource_ids) if resource_ids else {}
+            )
+
+            # Update internal state under lock
+            with self._lock:
+                for i, key in enumerate(job_keys):
+                    if i in internal_statuses:
+                        continue  # already set by terminal short-circuit
+                    if key is not None and key in self.job_map:
+                        resource_id = self.job_map[key]["resource_id"]
+                        if resource_id in status_map:
+                            status_str = status_map[resource_id]
+                            self.job_map[key]["status"] = status_str
+                            if resource_id in self.resources:
+                                self.resources[resource_id]["status"] = status_str
+                            internal_statuses[i] = status_str
+                        else:
+                            # Resource not found — likely already cleaned up
+                            internal_statuses[i] = "COMPLETED"
+                    else:
+                        internal_statuses[i] = "UNKNOWN"
+
+            # Save the updated state
+            self._save_state()
+
+        except Exception as e:
+            logger.error(f"Failed to get status for jobs {job_ids}: {e}")
+            for i in range(len(job_keys)):
+                internal_statuses.setdefault(i, "UNKNOWN")
+
+        # Trigger cleanup to process warm-pool transitions and TTL evictions, and
+        # to terminate finished one-shot instances — their command is delivered
+        # over SSM rather than UserData, so nothing on the instance shuts it down.
+        # _cleanup_resources() is idempotent and handles its own errors.
+        if self.warm_pool_size > 0 or self.one_shot:
+            self._cleanup_resources()
+
+        return [
+            JobStatus(
+                _STRING_TO_JOB_STATE.get(
+                    internal_statuses.get(i, "UNKNOWN"), JobState.UNKNOWN
+                )
+            )
+            for i in range(len(job_keys))
+        ]
+
+    def cancel(self, job_ids: Sequence[object]) -> List[bool]:
+        """Cancel specified jobs.
+
+        Parameters
+        ----------
+        job_ids : Sequence[object]
+            Job identifiers to cancel. Typed as ``object`` to match Parsl's
+            ``ExecutionProvider``; an ID this provider never issued reports
+            ``False`` rather than raising.
+
+        Returns
+        -------
+        List[bool]
+            True for each job_id where cancellation was accepted, False otherwise.
+        """
+        # Narrow to ``job_map``'s string keys once — see status() for why.
+        job_keys = [jid if isinstance(jid, str) else None for jid in job_ids]
+
+        # Success tracked by position, not by ID: an unhashable ID is legal under
+        # ``Sequence[object]`` and would raise TypeError as a dict key. Defaults
+        # to False (unknown / not found).
+        cancel_results: Dict[int, bool] = {i: False for i in range(len(job_keys))}
+
+        try:
+            # Read resource IDs under lock
+            with self._lock:
+                resources_to_terminate = [
+                    self.job_map[key]["resource_id"]
+                    for key in job_keys
+                    if key is not None and key in self.job_map
+                ]
+
+            # Cancel jobs outside lock (may involve network calls)
+            cancel_map = self.operating_mode.cancel_jobs(resources_to_terminate)
+
+            # Update internal state under lock
+            with self._lock:
+                for i, key in enumerate(job_keys):
+                    if key is not None and key in self.job_map:
+                        resource_id = self.job_map[key]["resource_id"]
+                        if resource_id in cancel_map:
+                            status_str = cancel_map[resource_id]
+                            self.job_map[key]["status"] = status_str
+                            if resource_id in self.resources:
+                                self.resources[resource_id]["status"] = status_str
+                            cancel_results[i] = status_str != "UNKNOWN"
+                        # else: resource not in cancel_map → remains False
+
+            # Clean up completed/failed resources (acquires lock internally)
+            self._cleanup_resources()
+
+            # Save the updated state
+            self._save_state()
+
+        except Exception as e:
+            logger.error(f"Failed to cancel jobs {job_ids}: {e}")
+
+        return [cancel_results[i] for i in range(len(job_keys))]
+
+    def _save_state(self) -> None:
+        """Save the current state under the provider's own state key.
+
+        The operating mode writes ``STATE_KEY_MODE`` from its own
+        ``save_state()``. Both used to write the whole document to one slot with
+        different key sets, so each overwrite destroyed the other's fields —
+        losing ``job_map`` here and the baked AMI ID there (#78).
+        """
+        with self._lock:
+            state = {
+                "provider_id": self.provider_id,
+                "mode": self.mode_type.value,
+                "resources": dict(self.resources),
+                "job_map": dict(self.job_map),
+                "timestamp": time.time(),
+                "warm_instances": list(
+                    getattr(self.operating_mode, "_warm_instances", [])
+                ),
+            }
+
+        try:
+            self.state_store.save_state(STATE_KEY_PROVIDER, state)
+            logger.debug("Saved provider state")
+        except Exception as e:
+            logger.error(f"Failed to save provider state: {e}")
+
+    def _adopt_persisted_provider_id(self) -> None:
+        """Take over the provider_id recorded at this state location, if any.
+
+        Nothing about *where* state is stored depends on ``provider_id`` — the
+        file path, SSM prefix, and S3 key prefix are the only scoping. So two
+        providers sharing a path share a slot, which is exactly how state is
+        handed from one provider instance to its successor.
+
+        But ``provider_id`` defaults to a fresh UUID, and both this class and
+        ``OperatingMode.load_state()`` refuse to load a document whose
+        ``provider_id`` differs from their own. A successor therefore rejected
+        the very state it was pointed at, unless the caller happened to pass the
+        original ID back in. Adopting the persisted ID makes restart work with
+        nothing but a shared state location.
+
+        Only called when the caller did not pass ``provider_id`` explicitly; an
+        explicit ID is a deliberate choice and is left alone.
+
+        Both keys are consulted. The provider writes its own key only once a job
+        has been submitted, so a provider that constructed and exited without
+        submitting leaves the mode key alone at the location — and that is
+        precisely the state a successor needs, since it holds the network IDs and
+        the baked-AMI ownership flag.
+        """
+        for state_key in (STATE_KEY_PROVIDER, STATE_KEY_MODE):
+            try:
+                state = self.state_store.load_state(state_key)
+            except Exception as e:
+                logger.debug(f"No {state_key} state to adopt an ID from: {e}")
+                continue
+
+            persisted_id = (state or {}).get("provider_id")
+            if persisted_id and persisted_id != self.provider_id:
+                logger.info(
+                    f"Adopting provider_id {persisted_id} from {state_key} state"
+                )
+                self.provider_id = persisted_id
+                return
+
+    def _load_state(self) -> None:
+        """Load the state stored under the provider's own state key."""
+        try:
+            state = self.state_store.load_state(STATE_KEY_PROVIDER)
+            if state and state.get("provider_id") == self.provider_id:
+                with self._lock:
+                    self.resources = state.get("resources", {})
+                    self.job_map = state.get("job_map", {})
+                    # Restore warm-pool instance list into the operating mode
+                    if self.warm_pool_size > 0 and hasattr(
+                        self.operating_mode, "_warm_instances"
+                    ):
+                        self.operating_mode._warm_instances = state.get(
+                            "warm_instances", []
+                        )
+                logger.info(f"Loaded state with {len(self.resources)} resources")
+        except Exception as e:
+            logger.error(f"Failed to load provider state: {e}")
+
+    def _delete_state(self) -> None:
+        """Delete the persisted state for both the provider and its mode.
+
+        Both keys go: a mode document that outlives the provider's still
+        describes network IDs and a baked AMI that shutdown has just released.
+        """
+        try:
+            self.state_store.delete_state(STATE_KEY_PROVIDER)
+        except Exception as e:
+            logger.error(f"Failed to delete provider state: {e}")
+
+        delete_mode_state = getattr(self.operating_mode, "delete_state", None)
+        if callable(delete_mode_state):
+            try:
+                delete_mode_state()
+            except Exception as e:
+                logger.error(f"Failed to delete mode state: {e}")
+
+    def _cleanup_resources(self) -> None:
+        """Clean up resources that are completed or failed.
+
+        Also handles the warm-pool lifecycle: transitioning COMPLETED warm-pool
+        instances to WARM state (keeping them alive for reuse) and evicting
+        instances that have exceeded their TTL.
+        """
+        resources_to_cleanup: List[str] = []
+        warm_transitions: List[str] = []  # COMPLETED warm-pool → WARM
+
+        # Scan resources under lock to build action lists
+        with self._lock:
+            for resource_id, resource in self.resources.items():
+                # Parsl's base class declares ``resources`` as ``Dict[object, Any]``,
+                # but every key this provider inserts is a mode-issued string ID.
+                # Narrow here so cleanup_resources() and job_map stay string-typed.
+                if not isinstance(resource_id, str):
+                    continue
+                status = resource.get("status", "UNKNOWN")
+
+                if resource.get("warm_pool"):
+                    if status == STATUS_WARM:
+                        # Check TTL for warm idle instances
+                        age = time.time() - resource.get("warm_since", 0)
+                        if age > self.warm_pool_ttl:
+                            logger.info(
+                                f"Warm instance {resource_id} TTL expired "
+                                f"({age:.0f}s > {self.warm_pool_ttl}s), terminating"
+                            )
+                            resources_to_cleanup.append(resource_id)
+                        continue  # don't apply normal cleanup logic
+
+                    elif status == "COMPLETED":
+                        warm_transitions.append(resource_id)
+                        continue  # decision made below
+
+                    # STATUS_INTERRUPTED is here rather than in the WARM branch
+                    # above on purpose: a reclaimed instance is being taken by
+                    # AWS, so it must never be recycled into the pool (#137).
+                    elif status in ("FAILED", "CANCELED", STATUS_INTERRUPTED):
+                        resources_to_cleanup.append(resource_id)
+                        continue
+
+                    else:
+                        continue  # PENDING/RUNNING — leave alone
+
+                # Normal (non-warm-pool) lifecycle. STATUS_INTERRUPTED terminates
+                # like any other terminal state -- omitting it leaked the
+                # instance, trading a silently-successful reclaim for a silent
+                # cost leak (#137).
+                if status in ["COMPLETED", "FAILED", "CANCELED", STATUS_INTERRUPTED]:
+                    resources_to_cleanup.append(resource_id)
+
+                # A RUNNING resource is never reaped here. There used to be a
+                # branch that terminated one once
+                # `time.time() - resource["timestamp"] > max_idle_time`, but
+                # "timestamp" is stamped once at submit and never refreshed, so
+                # that expression measured wall-clock age since submission and
+                # had no idleness component at all -- it killed any task that
+                # simply ran longer than the limit, mid-flight (#194).
+                #
+                # It cannot be repaired at this layer: idleness means "no tasks
+                # assigned", and a provider never sees task state. Parsl does,
+                # and already reaps on it -- HighThroughputExecutor.scale_in
+                # selects blocks with `idle > max_idletime and tasks == 0` from
+                # per-manager `idle_duration` and `tasks` counts that only the
+                # interchange has. Set `max_idletime` on the Parsl config to
+                # tune it.
+                #
+                # Nothing is leaked by dropping this. Whenever auto_shutdown is
+                # set -- the only case the old branch fired in -- the worker's
+                # UserData ends in `shutdown -h now`
+                # (modes/standard.py:_generate_init_script) with
+                # InstanceInitiatedShutdownBehavior=terminate, so a worker that
+                # finishes its command terminates itself, and the COMPLETED
+                # branch above collects the record.
+
+        # Process COMPLETED → WARM transitions
+        state_dirty = False
+        if warm_transitions:
+            with self._lock:
+                current_warm = [
+                    rid
+                    for rid, r in self.resources.items()
+                    if isinstance(rid, str)
+                    and r.get("warm_pool")
+                    and r.get("status") == STATUS_WARM
+                ]
+                for resource_id in warm_transitions:
+                    if resource_id not in self.resources:
+                        continue
+                    # Every branch below mutates resource status and the mode's
+                    # reuse list, so the state file is now behind memory.
+                    state_dirty = True
+                    if len(current_warm) < self.warm_pool_size:
+                        # Transition this instance into the warm pool
+                        self.resources[resource_id]["status"] = STATUS_WARM
+                        self.resources[resource_id]["warm_since"] = time.time()
+                        current_warm.append(resource_id)
+                        if hasattr(self.operating_mode, "_warm_instances"):
+                            self.operating_mode._warm_instances.append(resource_id)
+                        logger.info(
+                            f"Instance {resource_id} moved to warm pool "
+                            f"({len(current_warm)}/{self.warm_pool_size})"
+                        )
+                    else:
+                        # Pool full — evict the oldest warm instance to make room
+                        oldest = min(
+                            current_warm,
+                            key=lambda r: self.resources.get(r, {}).get(
+                                "warm_since", 0
+                            ),
+                        )
+                        current_warm.remove(oldest)
+                        resources_to_cleanup.append(oldest)
+                        if hasattr(self.operating_mode, "_warm_instances"):
+                            try:
+                                self.operating_mode._warm_instances.remove(oldest)
+                            except ValueError:
+                                pass
+                        logger.info(
+                            f"Warm pool full; evicting oldest instance {oldest}, "
+                            f"replacing with {resource_id}"
+                        )
+                        self.resources[resource_id]["status"] = STATUS_WARM
+                        self.resources[resource_id]["warm_since"] = time.time()
+                        current_warm.append(resource_id)
+                        if hasattr(self.operating_mode, "_warm_instances"):
+                            self.operating_mode._warm_instances.append(resource_id)
+
+        # Remove TTL-expired warm instances from the mode's reuse list before
+        # the network termination call (so they can't be dispatched to mid-flight)
+        if resources_to_cleanup and hasattr(self.operating_mode, "_warm_instances"):
+            with self._lock:
+                for resource_id in resources_to_cleanup:
+                    resource = self.resources.get(resource_id, {})
+                    if (
+                        resource.get("warm_pool")
+                        and resource.get("status") == STATUS_WARM
+                    ):
+                        try:
+                            self.operating_mode._warm_instances.remove(resource_id)
+                        except ValueError:
+                            pass
+
+        # Terminate and remove cleaned-up resources (network calls, outside lock)
+        if resources_to_cleanup:
+            try:
+                self.operating_mode.cleanup_resources(resources_to_cleanup)
+
+                # Update internal state under lock
+                with self._lock:
+                    for resource_id in resources_to_cleanup:
+                        if resource_id in self.resources:
+                            job_id = self.resources[resource_id].get("job_id")
+                            del self.resources[resource_id]
+                            if job_id and job_id in self.job_map:
+                                del self.job_map[job_id]
+
+                state_dirty = True
+                logger.info(f"Cleaned up {len(resources_to_cleanup)} resources")
+            except Exception as e:
+                logger.error(f"Failed to clean up resources: {e}")
+
+        # Persist whatever changed. This must run even when nothing needed
+        # terminating: a COMPLETED → WARM transition is a state change by
+        # itself, and dropping it means a restarted provider forgets the warm
+        # instances it is still being billed for.
+        #
+        # Both documents, because the warm pool is recorded in both and the
+        # mode's copy is the one that survives: __init__ restores
+        # ``_warm_instances`` from the provider key, then
+        # ``operating_mode.initialize()`` runs ``load_state()``, which overwrites
+        # it from the mode key. Saving only the provider key here left that key
+        # stale, so a successor read the pool and then immediately discarded it.
+        if state_dirty:
+            self._save_state()
+            mode_save_state = getattr(self.operating_mode, "save_state", None)
+            if callable(mode_save_state):
+                try:
+                    mode_save_state()
+                except Exception as e:
+                    logger.error(f"Failed to save operating mode state: {e}")
+
+    def scale_in(self, blocks: int) -> List[str]:
+        """Scale in the number of blocks by the specified amount.
+
+        Parameters
+        ----------
+        blocks : int
+            Number of blocks to scale in by.
+
+        Returns
+        -------
+        List[str]
+            List of job IDs that were terminated.
+        """
+        if blocks <= 0:
+            return []
+
+        # Find running resources to terminate (lock protects self.resources)
+        with self._lock:
+            running_resources = [
+                resource_id
+                for resource_id, resource in self.resources.items()
+                if resource.get("status") == "RUNNING"
+            ]
+            resources_to_terminate = running_resources[:blocks]
+            # Drop resources carrying no job_id rather than passing None down.
+            # A tracked resource normally has one, but a partially-restored
+            # state document or an interrupted submit can leave it absent, and
+            # `@typechecked` on this class turns that into a TypeCheckError from
+            # cancel() instead of a no-op.
+            job_ids = [
+                job_id
+                for resource_id in resources_to_terminate
+                if (job_id := self.resources.get(resource_id, {}).get("job_id"))
+                is not None
+            ]
+
+        # Cancel the selected jobs (cancel() acquires the lock internally)
+        self.cancel(job_ids)
+
+        return job_ids
+
+    def scale_out(self, blocks: int) -> List[str]:
+        """Scale out resources by the specified number of blocks.
+
+        Parameters
+        ----------
+        blocks : int
+            Number of blocks to scale out by.
+
+        Returns
+        -------
+        List[str]
+            List of job IDs for the new resources.
+        """
+        # Not implemented in the base provider
+        # This would be implemented by Parsl's strategy components
+        return []
+
+    def shutdown(self) -> None:
+        """Shutdown the provider and cleanup all resources."""
+        logger.info("Shutting down EphemeralProvider")
+
+        try:
+            # Cancel all jobs (cancel() acquires the lock internally)
+            with self._lock:
+                job_ids = list(self.job_map.keys())
+            if job_ids:
+                self.cancel(job_ids)
+
+            # Clean up infrastructure (outside lock — may be slow)
+            self.operating_mode.cleanup_infrastructure()
+
+            # Clear state
+            with self._lock:
+                self.resources = {}
+                self.job_map = {}
+
+            # Delete the persisted state rather than saving an empty document.
+            # The resources it describes are gone, so a surviving document only
+            # misleads the next provider that reads the same slot — and for the
+            # AWS backends it also leaves parameters and objects behind.
+            self._delete_state()
+
+            logger.info("Provider shutdown complete")
+        except Exception as e:
+            logger.error(f"Error during provider shutdown: {e}")
+
+    def list_resources(self) -> Dict[str, List[Dict[str, Any]]]:
+        """List all resources created by this provider.
+
+        Returns
+        -------
+        Dict[str, List[Dict[str, Any]]]
+            Dictionary of resource types and their details.
+        """
+        try:
+            return self.operating_mode.list_resources()
+        except Exception as e:
+            logger.error(f"Failed to list resources: {e}")
+            return {}
+
+    def cleanup_all(self) -> None:
+        """Clean up all resources created by this provider."""
+        logger.info("Cleaning up all resources")
+
+        try:
+            # Clean up all resources in the operating mode
+            self.operating_mode.cleanup_all()
+
+            # Clear state
+            self.resources = {}
+            self.job_map = {}
+
+            # Save the empty state
+            self._save_state()
+
+            logger.info("All resources cleaned up")
+        except Exception as e:
+            logger.error(f"Failed to clean up all resources: {e}")
+            raise ProviderError(f"Failed to clean up all resources: {e}")
+
+    @property
+    def status_polling_interval(self) -> int:
+        """Return the status polling interval for the provider.
+
+        Returns
+        -------
+        int
+            Polling interval in seconds.
+        """
+        return self._status_polling_interval
+
+    @property
+    def label(self) -> str:
+        """Return the label for the provider.
+
+        Returns
+        -------
+        str
+            Provider label.
+        """
+        return f"ephemeral-aws-{self.mode_type.value}-{self.provider_id[:8]}"
+
+    def __repr__(self) -> str:
+        """Return string representation of the provider.
+
+        Returns
+        -------
+        str
+            String representation.
+        """
+        return (
+            f"EphemeralProvider(mode={self.mode_type.value}, "
+            f"region={self.region}, "
+            f"min_blocks={self.min_blocks}, "
+            f"max_blocks={self.max_blocks})"
+        )

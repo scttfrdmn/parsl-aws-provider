@@ -1,5 +1,5 @@
-Parsl AWS Provider
-==================
+Parsl Ephemeral Provider for AWS
+================================
 
 A provider for the `Parsl <https://parsl-project.org/>`_ parallel scripting library
 that runs workflows on ephemeral AWS resources: instances are created when work
@@ -9,8 +9,8 @@ arrives and destroyed when it finishes.
    :target: https://opensource.org/licenses/Apache-2.0
    :alt: License
 
-.. image:: https://github.com/scttfrdmn/parsl-aws-provider/actions/workflows/ci.yml/badge.svg
-   :target: https://github.com/scttfrdmn/parsl-aws-provider/actions/workflows/ci.yml
+.. image:: https://github.com/scttfrdmn/parsl-ephemeral-provider/actions/workflows/ci.yml/badge.svg
+   :target: https://github.com/scttfrdmn/parsl-ephemeral-provider/actions/workflows/ci.yml
    :alt: Build Status
 
 .. warning::
@@ -48,9 +48,9 @@ Quick example
    import parsl
    from parsl.config import Config
    from parsl.executors import HighThroughputExecutor
-   from parsl_aws_provider import EphemeralAWSProvider
+   from parsl_ephemeral_provider import EphemeralProvider
 
-   provider = EphemeralAWSProvider(
+   provider = EphemeralProvider(
        region="us-east-1",
        instance_type="t3.medium",
        # Pre-provisioned network resources. Required -- see network-prerequisites.

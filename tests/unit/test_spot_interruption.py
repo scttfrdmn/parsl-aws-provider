@@ -20,9 +20,9 @@ import threading
 import queue
 from unittest.mock import MagicMock, patch
 
-from parsl_aws_provider.compute.spot_interruption import SpotInterruptionMonitor
-from parsl_aws_provider.constants import STATUS_INTERRUPTED, STATUS_RUNNING
-from parsl_aws_provider.modes.base import OperatingMode
+from parsl_ephemeral_provider.compute.spot_interruption import SpotInterruptionMonitor
+from parsl_ephemeral_provider.constants import STATUS_INTERRUPTED, STATUS_RUNNING
+from parsl_ephemeral_provider.modes.base import OperatingMode
 
 pytestmark = pytest.mark.unit
 

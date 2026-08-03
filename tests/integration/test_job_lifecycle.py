@@ -1,7 +1,7 @@
 """Integration tests for full job lifecycle and state recovery.
 
 These tests exercise the complete submit → status → cancel → shutdown cycle
-of EphemeralAWSProvider with a real FileStateStore (no emulator required).
+of EphemeralProvider with a real FileStateStore (no emulator required).
 The operating mode is mocked to avoid EC2/Lambda API calls, letting us focus
 on the provider's state management and concurrency guarantees.
 
@@ -18,10 +18,10 @@ from unittest.mock import MagicMock, patch
 import pytest
 from parsl.jobs.states import JobState
 
-from parsl_aws_provider.exceptions import ProviderError
-from parsl_aws_provider.provider import EphemeralAWSProvider
-from parsl_aws_provider.state.base import STATE_KEY_PROVIDER
-from parsl_aws_provider.state.file import FileStateStore
+from parsl_ephemeral_provider.exceptions import ProviderError
+from parsl_ephemeral_provider.provider import EphemeralProvider
+from parsl_ephemeral_provider.state.base import STATE_KEY_PROVIDER
+from parsl_ephemeral_provider.state.file import FileStateStore
 from tests.substrate_support import is_substrate_available
 
 
@@ -36,7 +36,7 @@ _SUBSTRATE_AVAILABLE = is_substrate_available()
 
 
 def _make_provider_with_file_state(tmp_dir, provider_id=None, max_blocks=10):
-    """Create an EphemeralAWSProvider backed by a FileStateStore.
+    """Create an EphemeralProvider backed by a FileStateStore.
 
     The operating mode is replaced with a MagicMock after construction so that
     no real AWS calls are made.  Returns (provider, mock_mode, state_store).
@@ -56,20 +56,20 @@ def _make_provider_with_file_state(tmp_dir, provider_id=None, max_blocks=10):
     mode_mock.list_resources.return_value = {}
 
     with (
-        patch("parsl_aws_provider.provider.create_session") as mock_sf,
+        patch("parsl_ephemeral_provider.provider.create_session") as mock_sf,
         patch.object(
-            EphemeralAWSProvider,
+            EphemeralProvider,
             "_initialize_state_store",
             return_value=state_store,
         ),
         patch.object(
-            EphemeralAWSProvider,
+            EphemeralProvider,
             "_initialize_operating_mode",
             return_value=mode_mock,
         ),
     ):
         mock_sf.return_value = MagicMock()
-        provider = EphemeralAWSProvider(
+        provider = EphemeralProvider(
             provider_id=provider_id,
             region="us-east-1",
             image_id="ami-12345678",
@@ -157,20 +157,20 @@ class TestJobLifecycle:
         mode_mock.cleanup_infrastructure.return_value = None
 
         with (
-            patch("parsl_aws_provider.provider.create_session") as mock_sf,
+            patch("parsl_ephemeral_provider.provider.create_session") as mock_sf,
             patch.object(
-                EphemeralAWSProvider,
+                EphemeralProvider,
                 "_initialize_state_store",
                 return_value=state_store_1,
             ),
             patch.object(
-                EphemeralAWSProvider,
+                EphemeralProvider,
                 "_initialize_operating_mode",
                 return_value=mode_mock,
             ),
         ):
             mock_sf.return_value = MagicMock()
-            provider1 = EphemeralAWSProvider(
+            provider1 = EphemeralProvider(
                 provider_id=provider_id,
                 region="us-east-1",
                 image_id="ami-12345678",

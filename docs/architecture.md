@@ -1,10 +1,10 @@
-# Parsl AWS Provider Architecture
+# Parsl Ephemeral Provider Architecture
 
-This document provides an overview of the architecture and design of the Parsl AWS Provider.
+This document provides an overview of the architecture and design of the Parsl Ephemeral Provider.
 
 ## Overview
 
-The Parsl AWS Provider runs Parsl workflows on AWS compute that is
+The Parsl Ephemeral Provider runs Parsl workflows on AWS compute that is
 created when work arrives and destroyed when it finishes.
 
 **Networking is not ephemeral.** Since v0.7.0 the VPC, subnet, and security group
@@ -17,9 +17,9 @@ to run it.
 ## Key components
 
 ```
-parsl_aws_provider/
-├── provider.py                 # EphemeralAWSProvider — the Parsl interface
-├── globus_compute.py           # GlobusComputeProvider subclass
+parsl_ephemeral_provider/
+├── provider.py                 # EphemeralProvider — the Parsl interface
+├── globus_compute.py           # EphemeralComputeProvider subclass
 ├── constants.py                # AWS constants and defaults
 ├── exceptions.py               # Exception hierarchy
 ├── error_handling.py           # Retry/backoff framework (used by compute/)
@@ -45,7 +45,7 @@ parsl_aws_provider/
 
 `network/`, `compute/ec2.py`, `utils/logging.py`, and `templates/terraform/` are
 not reachable from any live path; they are scheduled for removal in v0.9.0
-([#90](https://github.com/scttfrdmn/parsl-aws-provider/issues/90)).
+([#90](https://github.com/scttfrdmn/parsl-ephemeral-provider/issues/90)).
 `security/encryption.py` is *not* among them — it is exported from
 `security/__init__.py` and covered, so #90's original body was wrong to list it.
 
@@ -80,7 +80,7 @@ behind NAT.
 
 The bastion is an autonomous orchestrator, not a network tunnel — which is why an
 EC2 Instance Connect Endpoint cannot replace it
-([#88](https://github.com/scttfrdmn/parsl-aws-provider/issues/88)).
+([#88](https://github.com/scttfrdmn/parsl-ephemeral-provider/issues/88)).
 
 ### Serverless mode
 
@@ -97,7 +97,7 @@ The provider creates and manages:
   and the instance profile
 - **IAM instance profile and role**: only when `auto_create_instance_profile=True`,
   and deleted on shutdown since v0.8.0
-  ([#132](https://github.com/scttfrdmn/parsl-aws-provider/issues/132)). A profile
+  ([#132](https://github.com/scttfrdmn/parsl-ephemeral-provider/issues/132)). A profile
   you supply through `iam_instance_profile_arn` is never touched.
 - **CloudFormation stacks**: bastion (detached), Lambda and ECS workers
   (serverless)
@@ -107,9 +107,9 @@ It does **not** create or delete VPCs, subnets, or security groups.
 
 EC2 resources are tagged so anything left behind is findable, in one of two
 conventions depending on the mode: standard mode writes
-`CreatedBy=ParslEphemeralAWSProvider` and `ProviderId=<provider_id>`, while
+`CreatedBy=ParslEphemeralProvider` and `ProviderId=<provider_id>`, while
 detached mode and the serverless fleet write `ParslResource=true` and
-`ParslWorkflowId=<provider_id>`. `parsl-aws-cleanup --dry-run` queries both and
+`ParslWorkflowId=<provider_id>`. `parsl-ephemeral-cleanup --dry-run` queries both and
 reports the union.
 
 ## State management
@@ -134,7 +134,7 @@ CloudFormation templates ship inside the wheel and are loaded with
 `get_cf_template()`, not by filesystem path — a wheel install has no source tree.
 The Terraform modules under `templates/terraform/` are referenced by nothing and
 are slated for removal in v0.9.0
-([#90](https://github.com/scttfrdmn/parsl-aws-provider/issues/90)).
+([#90](https://github.com/scttfrdmn/parsl-ephemeral-provider/issues/90)).
 
 ## Error handling and recovery
 
@@ -145,11 +145,11 @@ are slated for removal in v0.9.0
 
 `error_handling.py` is used by the `compute/` managers. The `modes/` hand-roll
 their own polling loops instead; keeping both is tracked as
-[#91](https://github.com/scttfrdmn/parsl-aws-provider/issues/91).
+[#91](https://github.com/scttfrdmn/parsl-ephemeral-provider/issues/91).
 
 ## Security considerations
 
-- Least-privilege IAM: `GlobusComputeProvider.minimum_iam_policy()` returns the
+- Least-privilege IAM: `EphemeralComputeProvider.minimum_iam_policy()` returns the
   actual action set the provider uses
 - IMDSv2 required on every launch path, set in the launch template
 - No long-lived credentials on instances — workers use an instance profile
@@ -157,11 +157,11 @@ their own polling loops instead; keeping both is tracked as
 
 Instance profiles created with `auto_create_instance_profile=True` are deleted on
 shutdown since v0.8.0
-([#132](https://github.com/scttfrdmn/parsl-aws-provider/issues/132)). Deletion is
+([#132](https://github.com/scttfrdmn/parsl-ephemeral-provider/issues/132)). Deletion is
 gated on ownership, so a profile supplied through `iam_instance_profile_arn`
 survives — supply your own ARN to control that lifecycle yourself. Grant the
 teardown actions in your IAM policy, or cleanup fails silently and the roles
-accumulate ([#195](https://github.com/scttfrdmn/parsl-aws-provider/issues/195)).
+accumulate ([#195](https://github.com/scttfrdmn/parsl-ephemeral-provider/issues/195)).
 
 ## Testing with a local AWS emulator
 

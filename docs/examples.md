@@ -1,11 +1,11 @@
 # Examples
 
 Every configuration below is checked against the real
-`EphemeralAWSProvider` signature by `tests/unit/test_docs_examples.py`. Unknown
+`EphemeralProvider` signature by `tests/unit/test_docs_examples.py`. Unknown
 keyword arguments raise `ProviderConfigurationError`, so an option copied from an
 older tutorial fails at construction rather than being ignored.
 
-Runnable scripts live in [`examples/`](https://github.com/scttfrdmn/parsl-aws-provider/tree/main/examples).
+Runnable scripts live in [`examples/`](https://github.com/scttfrdmn/parsl-ephemeral-provider/tree/main/examples).
 They read the network IDs from the environment:
 
 ```bash
@@ -23,9 +23,9 @@ uv run python examples/standard_mode.py
 import parsl
 from parsl.config import Config
 from parsl.executors import HighThroughputExecutor
-from parsl_aws_provider import EphemeralAWSProvider
+from parsl_ephemeral_provider import EphemeralProvider
 
-provider = EphemeralAWSProvider(
+provider = EphemeralProvider(
     region="us-east-1",
     vpc_id="vpc-0123456789abcdef0",
     subnet_id="subnet-0123456789abcdef0",
@@ -76,9 +76,9 @@ the provider's AWS ones, and nothing runs at interpreter exit.
 import parsl
 from parsl.config import Config
 from parsl.executors import HighThroughputExecutor
-from parsl_aws_provider import EphemeralAWSProvider
+from parsl_ephemeral_provider import EphemeralProvider
 
-provider = EphemeralAWSProvider(
+provider = EphemeralProvider(
     region="us-east-1",
     vpc_id="vpc-0123456789abcdef0",
     subnet_id="subnet-0123456789abcdef0",
@@ -138,10 +138,10 @@ automatically. Call `shutdown()` when the workflow is genuinely finished.
 import parsl
 from parsl.config import Config
 from parsl.executors import HighThroughputExecutor
-from parsl_aws_provider import EphemeralAWSProvider
+from parsl_ephemeral_provider import EphemeralProvider
 
 # Lambda runs in the Lambda-managed VPC, so no network IDs are required.
-provider = EphemeralAWSProvider(
+provider = EphemeralProvider(
     region="us-east-1",
     mode="serverless",
     compute_type="lambda",
@@ -187,9 +187,9 @@ Dependencies must be in the deployment package or a layer. For ECS/Fargate, use
 import parsl
 from parsl.config import Config
 from parsl.executors import HighThroughputExecutor
-from parsl_aws_provider import EphemeralAWSProvider
+from parsl_ephemeral_provider import EphemeralProvider
 
-provider = EphemeralAWSProvider(
+provider = EphemeralProvider(
     region="us-east-1",
     vpc_id="vpc-0123456789abcdef0",
     subnet_id="subnet-0123456789abcdef0",
@@ -253,14 +253,14 @@ What a detected reclaim does is mark the block `FAILED`, which is what makes Par
 stop dispatching to it and re-run its tasks elsewhere. **`retries` on the Parsl
 `Config` is therefore what actually saves your work** — the provider cannot
 checkpoint a task, because it is never told which tasks a block is running
-([#137](https://github.com/scttfrdmn/parsl-aws-provider/issues/137)). Set
+([#137](https://github.com/scttfrdmn/parsl-ephemeral-provider/issues/137)). Set
 `retries` to at least 1 whenever `use_spot=True`; without it a reclaim fails the
 app instead of retrying it.
 
 ## Diversified instance types via EC2 Fleet
 
 ```python
-provider = EphemeralAWSProvider(
+provider = EphemeralProvider(
     region="us-east-1",
     vpc_id="vpc-0123456789abcdef0",
     subnet_id="subnet-0123456789abcdef0",
@@ -282,12 +282,12 @@ rates. Details in [spot_fleet.md](spot_fleet.md).
 Set `use_spot=True` as well. `use_spot_fleet=True` on its own is currently
 ignored — no fleet manager is built and the block launches as a single on-demand
 instance, with no error
-([#137](https://github.com/scttfrdmn/parsl-aws-provider/issues/137)).
+([#137](https://github.com/scttfrdmn/parsl-ephemeral-provider/issues/137)).
 
 ## Graviton (arm64)
 
 ```python
-provider = EphemeralAWSProvider(
+provider = EphemeralProvider(
     region="us-east-1",
     vpc_id="vpc-0123456789abcdef0",
     subnet_id="subnet-0123456789abcdef0",
@@ -311,9 +311,9 @@ code becomes the job status, and the instance terminates.
 ```python
 import time
 
-from parsl_aws_provider import EphemeralAWSProvider
+from parsl_ephemeral_provider import EphemeralProvider
 
-provider = EphemeralAWSProvider(
+provider = EphemeralProvider(
     region="us-east-1",
     vpc_id="vpc-0123456789abcdef0",
     subnet_id="subnet-0123456789abcdef0",
@@ -344,7 +344,7 @@ Reuse finished instances instead of paying the boot and `worker_init` cost again
 Standard mode only.
 
 ```python
-provider = EphemeralAWSProvider(
+provider = EphemeralProvider(
     region="us-east-1",
     vpc_id="vpc-0123456789abcdef0",
     subnet_id="subnet-0123456789abcdef0",
@@ -361,7 +361,7 @@ provider = EphemeralAWSProvider(
 Warm instances are held **Running** and bill at the full rate for up to
 `warm_pool_ttl` seconds per idle period, which is why `warm_pool_size` is capped.
 Migration to native ASG warm pools, which hold instances Stopped or Hibernated, is
-[#130](https://github.com/scttfrdmn/parsl-aws-provider/issues/130).
+[#130](https://github.com/scttfrdmn/parsl-ephemeral-provider/issues/130).
 
 ## AMI baking
 
@@ -369,7 +369,7 @@ If `worker_init` is slow, run it once into a custom AMI rather than on every
 launch. Standard mode only.
 
 ```python
-provider = EphemeralAWSProvider(
+provider = EphemeralProvider(
     region="us-east-1",
     vpc_id="vpc-0123456789abcdef0",
     subnet_id="subnet-0123456789abcdef0",
@@ -392,7 +392,7 @@ it alone.
 ## State persistence and reconnection
 
 ```python
-from parsl_aws_provider import EphemeralAWSProvider
+from parsl_ephemeral_provider import EphemeralProvider
 
 network = dict(
     region="us-east-1",
@@ -402,7 +402,7 @@ network = dict(
 )
 
 # First process
-provider = EphemeralAWSProvider(
+provider = EphemeralProvider(
     mode="detached",
     state_store_type="s3",
     s3_bucket="my-parsl-state-bucket",
@@ -413,7 +413,7 @@ job_id = provider.submit("python3 long_running.py", tasks_per_node=1)
 
 # Later, in a new process: same store and key, so the bastion and job map are
 # adopted along with the persisted provider_id.
-provider = EphemeralAWSProvider(
+provider = EphemeralProvider(
     mode="detached",
     state_store_type="s3",
     s3_bucket="my-parsl-state-bucket",
@@ -435,12 +435,12 @@ import logging
 import parsl
 from parsl.config import Config
 from parsl.executors import HighThroughputExecutor
-from parsl_aws_provider import EphemeralAWSProvider
+from parsl_ephemeral_provider import EphemeralProvider
 
 parsl.set_stream_logger()
-logging.getLogger("parsl_aws_provider").setLevel(logging.DEBUG)
+logging.getLogger("parsl_ephemeral_provider").setLevel(logging.DEBUG)
 
-provider = EphemeralAWSProvider(
+provider = EphemeralProvider(
     region="us-east-1",
     vpc_id="vpc-0123456789abcdef0",
     subnet_id="subnet-0123456789abcdef0",
@@ -478,7 +478,7 @@ side — the interchange ports are not reachable inbound. Reach the instance wit
 ## Resource tracking and cleanup
 
 ```python
-provider = EphemeralAWSProvider(
+provider = EphemeralProvider(
     region="us-east-1",
     vpc_id="vpc-0123456789abcdef0",
     subnet_id="subnet-0123456789abcdef0",
@@ -505,7 +505,7 @@ Every resource is tagged `ParslResource=true` and
 anything a crash left behind:
 
 ```bash
-parsl-aws-cleanup --dry-run --region us-east-1
+parsl-ephemeral-cleanup --dry-run --region us-east-1
 ```
 
 ## Migrating from Parsl's `AWSProvider`
@@ -526,9 +526,9 @@ provider = AWSProvider(
 
 ```python
 # After
-from parsl_aws_provider import EphemeralAWSProvider
+from parsl_ephemeral_provider import EphemeralProvider
 
-provider = EphemeralAWSProvider(
+provider = EphemeralProvider(
     # image_id is now optional — omit it to resolve the latest AL2023 AMI
     instance_type="t3.medium",
     region="us-east-1",

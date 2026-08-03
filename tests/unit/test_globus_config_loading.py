@@ -40,9 +40,9 @@ from unittest.mock import MagicMock, patch
 import pytest
 import yaml
 
-from parsl_aws_provider import GlobusComputeProvider
-from parsl_aws_provider.provider import EphemeralAWSProvider
-from parsl_aws_provider.state.file import FileStateStore
+from parsl_ephemeral_provider import EphemeralComputeProvider
+from parsl_ephemeral_provider.provider import EphemeralProvider
+from parsl_ephemeral_provider.state.file import FileStateStore
 
 _config_utils = pytest.importorskip(
     "globus_compute_endpoint.endpoint.config.utils",
@@ -67,8 +67,8 @@ VPC_ID = "vpc-0123456789abcdef0"
 SUBNET_ID = "subnet-0123456789abcdef0"
 SG_ID = "sg-0123456789abcdef0"
 
-# Run in the exec'd child. Deliberately never names `parsl_aws_provider`:
-# `patch("parsl_aws_provider.provider.create_session")` would *import* the
+# Run in the exec'd child. Deliberately never names `parsl_ephemeral_provider`:
+# `patch("parsl_ephemeral_provider.provider.create_session")` would *import* the
 # package by name, which is the very thing the negative control has to rule out.
 # Patching botocore instead keeps the AWS calls in the constructor mocked without
 # touching the import under test.
@@ -78,7 +78,7 @@ from unittest.mock import MagicMock, patch
 from globus_compute_endpoint.endpoint.config.utils import load_config_yaml
 
 out = {"sitecustomize_ran": "sitecustomize" in sys.modules,
-       "package_imported": "parsl_aws_provider" in sys.modules}
+       "package_imported": "parsl_ephemeral_provider" in sys.modules}
 with patch("boto3.Session", MagicMock()), patch("botocore.session.Session", MagicMock()):
     try:
         cfg = load_config_yaml(sys.stdin.read())
@@ -94,7 +94,7 @@ print("RESULT " + json.dumps(out))
 """
 
 
-def _make_provider(tmp_path, **extra_kwargs) -> GlobusComputeProvider:
+def _make_provider(tmp_path, **extra_kwargs) -> EphemeralComputeProvider:
     """Build a provider with every AWS interaction mocked out.
 
     `_initialize_operating_mode` is patched because `provider.__init__` calls
@@ -107,18 +107,18 @@ def _make_provider(tmp_path, **extra_kwargs) -> GlobusComputeProvider:
     )
 
     with (
-        patch("parsl_aws_provider.provider.create_session") as mock_session,
+        patch("parsl_ephemeral_provider.provider.create_session") as mock_session,
         patch.object(
-            EphemeralAWSProvider, "_initialize_state_store", return_value=state_store
+            EphemeralProvider, "_initialize_state_store", return_value=state_store
         ),
         patch.object(
-            EphemeralAWSProvider,
+            EphemeralProvider,
             "_initialize_operating_mode",
             return_value=MagicMock(),
         ),
     ):
         mock_session.return_value = MagicMock()
-        return GlobusComputeProvider(
+        return EphemeralComputeProvider(
             provider_id=provider_id,
             region="us-east-1",
             image_id="ami-0123456789abcdef0",
@@ -166,7 +166,7 @@ def _load_in_child(endpoint_dir: Path, *, with_bootstrap: bool = True) -> dict:
     into `env` immediately before the exec. This reproduces that shape exactly.
 
     A subprocess is not incidental here. This process imported
-    `parsl_aws_provider` at module scope, so `parsl.providers` already carries the
+    `parsl_ephemeral_provider` at module scope, so `parsl.providers` already carries the
     class and any in-process assertion is answering the wrong question.
     """
     env = dict(os.environ)
@@ -207,7 +207,7 @@ def _load(endpoint_dir: Path):
     """Load the rendered user config in-process, for parameter round-tripping.
 
     The provider really is constructed, so the AWS session has to be mocked --
-    `EphemeralAWSProvider.__init__` calls `GetCallerIdentity`, which fails against
+    `EphemeralProvider.__init__` calls `GetCallerIdentity`, which fails against
     the synthetic credentials the non-`aws` suites run under. Everything the
     parameter tests care about happens before that: the dispatcher's
     `getattr(parsl.providers, ...)` lookup, the YAML parse, and the binding of the
@@ -215,9 +215,9 @@ def _load(endpoint_dir: Path):
     """
     rendered = _render(endpoint_dir)
     with (
-        patch("parsl_aws_provider.provider.create_session") as mock_session,
+        patch("parsl_ephemeral_provider.provider.create_session") as mock_session,
         patch.object(
-            EphemeralAWSProvider,
+            EphemeralProvider,
             "_initialize_operating_mode",
             return_value=MagicMock(),
         ),
@@ -281,7 +281,7 @@ class TestManagerConfigIsStartable:
 
         Before #196 the `engine:` block sat in `config.yaml`, so *every* load --
         including the ones that went on to be rejected -- constructed a provider,
-        and `EphemeralAWSProvider.__init__` calls `initialize()`, which creates an
+        and `EphemeralProvider.__init__` calls `initialize()`, which creates an
         IAM role and instance profile. A rejected config now creates nothing
         because nothing is constructed: note that this test mocks no AWS at all
         and still passes.
@@ -312,7 +312,7 @@ class TestUserEndpointLoadsInAForkedInterpreter:
 
         assert "error" not in result, result.get("error")
         assert result["config_class"] == "UserEndpointConfig"
-        assert result["provider_class"] == "GlobusComputeProvider"
+        assert result["provider_class"] == "EphemeralComputeProvider"
         assert result["region"] == "us-east-1"
         assert result["encrypted"] is False
 
@@ -360,7 +360,7 @@ class TestGeneratedConfigLoads:
         config = _load(tmp_path / "ep")
 
         assert config.engine is not None
-        assert isinstance(config.engine.provider, GlobusComputeProvider)
+        assert isinstance(config.engine.provider, EphemeralComputeProvider)
 
     def test_provider_receives_network_ids(self, tmp_path):
         """The constructor rejects a provider without them, so this also proves
@@ -409,7 +409,7 @@ class TestEveryParameterSurvivesTheRoundTrip:
         `globus-compute-endpoint python-exec ...`, so that binary must be on the
         worker's PATH and only `worker_init` puts it there. The generator dropped
         it, so the reconstructed provider fell back to
-        `EphemeralAWSProvider.DEFAULT_WORKER_INIT` -- which installs `parsl` and
+        `EphemeralProvider.DEFAULT_WORKER_INIT` -- which installs `parsl` and
         not `globus-compute-endpoint`, making every worker command "command not
         found".
         """
@@ -514,9 +514,9 @@ class TestEveryParameterSurvivesTheRoundTrip:
             assert actual == expected, f"{name}: {actual!r} != {expected!r}"
 
     def test_subclass_own_params_survive(self, tmp_path):
-        """The four `GlobusComputeProvider` params, which the signature loop misses.
+        """The four `EphemeralComputeProvider` params, which the signature loop misses.
 
-        `_provider_params_yaml` walks `EphemeralAWSProvider.__init__`, so these
+        `_provider_params_yaml` walks `EphemeralProvider.__init__`, so these
         need naming individually -- and since #196 they land in three different
         places across *two* files: `display_name` in the manager `config.yaml`,
         `encrypted` and `container_uri` on the engine in the template, and
@@ -543,7 +543,7 @@ class TestEveryParameterSurvivesTheRoundTrip:
     def test_endpoint_id_reaches_the_provider_but_not_the_manager(self, tmp_path):
         """Both halves, each asserted after a real load.
 
-        Nested under `engine.provider` it binds to a `GlobusComputeProvider` kwarg
+        Nested under `engine.provider` it binds to a `EphemeralComputeProvider` kwarg
         and survives. At the top level of `config.yaml` it would raise `Unexpected
         keyword argument` from `BaseConfig` -- which is what the old output's `TODO`
         told the reader to do. The manager writes the real UUID to `endpoint.json`;
@@ -573,9 +573,9 @@ class TestEveryParameterSurvivesTheRoundTrip:
         """
         provider_id = f"test-{uuid.uuid4().hex[:8]}"
         with (
-            patch("parsl_aws_provider.provider.create_session") as mock_session,
+            patch("parsl_ephemeral_provider.provider.create_session") as mock_session,
             patch.object(
-                EphemeralAWSProvider,
+                EphemeralProvider,
                 "_initialize_state_store",
                 return_value=FileStateStore(
                     file_path=str(tmp_path / f"{provider_id}.json"),
@@ -583,13 +583,13 @@ class TestEveryParameterSurvivesTheRoundTrip:
                 ),
             ),
             patch.object(
-                EphemeralAWSProvider,
+                EphemeralProvider,
                 "_initialize_operating_mode",
                 return_value=MagicMock(),
             ),
         ):
             mock_session.return_value = MagicMock()
-            provider = GlobusComputeProvider(
+            provider = EphemeralComputeProvider(
                 provider_id=provider_id,
                 region="us-east-1",
                 mode="standard",
@@ -629,8 +629,8 @@ class TestEveryParameterSurvivesTheRoundTrip:
         """
         import inspect
 
-        signature = inspect.signature(EphemeralAWSProvider.__init__)
-        from parsl_aws_provider.globus_compute import _SKIP_PARAMS
+        signature = inspect.signature(EphemeralProvider.__init__)
+        from parsl_ephemeral_provider.globus_compute import _SKIP_PARAMS
 
         # Values chosen only to be non-default and type-plausible; the assertion
         # is about presence, not about what a sane configuration looks like.

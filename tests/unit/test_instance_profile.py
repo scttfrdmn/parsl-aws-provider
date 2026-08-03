@@ -16,9 +16,9 @@ import pytest
 from botocore.exceptions import ClientError
 from moto import mock_aws
 
-from parsl_aws_provider.exceptions import ResourceNotFoundError
-from parsl_aws_provider.modes.standard import StandardMode
-from parsl_aws_provider.utils.aws import (
+from parsl_ephemeral_provider.exceptions import ResourceNotFoundError
+from parsl_ephemeral_provider.modes.standard import StandardMode
+from parsl_ephemeral_provider.utils.aws import (
     _wait_for_instance_profile,
     delete_ssm_instance_profile,
     get_or_create_ssm_instance_profile,
@@ -182,7 +182,7 @@ class TestWaitForInstanceProfile:
         ec2 = session.client.return_value
         ec2.run_instances.side_effect = _client_error("DryRunOperation")
 
-        with patch("parsl_aws_provider.utils.aws.time.sleep") as sleep:
+        with patch("parsl_ephemeral_provider.utils.aws.time.sleep") as sleep:
             _wait_for_instance_profile(session, "arn:aws:iam::1:instance-profile/p")
 
         assert ec2.run_instances.call_count == 1
@@ -197,7 +197,7 @@ class TestWaitForInstanceProfile:
             _client_error("DryRunOperation"),
         ]
 
-        with patch("parsl_aws_provider.utils.aws.time.sleep") as sleep:
+        with patch("parsl_ephemeral_provider.utils.aws.time.sleep") as sleep:
             _wait_for_instance_profile(session, "arn:aws:iam::1:instance-profile/p")
 
         assert ec2.run_instances.call_count == 3
@@ -225,7 +225,7 @@ class TestWaitForInstanceProfile:
         ec2 = session.client.return_value
         ec2.run_instances.side_effect = _client_error("InvalidAMIID.NotFound")
 
-        with patch("parsl_aws_provider.utils.aws.time.sleep") as sleep:
+        with patch("parsl_ephemeral_provider.utils.aws.time.sleep") as sleep:
             _wait_for_instance_profile(session, "arn:aws:iam::1:instance-profile/p")
 
         assert ec2.run_instances.call_count == 1
@@ -249,9 +249,10 @@ class TestWaitForInstanceProfile:
 
         with (
             patch(
-                "parsl_aws_provider.utils.aws.time.time", side_effect=lambda: clock[0]
+                "parsl_ephemeral_provider.utils.aws.time.time",
+                side_effect=lambda: clock[0],
             ),
-            patch("parsl_aws_provider.utils.aws.time.sleep", side_effect=advance),
+            patch("parsl_ephemeral_provider.utils.aws.time.sleep", side_effect=advance),
         ):
             _wait_for_instance_profile(
                 session, "arn:aws:iam::1:instance-profile/p", timeout=10
@@ -311,7 +312,7 @@ class TestStandardModeProfileResolution:
         assert mode.iam_instance_profile_arn is None
 
         with patch(
-            "parsl_aws_provider.modes.standard.get_or_create_ssm_instance_profile",
+            "parsl_ephemeral_provider.modes.standard.get_or_create_ssm_instance_profile",
             return_value="arn:aws:iam::1:instance-profile/created",
         ) as resolve:
             mode.initialize()
@@ -333,7 +334,7 @@ class TestStandardModeProfileResolution:
         )
 
         with patch(
-            "parsl_aws_provider.modes.standard.get_or_create_ssm_instance_profile"
+            "parsl_ephemeral_provider.modes.standard.get_or_create_ssm_instance_profile"
         ) as resolve:
             mode.initialize()
 
@@ -347,7 +348,7 @@ class TestStandardModeProfileResolution:
         mode = self._mode(mock_session, mock_state_store)
 
         with patch(
-            "parsl_aws_provider.modes.standard.get_or_create_ssm_instance_profile"
+            "parsl_ephemeral_provider.modes.standard.get_or_create_ssm_instance_profile"
         ) as resolve:
             mode.initialize()
 
@@ -366,7 +367,7 @@ class TestStandardModeProfileResolution:
         )
 
         with patch(
-            "parsl_aws_provider.modes.standard.get_or_create_ssm_instance_profile",
+            "parsl_ephemeral_provider.modes.standard.get_or_create_ssm_instance_profile",
             side_effect=RuntimeError("IAM denied"),
         ):
             mode.initialize()
@@ -494,7 +495,7 @@ class TestStandardModeProfileOwnership:
         )
 
         with patch(
-            "parsl_aws_provider.modes.standard.get_or_create_ssm_instance_profile",
+            "parsl_ephemeral_provider.modes.standard.get_or_create_ssm_instance_profile",
             return_value="arn:aws:iam::1:instance-profile/auto",
         ):
             mode.initialize()
@@ -502,7 +503,7 @@ class TestStandardModeProfileOwnership:
         assert mode._owns_instance_profile is True
 
         with patch(
-            "parsl_aws_provider.modes.standard.delete_ssm_instance_profile"
+            "parsl_ephemeral_provider.modes.standard.delete_ssm_instance_profile"
         ) as delete:
             mode.cleanup_infrastructure()
 
@@ -526,7 +527,7 @@ class TestStandardModeProfileOwnership:
         assert mode._owns_instance_profile is False
 
         with patch(
-            "parsl_aws_provider.modes.standard.delete_ssm_instance_profile"
+            "parsl_ephemeral_provider.modes.standard.delete_ssm_instance_profile"
         ) as delete:
             mode.cleanup_infrastructure()
 
@@ -542,7 +543,7 @@ class TestStandardModeProfileOwnership:
         assert mode._owns_instance_profile is False
 
         with patch(
-            "parsl_aws_provider.modes.standard.delete_ssm_instance_profile"
+            "parsl_ephemeral_provider.modes.standard.delete_ssm_instance_profile"
         ) as delete:
             mode.cleanup_infrastructure()
 
@@ -573,7 +574,7 @@ class TestStandardModeProfileOwnership:
         assert mode._owns_instance_profile is True
 
         with patch(
-            "parsl_aws_provider.modes.standard.delete_ssm_instance_profile"
+            "parsl_ephemeral_provider.modes.standard.delete_ssm_instance_profile"
         ) as delete:
             mode.cleanup_infrastructure()
 
@@ -589,7 +590,7 @@ class TestStandardModeProfileOwnership:
         )
 
         with patch(
-            "parsl_aws_provider.modes.standard.get_or_create_ssm_instance_profile",
+            "parsl_ephemeral_provider.modes.standard.get_or_create_ssm_instance_profile",
             return_value="arn:aws:iam::1:instance-profile/auto",
         ):
             mode.initialize()
@@ -609,13 +610,13 @@ class TestStandardModeProfileOwnership:
         )
 
         with patch(
-            "parsl_aws_provider.modes.standard.get_or_create_ssm_instance_profile",
+            "parsl_ephemeral_provider.modes.standard.get_or_create_ssm_instance_profile",
             return_value="arn:aws:iam::1:instance-profile/auto",
         ):
             mode.initialize()
 
         with patch(
-            "parsl_aws_provider.modes.standard.delete_ssm_instance_profile",
+            "parsl_ephemeral_provider.modes.standard.delete_ssm_instance_profile",
             side_effect=RuntimeError("AccessDenied"),
         ):
             mode.cleanup_infrastructure()  # must not raise
@@ -651,11 +652,11 @@ class TestStandardModeProfileOwnership:
 
         with (
             patch(
-                "parsl_aws_provider.modes.standard.get_or_create_ssm_instance_profile",
+                "parsl_ephemeral_provider.modes.standard.get_or_create_ssm_instance_profile",
                 return_value="arn:aws:iam::1:instance-profile/auto",
             ),
             patch(
-                "parsl_aws_provider.modes.standard.delete_ssm_instance_profile"
+                "parsl_ephemeral_provider.modes.standard.delete_ssm_instance_profile"
             ) as delete,
             pytest.raises(ResourceNotFoundError, match="subnet-12345"),
         ):

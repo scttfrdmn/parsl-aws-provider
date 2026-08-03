@@ -17,7 +17,7 @@ on the next poll would overwrite it.
 **Parsl recovers.** `retries` on the `Config` is what re-runs the tasks that were on
 the lost block. The provider cannot do it: a Parsl provider is handed a command and
 returns a block ID, and is never told which tasks a block is running
-(https://github.com/scttfrdmn/parsl-aws-provider/issues/137). So this example sets
+(https://github.com/scttfrdmn/parsl-ephemeral-provider/issues/137). So this example sets
 `retries`, keeps chunks small enough that losing one is cheap, and shows how to
 trigger a real interruption to watch the detection fire.
 
@@ -52,10 +52,10 @@ from parsl.addresses import address_by_route
 from parsl.config import Config
 from parsl.executors import HighThroughputExecutor
 
-from parsl_aws_provider import EphemeralAWSProvider
+from parsl_ephemeral_provider import EphemeralProvider
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-logging.getLogger("parsl_aws_provider.compute.spot_interruption").setLevel(
+logging.getLogger("parsl_ephemeral_provider.compute.spot_interruption").setLevel(
     logging.DEBUG
 )
 logger = logging.getLogger("spot-interruption")
@@ -120,7 +120,7 @@ def chunk_of_work(chunk_id, iterations=20):
 def main() -> int:
     """Run a chunked workload on diversified spot capacity."""
     try:
-        provider = EphemeralAWSProvider(
+        provider = EphemeralProvider(
             region=os.environ.get("AWS_TEST_REGION", "us-east-1"),
             vpc_id=os.environ["AWS_TEST_VPC_ID"],
             subnet_id=os.environ["AWS_TEST_SUBNET_ID"],

@@ -30,13 +30,13 @@ jobs:
         run: uv sync --locked --extra dev --extra test
 
       - name: Verify the tag matches the packaged version
-        # bump-my-version has silently missed parsl_aws_provider/__init__.py
+        # bump-my-version has silently missed parsl_ephemeral_provider/__init__.py
         # before -- its [tool.bumpversion] search string drifted out of sync, so
         # v0.6.0 shipped with __version__ == "0.1.0". Catch that here rather than
         # on PyPI, where a version can never be reused.
         run: |
           tag="${GITHUB_REF_NAME#v}"
-          pkg="$(uv run python -c 'import parsl_aws_provider as p; print(p.__version__)')"
+          pkg="$(uv run python -c 'import parsl_ephemeral_provider as p; print(p.__version__)')"
           if [ "$tag" != "$pkg" ]; then
             echo "::error::tag $GITHUB_REF_NAME disagrees with __version__ $pkg"
             exit 1

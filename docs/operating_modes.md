@@ -2,10 +2,10 @@
 
 Three modes, differing in who owns the worker lifecycle and where the work runs.
 Select one with the `mode` string; every other option is a flat keyword argument
-on `EphemeralAWSProvider`.
+on `EphemeralProvider`.
 
 ```python
-provider = EphemeralAWSProvider(
+provider = EphemeralProvider(
     mode="standard",  # or "detached", "serverless"
     # ... the rest of the options, all flat keyword arguments
 )
@@ -40,9 +40,9 @@ development.
 ### Configuration
 
 ```python
-from parsl_aws_provider import EphemeralAWSProvider
+from parsl_ephemeral_provider import EphemeralProvider
 
-provider = EphemeralAWSProvider(
+provider = EphemeralProvider(
     mode="standard",
     region="us-west-2",
     vpc_id="vpc-0123456789abcdef0",
@@ -67,7 +67,7 @@ Workers connect *outbound* to the Parsl interchange, so the client has to accept
 inbound TCP on the HTEX port range (54000–55000 by default). A laptop behind
 home or office NAT cannot do this without port forwarding or a VPN — use detached
 mode instead. Set `encrypted=False` on `HighThroughputExecutor` for now; CurveZMQ
-certificate distribution is [#62](https://github.com/scttfrdmn/parsl-aws-provider/issues/62).
+certificate distribution is [#62](https://github.com/scttfrdmn/parsl-ephemeral-provider/issues/62).
 
 ### When to use
 
@@ -116,7 +116,7 @@ either `auto_create_instance_profile=True` or an explicit
 Warm instances are held **Running** and bill at the full instance rate for up to
 `warm_pool_ttl` seconds per idle period, which is why `warm_pool_size` is capped.
 Migrating to native ASG warm pools, which hold instances Stopped or Hibernated,
-is [#130](https://github.com/scttfrdmn/parsl-aws-provider/issues/130).
+is [#130](https://github.com/scttfrdmn/parsl-ephemeral-provider/issues/130).
 
 ## Detached Mode
 
@@ -134,7 +134,7 @@ the client can disconnect entirely and reconnect later.
 ### Configuration
 
 ```python
-provider = EphemeralAWSProvider(
+provider = EphemeralProvider(
     mode="detached",
     region="us-west-2",
     vpc_id="vpc-0123456789abcdef0",
@@ -173,7 +173,7 @@ effect.
 
 Note `idle_timeout` governs only the bastion. It is unrelated to the provider's
 `max_idle_time`, which is deprecated and ignored
-([#194](https://github.com/scttfrdmn/parsl-aws-provider/issues/194)) — to reclaim
+([#194](https://github.com/scttfrdmn/parsl-ephemeral-provider/issues/194)) — to reclaim
 idle workers, set `max_idletime` on your Parsl `Config`.
 
 ### When to use
@@ -203,7 +203,7 @@ idle workers, set `max_idletime` on your Parsl `Config`.
 
 The bastion is an autonomous orchestrator with its own polling loop, not a
 network tunnel — which is why an EC2 Instance Connect Endpoint cannot replace it
-([#88](https://github.com/scttfrdmn/parsl-aws-provider/issues/88)).
+([#88](https://github.com/scttfrdmn/parsl-ephemeral-provider/issues/88)).
 
 ## Serverless Mode
 
@@ -222,7 +222,7 @@ Tasks run on Lambda or ECS/Fargate. No EC2 instances.
 
 ```python
 # Lambda: no network IDs needed at all
-provider = EphemeralAWSProvider(
+provider = EphemeralProvider(
     mode="serverless",
     region="us-west-2",
     compute_type="lambda",
@@ -235,7 +235,7 @@ provider = EphemeralAWSProvider(
 
 ```python
 # ECS/Fargate: subnet and security group are mandatory for awsvpcConfiguration
-provider = EphemeralAWSProvider(
+provider = EphemeralProvider(
     mode="serverless",
     region="us-west-2",
     compute_type="ecs",
@@ -268,7 +268,7 @@ dependencies — that is usually the reason to choose Fargate over Lambda. The
 stock default gives you the standard library only:
 
 ```python
-provider = EphemeralAWSProvider(
+provider = EphemeralProvider(
     mode="serverless",
     compute_type="ecs",
     ecs_container_image="123456789012.dkr.ecr.us-east-1.amazonaws.com/my-worker:latest",
@@ -412,7 +412,7 @@ configuration carries over.
 
 ### Any mode
 - `provider.list_resources()` reports what the provider believes it owns
-- `parsl-aws-cleanup --dry-run --region <region>` finds
+- `parsl-ephemeral-cleanup --dry-run --region <region>` finds
   resources tagged `ParslResource=true` that the state no longer names
 
 SPDX-License-Identifier: Apache-2.0

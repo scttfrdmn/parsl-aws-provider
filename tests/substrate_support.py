@@ -1,6 +1,6 @@
 """Substrate-backed AWS emulation helpers for the integration suite.
 
-This replaces ``parsl_aws_provider/utils/localstack.py``, which lived inside the
+This replaces ``parsl_ephemeral_provider/utils/localstack.py``, which lived inside the
 shipped package despite being imported only by tests (#125).
 
 LocalStack OSS is end-of-life: the upstream repository was archived read-only in

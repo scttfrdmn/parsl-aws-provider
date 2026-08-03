@@ -31,7 +31,7 @@ from parsl.addresses import address_by_route
 from parsl.config import Config
 from parsl.executors import HighThroughputExecutor
 
-from parsl_aws_provider import EphemeralAWSProvider
+from parsl_ephemeral_provider import EphemeralProvider
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("standard-mode")
@@ -68,7 +68,7 @@ def main() -> int:
         logger.error("See the module docstring, and docs/network-prerequisites.md.")
         return 2
 
-    provider = EphemeralAWSProvider(
+    provider = EphemeralProvider(
         instance_type="t3.small",  # t3.micro can OOM during pip install
         mode="standard",
         min_blocks=0,

@@ -18,7 +18,7 @@ import pytest
 from botocore.exceptions import ClientError, NoCredentialsError
 from moto import mock_aws
 
-from parsl_aws_provider.utils.aws import describe_instance_capacity
+from parsl_ephemeral_provider.utils.aws import describe_instance_capacity
 
 
 pytestmark = pytest.mark.unit

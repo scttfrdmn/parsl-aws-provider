@@ -22,8 +22,8 @@ try:
 except ImportError:
     MOTO_AVAILABLE = False
 
-from parsl_aws_provider.modes.detached import DetachedMode
-from parsl_aws_provider.constants import (
+from parsl_ephemeral_provider.modes.detached import DetachedMode
+from parsl_ephemeral_provider.constants import (
     RESOURCE_TYPE_EC2,
     RESOURCE_TYPE_SPOT_FLEET,
     STATUS_PENDING,

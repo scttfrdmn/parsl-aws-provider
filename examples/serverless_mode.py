@@ -42,7 +42,7 @@ from parsl import python_app
 from parsl.config import Config
 from parsl.executors import HighThroughputExecutor
 
-from parsl_aws_provider import EphemeralAWSProvider
+from parsl_ephemeral_provider import EphemeralProvider
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("serverless-mode")
@@ -90,7 +90,7 @@ def serverless_task(task_type="processing", data_size=1):
     }
 
 
-def _build_provider(compute_type: str) -> EphemeralAWSProvider:
+def _build_provider(compute_type: str) -> EphemeralProvider:
     """Build a serverless provider for the requested backend."""
     options = {
         "region": os.environ.get("AWS_TEST_REGION", "us-east-1"),
@@ -129,7 +129,7 @@ def _build_provider(compute_type: str) -> EphemeralAWSProvider:
             ecs_task_memory=1024,
         )
 
-    return EphemeralAWSProvider(**options)
+    return EphemeralProvider(**options)
 
 
 def main() -> int:

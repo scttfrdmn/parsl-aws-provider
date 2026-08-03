@@ -5,7 +5,7 @@ the provider rejects unknown keyword arguments:
 
 ```
 ProviderConfigurationError: Unknown configuration option(s): use_ssh_tunnel.
-Check the spelling against EphemeralAWSProvider.__init__; an option accepted
+Check the spelling against EphemeralProvider.__init__; an option accepted
 here but never read would be silently ignored.
 ```
 
@@ -21,7 +21,7 @@ implemented; they now fail loudly instead of being ignored.
 import logging
 
 logging.basicConfig(level=logging.INFO)
-logging.getLogger("parsl_aws_provider").setLevel(logging.DEBUG)
+logging.getLogger("parsl_ephemeral_provider").setLevel(logging.DEBUG)
 ```
 
 Or pass `debug=True` to the provider. Add `logging.getLogger("botocore").setLevel(
@@ -138,7 +138,7 @@ HighThroughputExecutor(label="aws", provider=provider, encrypted=False)
 With encryption on, Parsl generates CurveZMQ certificates in the client's
 `run_dir`, which workers cannot read — so they fail to register with no obvious
 error. Certificate distribution is
-[#62](https://github.com/scttfrdmn/parsl-aws-provider/issues/62).
+[#62](https://github.com/scttfrdmn/parsl-ephemeral-provider/issues/62).
 
 **Interchange address.** On EC2, an elastic or public IP is not bound to the
 interface; only the private IP is. Use `address_by_route()` for a same-VPC
@@ -152,7 +152,7 @@ in the VPC can connect back to.
 AWS has no capacity for that type in that Availability Zone right now.
 
 ```python
-provider = EphemeralAWSProvider(
+provider = EphemeralProvider(
     # ... network options ...
     use_spot=True,
     use_spot_fleet=True,
@@ -204,7 +204,7 @@ queueing. Raise `max_blocks`, or let jobs finish first.
 Diversify across families and generations rather than sizes:
 
 ```python
-provider = EphemeralAWSProvider(
+provider = EphemeralProvider(
     # ... network options ...
     use_spot=True,
     use_spot_fleet=True,
@@ -253,9 +253,9 @@ Generate the exact policy from the code rather than transcribing one:
 ```python
 import json
 
-from parsl_aws_provider import GlobusComputeProvider
+from parsl_ephemeral_provider import EphemeralComputeProvider
 
-print(json.dumps(GlobusComputeProvider.minimum_iam_policy(), indent=2))
+print(json.dumps(EphemeralComputeProvider.minimum_iam_policy(), indent=2))
 ```
 
 There is no `check_iam_permissions()` helper — older versions of this document
@@ -304,7 +304,7 @@ If you have a stale `ephemeral_aws_state.json` from an older version, deleting i
 is safe once you have confirmed the resources it names are gone:
 
 ```bash
-parsl-aws-cleanup --dry-run --region us-east-1
+parsl-ephemeral-cleanup --dry-run --region us-east-1
 ```
 
 ### `StateStoreError` on the file backend
@@ -371,7 +371,7 @@ That is deliberate: the bastion is preserved so you can reconnect. Call
 `preserve_bastion=False` so shutdown terminates it. Its own idle-shutdown timer
 is `idle_timeout` (minutes, default 30). The provider's `max_idle_time` is
 unrelated, and is deprecated and ignored
-([#194](https://github.com/scttfrdmn/parsl-aws-provider/issues/194)).
+([#194](https://github.com/scttfrdmn/parsl-ephemeral-provider/issues/194)).
 
 ## Cost
 
@@ -384,10 +384,10 @@ unrelated, and is deprecated and ignored
 To find orphans from a crash:
 
 ```bash
-parsl-aws-cleanup --dry-run --region us-east-1   # then without --dry-run
+parsl-ephemeral-cleanup --dry-run --region us-east-1   # then without --dry-run
 ```
 
-It sweeps by tag — both `CreatedBy=ParslEphemeralAWSProvider` (standard mode) and
+It sweeps by tag — both `CreatedBy=ParslEphemeralProvider` (standard mode) and
 `ParslResource=true` (detached and serverless) — so it finds resources the state
 file no longer names. It ships with the package, so it is on `PATH` after any
 install, not only in a git clone.
@@ -411,14 +411,14 @@ Two things to know specifically:
 - **Warm-pool instances are held `Running`** and bill at the full rate for up to
   `warm_pool_ttl` seconds per idle period. Native ASG warm pools, which hold
   instances `Stopped`, are
-  [#130](https://github.com/scttfrdmn/parsl-aws-provider/issues/130).
+  [#130](https://github.com/scttfrdmn/parsl-ephemeral-provider/issues/130).
 - **A role created by `auto_create_instance_profile=True`** is deleted on shutdown
-  since v0.8.0 ([#132](https://github.com/scttfrdmn/parsl-aws-provider/issues/132)).
+  since v0.8.0 ([#132](https://github.com/scttfrdmn/parsl-ephemeral-provider/issues/132)).
   If you still see them accumulating, your IAM policy is missing the teardown
   actions: cleanup logs rather than raises, so `AccessDenied` there is silent
-  ([#195](https://github.com/scttfrdmn/parsl-aws-provider/issues/195)). Generate a
-  current policy with `GlobusComputeProvider.minimum_iam_policy()`, and reap
-  existing orphans with `parsl-aws-cleanup`.
+  ([#195](https://github.com/scttfrdmn/parsl-ephemeral-provider/issues/195)). Generate a
+  current policy with `EphemeralComputeProvider.minimum_iam_policy()`, and reap
+  existing orphans with `parsl-ephemeral-cleanup`.
 
 ### Stopped instances with billed EBS volumes
 
@@ -452,17 +452,17 @@ If it is persistent, raise `status_polling_interval` (default 60 s) and
 ## Getting help
 
 Open an issue at
-[github.com/scttfrdmn/parsl-aws-provider/issues](https://github.com/scttfrdmn/parsl-aws-provider/issues)
+[github.com/scttfrdmn/parsl-ephemeral-provider/issues](https://github.com/scttfrdmn/parsl-ephemeral-provider/issues)
 with:
 
 - What you ran, including the full provider configuration with IDs redacted
 - The full traceback
-- The provider version (`python -c "import parsl_aws_provider; print(parsl_aws_provider.__version__)"`)
+- The provider version (`python -c "import parsl_ephemeral_provider; print(parsl_ephemeral_provider.__version__)"`)
   and the Parsl version
 - `/var/log/cloud-init-output.log` from a worker, if the workers launched
 
 For a suspected vulnerability, open a
-[security advisory](https://github.com/scttfrdmn/parsl-aws-provider/security/advisories/new)
+[security advisory](https://github.com/scttfrdmn/parsl-ephemeral-provider/security/advisories/new)
 instead.
 
 SPDX-License-Identifier: Apache-2.0

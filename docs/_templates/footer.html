@@ -1,0 +1,37 @@
+{# Non-affiliation notice on every page of the built site.
+
+   This exists because the disclaimer previously lived only in NOTICE and the
+   README -- neither of which is part of the published HTML. Someone arriving at
+   a deep page from a search engine (which is how documentation is usually read)
+   saw a site titled "Parsl Ephemeral Provider for AWS" with nothing on it
+   saying the project is unofficial.
+
+   A footer override rather than `rst_prolog`, because all but three of the doc
+   sources are Markdown and MyST does not apply rst_prolog to them -- so a
+   prolog would have covered three pages out of eighteen. `templates_path`
+   already named `_templates` in conf.py; the directory simply did not exist.
+
+   `{{ super() }}` keeps the theme's own copyright/build-info footer intact
+   rather than replacing it. #}
+{% extends "!footer.html" %}
+{% block extrafooter %}
+{{ super() }}
+<div role="contentinfo" style="margin-top: 1em; padding-top: 1em; border-top: 1px solid #e1e4e5; font-size: 90%; color: #666;">
+  <p>
+    <strong>Independent project.</strong> This is not an official product of, nor
+    is it endorsed, sponsored, or approved by Amazon.com, Inc., the Parsl project,
+    or the University of Chicago. In particular it is <strong>not</strong> the AWS
+    provider that ships with Parsl (<code>parsl.providers.AWSProvider</code>),
+    which is a separate first-party implementation.
+  </p>
+  <p>
+    Amazon Web Services, AWS, Amazon EC2, AWS Lambda, Amazon ECS, AWS Fargate,
+    AWS Systems Manager and Amazon S3 are trademarks of Amazon.com, Inc. or its
+    affiliates. Parsl is a project of the Parsl developer community. Globus and
+    Globus Compute are trademarks of the University of Chicago. These names
+    appear here solely to identify the services and projects this software
+    interoperates with. See
+    <a href="https://github.com/scttfrdmn/parsl-ephemeral-provider/blob/main/NOTICE">NOTICE</a>.
+  </p>
+</div>
+{% endblock %}

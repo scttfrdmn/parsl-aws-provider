@@ -36,7 +36,7 @@ from parsl import python_app
 from parsl.config import Config
 from parsl.executors import HighThroughputExecutor
 
-from parsl_aws_provider import EphemeralAWSProvider
+from parsl_ephemeral_provider import EphemeralProvider
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("detached-mode")
@@ -57,7 +57,7 @@ def detached_task(duration=30, task_id=None):
     }
 
 
-def _build_provider(parameter_store_path: str) -> EphemeralAWSProvider:
+def _build_provider(parameter_store_path: str) -> EphemeralProvider:
     """Construct the provider. The same call starts or adopts a workflow.
 
     Reconnection is not a separate mode or flag: pointing a new provider at an
@@ -65,7 +65,7 @@ def _build_provider(parameter_store_path: str) -> EphemeralAWSProvider:
     map. The corollary is that two concurrent workflows must never share a state
     location, or they will fight over each other's resources.
     """
-    return EphemeralAWSProvider(
+    return EphemeralProvider(
         region=os.environ.get("AWS_TEST_REGION", "us-east-1"),
         vpc_id=os.environ["AWS_TEST_VPC_ID"],
         subnet_id=os.environ["AWS_TEST_SUBNET_ID"],

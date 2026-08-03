@@ -14,7 +14,7 @@ from pathlib import Path
 from unittest.mock import MagicMock
 from typing import Generator
 
-from parsl_aws_provider.provider import EphemeralAWSProvider
+from parsl_ephemeral_provider.provider import EphemeralProvider
 from tests.substrate_support import (
     cleanup_substrate_vpc,
     create_substrate_session,
@@ -35,9 +35,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 # Read from the signature rather than hardcoded, so the guard below keeps working
 # if the default is ever renamed. Kept out of the fixture to pay the import once.
 DEFAULT_STATE_FILENAME = (
-    inspect.signature(EphemeralAWSProvider.__init__)
-    .parameters["state_file_path"]
-    .default
+    inspect.signature(EphemeralProvider.__init__).parameters["state_file_path"].default
 )
 
 
@@ -557,7 +555,7 @@ def test_session(request, substrate_session, aws_session) -> boto3.Session:
 
 @pytest.fixture
 def ephemeral_provider_config():
-    """Base configuration for EphemeralAWSProvider testing."""
+    """Base configuration for EphemeralProvider testing."""
     return {
         "image_id": "ami-0abcdef1234567890",  # Amazon Linux 2 AMI (example)
         "instance_type": "t3.micro",

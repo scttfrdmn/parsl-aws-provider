@@ -50,7 +50,7 @@ import time
 
 from parsl.jobs.states import JobState
 
-from parsl_aws_provider import EphemeralAWSProvider
+from parsl_ephemeral_provider import EphemeralProvider
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("one-shot-mode")
@@ -101,7 +101,7 @@ def main() -> int:
         logger.error("See the module docstring, and docs/network-prerequisites.md.")
         return 2
 
-    provider = EphemeralAWSProvider(
+    provider = EphemeralProvider(
         instance_type="t3.micro",  # nothing is pip-installed here, so micro is fine
         mode="standard",  # one_shot is a standard-mode option
         one_shot=True,
