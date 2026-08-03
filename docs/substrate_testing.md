@@ -37,12 +37,12 @@ any step ran.
 The compose file is pinned to a specific image tag, deliberately — an emulator that
 silently changes under CI turns an unrelated PR red.
 
-`/health` reports the real version since 0.85.0 — `{"status":"ok","version":"v0.87.0"}` —
+`/health` reports the real version since 0.85.0 — `{"status":"ok","version":"v0.87.1"}` —
 so `make substrate-status` is enough to confirm the pin. Released images used to
 report `"version":"dev"` whatever their tag
 ([substrate#402](https://github.com/scttfrdmn/substrate/issues/402)); against an
 older image, use
-`podman image inspect ghcr.io/scttfrdmn/substrate:0.87.0 --format '{{.Digest}}'`
+`podman image inspect ghcr.io/scttfrdmn/substrate:0.87.1 --format '{{.Digest}}'`
 instead.
 
 When bumping the pin, change it in **two** places — `docker-compose.substrate.yml`
@@ -182,13 +182,18 @@ provider.
 
 ## Known gaps
 
-Verified by probing substrate `0.87.0` directly, not read off the milestones.
-CloudFormation is why part of the suite still uses moto (#183); the EventBridge
-row is a gap this project turns to its advantage rather than one it works around.
+Verified by probing substrate `0.87.1` directly, not read off the milestones.
+The remaining CloudFormation rows are why one file still uses moto (#183); the
+EventBridge row is a gap this project turns to its advantage rather than one it
+works around.
 
 | Gap | Effect | Upstream |
 |---|---|---|
-| CloudFormation stacks reach `CREATE_COMPLETE` having created nothing the caller can find — see below, this is two distinct defects | `tests/integration/test_serverless_mode_spot_fleet_integration.py` and `test_detached_mode_spot_fleet_integration.py` stay on moto; real coverage is in `tests/aws/` | [substrate#483](https://github.com/scttfrdmn/substrate/issues/483) reopened the door; the remainder is [substrate#516](https://github.com/scttfrdmn/substrate/issues/516) and [substrate#517](https://github.com/scttfrdmn/substrate/issues/517) |
+| `Fn::Split` resolves to its first element only | `ecs_worker.yml:208` uses `!Split [',', !Ref Command]` for a container command, so a multi-element command silently loses everything after the first item | [substrate#521](https://github.com/scttfrdmn/substrate/issues/521) |
+| An intrinsic nested inside a structured property is never resolved | The same `Command`, nested in `ContainerDefinitions`, is not walked into. `AWS::EC2::LaunchTemplate` resolves nested intrinsics because its deploy path enumerates them explicitly, so this is per-property rather than general | [substrate#526](https://github.com/scttfrdmn/substrate/issues/526) |
+| A CFN-deployed task definition's `ContainerDefinitions` keep CloudFormation's PascalCase keys | `describe_task_definition` returns `containerDefinitions: [{}]` — family, revision, cpu, memory and the ARN are all correct, only the container list reads empty | [substrate#527](https://github.com/scttfrdmn/substrate/issues/527) |
+| CloudWatch Logs read operations return PascalCase members | `describe_log_groups`, `describe_log_streams` and `get_log_events` put `LogGroupName`/`ARN`/`CreationTime` on the wire where the JSON 1.1 API uses `logGroupName`/`arn`/`creationTime`, so botocore parses every field to `None` and a caller sees `[{}]`. `filter_log_events` is correct, which makes it an inconsistency inside one plugin. Affects a directly-created group too, so it is not CFN-specific | unfiled |
+| `DeleteStack` does not delete the stack's resources | The stack record goes and `describe_stacks` then raises `ValidationError` correctly, but an S3 bucket and an IAM role both outlive their stack. A teardown assertion that only checks the stack passes for the wrong reason | [substrate#518](https://github.com/scttfrdmn/substrate/issues/518) |
 | EventBridge is not emulated; `PutRule` returns `501 service not emulated: awsevents` | The spot-warning notifier's degradation path is testable *because* of this. The warning path itself is covered end to end by wiring an SQS queue directly, since the monitor only ever reads warnings through SQS | — |
 
 ### CloudFormation
@@ -208,50 +213,51 @@ with `Outputs`, `describe_stack_resources`, `delete_stack`, both waiters,
 ([substrate#501](https://github.com/scttfrdmn/substrate/issues/501)) but nothing
 here calls it.
 
-Two defects behind that surface are why moto stays.
+`0.87.0` had two further defects behind that surface, both filed from here and both
+fixed in **`0.87.1`**. They are worth keeping on record, because each one failed
+*silently with a success status* — the shape of bug that a green suite hides:
 
-**YAML short-form intrinsics are not resolved**
-([substrate#516](https://github.com/scttfrdmn/substrate/issues/516)). `!Sub`, `!Ref`, `!If`, `!GetAtt`
-are stripped and the raw scalar used as a literal, while the `Fn::`-prefixed long
-forms are correct — `Fn::Sub: 'x-${P}'` substitutes, `Fn::If` picks the right
-branch on both true and false conditions, but `!Sub 'x-${P}'` yields the physical
-ID `x-${p}`. Every template in `parsl_aws_provider/templates/cloudformation/` uses
-the short forms, so deploying `ecs_worker.yml` produces a task definition whose ARN
-embeds an unevaluated condition array:
+- **YAML short-form intrinsics were not resolved**
+  ([substrate#516](https://github.com/scttfrdmn/substrate/issues/516)) — `!Sub`,
+  `!Ref`, `!If`, `!GetAtt` were stripped and the raw scalar used as a literal, while
+  the `Fn::` long forms were correct. The cause sat upstream of the intrinsics
+  engine, which is why the long forms were unaffected: `parseCFNTemplate` unmarshals
+  with `go.yaml.in/yaml/v3`, which has no notion of the CloudFormation tag
+  shorthands and so discarded the tag and kept the node value.
+- **Resources were written to a different account than the caller read**
+  ([substrate#517](https://github.com/scttfrdmn/substrate/issues/517)) —
+  `StackDeployer.dispatch` synthesised its `RequestContext` from constants, so a
+  stack ARN said `000000000000` while its contents lived in `123456789012`. EC2, ECS
+  and Logs partition their state keys by account and region and so were unreachable;
+  S3 and IAM do not and crossed the boundary invisibly, which is what made it look
+  like the EC2 resource handlers were missing when they were not.
 
-```
-arn:aws:ecs:us-east-1:123456789012:task-definition/["HasTaskFamily","TaskFamily","parsl-task-${WorkflowId}-${JobId}"]:1
-```
+**The upshot for `bastion.yml` is that substrate is now ahead of moto, not behind
+it.** The full template deploys against `0.87.1`: `AWS::EC2::Instance` resolves its
+`ImageId` through `AWS::EC2::LaunchTemplate`, the instance is queryable with
+`describe_instances`, and `Outputs` resolve — `BastionHostId` returns the real
+`i-…`. moto cannot do this at all: its CloudFormation handler for
+`AWS::EC2::Instance` reads `properties["ImageId"]` directly
+(`moto/ec2/models/instances.py:400`) and resolves no launch template, so it raises
+`KeyError: 'ImageId'` on a stack real CloudFormation accepts. That is why
+`test_detached_mode_spot_fleet_integration.py` passes `bastion_host_type="direct"`;
+the CloudFormation bastion path is a candidate to move onto substrate now.
 
-The cause is upstream of the intrinsics engine, which is why the long forms are
-unaffected: `parseCFNTemplate` (`emulator/betty_cfn.go:3358`) unmarshals directly
-into its template struct with `go.yaml.in/yaml/v3`, and that library has no notion
-of the CloudFormation tag shorthands — it discards the tag and keeps the node value,
-so nothing downstream can tell a `!Sub` string from a literal one.
+Two related fixes shipped in `0.87.1` alongside those, both found upstream while
+fixing #516 and each worth knowing:
 
-**Resources are written to a different account than the caller reads**
-([substrate#517](https://github.com/scttfrdmn/substrate/issues/517)).
-`StackDeployer.dispatch` (`emulator/betty_cfn.go:2847`) synthesises its
-`RequestContext` from the constants `testAccountID` (`123456789012`) and
-`defaultRegion` rather than threading the inbound request's identity. The caller is
-account `000000000000`, so `AWS::EC2::Instance`, `AWS::EC2::LaunchTemplate`,
-`AWS::ECS::Cluster` and `AWS::Logs::LogGroup` all report `CREATE_COMPLETE` with
-plausible physical IDs that resolve nowhere in any region — `describe_instances`
-raises `InvalidInstanceID.NotFound`, `list_clusters` returns empty. A direct
-`run_instances` is visible immediately, so this is not general EC2 breakage; it is
-the same partitioning that
-[substrate#391](https://github.com/scttfrdmn/substrate/issues/391) covered for
-regions. `AWS::IAM::Role` and `AWS::IAM::InstanceProfile` cross the boundary
-intact because IAM is global, which is what makes the split look like missing
-resource handlers rather than one misplaced struct — the handlers exist, and
-`deployEC2Instance` really does dispatch `RunInstances`.
+- A plugin's 4xx *response* with a nil Go error was neither an error nor a status
+  ([substrate#519](https://github.com/scttfrdmn/substrate/issues/519)), so **every
+  S3 and IAM resource failure in a stack was swallowed** and reported
+  `CREATE_COMPLETE`. Now such a resource reports `CREATE_FAILED` — a behaviour
+  change to be aware of when reading a stack status against `0.87.1` or later.
+- `Default: ''` was treated as no default at all, which **inverted**
+  `!Not [!Equals [!Ref X, '']]`. That idiom is how an optional parameter is spelled
+  and appears 21 times across this project's five templates, so it would have bitten
+  immediately once #516 landed.
 
-`bastion.yml` needs `AWS::EC2::Instance` and `AWS::EC2::LaunchTemplate`, so
-`DetachedMode` gets a stack it cannot then query. Relatedly, `delete_stack` removes
-the stack record — `describe_stacks` correctly raises `ValidationError` afterwards —
-but not the stack's resources: an S3 bucket and an IAM role both outlive their
-stack. A teardown assertion that only checks the stack is gone passes for the wrong
-reason.
+Substrate still does not roll a failed stack back
+([substrate#520](https://github.com/scttfrdmn/substrate/issues/520)).
 
 Fixed since, and no longer worked around anywhere:
 

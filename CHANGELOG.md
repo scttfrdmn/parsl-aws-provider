@@ -8,7 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
-- **The substrate emulator pin moves `0.85.0` → `0.87.0`**, in
+- **The substrate emulator pin moves `0.85.0` → `0.87.1`**, in
   `docker-compose.substrate.yml` and `.github/workflows/ci.yml` together. 0.87.0
   carries all three fixes filed from this repo while probing 0.85.0, and the
   integration suite goes from **130 passed / 1 skipped** to **131 passed / 0
@@ -30,16 +30,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `cloudformation` plugin is registered. Through 0.85.0 CFN was implemented but
     unrouted, reachable only from Go via `betty.Deploy`.
 
-  CloudFormation still is not a moto replacement, and #183 stays open for it.
-  substrate does not resolve YAML short-form intrinsics — `!Sub`, `!Ref`, `!If`
-  are stripped and the raw scalar used literally, while the `Fn::` long forms are
-  correct ([substrate#516](https://github.com/scttfrdmn/substrate/issues/516)) —
-  and `StackDeployer.dispatch` writes resources as account `123456789012` while
-  the caller is `000000000000`
-  ([substrate#517](https://github.com/scttfrdmn/substrate/issues/517)). Every template in
-  `parsl_aws_provider/templates/cloudformation/` uses the short forms, so a stack
-  reaches `CREATE_COMPLETE` having created nothing the caller can query.
-  `docs/substrate_testing.md` records both, with the evidence.
+  0.87.0's CloudFormation was still not a moto replacement, for two further
+  defects also filed from here — and **0.87.1 fixes both**, which is why the pin
+  lands on `.1` rather than `.0`:
+
+  - [substrate#516](https://github.com/scttfrdmn/substrate/issues/516) — YAML
+    short-form intrinsics were stripped and the raw scalar used literally, while
+    the `Fn::` long forms were correct. Every template in
+    `parsl_aws_provider/templates/cloudformation/` uses the short forms, so a
+    stack reached `CREATE_COMPLETE` with an unevaluated `!If` array embedded in an
+    ECS task-definition ARN. The cause was upstream of the intrinsics engine:
+    `parseCFNTemplate` unmarshals with `go.yaml.in/yaml/v3`, which has no notion
+    of the CloudFormation tag shorthands.
+  - [substrate#517](https://github.com/scttfrdmn/substrate/issues/517) —
+    `StackDeployer.dispatch` synthesised its request context from constants, so
+    resources were written as account `123456789012` while the caller read
+    `000000000000`. EC2, ECS and Logs partition their state keys by account and
+    region and so were unreachable; S3 and IAM do not, and crossed the boundary
+    invisibly.
+
+  The consequence is larger than a bug count: **`bastion.yml` now deploys against
+  substrate end to end** — the `AWS::EC2::Instance` resolves its `ImageId` through
+  the launch template, the instance is queryable, and `Outputs` are correct. That
+  is precisely the case moto cannot do, since its CloudFormation handler reads
+  `properties["ImageId"]` directly and raises `KeyError` on a stack real
+  CloudFormation accepts. On the bastion path substrate is now ahead of moto
+  rather than behind it.
+
+  #183 stays open, but for a narrower set:
+  [substrate#521](https://github.com/scttfrdmn/substrate/issues/521) (`Fn::Split`
+  yields only its first element),
+  [substrate#526](https://github.com/scttfrdmn/substrate/issues/526) (an intrinsic
+  nested in a structured property is never resolved) and
+  [substrate#527](https://github.com/scttfrdmn/substrate/issues/527) (a
+  CFN-deployed task definition's `ContainerDefinitions` keep PascalCase keys, so
+  `describe_task_definition` returns `[{}]`) — all three hitting `ecs_worker.yml`.
+  `docs/substrate_testing.md` records the evidence for each.
 - **`ruff` floor raised to `0.16.0`, and the lint rule selection made explicit.**
   0.16.0 changed the *implicit* default rule set from 59 rules to 413, which is a
   breaking change for any project that never wrote a `select` — and this was one.
