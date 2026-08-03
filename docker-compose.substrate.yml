@@ -70,17 +70,23 @@ services:
     # directly and raises KeyError), so on the bastion path substrate is now
     # ahead of moto rather than behind it.
     #
-    # What still keeps moto is narrower and no longer about CFN's core:
-    # substrate#521 (Fn::Split yields only its first element), substrate#526 (an
-    # intrinsic nested in a structured property is never resolved) and
-    # substrate#527 (a CFN-deployed task definition's ContainerDefinitions keep
-    # PascalCase keys, so describe_task_definition returns [{}]). All three hit
-    # ecs_worker.yml. See docs/substrate_testing.md.
+    # 0.88.0 closes the last four gaps that kept moto, all filed from here and all
+    # verified against this image rather than taken from the changelog:
+    # substrate#521 (Fn::Split yielded only its first element -- an Fn::Select of
+    # index 2 now returns the third), substrate#526 (an intrinsic nested inside a
+    # structured property was never resolved -- a Fn::Sub in a
+    # ContainerDefinitions entry now resolves), substrate#527 (a CFN-deployed task
+    # definition's ContainerDefinitions kept PascalCase keys, so
+    # describe_task_definition returned [{}] -- it now parses to camelCase) and
+    # substrate#528 (Logs returned PascalCase members, so every field parsed to
+    # null). The first three are the ecs_worker.yml path; see #183 for what
+    # retiring moto now depends on, and docs/substrate_testing.md.
     #
     # Verify a bump reaches the image, not just the git tag: substrate cuts
     # release commits, so a merged fix sits on `main` after the newest tag and is
-    # invisible to this pin. `git tag --contains <sha>` is the check.
-    image: ghcr.io/scttfrdmn/substrate:0.87.1
+    # invisible to this pin. `git tag --contains <sha>` is the check -- and note
+    # #446 landed in 0.85.0, not in the release that closed its issue.
+    image: ghcr.io/scttfrdmn/substrate:0.88.0
     container_name: parsl-substrate
     ports:
       - "4566:4566"
