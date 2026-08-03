@@ -11,7 +11,7 @@ SPDX-FileCopyrightText: 2025-2026 Scott Friedman and Project Contributors
 import pytest
 from unittest.mock import MagicMock, patch
 
-from parsl_aws_provider.compute.spot_fleet import SpotFleetManager
+from parsl_ephemeral_provider.compute.spot_fleet import SpotFleetManager
 
 
 def _make_provider(instance_type="t3.micro", instance_types=None):
@@ -47,8 +47,10 @@ class TestSpotFleetInstanceTypes:
     def _patch_credential_manager(self):
         """Suppress real credential/session creation."""
         with (
-            patch("parsl_aws_provider.compute.spot_fleet.CredentialManager") as mock_cm,
-            patch("parsl_aws_provider.compute.spot_fleet.SecurityConfig"),
+            patch(
+                "parsl_ephemeral_provider.compute.spot_fleet.CredentialManager"
+            ) as mock_cm,
+            patch("parsl_ephemeral_provider.compute.spot_fleet.SecurityConfig"),
         ):
             mock_cm.return_value.create_boto3_session.return_value = MagicMock()
             yield

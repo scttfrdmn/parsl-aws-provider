@@ -10,7 +10,7 @@ import boto3
 import pytest
 from botocore.exceptions import ClientError
 
-from parsl_aws_provider.compute.spot_fleet_cleanup import (
+from parsl_ephemeral_provider.compute.spot_fleet_cleanup import (
     cleanup_spot_fleet_role,
     cleanup_all_spot_fleet_resources,
 )
@@ -238,7 +238,7 @@ class TestSpotFleetCleanup(unittest.TestCase):
 
         # Call the function with patch for cleanup_spot_fleet_role
         with patch(
-            "parsl_aws_provider.compute.spot_fleet_cleanup.cleanup_spot_fleet_role"
+            "parsl_ephemeral_provider.compute.spot_fleet_cleanup.cleanup_spot_fleet_role"
         ) as mock_cleanup_role:
             mock_cleanup_role.return_value = True
 

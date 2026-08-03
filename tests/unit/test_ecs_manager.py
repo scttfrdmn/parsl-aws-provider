@@ -10,9 +10,9 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from parsl_aws_provider.compute.ecs import ECSManager
-from parsl_aws_provider.constants import TAG_MANAGED
-from parsl_aws_provider.exceptions import ResourceCreationError
+from parsl_ephemeral_provider.compute.ecs import ECSManager
+from parsl_ephemeral_provider.constants import TAG_MANAGED
+from parsl_ephemeral_provider.exceptions import ResourceCreationError
 
 
 pytestmark = pytest.mark.unit

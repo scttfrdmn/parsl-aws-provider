@@ -21,10 +21,10 @@ import uuid
 
 import pytest
 
-from parsl_aws_provider.modes.detached import DetachedMode
-from parsl_aws_provider.modes.serverless import ServerlessMode
-from parsl_aws_provider.modes.standard import StandardMode
-from parsl_aws_provider.state.file import FileStateStore
+from parsl_ephemeral_provider.modes.detached import DetachedMode
+from parsl_ephemeral_provider.modes.serverless import ServerlessMode
+from parsl_ephemeral_provider.modes.standard import StandardMode
+from parsl_ephemeral_provider.state.file import FileStateStore
 from tests.substrate_support import is_substrate_available
 
 pytestmark = pytest.mark.skipif(

@@ -26,7 +26,7 @@ import time
 
 import pytest
 
-from parsl_aws_provider.provider import EphemeralAWSProvider
+from parsl_ephemeral_provider.provider import EphemeralProvider
 
 logger = logging.getLogger(__name__)
 
@@ -142,7 +142,7 @@ class TestParameterStoreState:
         path = f"/parsl/e2e-test/{test_run_id}"
 
         # First provider: initialize and submit
-        provider1 = EphemeralAWSProvider(
+        provider1 = EphemeralProvider(
             region=aws_region,
             instance_type="t3.micro",
             mode="standard",
@@ -167,7 +167,7 @@ class TestParameterStoreState:
         time.sleep(5)
 
         # Second provider: load state from the same path
-        provider2 = EphemeralAWSProvider(
+        provider2 = EphemeralProvider(
             region=aws_region,
             instance_type="t3.micro",
             mode="standard",
@@ -305,7 +305,7 @@ class TestS3State:
         state and have a non-empty job_map.
         """
         # First provider: initialize and submit
-        provider1 = EphemeralAWSProvider(
+        provider1 = EphemeralProvider(
             region=aws_region,
             instance_type="t3.micro",
             mode="standard",
@@ -329,7 +329,7 @@ class TestS3State:
         time.sleep(5)
 
         # Second provider: load state from the same S3 bucket
-        provider2 = EphemeralAWSProvider(
+        provider2 = EphemeralProvider(
             region=aws_region,
             instance_type="t3.micro",
             mode="standard",

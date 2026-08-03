@@ -1,4 +1,4 @@
-"""Real-AWS + Globus Compute E2E tests for GlobusComputeProvider.
+"""Real-AWS + Globus Compute E2E tests for EphemeralComputeProvider.
 
 These tests verify the full Globus Compute integration lifecycle:
 
@@ -46,7 +46,7 @@ import pytest
 
 from parsl.jobs.states import JobState
 
-from parsl_aws_provider import GlobusComputeProvider
+from parsl_ephemeral_provider import EphemeralComputeProvider
 
 logger = logging.getLogger(__name__)
 
@@ -192,12 +192,12 @@ def _stop_endpoint(endpoint_name: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# TestGlobusComputeProviderConfig
+# TestEphemeralComputeProviderConfig
 # ---------------------------------------------------------------------------
 
 
 def _offline_provider(tmp_path, provider_id: str, network_ids: dict, **kwargs):
-    """Build a GlobusComputeProvider without touching AWS.
+    """Build a EphemeralComputeProvider without touching AWS.
 
     The session, state store, and operating mode are all stubbed, so nothing here
     creates a resource — but ``network_ids`` is still required, because the
@@ -206,31 +206,33 @@ def _offline_provider(tmp_path, provider_id: str, network_ids: dict, **kwargs):
     """
     from unittest.mock import MagicMock, patch
 
-    from parsl_aws_provider.provider import EphemeralAWSProvider
-    from parsl_aws_provider.state.file import FileStateStore
+    from parsl_ephemeral_provider.provider import EphemeralProvider
+    from parsl_ephemeral_provider.state.file import FileStateStore
 
     state_store = FileStateStore(
         file_path=str(tmp_path / f"{provider_id}.json"), provider_id=provider_id
     )
 
     with (
-        patch("parsl_aws_provider.provider.create_session") as mock_sess,
+        patch("parsl_ephemeral_provider.provider.create_session") as mock_sess,
         patch.object(
-            EphemeralAWSProvider, "_initialize_state_store", return_value=state_store
+            EphemeralProvider, "_initialize_state_store", return_value=state_store
         ),
         patch.object(
-            EphemeralAWSProvider, "_initialize_operating_mode", return_value=MagicMock()
+            EphemeralProvider, "_initialize_operating_mode", return_value=MagicMock()
         ),
     ):
         mock_sess.return_value = MagicMock()
-        return GlobusComputeProvider(provider_id=provider_id, **network_ids, **kwargs)
+        return EphemeralComputeProvider(
+            provider_id=provider_id, **network_ids, **kwargs
+        )
 
 
 @pytest.mark.aws
 @pytest.mark.globus
 @pytest.mark.slow
-class TestGlobusComputeProviderConfig:
-    """Verify GlobusComputeProvider config generation works end-to-end.
+class TestEphemeralComputeProviderConfig:
+    """Verify EphemeralComputeProvider config generation works end-to-end.
 
     These tests exercise the Python layer only (no running Globus Compute
     service required), verifying that the generated endpoint directory is a valid
@@ -480,7 +482,7 @@ class TestGlobusComputeEndpointLifecycle:
         endpoint_name = f"parsl-e2e-{test_run_id}"
         endpoint_dir = str(Path.home() / ".globus_compute" / endpoint_name)
 
-        provider = GlobusComputeProvider(
+        provider = EphemeralComputeProvider(
             region=aws_region,
             instance_type="t3.small",
             mode="standard",
@@ -528,7 +530,7 @@ class TestGlobusComputeEndpointLifecycle:
     ):
         """Starting an endpoint registers it with the Globus Compute service.
 
-        This is an integration smoke test: creates a GlobusComputeProvider,
+        This is an integration smoke test: creates a EphemeralComputeProvider,
         writes the config, starts the endpoint daemon, confirms it appears in
         the endpoint list, then stops it.
         """
@@ -538,7 +540,7 @@ class TestGlobusComputeEndpointLifecycle:
         endpoint_name = f"parsl-e2e-{test_run_id}"
         endpoint_dir = str(Path.home() / ".globus_compute" / endpoint_name)
 
-        provider = GlobusComputeProvider(
+        provider = EphemeralComputeProvider(
             region=aws_region,
             instance_type="t3.small",
             mode="standard",
@@ -612,15 +614,15 @@ class TestGlobusComputeEC2Cleanup:
     ):
         """After provider.shutdown(), no EC2 instances tagged with the run ID remain.
 
-        This test submits a job via the standard ``EphemeralAWSProvider`` path
+        This test submits a job via the standard ``EphemeralProvider`` path
         (not via Globus Compute service) to verify the underlying AWS teardown
         — the Globus Compute layer delegates resource lifecycle to the provider.
         """
-        from parsl_aws_provider.provider import EphemeralAWSProvider
+        from parsl_ephemeral_provider.provider import EphemeralProvider
 
         state_file = str(tmp_path / f"state-{test_run_id}.json")
 
-        provider = EphemeralAWSProvider(
+        provider = EphemeralProvider(
             region=aws_region,
             instance_type="t3.small",
             mode="standard",

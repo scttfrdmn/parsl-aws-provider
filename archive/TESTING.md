@@ -70,7 +70,7 @@ Run all tests and generate a coverage report:
 ./scripts/run_tests.sh --coverage
 
 # Or run pytest directly with coverage
-pytest --cov=parsl_aws_provider --cov-report=term --cov-report=html
+pytest --cov=parsl_ephemeral_provider --cov-report=term --cov-report=html
 ```
 
 ## AWS Mocking with Moto
@@ -171,7 +171,7 @@ The project maintains a test coverage report that's updated with each test run:
 
 ```bash
 # Generate coverage report
-pytest --cov=parsl_aws_provider --cov-report=term --cov-report=html
+pytest --cov=parsl_ephemeral_provider --cov-report=term --cov-report=html
 
 # View HTML coverage report
 open coverage_html_report/index.html

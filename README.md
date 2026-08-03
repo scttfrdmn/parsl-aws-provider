@@ -1,23 +1,23 @@
-# Parsl AWS Provider
+# Parsl Ephemeral Provider for AWS
 
 **Ephemeral AWS compute for [Parsl](https://parsl.readthedocs.io/) — EC2, Spot
 Fleet, Lambda, or Fargate, scaled from zero and torn down when you are done.**
 
-[![CI](https://github.com/scttfrdmn/parsl-aws-provider/actions/workflows/ci.yml/badge.svg)](https://github.com/scttfrdmn/parsl-aws-provider/actions/workflows/ci.yml)
+[![CI](https://github.com/scttfrdmn/parsl-ephemeral-provider/actions/workflows/ci.yml/badge.svg)](https://github.com/scttfrdmn/parsl-ephemeral-provider/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
-[![Docs](https://img.shields.io/badge/docs-github.io-blue.svg)](https://scttfrdmn.github.io/parsl-aws-provider/)
-[![Status](https://img.shields.io/badge/Status-Alpha-yellow.svg)](https://github.com/scttfrdmn/parsl-aws-provider/blob/main/CHANGELOG.md)
+[![Docs](https://img.shields.io/badge/docs-github.io-blue.svg)](https://scttfrdmn.github.io/parsl-ephemeral-provider/)
+[![Status](https://img.shields.io/badge/Status-Alpha-yellow.svg)](https://github.com/scttfrdmn/parsl-ephemeral-provider/blob/main/CHANGELOG.md)
 
 > **Independent project.** This is unaffiliated, community-maintained work. It is
 > **not** an official or endorsed product of Amazon Web Services, the Parsl
 > project, or Globus. It is not the AWS provider that ships with Parsl — that is
 > `parsl.providers.AWSProvider`, maintained by the Parsl project, with a different
-> configuration contract. See [NOTICE](https://github.com/scttfrdmn/parsl-aws-provider/blob/main/NOTICE) for trademark attribution.
+> configuration contract. See [NOTICE](https://github.com/scttfrdmn/parsl-ephemeral-provider/blob/main/NOTICE) for trademark attribution.
 
 > **Alpha.** The public interface is settling but not settled, and several paths
 > are covered only against mocks and a local emulator rather than real AWS —
-> [#166](https://github.com/scttfrdmn/parsl-aws-provider/issues/166) tracks which.
+> [#166](https://github.com/scttfrdmn/parsl-ephemeral-provider/issues/166) tracks which.
 > Everything here creates billable resources.
 
 ## What it gives you
@@ -35,16 +35,16 @@ Fleet, Lambda, or Fargate, scaled from zero and torn down when you are done.**
   Graviton alike.
 - **State that outlives the process.** A local file, S3, or SSM Parameter Store,
   so a later session can adopt a running workflow.
-- **Globus Compute endpoints**, via `GlobusComputeProvider`, which generates the
+- **Globus Compute endpoints**, via `EphemeralComputeProvider`, which generates the
   endpoint directory for you.
 
 ## Install
 
-Not yet on PyPI ([#180](https://github.com/scttfrdmn/parsl-aws-provider/issues/180)),
+Not yet on PyPI ([#180](https://github.com/scttfrdmn/parsl-ephemeral-provider/issues/180)),
 so install from the repository:
 
 ```bash
-uv add git+https://github.com/scttfrdmn/parsl-aws-provider
+uv add git+https://github.com/scttfrdmn/parsl-ephemeral-provider
 ```
 
 Python 3.10 or newer (Parsl 2026.x dropped 3.9). This project manages
@@ -59,7 +59,7 @@ look like its cause.
 **1. You supply the network.** Since v0.7.0 the provider creates and deletes no
 network resources: `vpc_id`, `subnet_id`, and `security_group_id` are required and
 validated against AWS at construction. See
-[network-prerequisites.md](https://scttfrdmn.github.io/parsl-aws-provider/network-prerequisites.html).
+[network-prerequisites.md](https://scttfrdmn.github.io/parsl-ephemeral-provider/network-prerequisites.html).
 
 **2. In standard mode your client must be reachable.** Parsl's HTEX workers dial
 *outbound* to an interchange that runs next to your client, so the client has to
@@ -78,9 +78,9 @@ IDs — so it needs working credentials, and it is not free.
 import parsl
 from parsl.config import Config
 from parsl.executors import HighThroughputExecutor
-from parsl_aws_provider import EphemeralAWSProvider
+from parsl_ephemeral_provider import EphemeralProvider
 
-provider = EphemeralAWSProvider(
+provider = EphemeralProvider(
     region="us-east-1",
     vpc_id="vpc-0123456789abcdef0",
     subnet_id="subnet-0123456789abcdef0",
@@ -132,11 +132,11 @@ arguments.
 ## Operating modes
 
 `mode` is a **string**. Full details in
-[operating_modes.md](https://scttfrdmn.github.io/parsl-aws-provider/operating_modes.html).
+[operating_modes.md](https://scttfrdmn.github.io/parsl-ephemeral-provider/operating_modes.html).
 
 ```python
 # Detached: a bastion owns the workers, so the client may disconnect and reconnect.
-provider = EphemeralAWSProvider(
+provider = EphemeralProvider(
     mode="detached",
     region="us-east-1",
     vpc_id="vpc-0123456789abcdef0",
@@ -151,7 +151,7 @@ provider = EphemeralAWSProvider(
 
 ```python
 # Serverless: Lambda needs no network IDs at all; ECS/Fargate needs subnet + SG.
-provider = EphemeralAWSProvider(
+provider = EphemeralProvider(
     mode="serverless",
     region="us-east-1",
     compute_type="lambda",  # or "ecs"
@@ -170,7 +170,7 @@ adoption possible; pass `preserve_bastion=False` to tear it down instead.
 ## Spot instances
 
 ```python
-provider = EphemeralAWSProvider(
+provider = EphemeralProvider(
     region="us-east-1",
     vpc_id="vpc-0123456789abcdef0",
     subnet_id="subnet-0123456789abcdef0",
@@ -186,15 +186,15 @@ provider = EphemeralAWSProvider(
 Diversifying across instance types materially reduces interruption rates. **Both
 spot flags are required**: `use_spot_fleet=True` alone builds no fleet manager and
 the block quietly falls through to a single on-demand instance
-([#137](https://github.com/scttfrdmn/parsl-aws-provider/issues/137)). See
-[spot_fleet.md](https://scttfrdmn.github.io/parsl-aws-provider/spot_fleet.html).
+([#137](https://github.com/scttfrdmn/parsl-ephemeral-provider/issues/137)). See
+[spot_fleet.md](https://scttfrdmn.github.io/parsl-ephemeral-provider/spot_fleet.html).
 
 ## Globus Compute
 
-> **Full guide**: [docs/globus_compute.md](https://scttfrdmn.github.io/parsl-aws-provider/globus_compute.html) — architecture,
+> **Full guide**: [docs/globus_compute.md](https://scttfrdmn.github.io/parsl-ephemeral-provider/globus_compute.html) — architecture,
 > IAM setup, spot and container examples, multi-region deployment, troubleshooting.
 
-`GlobusComputeProvider` generates the whole endpoint directory rather than making
+`EphemeralComputeProvider` generates the whole endpoint directory rather than making
 you hand-write YAML — including the two pieces that are easy to get wrong: the
 `engine:` block belongs in `user_config_template.yaml.j2` and not in `config.yaml`,
 or `start` refuses the endpoint outright; and the forked user-endpoint process
@@ -207,9 +207,9 @@ uv run globus-compute-endpoint login
 ```
 
 ```python
-from parsl_aws_provider import GlobusComputeProvider
+from parsl_ephemeral_provider import EphemeralComputeProvider
 
-provider = GlobusComputeProvider(
+provider = EphemeralComputeProvider(
     region="us-east-1",
     vpc_id="vpc-0123456789abcdef0",
     subnet_id="subnet-0123456789abcdef0",
@@ -252,8 +252,8 @@ def process_s3_dataset(s3_input_uri, s3_output_uri):
 ```
 
 The instance profile must carry the S3 permissions for this; see
-[security.md](https://scttfrdmn.github.io/parsl-aws-provider/security.html). More patterns in
-[docs/examples.md](https://scttfrdmn.github.io/parsl-aws-provider/examples.html).
+[security.md](https://scttfrdmn.github.io/parsl-ephemeral-provider/security.html). More patterns in
+[docs/examples.md](https://scttfrdmn.github.io/parsl-ephemeral-provider/examples.html).
 
 ## Worker setup
 
@@ -262,7 +262,7 @@ shebang. The default installs Python 3.11 and Parsl on Amazon Linux 2023 and
 nothing else.
 
 ```python
-provider = EphemeralAWSProvider(
+provider = EphemeralProvider(
     # ... network options ...
     worker_init="""
         dnf install -y python3.11 python3.11-pip
@@ -286,38 +286,38 @@ the provider believes it owns.
 To find what a crash left behind:
 
 ```bash
-parsl-aws-cleanup --dry-run --region us-east-1
+parsl-ephemeral-cleanup --dry-run --region us-east-1
 ```
 
 ## Examples
 
-Eight runnable scripts in [`examples/`](https://github.com/scttfrdmn/parsl-aws-provider/tree/main/examples/), each reading its network IDs
+Eight runnable scripts in [`examples/`](https://github.com/scttfrdmn/parsl-ephemeral-provider/tree/main/examples/), each reading its network IDs
 from the environment. Every one creates real AWS resources.
 
 | Example | What it shows |
 |---|---|
-| [standard_mode.py](https://github.com/scttfrdmn/parsl-aws-provider/blob/main/examples/standard_mode.py) | The common case: EC2 workers connecting back to your client |
-| [basic_usage.py](https://github.com/scttfrdmn/parsl-aws-provider/blob/main/examples/basic_usage.py) | One provider configured for all three modes, side by side |
-| [parsl_aws_integration.py](https://github.com/scttfrdmn/parsl-aws-provider/blob/main/examples/parsl_aws_integration.py) | A full Parsl workflow, driven from EC2 in the same VPC |
-| [detached_mode.py](https://github.com/scttfrdmn/parsl-aws-provider/blob/main/examples/detached_mode.py) | A bastion owning the workers, and how reconnection works |
-| [serverless_mode.py](https://github.com/scttfrdmn/parsl-aws-provider/blob/main/examples/serverless_mode.py) | Lambda functions or Fargate tasks instead of instances |
-| [spot_fleet_example.py](https://github.com/scttfrdmn/parsl-aws-provider/blob/main/examples/spot_fleet_example.py) | An EC2 Fleet across several instance types |
-| [spot_interruption_example.py](https://github.com/scttfrdmn/parsl-aws-provider/blob/main/examples/spot_interruption_example.py) | Detecting a reclaim two minutes ahead |
-| [serverless_spot_fleet_example.py](https://github.com/scttfrdmn/parsl-aws-provider/blob/main/examples/serverless_spot_fleet_example.py) | Serverless mode's fleet path — an unusual corner |
+| [standard_mode.py](https://github.com/scttfrdmn/parsl-ephemeral-provider/blob/main/examples/standard_mode.py) | The common case: EC2 workers connecting back to your client |
+| [basic_usage.py](https://github.com/scttfrdmn/parsl-ephemeral-provider/blob/main/examples/basic_usage.py) | One provider configured for all three modes, side by side |
+| [parsl_integration.py](https://github.com/scttfrdmn/parsl-ephemeral-provider/blob/main/examples/parsl_integration.py) | A full Parsl workflow, driven from EC2 in the same VPC |
+| [detached_mode.py](https://github.com/scttfrdmn/parsl-ephemeral-provider/blob/main/examples/detached_mode.py) | A bastion owning the workers, and how reconnection works |
+| [serverless_mode.py](https://github.com/scttfrdmn/parsl-ephemeral-provider/blob/main/examples/serverless_mode.py) | Lambda functions or Fargate tasks instead of instances |
+| [spot_fleet_example.py](https://github.com/scttfrdmn/parsl-ephemeral-provider/blob/main/examples/spot_fleet_example.py) | An EC2 Fleet across several instance types |
+| [spot_interruption_example.py](https://github.com/scttfrdmn/parsl-ephemeral-provider/blob/main/examples/spot_interruption_example.py) | Detecting a reclaim two minutes ahead |
+| [serverless_spot_fleet_example.py](https://github.com/scttfrdmn/parsl-ephemeral-provider/blob/main/examples/serverless_spot_fleet_example.py) | Serverless mode's fleet path — an unusual corner |
 
 ## Documentation
 
-<https://scttfrdmn.github.io/parsl-aws-provider/>
+<https://scttfrdmn.github.io/parsl-ephemeral-provider/>
 
-- [Getting Started](https://scttfrdmn.github.io/parsl-aws-provider/getting_started.html) — install, configure, first run
-- [Network Prerequisites](https://scttfrdmn.github.io/parsl-aws-provider/network-prerequisites.html) — VPC, subnet, and security group requirements
-- [Operating Modes](https://scttfrdmn.github.io/parsl-aws-provider/operating_modes.html) — standard, detached, serverless, and the options each accepts
-- [Spot Fleet](https://scttfrdmn.github.io/parsl-aws-provider/spot_fleet.html) — diversification and interruption handling
-- [State Persistence](https://scttfrdmn.github.io/parsl-aws-provider/state_persistence.html) — file, S3, and Parameter Store backends
-- [Security](https://scttfrdmn.github.io/parsl-aws-provider/security.html) — least-privilege IAM, instance profiles, encryption
-- [Architecture](https://scttfrdmn.github.io/parsl-aws-provider/architecture.html) — how the pieces fit
-- [Troubleshooting](https://scttfrdmn.github.io/parsl-aws-provider/troubleshooting.html) — common failures and how to clear them
-- [Examples](https://scttfrdmn.github.io/parsl-aws-provider/examples.html) — annotated configurations
+- [Getting Started](https://scttfrdmn.github.io/parsl-ephemeral-provider/getting_started.html) — install, configure, first run
+- [Network Prerequisites](https://scttfrdmn.github.io/parsl-ephemeral-provider/network-prerequisites.html) — VPC, subnet, and security group requirements
+- [Operating Modes](https://scttfrdmn.github.io/parsl-ephemeral-provider/operating_modes.html) — standard, detached, serverless, and the options each accepts
+- [Spot Fleet](https://scttfrdmn.github.io/parsl-ephemeral-provider/spot_fleet.html) — diversification and interruption handling
+- [State Persistence](https://scttfrdmn.github.io/parsl-ephemeral-provider/state_persistence.html) — file, S3, and Parameter Store backends
+- [Security](https://scttfrdmn.github.io/parsl-ephemeral-provider/security.html) — least-privilege IAM, instance profiles, encryption
+- [Architecture](https://scttfrdmn.github.io/parsl-ephemeral-provider/architecture.html) — how the pieces fit
+- [Troubleshooting](https://scttfrdmn.github.io/parsl-ephemeral-provider/troubleshooting.html) — common failures and how to clear them
+- [Examples](https://scttfrdmn.github.io/parsl-ephemeral-provider/examples.html) — annotated configurations
 
 ## AWS permissions
 
@@ -327,19 +327,19 @@ the code, which cannot:
 ```python
 import json
 
-from parsl_aws_provider import GlobusComputeProvider
+from parsl_ephemeral_provider import EphemeralComputeProvider
 
-print(json.dumps(GlobusComputeProvider.minimum_iam_policy(), indent=2))
+print(json.dumps(EphemeralComputeProvider.minimum_iam_policy(), indent=2))
 ```
 
 It is a `@staticmethod`, so you need no provider instance — and it describes the
 base provider just as well, despite living on the Globus subclass.
-[security.md](https://scttfrdmn.github.io/parsl-aws-provider/security.html) explains what it deliberately omits — no
+[security.md](https://scttfrdmn.github.io/parsl-ephemeral-provider/security.html) explains what it deliberately omits — no
 `ec2:CreateVpc`, no `CreateSecurityGroup` — and what each mode adds.
 
 ## Troubleshooting
 
-Fuller coverage in [troubleshooting.md](https://scttfrdmn.github.io/parsl-aws-provider/troubleshooting.html).
+Fuller coverage in [troubleshooting.md](https://scttfrdmn.github.io/parsl-ephemeral-provider/troubleshooting.html).
 
 **Workers launch but never register.** Almost always the inbound-port
 prerequisite above. Check the security group on your *client*, not the workers.
@@ -347,7 +347,7 @@ prerequisite above. Check the security group on your *client*, not the workers.
 **`ProviderConfigurationError: Unknown configuration option(s): ...`.** The option
 does not exist. Unknown keywords are rejected rather than ignored, which is why
 configurations from older versions fail loudly — check the name against
-[api_reference.rst](https://scttfrdmn.github.io/parsl-aws-provider/api_reference.html).
+[api_reference.rst](https://scttfrdmn.github.io/parsl-ephemeral-provider/api_reference.html).
 
 **`ResourceNotFoundError` on construction.** One of the three network IDs does not
 exist, or belongs to another region.
@@ -361,12 +361,12 @@ aws ssm describe-instance-information --region us-east-1       # SSM sees anythi
 
 Issues and pull requests are welcome. All work goes on a feature branch and merges
 via a PR; issues carry `severity:`, `type:`, and `component:` labels and a
-milestone. See [CLAUDE.md](https://github.com/scttfrdmn/parsl-aws-provider/blob/main/CLAUDE.md) for the development conventions and
-[docs/ci_cd.md](https://scttfrdmn.github.io/parsl-aws-provider/ci_cd.html) for what CI checks.
+milestone. See [CLAUDE.md](https://github.com/scttfrdmn/parsl-ephemeral-provider/blob/main/CLAUDE.md) for the development conventions and
+[docs/ci_cd.md](https://scttfrdmn.github.io/parsl-ephemeral-provider/ci_cd.html) for what CI checks.
 
 ```bash
-git clone https://github.com/scttfrdmn/parsl-aws-provider
-cd parsl-aws-provider
+git clone https://github.com/scttfrdmn/parsl-ephemeral-provider
+cd parsl-ephemeral-provider
 
 # uv only — no pip, venv, or pyenv
 uv sync --extra dev --extra test
@@ -377,15 +377,15 @@ uv run ruff check . && uv run ruff format --check .
 
 Integration tests run against [substrate](https://github.com/scttfrdmn/substrate),
 a local AWS emulator (`make substrate-up`) — see
-[substrate_testing.md](https://scttfrdmn.github.io/parsl-aws-provider/substrate_testing.html). Tests under `tests/aws/` need
+[substrate_testing.md](https://scttfrdmn.github.io/parsl-ephemeral-provider/substrate_testing.html). Tests under `tests/aws/` need
 real credentials and cost money.
 
 ## License
 
-Apache License 2.0 — see [LICENSE](https://github.com/scttfrdmn/parsl-aws-provider/blob/main/LICENSE) and [NOTICE](https://github.com/scttfrdmn/parsl-aws-provider/blob/main/NOTICE).
+Apache License 2.0 — see [LICENSE](https://github.com/scttfrdmn/parsl-ephemeral-provider/blob/main/LICENSE) and [NOTICE](https://github.com/scttfrdmn/parsl-ephemeral-provider/blob/main/NOTICE).
 
 ## Support
 
-- [GitHub Issues](https://github.com/scttfrdmn/parsl-aws-provider/issues)
+- [GitHub Issues](https://github.com/scttfrdmn/parsl-ephemeral-provider/issues)
 - [Parsl documentation](https://parsl.readthedocs.io)
 - [Globus Compute documentation](https://globus-compute.readthedocs.io)

@@ -30,14 +30,16 @@ what the provider actually calls:
 ```python
 import json
 
-from parsl_aws_provider import GlobusComputeProvider
+from parsl_ephemeral_provider import EphemeralComputeProvider
 
-print(json.dumps(GlobusComputeProvider.minimum_iam_policy(), indent=2))
-print(json.dumps(GlobusComputeProvider.minimum_iam_policy(include_ecr=True), indent=2))
+print(json.dumps(EphemeralComputeProvider.minimum_iam_policy(), indent=2))
+print(
+    json.dumps(EphemeralComputeProvider.minimum_iam_policy(include_ecr=True), indent=2)
+)
 ```
 
 This is a `@staticmethod` — you do not need to construct a provider to call it,
-and it applies to `EphemeralAWSProvider` just as much as to the Globus subclass.
+and it applies to `EphemeralProvider` just as much as to the Globus subclass.
 
 It returns five statements: `SessionValidation`, `EC2Management`,
 `SSMCommandsAndParameters`, `SpotInterruptionWarning`, and `IAMInstanceProfile`,
@@ -49,7 +51,7 @@ of this document asked for all of them. The provider creates no network resource
 (#69) and uses `CreateFleet` rather than the legacy Spot Fleet API (#86). Nor any
 Session Manager action — `ssm:StartSession` and its four companions were granted
 for a tunnel this package does not have, and were removed in
-[#195](https://github.com/scttfrdmn/parsl-aws-provider/issues/195).
+[#195](https://github.com/scttfrdmn/parsl-ephemeral-provider/issues/195).
 
 The IAM statement grants **both halves** of the instance-profile lifecycle. The
 teardown grants are not symmetry for its own sake: `cleanup_infrastructure()`
@@ -161,7 +163,7 @@ If your workload needs more — reading S3, writing CloudWatch Logs — create t
 role yourself and pass `iam_instance_profile_arn`:
 
 ```python
-provider = EphemeralAWSProvider(
+provider = EphemeralProvider(
     # ... network and compute options ...
     iam_instance_profile_arn="arn:aws:iam::123456789012:instance-profile/parsl-worker",
 )
@@ -196,12 +198,12 @@ Attach `AmazonSSMManagedInstanceCore` as well if you use the warm pool or one-sh
 mode.
 
 **A role created with `auto_create_instance_profile=True` is deleted on shutdown**
-since v0.8.0 ([#132](https://github.com/scttfrdmn/parsl-aws-provider/issues/132)),
+since v0.8.0 ([#132](https://github.com/scttfrdmn/parsl-ephemeral-provider/issues/132)),
 along with its instance profile. Deletion is gated on ownership, so a profile you
 supplied through `iam_instance_profile_arn` is never deleted. Your policy must
 grant the teardown actions listed above — cleanup logs rather than raises, so
 without them the roles accumulate silently
-([#195](https://github.com/scttfrdmn/parsl-aws-provider/issues/195)).
+([#195](https://github.com/scttfrdmn/parsl-ephemeral-provider/issues/195)).
 
 ### Bastion instance profile (detached mode)
 
@@ -247,7 +249,7 @@ ec2.authorize_security_group_ingress(
     ],
 )
 
-provider = EphemeralAWSProvider(
+provider = EphemeralProvider(
     region="us-east-1",
     vpc_id="vpc-0123456789abcdef0",
     subnet_id="subnet-0123456789abcdef0",
@@ -269,7 +271,7 @@ required for access.
 ### Private subnets
 
 ```python
-provider = EphemeralAWSProvider(
+provider = EphemeralProvider(
     # ... other options ...
     subnet_id="subnet-private0123456789",
     use_public_ips=False,
@@ -290,7 +292,7 @@ CurveZMQ certificates are generated in the client's `run_dir`, which workers
 cannot read, so leaving encryption on makes workers fail to register. Same-VPC
 deployments rely on VPC isolation; certificate distribution for cross-VPC and
 internet paths is
-[#62](https://github.com/scttfrdmn/parsl-aws-provider/issues/62).
+[#62](https://github.com/scttfrdmn/parsl-ephemeral-provider/issues/62).
 
 ### Encryption at rest
 
@@ -310,7 +312,7 @@ aws s3api put-bucket-encryption --bucket my-parsl-state-bucket \
 before the first `submit()`:
 
 ```python
-from parsl_aws_provider.state.parameter_store import ParameterStoreState
+from parsl_ephemeral_provider.state.parameter_store import ParameterStoreState
 
 provider.state_store = ParameterStoreState(
     provider=provider,
@@ -335,7 +337,7 @@ environment variables, `~/.aws/credentials`, and instance profiles all work.
 Select a named profile with `profile_name`:
 
 ```python
-provider = EphemeralAWSProvider(
+provider = EphemeralProvider(
     profile_name="parsl-profile",
     # ... other options ...
 )
@@ -349,7 +351,7 @@ use keys, rotate them on your usual schedule.
 ### Tagging
 
 ```python
-provider = EphemeralAWSProvider(
+provider = EphemeralProvider(
     # ... other options ...
     additional_tags={
         "Project": "MyDataScience",
@@ -366,13 +368,13 @@ work.
 
 ### Audit logging
 
-`parsl_aws_provider.security.audit` provides `AuditLogger` and
+`parsl_ephemeral_provider.security.audit` provides `AuditLogger` and
 `SecurityMonitor`. `ParameterStoreState` emits `STATE_ACCESS` events when the
 provider has an `audit_logger` attribute — but the provider takes no such
 constructor argument and sets no such attribute, so you must attach one yourself:
 
 ```python
-from parsl_aws_provider.security.audit import AuditLogger
+from parsl_ephemeral_provider.security.audit import AuditLogger
 
 provider.audit_logger = AuditLogger(log_file="parsl-audit.jsonl")
 ```
@@ -419,7 +421,7 @@ another process, construct a provider against the same state location — the
 persisted `provider_id` is adopted automatically:
 
 ```python
-provider = EphemeralAWSProvider(
+provider = EphemeralProvider(
     mode="detached",
     region="us-east-1",
     vpc_id="vpc-0123456789abcdef0",
@@ -434,13 +436,13 @@ provider.shutdown()
 If the state is gone, sweep by tag instead:
 
 ```bash
-parsl-aws-cleanup --region us-east-1            # --dry-run first
+parsl-ephemeral-cleanup --region us-east-1            # --dry-run first
 ```
 
 ## Reporting a vulnerability
 
 Open a
-[security advisory](https://github.com/scttfrdmn/parsl-aws-provider/security/advisories/new)
+[security advisory](https://github.com/scttfrdmn/parsl-ephemeral-provider/security/advisories/new)
 rather than a public issue.
 
 SPDX-License-Identifier: Apache-2.0

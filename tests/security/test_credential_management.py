@@ -10,7 +10,7 @@ from unittest.mock import Mock, patch
 from datetime import datetime, timedelta
 from botocore.exceptions import ClientError, NoCredentialsError
 
-from parsl_aws_provider.security.credential_manager import (
+from parsl_ephemeral_provider.security.credential_manager import (
     CredentialConfiguration,
     CredentialSanitizer,
     SanitizingLogHandler,
@@ -278,7 +278,7 @@ class TestCredentialManager:
         assert manager.config == config
         assert manager.current_credentials is None
 
-    @patch("parsl_aws_provider.security.credential_manager.logging.getLogger")
+    @patch("parsl_ephemeral_provider.security.credential_manager.logging.getLogger")
     def test_log_sanitization_setup(self, mock_get_logger):
         """Test log sanitization setup.
 
@@ -340,7 +340,7 @@ class TestCredentialManager:
         ):
             manager._get_environment_credentials()
 
-    @patch("parsl_aws_provider.security.credential_manager.boto3.Session")
+    @patch("parsl_ephemeral_provider.security.credential_manager.boto3.Session")
     def test_get_instance_profile_credentials(self, mock_session_class):
         """Test getting credentials from instance profile."""
         # Mock session and credentials
@@ -361,7 +361,7 @@ class TestCredentialManager:
         assert creds.access_key == "AKIAIOSFODNN7EXAMPLE"
         assert creds.source == "instance_profile"
 
-    @patch("parsl_aws_provider.security.credential_manager.boto3.Session")
+    @patch("parsl_ephemeral_provider.security.credential_manager.boto3.Session")
     def test_get_instance_profile_credentials_missing(self, mock_session_class):
         """Test error when instance profile credentials are missing."""
         mock_session = Mock()
@@ -376,7 +376,7 @@ class TestCredentialManager:
         ):
             manager._get_instance_profile_credentials()
 
-    @patch("parsl_aws_provider.security.credential_manager.boto3.client")
+    @patch("parsl_ephemeral_provider.security.credential_manager.boto3.client")
     def test_assume_role(self, mock_boto3_client):
         """Test IAM role assumption."""
         # Mock STS client response
@@ -411,7 +411,7 @@ class TestCredentialManager:
             DurationSeconds=3600,
         )
 
-    @patch("parsl_aws_provider.security.credential_manager.boto3.client")
+    @patch("parsl_ephemeral_provider.security.credential_manager.boto3.client")
     def test_assume_role_failure(self, mock_boto3_client):
         """Test IAM role assumption failure."""
         mock_sts_client = Mock()
@@ -448,7 +448,7 @@ class TestCredentialManager:
         assert creds == cached_creds
 
     @patch(
-        "parsl_aws_provider.security.credential_manager.CredentialManager._obtain_credentials"
+        "parsl_ephemeral_provider.security.credential_manager.CredentialManager._obtain_credentials"
     )
     def test_get_credentials_refresh_needed(self, mock_obtain):
         """Test getting credentials when refresh is needed."""
@@ -482,7 +482,7 @@ class TestCredentialManager:
         assert manager.current_credentials == new_creds
         mock_obtain.assert_called_once()
 
-    @patch("parsl_aws_provider.security.credential_manager.boto3.Session")
+    @patch("parsl_ephemeral_provider.security.credential_manager.boto3.Session")
     def test_create_boto3_session(self, mock_session_class):
         """Test creating boto3 session with credentials."""
         config = CredentialConfiguration()
@@ -541,7 +541,7 @@ class TestCredentialManager:
         assert "expires_in_seconds" in info
 
     @patch(
-        "parsl_aws_provider.security.credential_manager.CredentialManager._obtain_credentials"
+        "parsl_ephemeral_provider.security.credential_manager.CredentialManager._obtain_credentials"
     )
     def test_refresh_credentials(self, mock_obtain):
         """Test forcing credential refresh."""

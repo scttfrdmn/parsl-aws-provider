@@ -17,8 +17,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from parsl_aws_provider.provider import EphemeralAWSProvider
-from parsl_aws_provider.state.file import FileStateStore
+from parsl_ephemeral_provider.provider import EphemeralProvider
+from parsl_ephemeral_provider.state.file import FileStateStore
 
 
 # ---------------------------------------------------------------------------
@@ -41,20 +41,20 @@ def _make_provider(tmp_dir, provider_id, state_file, max_blocks=10):
     mode_mock.list_resources.return_value = {}
 
     with (
-        patch("parsl_aws_provider.provider.create_session") as mock_sf,
+        patch("parsl_ephemeral_provider.provider.create_session") as mock_sf,
         patch.object(
-            EphemeralAWSProvider,
+            EphemeralProvider,
             "_initialize_state_store",
             return_value=state_store,
         ),
         patch.object(
-            EphemeralAWSProvider,
+            EphemeralProvider,
             "_initialize_operating_mode",
             return_value=mode_mock,
         ),
     ):
         mock_sf.return_value = MagicMock()
-        provider = EphemeralAWSProvider(
+        provider = EphemeralProvider(
             provider_id=provider_id,
             region="us-east-1",
             image_id="ami-12345678",

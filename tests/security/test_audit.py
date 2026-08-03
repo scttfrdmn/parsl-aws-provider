@@ -9,7 +9,7 @@ import json
 import tempfile
 import os
 
-from parsl_aws_provider.security.audit import (
+from parsl_ephemeral_provider.security.audit import (
     SecurityEventType,
     SecurityEventSeverity,
     SecurityEvent,

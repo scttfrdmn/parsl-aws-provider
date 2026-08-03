@@ -30,7 +30,7 @@ import logging
 import os
 import sys
 
-from parsl_aws_provider import EphemeralAWSProvider
+from parsl_ephemeral_provider import EphemeralProvider
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("basic-usage")
@@ -46,9 +46,9 @@ def _network() -> dict:
     }
 
 
-def standard_mode_provider() -> EphemeralAWSProvider:
+def standard_mode_provider() -> EphemeralProvider:
     """EC2 workers that dial back to this machine. Simplest, needs reachability."""
-    return EphemeralAWSProvider(
+    return EphemeralProvider(
         mode="standard",
         instance_type="t3.small",
         min_blocks=0,
@@ -66,9 +66,9 @@ def standard_mode_provider() -> EphemeralAWSProvider:
     )
 
 
-def detached_mode_provider() -> EphemeralAWSProvider:
+def detached_mode_provider() -> EphemeralProvider:
     """A bastion owns the worker lifecycle, so this machine need not be reachable."""
-    return EphemeralAWSProvider(
+    return EphemeralProvider(
         mode="detached",
         instance_type="t3.small",
         bastion_instance_type="t3.micro",
@@ -84,9 +84,9 @@ def detached_mode_provider() -> EphemeralAWSProvider:
     )
 
 
-def serverless_mode_provider() -> EphemeralAWSProvider:
+def serverless_mode_provider() -> EphemeralProvider:
     """Lambda functions instead of instances. No network IDs needed."""
-    return EphemeralAWSProvider(
+    return EphemeralProvider(
         # Lambda runs in the Lambda-managed VPC, so vpc_id/subnet_id/
         # security_group_id are not required here. ECS/Fargate does need them.
         region=os.environ.get("AWS_TEST_REGION", "us-east-1"),

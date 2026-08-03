@@ -8,7 +8,7 @@ import pytest
 import time
 from botocore.exceptions import ClientError, NoCredentialsError
 
-from parsl_aws_provider.error_handling import (
+from parsl_ephemeral_provider.error_handling import (
     ErrorSeverity,
     RecoveryAction,
     RetryConfig,

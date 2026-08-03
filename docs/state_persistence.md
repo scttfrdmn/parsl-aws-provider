@@ -19,9 +19,9 @@ the provider builds it, wiring in its own session, region, credentials, and audi
 logger:
 
 ```python
-from parsl_aws_provider import EphemeralAWSProvider
+from parsl_ephemeral_provider import EphemeralProvider
 
-provider = EphemeralAWSProvider(
+provider = EphemeralProvider(
     region="us-east-1",
     vpc_id="vpc-0123456789abcdef0",
     subnet_id="subnet-0123456789abcdef0",
@@ -32,14 +32,14 @@ provider = EphemeralAWSProvider(
 ```
 
 `state_store_type` accepts a string or a `StateStoreType` enum member
-(`from parsl_aws_provider.provider import StateStoreType`).
+(`from parsl_ephemeral_provider.provider import StateStoreType`).
 
 ### File store (default)
 
 State lives in a local JSON file, written under an `fcntl` lock.
 
 ```python
-provider = EphemeralAWSProvider(
+provider = EphemeralProvider(
     # ... network and compute options ...
     state_store_type="file",
     state_file_path="./aws_provider_state.json",
@@ -55,7 +55,7 @@ State lives in an AWS Systems Manager parameter, readable from both the client a
 the bastion — the reason detached mode prefers it.
 
 ```python
-provider = EphemeralAWSProvider(
+provider = EphemeralProvider(
     # ... network and compute options ...
     state_store_type="parameter_store",
     parameter_store_path="/parsl/my-workflow-state",
@@ -69,7 +69,7 @@ can reach; use S3 if you expect that.
 ### S3
 
 ```python
-provider = EphemeralAWSProvider(
+provider = EphemeralProvider(
     # ... network and compute options ...
     state_store_type="s3",
     s3_bucket="my-parsl-state-bucket",
@@ -92,7 +92,7 @@ create it.
 ## The store interface
 
 All three stores implement the same **keyed** interface from
-`parsl_aws_provider.state.base.StateStore`:
+`parsl_ephemeral_provider.state.base.StateStore`:
 
 ```text
 save_state(state_key: str, state_data: Dict[str, Any]) -> None
@@ -145,14 +145,14 @@ standard mode `baked_ami_id` / `owns_baked_ami`; for detached mode `bastion_id`.
 
 ## Recovery
 
-Recovery is automatic. `EphemeralAWSProvider.__init__` loads whatever is stored at
+Recovery is automatic. `EphemeralProvider.__init__` loads whatever is stored at
 the configured location, and if the state records a `provider_id` and you did not
 pass one, that ID is adopted — so a second provider pointed at the same state
 location continues the first one's work rather than starting a parallel run:
 
 ```python
 # First run
-provider = EphemeralAWSProvider(
+provider = EphemeralProvider(
     mode="detached",
     state_store_type="parameter_store",
     parameter_store_path="/parsl/my-workflow-state",
@@ -163,7 +163,7 @@ provider = EphemeralAWSProvider(
 
 # Later, in a new process: same store and path, so the bastion, tracked jobs,
 # and any baked AMI are picked back up.
-provider = EphemeralAWSProvider(
+provider = EphemeralProvider(
     mode="detached",
     state_store_type="parameter_store",
     parameter_store_path="/parsl/my-workflow-state",
@@ -198,7 +198,7 @@ Subclass `StateStore` and implement the three keyed methods:
 ```python
 from typing import Any, Dict, Optional
 
-from parsl_aws_provider.state.base import StateStore
+from parsl_ephemeral_provider.state.base import StateStore
 
 
 class MyCustomStateStore(StateStore):
@@ -226,7 +226,7 @@ construction (`provider.state_store = MyCustomStateStore(...)`) before the first
   resources.
 - Parameter Store operations emit `STATE_ACCESS` audit events when the provider
   has an `audit_logger`.
-- After any crash, run `parsl-aws-cleanup --dry-run --region <region>`
+- After any crash, run `parsl-ephemeral-cleanup --dry-run --region <region>`
   to check for resources the state no longer names.
 
 SPDX-License-Identifier: Apache-2.0

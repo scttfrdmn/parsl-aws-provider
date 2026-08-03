@@ -8,7 +8,7 @@ import pytest
 import os
 import tempfile
 from unittest.mock import Mock, patch
-from parsl_aws_provider.security.encryption import (
+from parsl_ephemeral_provider.security.encryption import (
     EncryptionConfiguration,
     EncryptionKeyManager,
     StateEncryptor,

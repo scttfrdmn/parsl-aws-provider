@@ -1,7 +1,7 @@
 # CI/CD Pipeline
 
 This document describes the continuous integration and release pipeline for the
-Parsl AWS Provider.
+Parsl Ephemeral Provider.
 
 The authoritative definitions are the workflow files themselves —
 [`.github/workflows/ci.yml`](../.github/workflows/ci.yml) and
@@ -32,9 +32,9 @@ checkout does.
 Two details worth knowing:
 
 * **Scope is `.`, the whole repository.** It was once narrowed to
-  `parsl_aws_provider tests`, because `tools/` carried bare excepts and unused
-  imports in one-off debug scripts. [#93](https://github.com/scttfrdmn/parsl-aws-provider/issues/93)
-  and [#165](https://github.com/scttfrdmn/parsl-aws-provider/issues/165) pruned
+  `parsl_ephemeral_provider tests`, because `tools/` carried bare excepts and unused
+  imports in one-off debug scripts. [#93](https://github.com/scttfrdmn/parsl-ephemeral-provider/issues/93)
+  and [#165](https://github.com/scttfrdmn/parsl-ephemeral-provider/issues/165) pruned
   those in v0.8.0, so the narrowing no longer protects anything and a `.`-scoped
   check passes.
 * **ruff-format, not black.** `black` and `isort` are no longer dependencies. The
@@ -46,10 +46,10 @@ Two details worth knowing:
 
 ### `type-check`
 
-`mypy parsl_aws_provider`, reported but **not gated** (`continue-on-error: true`)
+`mypy parsl_ephemeral_provider`, reported but **not gated** (`continue-on-error: true`)
 while the pre-existing error count is worked down under
-[#81](https://github.com/scttfrdmn/parsl-aws-provider/issues/81) and
-[#82](https://github.com/scttfrdmn/parsl-aws-provider/issues/82). Remove the
+[#81](https://github.com/scttfrdmn/parsl-ephemeral-provider/issues/81) and
+[#82](https://github.com/scttfrdmn/parsl-ephemeral-provider/issues/82). Remove the
 `continue-on-error` once it reaches zero.
 
 ### `unit-tests`
@@ -78,17 +78,17 @@ alone measures 34%.
 Runs `tests/integration` against a pinned substrate service container
 (`ghcr.io/scttfrdmn/substrate`), plus a gated `tests/test_substrate_emulation.py`
 conformance step. Substrate replaced LocalStack in
-[#125](https://github.com/scttfrdmn/parsl-aws-provider/issues/125): LocalStack OSS
+[#125](https://github.com/scttfrdmn/parsl-ephemeral-provider/issues/125): LocalStack OSS
 is end-of-life and its `latest` community tag now resolves to the Pro build, which
 exits 55 without a license token -- before any step runs, and outside what
 `continue-on-error` covers.
 
 The integration suite **gates** as of
-[#192](https://github.com/scttfrdmn/parsl-aws-provider/issues/192). It carried
+[#192](https://github.com/scttfrdmn/parsl-ephemeral-provider/issues/192). It carried
 `continue-on-error: true` for as long as 46 mode constructions across 9 files
-omitted the network IDs [#69](https://github.com/scttfrdmn/parsl-aws-provider/issues/69)
+omitted the network IDs [#69](https://github.com/scttfrdmn/parsl-ephemeral-provider/issues/69)
 made required, since gating before that was fixed would have turned every PR red on
-known debt. [#92](https://github.com/scttfrdmn/parsl-aws-provider/issues/92) closed
+known debt. [#92](https://github.com/scttfrdmn/parsl-ephemeral-provider/issues/92) closed
 in v0.8.0 and the suite is green, so the exemption could only have hidden a
 regression. Only the Codecov upload step remains non-gating.
 
@@ -100,7 +100,7 @@ guard; without one, a plain `pytest tests/integration` errors instead of skippin
 
 The real-AWS E2E suite (`tests/aws`), **manual dispatch only** — it bills money
 and needs a pre-provisioned VPC, subnet, and security group.
-[#60](https://github.com/scttfrdmn/parsl-aws-provider/issues/60) closed with tests
+[#60](https://github.com/scttfrdmn/parsl-ephemeral-provider/issues/60) closed with tests
 here that no workflow referenced; there are **87** now, across ten files.
 
 Credentials come from OIDC via `aws-actions/configure-aws-credentials`, so no
@@ -115,7 +115,7 @@ without these configured skips rather than failing. The gate is what makes that
 true, not `tests/aws/conftest.py`: conftest does skip when the three IDs are
 unset, but pytest is never reached — `configure-aws-credentials` fails first on
 the empty region, so before
-[#161](https://github.com/scttfrdmn/parsl-aws-provider/issues/161) every dispatch
+[#161](https://github.com/scttfrdmn/parsl-ephemeral-provider/issues/161) every dispatch
 was red.
 
 Once it does run, conftest validates the IDs against `AWS_TEST_REGION` up front —
@@ -123,7 +123,7 @@ IDs from another region otherwise surface minutes in, from deep inside
 `RunInstances`, after instances have been billed. Pick a subnet in an AZ that
 offers your instance type (`us-east-1e` does not offer `t3.micro`).
 
-A final `always()` step runs `parsl-aws-cleanup --dry-run` to report
+A final `always()` step runs `parsl-ephemeral-cleanup --dry-run` to report
 orphans, since a failed test is exactly when instances are most likely to be left
 running. It reports without deleting, so CI never mutates a shared account. The
 script takes credentials from the boto3 chain — the OIDC credentials the earlier
@@ -138,7 +138,7 @@ Runs `bats tests/bats/` for the shell scripts under `scripts/`.
 
 `uv build`, then `twine check`. Also asserts the CloudFormation templates are
 present in the built wheel: before
-[#112](https://github.com/scttfrdmn/parsl-aws-provider/issues/112),
+[#112](https://github.com/scttfrdmn/parsl-ephemeral-provider/issues/112),
 `get_cf_template()` resolved templates by filesystem path, so a wheel that omitted
 them failed only at runtime, on a real AWS call.
 
@@ -149,7 +149,7 @@ Builds the Sphinx documentation and uploads it as an artifact.
 ## `release.yml`
 
 Triggered by pushing a `v*` tag. Before anything else it **verifies the tag
-matches `parsl_aws_provider.__version__`** — `bump-my-version` has silently
+matches `parsl_ephemeral_provider.__version__`** — `bump-my-version` has silently
 missed `__init__.py` before (its `[tool.bumpversion]` search string drifted out of
 sync), and v0.6.0 shipped with `__version__ == "0.1.0"`. Catching that here
 matters because a PyPI version can never be reused. `make version-verify` runs the
@@ -184,9 +184,9 @@ on `PATH` rather than `.venv`. Use `uv run` (or the Makefile, which does).
 ## Badges
 
 ```markdown
-[![CI](https://github.com/scttfrdmn/parsl-aws-provider/actions/workflows/ci.yml/badge.svg)](https://github.com/scttfrdmn/parsl-aws-provider/actions/workflows/ci.yml)
-[![codecov](https://codecov.io/gh/scttfrdmn/parsl-aws-provider/branch/main/graph/badge.svg)](https://codecov.io/gh/scttfrdmn/parsl-aws-provider)
-[![PyPI version](https://badge.fury.io/py/parsl-aws-provider.svg)](https://badge.fury.io/py/parsl-aws-provider)
+[![CI](https://github.com/scttfrdmn/parsl-ephemeral-provider/actions/workflows/ci.yml/badge.svg)](https://github.com/scttfrdmn/parsl-ephemeral-provider/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/scttfrdmn/parsl-ephemeral-provider/branch/main/graph/badge.svg)](https://codecov.io/gh/scttfrdmn/parsl-ephemeral-provider)
+[![PyPI version](https://badge.fury.io/py/parsl-ephemeral-provider.svg)](https://badge.fury.io/py/parsl-ephemeral-provider)
 ```
 
 SPDX-License-Identifier: Apache-2.0

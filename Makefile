@@ -167,7 +167,7 @@ format: ## Format code with ruff
 # Run type checking
 type-check: ## Run type checking with mypy
 	@echo "$(YELLOW)Running type checks...$(RESET)"
-	$(RUN) mypy parsl_aws_provider
+	$(RUN) mypy parsl_ephemeral_provider
 
 # Run pre-commit hooks
 pre-commit: ## Run all pre-commit hooks
@@ -197,7 +197,7 @@ release: lint type-check test build ## Prepare package for release
 # Run security checks
 security: ## Run security scan with bandit
 	@echo "$(YELLOW)Running security scan...$(RESET)"
-	$(RUN) bandit -r parsl_aws_provider -c pyproject.toml
+	$(RUN) bandit -r parsl_ephemeral_provider -c pyproject.toml
 
 # Code coverage
 coverage: ## Generate test coverage report (excludes real-AWS tests)
@@ -240,7 +240,7 @@ version-bump-major: ## Bump major version (0.1.0 -> 1.0.0)
 
 version-verify: ## Check pyproject and __init__ versions agree
 	@toml="$$(grep '^version = ' pyproject.toml | head -1 | cut -d'"' -f2)"; \
-	pkg="$$($(RUN) python -c 'import parsl_aws_provider as p; print(p.__version__)')"; \
+	pkg="$$($(RUN) python -c 'import parsl_ephemeral_provider as p; print(p.__version__)')"; \
 	if [ "$$toml" != "$$pkg" ]; then \
 		echo "$(RED)version mismatch: pyproject=$$toml __init__=$$pkg$(RESET)"; \
 		echo "$(RED)bump-my-version's search string has drifted; edit __init__.py by hand$(RESET)"; \

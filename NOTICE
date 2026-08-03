@@ -1,4 +1,4 @@
-Parsl AWS Provider
+Parsl Ephemeral Provider
 Copyright 2025-2026 Scott Friedman and Project Contributors
 
 This product includes software developed by Scott Friedman and Project
@@ -26,21 +26,33 @@ TRADEMARK ATTRIBUTION
 
 Amazon Web Services, AWS, Amazon EC2, AWS Lambda, Amazon ECS, AWS Fargate, AWS
 Systems Manager, and Amazon S3 are trademarks of Amazon.com, Inc. or its
-affiliates. Use of these names in this project is nominative -- they identify the
-services this software interoperates with -- and does not imply any affiliation
+affiliates. These names appear in this project solely to identify the services
+this software interoperates with, and their use does not imply any affiliation
 with or endorsement by Amazon.com, Inc. or its affiliates.
 
-Parsl is a project of the Parsl developer community. Its name and marks are used
-here nominatively to identify the library this software extends, and do not imply
-affiliation with or endorsement by the Parsl project.
+No AWS mark forms part of any identifier this project publishes. The distribution
+name, the import package, the console script, and the public class names are all
+free of them, per section 7 of the AWS Trademark Guidelines, which prohibits
+combining, abbreviating, telescoping, or hyphenating an AWS mark with other words
+and prohibits incorporating one into a product name. Where the marks do appear --
+in this file, in the package description and keywords, and throughout the
+documentation -- they are plain text identifying the services involved, in the
+relational form section 13 permits ("... for AWS").
 
-Globus and Globus Compute are trademarks of the University of Chicago. Their use
-here is nominative, identifying the platform this software integrates with, and
-does not imply affiliation with or endorsement by the University of Chicago or
-the Globus organization.
+Parsl is a project of the Parsl developer community. Its name and marks appear
+here solely to identify the library this software extends, and do not imply
+affiliation with or endorsement by the Parsl project. The Parsl project publishes
+no trademark or naming policy; the `parsl-` prefix in this project's name is used
+to say what the software plugs into, and the wording above is what keeps that from
+reading as a claim of official status.
 
-Docker is a trademark of Docker, Inc. Its use here is nominative and does not
-imply affiliation or endorsement.
+Globus and Globus Compute are trademarks of the University of Chicago. They
+appear here solely to identify the platform this software integrates with, and
+their use does not imply affiliation with or endorsement by the University of
+Chicago or the Globus organization.
+
+Docker is a trademark of Docker, Inc. It appears here solely to identify the
+tooling involved and does not imply affiliation or endorsement.
 
 All other trademarks are the property of their respective owners.
 

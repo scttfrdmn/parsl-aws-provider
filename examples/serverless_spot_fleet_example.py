@@ -35,7 +35,7 @@ import parsl
 from parsl.config import Config
 from parsl.executors import HighThroughputExecutor
 
-from parsl_aws_provider import EphemeralAWSProvider
+from parsl_ephemeral_provider import EphemeralProvider
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("serverless-spot-fleet")
@@ -79,7 +79,7 @@ def main() -> int:
         logger.error("Missing required environment variable: %s", exc)
         return 2
 
-    provider = EphemeralAWSProvider(
+    provider = EphemeralProvider(
         mode="serverless",
         # "ecs" is required: the fleet branch lives in the ECS submit path.
         # compute_type="lambda" ignores use_spot_fleet entirely.

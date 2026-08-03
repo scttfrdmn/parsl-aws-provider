@@ -1,4 +1,4 @@
-# Contributing to Parsl AWS Provider
+# Contributing to Parsl Ephemeral Provider
 
 Thank you for your interest in contributing to this project! Here's how you can help.
 
@@ -7,8 +7,8 @@ Thank you for your interest in contributing to this project! Here's how you can 
 1. Fork the repository on GitHub
 2. Clone your fork locally
    ```bash
-   git clone https://github.com/your-username/parsl-aws-provider.git
-   cd parsl-aws-provider
+   git clone https://github.com/your-username/parsl-ephemeral-provider.git
+   cd parsl-ephemeral-provider
    ```
 3. Install [uv](https://docs.astral.sh/uv/), which manages both the Python
    interpreter and the dependencies for this project. Do not use `pip`,
@@ -40,14 +40,14 @@ Thank you for your interest in contributing to this project! Here's how you can 
 2. Make your changes and ensure they follow the project's coding standards
    ```bash
    # Format code and sort imports (ruff covers both)
-   uv run ruff format parsl_aws_provider
-   uv run ruff check --fix parsl_aws_provider tests
+   uv run ruff format parsl_ephemeral_provider
+   uv run ruff check --fix parsl_ephemeral_provider tests
 
    # Run linting
-   uv run ruff check parsl_aws_provider tests
+   uv run ruff check parsl_ephemeral_provider tests
 
    # Run type checking
-   uv run mypy parsl_aws_provider
+   uv run mypy parsl_ephemeral_provider
    ```
    Or all at once, exactly as CI runs them: `make lint-python type-check`.
 

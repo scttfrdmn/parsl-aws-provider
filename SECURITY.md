@@ -2,7 +2,7 @@
 
 ## Supported Versions
 
-The following versions of Parsl AWS Provider are currently being supported with security updates:
+The following versions of Parsl Ephemeral Provider are currently being supported with security updates:
 
 | Version | Supported          |
 | ------- | ------------------ |
@@ -11,17 +11,17 @@ The following versions of Parsl AWS Provider are currently being supported with 
 
 The project is pre-1.0 and alpha: only the latest minor line receives security
 fixes, and there are no backports. Nothing has been published to PyPI yet
-([#180](https://github.com/scttfrdmn/parsl-aws-provider/issues/180)), so every
+([#180](https://github.com/scttfrdmn/parsl-ephemeral-provider/issues/180)), so every
 existing install is from source.
 
 ## Reporting a Vulnerability
 
-We take the security of the Parsl AWS Provider seriously. If you believe you've found a security vulnerability, please follow these steps:
+We take the security of the Parsl Ephemeral Provider seriously. If you believe you've found a security vulnerability, please follow these steps:
 
 1. **Do not disclose the vulnerability publicly** on the issue tracker, mailing lists, or social media.
 
 2. **Report it privately through GitHub**, using
-   [Report a vulnerability](https://github.com/scttfrdmn/parsl-aws-provider/security/advisories/new)
+   [Report a vulnerability](https://github.com/scttfrdmn/parsl-ephemeral-provider/security/advisories/new)
    under the repository's Security tab. That opens a private advisory visible only
    to you and the maintainers. This replaces the previous "email the core
    maintainers" instruction, which named no address and so left reporters with no
@@ -38,7 +38,7 @@ We take the security of the Parsl AWS Provider seriously. If you believe you've 
 
 ## Security Best Practices
 
-When using the Parsl AWS Provider, follow these security best practices:
+When using the Parsl Ephemeral Provider, follow these security best practices:
 
 ### AWS IAM Permissions
 
@@ -78,7 +78,7 @@ responsibility rather than a default it picks for you:
 
 The provider deploys CloudFormation stacks for the detached-mode bastion and for
 the serverless Lambda and ECS workers. The Terraform templates under
-`parsl_aws_provider/templates/terraform/` are referenced by no code path and
+`parsl_ephemeral_provider/templates/terraform/` are referenced by no code path and
 deploy nothing.
 
 - Review the CloudFormation templates before running a mode that deploys them
@@ -100,7 +100,7 @@ outright rather than ignoring them, so a misspelling raises
 would be a silent false assurance.
 
 ```python
-provider = EphemeralAWSProvider(
+provider = EphemeralProvider(
     # Network: pre-provisioned by you, and never modified by the provider.
     # It creates no VPC, subnet, or security group, and deletes none.
     vpc_id="vpc-...",

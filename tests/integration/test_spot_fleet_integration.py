@@ -40,9 +40,9 @@ from types import SimpleNamespace
 
 import pytest
 
-from parsl_aws_provider.compute.spot_fleet import SpotFleetManager
-from parsl_aws_provider.constants import STATUS_CANCELLED, STATUS_RUNNING
-from parsl_aws_provider.exceptions import ResourceCreationError
+from parsl_ephemeral_provider.compute.spot_fleet import SpotFleetManager
+from parsl_ephemeral_provider.constants import STATUS_CANCELLED, STATUS_RUNNING
+from parsl_ephemeral_provider.exceptions import ResourceCreationError
 from tests.substrate_support import is_substrate_available
 
 pytestmark = [

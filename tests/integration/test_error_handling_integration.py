@@ -8,11 +8,11 @@ import pytest
 from unittest.mock import MagicMock, patch
 from botocore.exceptions import ClientError
 
-from parsl_aws_provider.compute.ec2 import EC2Manager
-from parsl_aws_provider.compute.ecs import ECSManager
-from parsl_aws_provider.compute.spot_fleet import SpotFleetManager
-from parsl_aws_provider.error_handling import ErrorContext, RobustErrorHandler
-from parsl_aws_provider.exceptions import (
+from parsl_ephemeral_provider.compute.ec2 import EC2Manager
+from parsl_ephemeral_provider.compute.ecs import ECSManager
+from parsl_ephemeral_provider.compute.spot_fleet import SpotFleetManager
+from parsl_ephemeral_provider.error_handling import ErrorContext, RobustErrorHandler
+from parsl_ephemeral_provider.exceptions import (
     ResourceCreationError,
     SpotFleetError,
     SpotFleetRequestError,
@@ -185,7 +185,7 @@ class TestErrorHandlingIntegration:
         ec2_manager = make_manager(EC2Manager, "ec2")
 
         # Simulate some errors
-        from parsl_aws_provider.error_handling import ErrorContext
+        from parsl_ephemeral_provider.error_handling import ErrorContext
 
         context = ErrorContext(
             operation="test_operation", resource_type="test_resource"

@@ -42,7 +42,7 @@ def _poll_until(
     Parameters
     ----------
     provider:
-        An initialised EphemeralAWSProvider instance.
+        An initialised EphemeralProvider instance.
     job_id:
         The job ID returned by provider.submit().
     target_state:

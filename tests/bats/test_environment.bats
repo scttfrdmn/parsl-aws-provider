@@ -69,10 +69,10 @@ teardown() {
 # Test the project structure
 @test "Project has expected directory structure" {
   # Check for key project directories
-  [ -d "$PROJ_ROOT/parsl_aws_provider" ]
-  [ -d "$PROJ_ROOT/parsl_aws_provider/modes" ]
-  [ -d "$PROJ_ROOT/parsl_aws_provider/compute" ]
-  [ -d "$PROJ_ROOT/parsl_aws_provider/state" ]
+  [ -d "$PROJ_ROOT/parsl_ephemeral_provider" ]
+  [ -d "$PROJ_ROOT/parsl_ephemeral_provider/modes" ]
+  [ -d "$PROJ_ROOT/parsl_ephemeral_provider/compute" ]
+  [ -d "$PROJ_ROOT/parsl_ephemeral_provider/state" ]
   [ -d "$PROJ_ROOT/tests" ]
 
   # Check for essential files. pyproject.toml is the single source of both

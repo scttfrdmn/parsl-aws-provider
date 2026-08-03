@@ -11,7 +11,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from parsl_aws_provider.network.vpc import VPCManager
+from parsl_ephemeral_provider.network.vpc import VPCManager
 
 
 # ---------------------------------------------------------------------------

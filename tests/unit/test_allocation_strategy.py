@@ -32,14 +32,14 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from parsl_aws_provider.constants import (
+from parsl_ephemeral_provider.constants import (
     DEFAULT_SPOT_ALLOCATION_STRATEGY,
     EC2_FLEET_ALLOCATION_STRATEGIES,
     EC2_FLEET_DEFAULT_ALLOCATION_STRATEGY,
     SPOT_FLEET_ALLOCATION_STRATEGIES,
     SPOT_FLEET_DEFAULT_ALLOCATION_STRATEGY,
 )
-from parsl_aws_provider.utils.aws import normalize_spot_fleet_allocation_strategy
+from parsl_ephemeral_provider.utils.aws import normalize_spot_fleet_allocation_strategy
 
 
 pytestmark = pytest.mark.unit
@@ -147,7 +147,7 @@ class TestNoHardcodedLowestPriceRemains:
     def test_spot_fleet_manager_does_not_hardcode_a_strategy(self):
         import inspect
 
-        from parsl_aws_provider.compute import spot_fleet
+        from parsl_ephemeral_provider.compute import spot_fleet
 
         source = inspect.getsource(spot_fleet)
         assert '"AllocationStrategy": "lowestPrice"' not in source
@@ -160,7 +160,7 @@ class TestNoHardcodedLowestPriceRemains:
         """
         import inspect
 
-        from parsl_aws_provider.modes import detached
+        from parsl_ephemeral_provider.modes import detached
 
         source = inspect.getsource(detached)
         assert "'AllocationStrategy': 'lowestPrice'" not in source
@@ -185,7 +185,7 @@ class TestBastionScriptInjection:
     """
 
     def _script(self, **kwargs):
-        from parsl_aws_provider.modes.detached import DetachedMode
+        from parsl_ephemeral_provider.modes.detached import DetachedMode
 
         mode = DetachedMode(
             provider_id="test-provider",

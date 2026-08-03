@@ -5,7 +5,7 @@
 **Not yet on PyPI**, so install from the repository:
 
 ```bash
-uv add git+https://github.com/scttfrdmn/parsl-aws-provider
+uv add git+https://github.com/scttfrdmn/parsl-ephemeral-provider
 ```
 
 Or, working from a clone:
@@ -14,8 +14,8 @@ Or, working from a clone:
 uv sync --extra dev --extra test
 ```
 
-`uv add parsl-aws-provider` will start working once
-[#180](https://github.com/scttfrdmn/parsl-aws-provider/issues/180) is resolved —
+`uv add parsl-ephemeral-provider` will start working once
+[#180](https://github.com/scttfrdmn/parsl-ephemeral-provider/issues/180) is resolved —
 the package name is unregistered, so that command currently fails with "no
 matching distribution found" rather than installing an older version.
 
@@ -47,9 +47,9 @@ public SSM parameters — x86_64 and arm64 alike, in every region.
 import parsl
 from parsl.config import Config
 from parsl.executors import HighThroughputExecutor
-from parsl_aws_provider import EphemeralAWSProvider
+from parsl_ephemeral_provider import EphemeralProvider
 
-provider = EphemeralAWSProvider(
+provider = EphemeralProvider(
     region="us-east-1",
     vpc_id="vpc-0123456789abcdef0",
     subnet_id="subnet-0123456789abcdef0",
@@ -89,7 +89,7 @@ Select a mode with the `mode` **string**. Full details in
 The client talks directly to workers.
 
 ```python
-provider = EphemeralAWSProvider(
+provider = EphemeralProvider(
     mode="standard",
     region="us-east-1",
     vpc_id="vpc-0123456789abcdef0",
@@ -104,7 +104,7 @@ provider = EphemeralAWSProvider(
 A bastion owns the worker lifecycle, so the client can disconnect.
 
 ```python
-provider = EphemeralAWSProvider(
+provider = EphemeralProvider(
     mode="detached",
     region="us-east-1",
     vpc_id="vpc-0123456789abcdef0",
@@ -123,7 +123,7 @@ provider = EphemeralAWSProvider(
 Lambda or ECS/Fargate, no EC2 instances. Lambda needs no network IDs at all.
 
 ```python
-provider = EphemeralAWSProvider(
+provider = EphemeralProvider(
     mode="serverless",
     region="us-east-1",
     compute_type="lambda",  # or "ecs", which does need subnet + security group
@@ -138,7 +138,7 @@ provider = EphemeralAWSProvider(
 ### Spot instances
 
 ```python
-provider = EphemeralAWSProvider(
+provider = EphemeralProvider(
     region="us-east-1",
     vpc_id="vpc-0123456789abcdef0",
     subnet_id="subnet-0123456789abcdef0",
@@ -157,7 +157,7 @@ instance already `shutting-down`.
 ### Scale to zero
 
 ```python
-provider = EphemeralAWSProvider(
+provider = EphemeralProvider(
     # ... network and compute options ...
     min_blocks=0,  # no floor; nothing runs when nothing is queued
     max_blocks=10,
@@ -181,7 +181,7 @@ config = Config(executors=[...], max_idletime=300.0)
 the limit and holding zero tasks. The provider's own `max_idle_time` is
 deprecated and ignored: it compared against a timestamp taken at submission, so
 it terminated any task that simply ran longer than the limit
-([#194](https://github.com/scttfrdmn/parsl-aws-provider/issues/194)).
+([#194](https://github.com/scttfrdmn/parsl-ephemeral-provider/issues/194)).
 
 ### Multiple instance types
 
@@ -189,7 +189,7 @@ Diversifying across instance types materially reduces spot interruption rates.
 `instance_types` is a list of **type names**:
 
 ```python
-provider = EphemeralAWSProvider(
+provider = EphemeralProvider(
     # ... network options ...
     use_spot=True,
     use_spot_fleet=True,
@@ -201,7 +201,7 @@ provider = EphemeralAWSProvider(
 This uses the EC2 Fleet API (`CreateFleet`) with `Type="instant"`. **Both flags are
 required**: `use_spot_fleet=True` on its own builds no fleet manager, so the block
 falls through to a single on-demand instance with no error
-([#137](https://github.com/scttfrdmn/parsl-aws-provider/issues/137)). With both
+([#137](https://github.com/scttfrdmn/parsl-ephemeral-provider/issues/137)). With both
 set, the fleet path takes precedence over the single-spot-instance path — see
 [spot_fleet.md](spot_fleet.md).
 
@@ -211,7 +211,7 @@ arm64 instance types work with no extra configuration; the AMI architecture is
 inferred from the type name.
 
 ```python
-provider = EphemeralAWSProvider(
+provider = EphemeralProvider(
     # ... network options ...
     instance_type="c7g.large",  # arm64 AMI resolved automatically
 )
@@ -223,7 +223,7 @@ provider = EphemeralAWSProvider(
 cloud-init, so no `sudo`.
 
 ```python
-provider = EphemeralAWSProvider(
+provider = EphemeralProvider(
     # ... network and compute options ...
     worker_init="""
         dnf install -y python3.11 python3.11-pip
@@ -241,13 +241,13 @@ rather than on every launch.
 ## Monitoring
 
 The provider logs through the standard `logging` module under the
-`parsl_aws_provider` hierarchy:
+`parsl_ephemeral_provider` hierarchy:
 
 ```python
 import logging
 
 logging.basicConfig(level=logging.INFO)
-logging.getLogger("parsl_aws_provider").setLevel(logging.DEBUG)
+logging.getLogger("parsl_ephemeral_provider").setLevel(logging.DEBUG)
 ```
 
 Or pass `debug=True` to the provider.
@@ -275,12 +275,12 @@ detached mode the bastion survives shutdown by default so a later session can
 adopt it — pass `preserve_bastion=False` to have it terminated instead.
 
 `parsl.clear()` does not reliably kill the HTEX interchange subprocess; the
-pattern in `examples/parsl_aws_integration.py` handles that.
+pattern in `examples/parsl_integration.py` handles that.
 
 To find anything a crash left behind:
 
 ```bash
-parsl-aws-cleanup --dry-run --region us-east-1
+parsl-ephemeral-cleanup --dry-run --region us-east-1
 ```
 
 ## Troubleshooting

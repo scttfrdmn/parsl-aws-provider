@@ -6,7 +6,7 @@ SPDX-FileCopyrightText: 2025-2026 Scott Friedman and Project Contributors
 
 import pytest
 
-from parsl_aws_provider import constants
+from parsl_ephemeral_provider import constants
 
 pytestmark = pytest.mark.unit
 

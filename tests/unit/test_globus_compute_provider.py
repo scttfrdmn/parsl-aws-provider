@@ -1,4 +1,4 @@
-"""Unit tests for GlobusComputeProvider.
+"""Unit tests for EphemeralComputeProvider.
 
 Verifies config generation for standard, spot, and container variants, the
 ``parsl.providers`` registration (#87) and the ``sitecustomize`` bootstrap that
@@ -19,14 +19,14 @@ import parsl.providers
 import pytest
 import yaml
 
-from parsl_aws_provider import GlobusComputeProvider
-from parsl_aws_provider.globus_compute import (
+from parsl_ephemeral_provider import EphemeralComputeProvider
+from parsl_ephemeral_provider.globus_compute import (
     _BOOTSTRAP_DIRNAME,
     _PROVIDER_TYPE,
     _register_with_parsl_providers,
 )
-from parsl_aws_provider.provider import EphemeralAWSProvider
-from parsl_aws_provider.state.file import FileStateStore
+from parsl_ephemeral_provider.provider import EphemeralProvider
+from parsl_ephemeral_provider.state.file import FileStateStore
 
 
 # ---------------------------------------------------------------------------
@@ -34,8 +34,8 @@ from parsl_aws_provider.state.file import FileStateStore
 # ---------------------------------------------------------------------------
 
 
-def _make_provider(tmp_path, **extra_kwargs) -> GlobusComputeProvider:
-    """Return a GlobusComputeProvider with all AWS interactions mocked out."""
+def _make_provider(tmp_path, **extra_kwargs) -> EphemeralComputeProvider:
+    """Return a EphemeralComputeProvider with all AWS interactions mocked out."""
     provider_id = f"test-{uuid.uuid4().hex[:8]}"
     state_file = str(tmp_path / f"{provider_id}.json")
     state_store = FileStateStore(file_path=state_file, provider_id=provider_id)
@@ -49,20 +49,20 @@ def _make_provider(tmp_path, **extra_kwargs) -> GlobusComputeProvider:
     mode_mock.list_resources.return_value = {}
 
     with (
-        patch("parsl_aws_provider.provider.create_session") as mock_session,
+        patch("parsl_ephemeral_provider.provider.create_session") as mock_session,
         patch.object(
-            EphemeralAWSProvider,
+            EphemeralProvider,
             "_initialize_state_store",
             return_value=state_store,
         ),
         patch.object(
-            EphemeralAWSProvider,
+            EphemeralProvider,
             "_initialize_operating_mode",
             return_value=mode_mock,
         ),
     ):
         mock_session.return_value = MagicMock()
-        provider = GlobusComputeProvider(
+        provider = EphemeralComputeProvider(
             provider_id=provider_id,
             region="us-east-1",
             image_id="ami-12345678",
@@ -88,23 +88,23 @@ def _all_actions(policy) -> set:
 
 
 # ---------------------------------------------------------------------------
-# TestGlobusComputeProviderImport
+# TestEphemeralComputeProviderImport
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
-class TestGlobusComputeProviderImport:
+class TestEphemeralComputeProviderImport:
     """Verify the public import path works."""
 
     def test_importable_from_package(self):
-        """``from parsl_aws_provider import GlobusComputeProvider`` works."""
+        """``from parsl_ephemeral_provider import EphemeralComputeProvider`` works."""
         # The import at the top of this file already validates this; an
         # explicit assertion makes the intent clear.
-        assert GlobusComputeProvider is not None
+        assert EphemeralComputeProvider is not None
 
     def test_is_subclass_of_ephemeral_aws_provider(self, tmp_path):
-        """GlobusComputeProvider is a subclass of EphemeralAWSProvider."""
-        assert issubclass(GlobusComputeProvider, EphemeralAWSProvider)
+        """EphemeralComputeProvider is a subclass of EphemeralProvider."""
+        assert issubclass(EphemeralComputeProvider, EphemeralProvider)
 
 
 # ---------------------------------------------------------------------------
@@ -125,7 +125,9 @@ class TestParslProvidersRegistration:
     def test_class_is_attribute_of_parsl_providers(self):
         """Importing the package puts the class on ``parsl.providers``."""
         # The import at the top of this file has already run the registration.
-        assert getattr(parsl.providers, _PROVIDER_TYPE, None) is GlobusComputeProvider
+        assert (
+            getattr(parsl.providers, _PROVIDER_TYPE, None) is EphemeralComputeProvider
+        )
 
     def test_provider_type_is_a_bare_name(self):
         """The type key has no dots -- ``getattr`` cannot walk them (#87)."""
@@ -149,7 +151,8 @@ class TestParslProvidersRegistration:
         try:
             _register_with_parsl_providers()
             assert (
-                getattr(parsl.providers, _PROVIDER_TYPE, None) is GlobusComputeProvider
+                getattr(parsl.providers, _PROVIDER_TYPE, None)
+                is EphemeralComputeProvider
             )
         finally:
             # Leave the module as the rest of the suite expects it.
@@ -157,12 +160,12 @@ class TestParslProvidersRegistration:
 
 
 # ---------------------------------------------------------------------------
-# TestGlobusComputeProviderConstruction
+# TestEphemeralComputeProviderConstruction
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
-class TestGlobusComputeProviderConstruction:
+class TestEphemeralComputeProviderConstruction:
     """Verify constructor stores the new attributes correctly."""
 
     def test_default_attributes(self, tmp_path):
@@ -184,7 +187,7 @@ class TestGlobusComputeProviderConstruction:
         assert provider.display_name == "My Endpoint"
 
     def test_inherits_standard_params(self, tmp_path):
-        """EphemeralAWSProvider params are still accessible."""
+        """EphemeralProvider params are still accessible."""
         provider = _make_provider(
             tmp_path,
             use_spot=True,
@@ -338,7 +341,7 @@ class TestGenerateEndpointConfig:
         """``BaseConfig`` rejects ``endpoint_id`` -- it is not a Globus config field.
 
         It stays legal where it is emitted, nested under ``engine.provider``, because
-        there it binds to a ``GlobusComputeProvider`` kwarg. At the top level of
+        there it binds to a ``EphemeralComputeProvider`` kwarg. At the top level of
         either file it would raise ``Unexpected keyword argument``, which is exactly
         what the old output's ``TODO`` instructed the reader to do.
         """
@@ -389,7 +392,7 @@ class TestGenerateEndpointConfig:
 
         The manager forks and ``execvpe``s a fresh interpreter for the user
         endpoint, which reads its config from stdin -- so nothing in this package
-        is imported there and the bare ``GlobusComputeProvider`` name does not
+        is imported there and the bare ``EphemeralComputeProvider`` name does not
         resolve. ``sitecustomize`` runs during ``site`` initialisation, before any
         user code, which is early enough.
         """
@@ -397,7 +400,7 @@ class TestGenerateEndpointConfig:
         provider.generate_endpoint_config(str(tmp_path / "ep"))
         bootstrap = tmp_path / "ep" / _BOOTSTRAP_DIRNAME / "sitecustomize.py"
 
-        assert "import parsl_aws_provider" in bootstrap.read_text()
+        assert "import parsl_ephemeral_provider" in bootstrap.read_text()
         compile(bootstrap.read_text(), str(bootstrap), "exec")
 
     def test_bootstrap_does_not_re_raise(self, tmp_path):
@@ -533,51 +536,51 @@ class TestMinimumIamPolicy:
     """Verify minimum_iam_policy() returns a well-formed IAM policy document."""
 
     def test_returns_dict(self):
-        policy = GlobusComputeProvider.minimum_iam_policy()
+        policy = EphemeralComputeProvider.minimum_iam_policy()
         assert isinstance(policy, dict)
 
     def test_version_field(self):
-        policy = GlobusComputeProvider.minimum_iam_policy()
+        policy = EphemeralComputeProvider.minimum_iam_policy()
         assert policy["Version"] == "2012-10-17"
 
     def test_has_statements(self):
-        policy = GlobusComputeProvider.minimum_iam_policy()
+        policy = EphemeralComputeProvider.minimum_iam_policy()
         assert "Statement" in policy
         assert len(policy["Statement"]) > 0
 
     def test_ec2_statement_present(self):
-        policy = GlobusComputeProvider.minimum_iam_policy()
+        policy = EphemeralComputeProvider.minimum_iam_policy()
         sids = {s["Sid"] for s in policy["Statement"]}
         assert "EC2Management" in sids
 
     def test_ssm_statement_present(self):
-        policy = GlobusComputeProvider.minimum_iam_policy()
+        policy = EphemeralComputeProvider.minimum_iam_policy()
         sids = {s["Sid"] for s in policy["Statement"]}
         assert "SSMCommandsAndParameters" in sids
 
     def test_iam_statement_present(self):
-        policy = GlobusComputeProvider.minimum_iam_policy()
+        policy = EphemeralComputeProvider.minimum_iam_policy()
         sids = {s["Sid"] for s in policy["Statement"]}
         assert "IAMInstanceProfile" in sids
 
     def test_ecr_absent_by_default(self):
-        policy = GlobusComputeProvider.minimum_iam_policy()
+        policy = EphemeralComputeProvider.minimum_iam_policy()
         sids = {s["Sid"] for s in policy["Statement"]}
         assert "ECRContainerImages" not in sids
 
     def test_ecr_present_when_requested(self):
-        policy = GlobusComputeProvider.minimum_iam_policy(include_ecr=True)
+        policy = EphemeralComputeProvider.minimum_iam_policy(include_ecr=True)
         sids = {s["Sid"] for s in policy["Statement"]}
         assert "ECRContainerImages" in sids
 
     def test_all_effects_are_allow(self):
-        policy = GlobusComputeProvider.minimum_iam_policy(include_ecr=True)
+        policy = EphemeralComputeProvider.minimum_iam_policy(include_ecr=True)
         for stmt in policy["Statement"]:
             assert stmt["Effect"] == "Allow"
 
     def test_spot_interruption_statement_present(self):
         """The #86 EventBridge -> SQS warning path needs its own grants."""
-        policy = GlobusComputeProvider.minimum_iam_policy()
+        policy = EphemeralComputeProvider.minimum_iam_policy()
         sids = {s["Sid"] for s in policy["Statement"]}
         assert "SpotInterruptionWarning" in sids
 
@@ -588,7 +591,7 @@ class TestMinimumIamPolicy:
         -- the same hazard class as the serverless SG deletion (#100).
         """
         actions = _all_actions(
-            GlobusComputeProvider.minimum_iam_policy(include_ecr=True)
+            EphemeralComputeProvider.minimum_iam_policy(include_ecr=True)
         )
         for action in (
             "ec2:CreateVpc",
@@ -606,7 +609,7 @@ class TestMinimumIamPolicy:
 
     def test_spot_fleet_actions_absent(self):
         """Spot Fleet was replaced by EC2 Fleet in #86."""
-        actions = _all_actions(GlobusComputeProvider.minimum_iam_policy())
+        actions = _all_actions(EphemeralComputeProvider.minimum_iam_policy())
         assert "ec2:RequestSpotFleet" not in actions
         assert "ec2:CancelSpotFleetRequests" not in actions
         assert "ec2:DescribeSpotFleetRequests" not in actions
@@ -622,7 +625,7 @@ class TestMinimumIamPolicy:
         than raises, so the AccessDenied never surfaced and the roles simply
         accumulated, 94 of them in a real account.
         """
-        actions = _all_actions(GlobusComputeProvider.minimum_iam_policy())
+        actions = _all_actions(EphemeralComputeProvider.minimum_iam_policy())
         for action in (
             "iam:RemoveRoleFromInstanceProfile",
             "iam:DeleteInstanceProfile",
@@ -635,10 +638,10 @@ class TestMinimumIamPolicy:
     def test_session_validation_present(self):
         """create_session() calls this before anything else (#195).
 
-        Omitting it failed the user at ``EphemeralAWSProvider(...)`` itself --
+        Omitting it failed the user at ``EphemeralProvider(...)`` itself --
         the first AWS call the package makes, on the construction path.
         """
-        actions = _all_actions(GlobusComputeProvider.minimum_iam_policy())
+        actions = _all_actions(EphemeralComputeProvider.minimum_iam_policy())
         assert "sts:GetCallerIdentity" in actions
 
     def test_parameter_store_write_actions_present(self):
@@ -648,7 +651,7 @@ class TestMinimumIamPolicy:
         backend calls both: delete_parameter() per key and delete_parameters()
         for the batched cleanup.
         """
-        actions = _all_actions(GlobusComputeProvider.minimum_iam_policy())
+        actions = _all_actions(EphemeralComputeProvider.minimum_iam_policy())
         for action in ("ssm:PutParameter", "ssm:DeleteParameter"):
             assert action in actions
         assert "ssm:DeleteParameters" in actions
@@ -662,7 +665,7 @@ class TestMinimumIamPolicy:
         network tunnel. StartSession in particular is a shell on the instance.
         """
         actions = _all_actions(
-            GlobusComputeProvider.minimum_iam_policy(include_ecr=True)
+            EphemeralComputeProvider.minimum_iam_policy(include_ecr=True)
         )
         for action in (
             "ssm:StartSession",
@@ -688,7 +691,7 @@ class TestMinimumIamPolicy:
         import re
         from pathlib import Path
 
-        pkg = Path(GlobusComputeProvider.__module__.split(".")[0])
+        pkg = Path(EphemeralComputeProvider.__module__.split(".")[0])
         source = "\n".join(
             p.read_text() for p in Path(pkg.name).rglob("*.py") if p.is_file()
         )
@@ -712,7 +715,7 @@ class TestMinimumIamPolicy:
 
         missing = []
         for action in _all_actions(
-            GlobusComputeProvider.minimum_iam_policy(include_ecr=True)
+            EphemeralComputeProvider.minimum_iam_policy(include_ecr=True)
         ):
             if action in exempt or action.startswith("ecr:"):
                 continue
@@ -734,11 +737,11 @@ class TestMinimumIamPolicy:
         import re
         from pathlib import Path
 
-        pkg = Path(GlobusComputeProvider.__module__.split(".")[0]).name
+        pkg = Path(EphemeralComputeProvider.__module__.split(".")[0]).name
         source = "\n".join(
             p.read_text() for p in Path(pkg).rglob("*.py") if p.is_file()
         )
-        granted = _all_actions(GlobusComputeProvider.minimum_iam_policy())
+        granted = _all_actions(EphemeralComputeProvider.minimum_iam_policy())
 
         # The calls this policy's scope reaches: instance-profile creation and
         # teardown, plus the session check. Derived from the client each is made
@@ -777,24 +780,24 @@ class TestMinimumIamPolicy:
 
     def test_launch_template_actions_present(self):
         """Every launch path goes through a launch template since #85."""
-        actions = _all_actions(GlobusComputeProvider.minimum_iam_policy())
+        actions = _all_actions(EphemeralComputeProvider.minimum_iam_policy())
         assert "ec2:CreateLaunchTemplate" in actions
         assert "ec2:DeleteLaunchTemplate" in actions
 
     def test_ssm_get_parameter_present(self):
         """AMI resolution moved to AWS's public SSM parameters in #82."""
-        actions = _all_actions(GlobusComputeProvider.minimum_iam_policy())
+        actions = _all_actions(EphemeralComputeProvider.minimum_iam_policy())
         assert "ssm:GetParameter" in actions
 
     def test_no_duplicate_actions(self):
         """A duplicated action means a list was pasted into two statements."""
         actions = _all_actions_list(
-            GlobusComputeProvider.minimum_iam_policy(include_ecr=True)
+            EphemeralComputeProvider.minimum_iam_policy(include_ecr=True)
         )
         assert len(actions) == len(set(actions))
 
     def test_every_statement_is_well_formed(self):
-        policy = GlobusComputeProvider.minimum_iam_policy(include_ecr=True)
+        policy = EphemeralComputeProvider.minimum_iam_policy(include_ecr=True)
         for stmt in policy["Statement"]:
             assert set(stmt) == {"Sid", "Effect", "Action", "Resource"}
             assert isinstance(stmt["Action"], list)

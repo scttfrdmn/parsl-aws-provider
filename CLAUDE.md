@@ -1,13 +1,13 @@
-# Using Claude Code for Parsl AWS Provider Development
+# Using Claude Code for Parsl Ephemeral Provider Development
 
-This document provides guidance on effectively using Claude Code to develop the Parsl AWS Provider project. Claude Code's capabilities are particularly well-suited for this type of infrastructure-as-code development.
+This document provides guidance on effectively using Claude Code to develop the Parsl Ephemeral Provider project. Claude Code's capabilities are particularly well-suited for this type of infrastructure-as-code development.
 
 ## Project Management — REQUIRED PRACTICES
 
 All work tracking for this project uses GitHub. **Do not create standalone planning documents, roadmap files, or status reports.** Use these instead:
 
 ### Issue Tracking
-- All bugs, features, technical debt, and test gaps are tracked as **GitHub issues** at https://github.com/scttfrdmn/parsl-aws-provider/issues
+- All bugs, features, technical debt, and test gaps are tracked as **GitHub issues** at https://github.com/scttfrdmn/parsl-ephemeral-provider/issues
 - Every issue must have:
   - A `severity:` label (`critical`, `high`, `medium`, `low`)
   - A `type:` label (`bug`, `security`, `testing`, `refactor`, `docs`, `performance`)
@@ -26,7 +26,7 @@ All work tracking for this project uses GitHub. **Do not create standalone plann
   open until the PR merges. That is intended — don't close them by hand.
 
 ### Milestones
-Every issue needs one. `gh api repos/scttfrdmn/parsl-aws-provider/milestones` is
+Every issue needs one. `gh api repos/scttfrdmn/parsl-ephemeral-provider/milestones` is
 authoritative — v0.1.0 through v0.7.0 are closed, so do not assign to them.
 
 - **v0.8.0** — Stabilization: stop the IAM leak, make documented options reachable,
@@ -46,13 +46,13 @@ authoritative — v0.1.0 through v0.7.0 are closed, so do not assign to them.
 - The footer must contain comparison links for every version
 
 ### Versioning Rules (semver2)
-- **MAJOR** (1.x.x) — breaking changes to the `EphemeralAWSProvider` public interface or config schema
+- **MAJOR** (1.x.x) — breaking changes to the `EphemeralProvider` public interface or config schema
 - **MINOR** (x.1.x) — new features, new operating modes, new state backends (backwards-compatible)
 - **PATCH** (x.x.1) — bug fixes, security patches, documentation (no interface changes)
 - Current version: read it from `pyproject.toml` rather than from here. This line
   named `0.1.0` through six releases; `make version-check` prints the real value,
   and `make version-verify` asserts `pyproject.toml` and
-  `parsl_aws_provider/__init__.py` agree.
+  `parsl_ephemeral_provider/__init__.py` agree.
 
 ---
 
@@ -92,7 +92,7 @@ Claude Code can assist with:
 When working with Claude, it's helpful to maintain a clear project structure. Here's the recommended structure for this project:
 
 ```
-parsl_aws_provider/
+parsl_ephemeral_provider/
 ├── __init__.py
 ├── provider.py               # Main provider implementation
 ├── constants.py              # AWS-related constants and defaults
@@ -191,7 +191,7 @@ The main provider class should extend Parsl's ExecutionProvider interface. Ask C
 
 Example prompt:
 ```
-I need to implement the core EphemeralAWSProvider class that extends Parsl's ExecutionProvider.
+I need to implement the core EphemeralProvider class that extends Parsl's ExecutionProvider.
 The class should handle:
 - Configuration processing with sensible defaults
 - Resource provisioning based on blocks
@@ -288,7 +288,7 @@ Claude excels at generating documentation. Request:
 
 Example prompt:
 ```
-Please generate comprehensive docstrings for the EphemeralAWSProvider class, including:
+Please generate comprehensive docstrings for the EphemeralProvider class, including:
 - Purpose and overall behavior
 - Parameters with types and descriptions
 - Return values and exceptions
@@ -370,12 +370,12 @@ The virtual environment is created at `.venv/` automatically by `uv sync`.
 
 3. **Linting and formatting**: `ruff` only — `flake8`, `black`, and `isort` are
    not dependencies of this project. Scope is `.`, the whole repository: the old
-   `parsl_aws_provider tests` narrowing existed because `tools/` carried
+   `parsl_ephemeral_provider tests` narrowing existed because `tools/` carried
    pre-existing errors, and #93/#165 pruned those in v0.8.0.
    ```bash
    uv run ruff check .
    uv run ruff format --check .
-   uv run mypy parsl_aws_provider     # 76-error baseline; do not add to it
+   uv run mypy parsl_ephemeral_provider     # 76-error baseline; do not add to it
    ```
    Or via the Makefile, which is what CI runs: `make lint-python type-check`.
 
@@ -418,7 +418,7 @@ Include comprehensive error handling, logging, and docstrings.
 
 ## Conclusion
 
-Claude Code is a powerful tool for developing the Parsl AWS Provider. By following these guidelines, you can maximize productivity and code quality throughout the development process.
+Claude Code is a powerful tool for developing the Parsl Ephemeral Provider. By following these guidelines, you can maximize productivity and code quality throughout the development process.
 
 Remember to:
 - Provide clear context for code generation

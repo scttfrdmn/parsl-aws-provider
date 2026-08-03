@@ -57,7 +57,7 @@ If possible, please provide debugging output by setting:
 import logging
 
 logging.basicConfig(level=logging.DEBUG)
-logging.getLogger("parsl_aws_provider").setLevel(logging.DEBUG)
+logging.getLogger("parsl_ephemeral_provider").setLevel(logging.DEBUG)
 ```
 
 **Screenshots**

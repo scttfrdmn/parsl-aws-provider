@@ -37,7 +37,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - [substrate#516](https://github.com/scttfrdmn/substrate/issues/516) — YAML
     short-form intrinsics were stripped and the raw scalar used literally, while
     the `Fn::` long forms were correct. Every template in
-    `parsl_aws_provider/templates/cloudformation/` uses the short forms, so a
+    `parsl_ephemeral_provider/templates/cloudformation/` uses the short forms, so a
     stack reached `CREATE_COMPLETE` with an unevaluated `!If` array embedded in an
     ECS task-definition ARN. The cause was upstream of the intrinsics engine:
     `parseCFNTemplate` unmarshals with `go.yaml.in/yaml/v3`, which has no notion
@@ -135,24 +135,94 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   #69 made required, so the suite could not pass and gating would have turned every
   PR red. #92 closed in v0.8.0 and the suite is green, so the exemption had stopped
   protecting anything and could only hide a regression.
-- **Renamed to `parsl-aws-provider`.** The distribution, the import package, and
-  the repository now agree: `parsl-ephemeral-aws` → `parsl-aws-provider`, and
-  `import parsl_ephemeral_aws` → `import parsl_aws_provider`. **Breaking for
-  imports**, but no released artifact is affected — the package has never been
-  published to PyPI (#180), so there is no installed version anywhere whose
-  imports could break. Doing it before the first publish is what makes it free;
-  afterwards it would have required a deprecation shim (#189).
+- **Renamed to `parsl-ephemeral-provider`, and no identifier carries an AWS mark
+  any more** (#189, #213). Every name changed at once, because a half-renamed
+  project is worse than either end state:
 
-  Two things deliberately did **not** change. The public class names
-  (`EphemeralAWSProvider`, `GlobusComputeProvider`) are unchanged, so existing
-  code needs only its import line adjusted. And every AWS **resource** name
-  prefix — `parsl-ephemeral-ssm-role-`, `parsl-ephemeral-ssm-profile-`,
+  | Surface | Was | Now |
+  |---|---|---|
+  | Distribution | `parsl-ephemeral-aws` | `parsl-ephemeral-provider` |
+  | Import package | `parsl_ephemeral_aws` | `parsl_ephemeral_provider` |
+  | Console script | `parsl-ephemeral-cleanup` | unchanged |
+  | Provider class | `EphemeralProvider` | `EphemeralProvider` |
+  | Globus class | `EphemeralComputeProvider` | `EphemeralComputeProvider` |
+  | Title | "Parsl Ephemeral AWS" | "Parsl Ephemeral Provider for AWS" |
+
+  The reason is the AWS Trademark Guidelines (rev. 2026-07-17) rather than
+  taste. Section 7: "You will not combine, abbreviate, telescope, or hyphenate
+  AWS Marks with any other words, trademarks, or brand elements," and "You will
+  not incorporate AWS Marks into the names of your organization, products, or
+  services." Neither clause is qualified to product names alone, so
+  `EphemeralProvider` is implicated on the same footing as the distribution
+  name. Section 13 separately *permits* plain-text factual reference in the form
+  `[Your Brand] [relational phrase] [AWS Mark]` — its own example is
+  `YourApp for Amazon S3` — which is why "for AWS" is correct in the title,
+  description, keywords and prose, and why the mark still appears there. `AWS`
+  alone is a listed Mark (s17). Nothing in the document addresses package naming,
+  so this is a judgment applied from the guidelines, not an approval obtained
+  from anyone: AWS operates no review queue for this.
+
+  `EphemeralComputeProvider` was renamed for the second, independent reason:
+  upstream Parsl already ships `parsl.providers.AWSProvider`, so a name asserting
+  a platform reads as *the official* provider for it. The Globus class is a
+  subclass of `EphemeralProvider` that exposes the same AWS compute as a Globus
+  Compute endpoint, so it is described relationally — "for Globus Compute", with
+  AWS named as the platform the work actually runs on.
+
+  **Breaking for imports and for the two class names.** No released artifact is
+  affected: the package has never been published to PyPI (#180), so there is no
+  installed version anywhere whose imports could break, and no deprecation shim
+  is owed. Doing it before the first publish is what makes it free.
+
+  Two things deliberately did **not** change. `EphemeralComputeProvider` is still
+  registered onto `parsl.providers` under its bare class name, because Globus
+  Compute resolves `provider: type:` by `getattr(parsl.providers, type_name)` and
+  a dotted path can never resolve (#87) — the generated
+  `user_config_template.yaml.j2` names the new class. And every AWS **resource**
+  name prefix — `parsl-ephemeral-ssm-role-`, `parsl-ephemeral-ssm-profile-`,
   `parsl-ephemeral-spot-fleet-role-`, `parsl-ephemeral-sg`,
   `parsl-ephemeral-cluster` — keeps its existing spelling, because
-  `parsl-aws-cleanup` reaps orphans by prefix and renaming them would strand
-  already-created resources in live accounts.
+  `parsl-ephemeral-cleanup` reaps orphans by prefix and renaming them would
+  strand already-created resources in live accounts. The distribution name now
+  matches those prefixes for the first time.
+
+  Two filenames carried the mark and were renamed with everything else:
+  `examples/parsl_aws_integration.py` → `examples/parsl_integration.py`, and
+  `.parslaws`, which was **deleted** rather than renamed — nothing read it, and
+  its `[amis]` block listed four AMI IDs that disagree with `constants.py`, so
+  keeping it under a new name would have preserved a stale trap. The
+  documentation footer now carries the non-affiliation notice on every page (see
+  below), which is where a reader arriving from a search engine actually needs
+  it.
+- **`CreatedBy` tag value is now `ParslEphemeralProvider`**, following the class
+  rename, and `parsl-ephemeral-cleanup` sweeps **both** it and the old
+  `ParslEphemeralAWSProvider`. Only writing the new value would have left
+  already-running instances tagged the old way invisible to the reaper — and this
+  is the tool that bounds the bill after a crash, since Parsl never calls
+  `provider.shutdown()`. Both values sit in one EC2 filter, because EC2 ORs the
+  `Values` of a single filter and ANDs separate ones.
 
 ### Added
+- **`keywords` in package metadata, which was empty** (#213). This mattered more
+  than it looks: with no keywords and no repository topics, the distribution
+  *name* carried one hundred percent of discoverability, so dropping `aws` from
+  it really would have made the project unfindable. PyPI indexes name, summary
+  and keywords, and section 13 of the AWS Trademark Guidelines permits the mark
+  in the factual ones — so `parsl`, `aws`, `ec2`, `spot-instances`, `ec2-fleet`,
+  `lambda`, `fargate`, `ecs`, `ephemeral`, `hpc`, `workflow`,
+  `scientific-computing` and `globus-compute` are all searchable now. Net result
+  is more discoverable after the rename than before it. The GitHub repository
+  description and topics, also both empty, are set to match.
+- **A non-affiliation notice in the documentation footer, on every page** (#213).
+  The disclaimer lived only in `NOTICE` and `README.md`, neither of which is part
+  of the published HTML — so someone landing on a deep page from a search engine
+  saw a site titled "Parsl Ephemeral Provider for AWS" with nothing on it saying
+  the project is unofficial, or that Parsl ships its own `AWSProvider`. Done as a
+  `docs/_templates/footer.html` theme override rather than `rst_prolog`, because
+  all but three doc sources are Markdown and MyST does not apply `rst_prolog` to
+  them — a prolog would have covered three pages out of seventeen. `conf.py`
+  already declared `templates_path = ["_templates"]`; the directory did not
+  exist. Verified present on all 17 built pages, with `-W` still clean.
 - **`examples/one_shot_mode.py`, an example two other examples already pointed
   at** (#199). `basic_usage.py` and `standard_mode.py` both referenced a file that
   did not exist — and `standard_mode.py` cited it as one of the two answers for a
@@ -170,7 +240,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **The documentation is actually published.** CI's `docs` job has built the
   Sphinx HTML on every PR since #124 and uploaded it as an artifact — a form only
   reachable by someone browsing a workflow run. It now deploys to GitHub Pages at
-  <https://scttfrdmn.github.io/parsl-aws-provider/> on pushes to `main`, and the
+  <https://scttfrdmn.github.io/parsl-ephemeral-provider/> on pushes to `main`, and the
   `Documentation` entry in `[project.urls]` points there instead of at a Read the
   Docs site that never existed.
 
@@ -302,13 +372,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   in an error message is the normal Globus debugging loop, and each iteration left
   another standing principal with `AmazonSSMManagedInstanceCore` attached.
 - **The forked user-endpoint process could not resolve
-  `GlobusComputeProvider`** (#196). A multi-user endpoint forks and `execvpe`s a
+  `EphemeralComputeProvider`** (#196). A multi-user endpoint forks and `execvpe`s a
   fresh interpreter that reads its config from stdin as JSON, so the `config.py`
   shim — which only `get_config()` honours — never runs there, and Globus
   Compute's attribute lookup on `parsl.providers` fails on a class this package
   never registered. The generated `user_environment.yaml` now puts a
   `_bootstrap/` directory on the child's `PYTHONPATH`; its `sitecustomize.py`
-  imports `parsl_aws_provider` during `site` initialisation, before any config is
+  imports `parsl_ephemeral_provider` during `site` initialisation, before any config is
   parsed. It swallows its own `ImportError` after writing a diagnostic to stderr,
   since raising there would break every interpreter the endpoint starts.
 
@@ -335,7 +405,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   whole reason this survived while `docs/security.md` — which *is* scanned — stayed
   correct throughout. It is in the list now.
 - **The published API reference told users the provider builds their network**
-  (#199). `EphemeralAWSProvider.__init__`'s docstring described `vpc_id`,
+  (#199). `EphemeralProvider.__init__`'s docstring described `vpc_id`,
   `subnet_id` and `security_group_id` as optional, each saying "If not provided, a
   new VPC/subnet/security group will be created". All three are required and
   omitting any raises `ValueError`; `api_reference.rst` autodocs this module, so
@@ -343,7 +413,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   serverless, whose functions run in the Lambda-managed VPC.
 - **`docs/ci_cd.md` misdescribed the pipeline it documents** (#199). Four
   measurable errors, each verified against the workflow: lint is scoped to `.` and
-  not `parsl_aws_provider tests` (#93/#165 pruned the `tools/` errors that forced
+  not `parsl_ephemeral_provider tests` (#93/#165 pruned the `tools/` errors that forced
   the narrowing); integration tests **gate** as of #192; the E2E suite holds 87
   tests across ten files, not 51; and the "88 of 295 tests" figure for the old
   marker divergence is long stale — both selections now collect 1,211. The same
@@ -366,13 +436,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - **Not distributed.** It lived at `tools/cleanup_aws_resources.py`, and `tools/`
     is in neither the wheel nor the sdist, so every documented
     `python tools/cleanup_aws_resources.py` invocation worked only inside a git
-    clone. Moved to `parsl_aws_provider/cleanup.py` and exposed as the
-    `parsl-aws-cleanup` console script via `[project.scripts]`; verified from a
+    clone. Moved to `parsl_ephemeral_provider/cleanup.py` and exposed as the
+    `parsl-ephemeral-cleanup` console script via `[project.scripts]`; verified from a
     fresh venv installed from the built wheel alone. `main()` returns an exit
     status rather than calling `sys.exit()` — `console_scripts` uses the return
     value — which also makes it testable. `logging.basicConfig` moved out of module
     scope into `main()`, since configuring the root logger at import would hijack
-    logging for anyone merely importing `parsl_aws_provider`.
+    logging for anyone merely importing `parsl_ephemeral_provider`.
   - **Its filters matched nothing the package writes.** It queried EC2 for
     `tag:parsl_provider` matching `*aws-enhanced*` and for security groups named
     `aws-enhanced-*`. Neither string appears anywhere in this package — not as a
@@ -425,7 +495,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `iam:DetachRolePolicy`, `iam:DeleteRole`, and `sts:GetCallerIdentity` —
   the last being the *first* AWS call the package makes, since `create_session()`
   validates every session with it, so a user on this policy previously failed at
-  `EphemeralAWSProvider(...)` before reaching any AWS work. Also added
+  `EphemeralProvider(...)` before reaching any AWS work. Also added
   `ssm:PutParameter`, `ssm:DeleteParameter` and `ssm:DeleteParameters` for
   `state_store_type="parameter_store"`; both deletes appear because they are
   distinct IAM actions and the backend calls both.
@@ -2382,12 +2452,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - ECS task definitions now create their CloudWatch log group before registration;
   log groups are tracked and deleted on cleanup (closes #22)
 
-[Unreleased]: https://github.com/scttfrdmn/parsl-aws-provider/compare/v0.8.0...HEAD
-[0.8.0]: https://github.com/scttfrdmn/parsl-aws-provider/compare/v0.7.0...v0.8.0
-[0.7.0]: https://github.com/scttfrdmn/parsl-aws-provider/compare/v0.6.0...v0.7.0
-[0.6.0]: https://github.com/scttfrdmn/parsl-aws-provider/compare/v0.5.0...v0.6.0
-[0.5.0]: https://github.com/scttfrdmn/parsl-aws-provider/compare/v0.4.0...v0.5.0
-[0.4.0]: https://github.com/scttfrdmn/parsl-aws-provider/compare/v0.3.0...v0.4.0
-[0.3.0]: https://github.com/scttfrdmn/parsl-aws-provider/compare/v0.2.0...v0.3.0
-[0.2.0]: https://github.com/scttfrdmn/parsl-aws-provider/compare/v0.1.0...v0.2.0
-[0.1.0]: https://github.com/scttfrdmn/parsl-aws-provider/releases/tag/v0.1.0
+[Unreleased]: https://github.com/scttfrdmn/parsl-ephemeral-provider/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/scttfrdmn/parsl-ephemeral-provider/compare/v0.7.0...v0.8.0
+[0.7.0]: https://github.com/scttfrdmn/parsl-ephemeral-provider/compare/v0.6.0...v0.7.0
+[0.6.0]: https://github.com/scttfrdmn/parsl-ephemeral-provider/compare/v0.5.0...v0.6.0
+[0.5.0]: https://github.com/scttfrdmn/parsl-ephemeral-provider/compare/v0.4.0...v0.5.0
+[0.4.0]: https://github.com/scttfrdmn/parsl-ephemeral-provider/compare/v0.3.0...v0.4.0
+[0.3.0]: https://github.com/scttfrdmn/parsl-ephemeral-provider/compare/v0.2.0...v0.3.0
+[0.2.0]: https://github.com/scttfrdmn/parsl-ephemeral-provider/compare/v0.1.0...v0.2.0
+[0.1.0]: https://github.com/scttfrdmn/parsl-ephemeral-provider/releases/tag/v0.1.0

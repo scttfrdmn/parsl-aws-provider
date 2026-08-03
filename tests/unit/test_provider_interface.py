@@ -1,4 +1,4 @@
-"""Unit tests for the EphemeralAWSProvider core Parsl interface methods.
+"""Unit tests for the EphemeralProvider core Parsl interface methods.
 
 Tests cover submit, status, cancel, scale_in, scale_out, shutdown, and
 thread-safety guarantees.  All AWS interactions are mocked.
@@ -17,9 +17,9 @@ import pytest
 
 from parsl.jobs.states import JobState, JobStatus
 
-from parsl_aws_provider.exceptions import ProviderError
-from parsl_aws_provider.provider import EphemeralAWSProvider
-from parsl_aws_provider.state.file import FileStateStore
+from parsl_ephemeral_provider.exceptions import ProviderError
+from parsl_ephemeral_provider.provider import EphemeralProvider
+from parsl_ephemeral_provider.state.file import FileStateStore
 
 
 # ---------------------------------------------------------------------------
@@ -28,7 +28,7 @@ from parsl_aws_provider.state.file import FileStateStore
 
 
 def _make_provider(tmp_dir, mode_mock=None, max_blocks=5):
-    """Return a fully wired EphemeralAWSProvider backed by a FileStateStore.
+    """Return a fully wired EphemeralProvider backed by a FileStateStore.
 
     All AWS calls are suppressed via mocked session and operating mode.
     """
@@ -49,20 +49,22 @@ def _make_provider(tmp_dir, mode_mock=None, max_blocks=5):
         mode_mock.list_resources.return_value = {}
 
     with (
-        patch("parsl_aws_provider.provider.create_session") as mock_session_factory,
+        patch(
+            "parsl_ephemeral_provider.provider.create_session"
+        ) as mock_session_factory,
         patch.object(
-            EphemeralAWSProvider,
+            EphemeralProvider,
             "_initialize_state_store",
             return_value=state_store,
         ),
         patch.object(
-            EphemeralAWSProvider,
+            EphemeralProvider,
             "_initialize_operating_mode",
             return_value=mode_mock,
         ),
     ):
         mock_session_factory.return_value = MagicMock()
-        provider = EphemeralAWSProvider(
+        provider = EphemeralProvider(
             provider_id=provider_id,
             region="us-east-1",
             image_id="ami-12345678",
@@ -86,7 +88,7 @@ def _make_provider(tmp_dir, mode_mock=None, max_blocks=5):
 
 @pytest.mark.unit
 class TestProviderInterface:
-    """Tests for core Parsl interface methods of EphemeralAWSProvider."""
+    """Tests for core Parsl interface methods of EphemeralProvider."""
 
     @pytest.fixture
     def tmp_dir(self):
@@ -322,7 +324,7 @@ class TestProviderInterface:
 class TestExecutionProviderConformance:
     """The provider must satisfy Parsl's ExecutionProvider contract (closes #82).
 
-    `@typechecked` on EphemeralAWSProvider makes the annotations load-bearing at
+    `@typechecked` on EphemeralProvider makes the annotations load-bearing at
     runtime, so a signature narrower than the base class's is not a typing nit —
     it raises TypeCheckError on inputs Parsl is entitled to pass.
     """
@@ -340,7 +342,7 @@ class TestExecutionProviderConformance:
 
         for name in ("submit", "status", "cancel"):
             base = inspect.signature(getattr(ExecutionProvider, name))
-            ours = inspect.signature(getattr(EphemeralAWSProvider, name))
+            ours = inspect.signature(getattr(EphemeralProvider, name))
             assert list(ours.parameters) == list(base.parameters), (
                 f"{name}() parameter names diverge from ExecutionProvider"
             )
@@ -455,7 +457,7 @@ class TestExecutionProviderConformance:
     def test_cores_and_mem_per_node_resolved(self, tmp_dir):
         """The base class declares both; EC2 modes populate them from the API."""
         with patch(
-            "parsl_aws_provider.provider.describe_instance_capacity",
+            "parsl_ephemeral_provider.provider.describe_instance_capacity",
             return_value=(2, 1.0),
         ):
             provider, _ = _make_provider(tmp_dir)
@@ -470,22 +472,22 @@ class TestExecutionProviderConformance:
         state_store = FileStateStore(file_path=state_file, provider_id=provider_id)
 
         with (
-            patch("parsl_aws_provider.provider.create_session"),
+            patch("parsl_ephemeral_provider.provider.create_session"),
             patch(
-                "parsl_aws_provider.provider.describe_instance_capacity"
+                "parsl_ephemeral_provider.provider.describe_instance_capacity"
             ) as mock_lookup,
             patch.object(
-                EphemeralAWSProvider,
+                EphemeralProvider,
                 "_initialize_state_store",
                 return_value=state_store,
             ),
             patch.object(
-                EphemeralAWSProvider,
+                EphemeralProvider,
                 "_initialize_operating_mode",
                 return_value=MagicMock(),
             ),
         ):
-            provider = EphemeralAWSProvider(
+            provider = EphemeralProvider(
                 provider_id=provider_id,
                 region="us-east-1",
                 image_id="ami-12345678",

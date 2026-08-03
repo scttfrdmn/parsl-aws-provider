@@ -9,8 +9,8 @@ from unittest.mock import MagicMock, patch
 import boto3
 import json
 
-from parsl_aws_provider.modes.detached import DetachedMode
-from parsl_aws_provider.constants import (
+from parsl_ephemeral_provider.modes.detached import DetachedMode
+from parsl_ephemeral_provider.constants import (
     RESOURCE_TYPE_SPOT_FLEET,
     STATUS_PENDING,
     STATUS_RUNNING,
@@ -234,8 +234,8 @@ class TestDetachedModeSpotFleet:
         assert detached_mode_with_spot_fleet.nodes_per_block == 2
         assert detached_mode_with_spot_fleet.spot_max_price_percentage == 80
 
-    @patch("parsl_aws_provider.modes.detached.get_default_ami")
-    @patch("parsl_aws_provider.modes.detached.get_cf_template")
+    @patch("parsl_ephemeral_provider.modes.detached.get_default_ami")
+    @patch("parsl_ephemeral_provider.modes.detached.get_cf_template")
     def test_initialize_with_spot_fleet(
         self,
         mock_get_cf_template,

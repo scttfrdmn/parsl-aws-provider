@@ -1,5 +1,5 @@
 [run]
-source = parsl_aws_provider
+source = parsl_ephemeral_provider
 omit =
     */tests/*
     */templates/*

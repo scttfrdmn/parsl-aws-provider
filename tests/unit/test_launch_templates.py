@@ -48,17 +48,17 @@ import boto3
 import pytest
 from botocore.exceptions import ClientError
 
-from parsl_aws_provider.compute.spot_fleet import SpotFleetManager
-from parsl_aws_provider.constants import (
+from parsl_ephemeral_provider.compute.spot_fleet import SpotFleetManager
+from parsl_ephemeral_provider.constants import (
     IMDSV2_METADATA_OPTIONS,
     LAUNCH_TEMPLATE_NAME_PREFIX,
 )
-from parsl_aws_provider.exceptions import (
+from parsl_ephemeral_provider.exceptions import (
     ResourceCreationError,
     ResourceDeletionError,
 )
-from parsl_aws_provider.modes.standard import StandardMode
-from parsl_aws_provider.utils.aws import (
+from parsl_ephemeral_provider.modes.standard import StandardMode
+from parsl_ephemeral_provider.utils.aws import (
     build_launch_template_data,
     create_launch_template,
     delete_launch_template,
@@ -419,7 +419,7 @@ class TestStandardModeLaunchTemplate:
             auto_create_instance_profile=True,
         )
         with patch(
-            "parsl_aws_provider.modes.standard.get_or_create_ssm_instance_profile",
+            "parsl_ephemeral_provider.modes.standard.get_or_create_ssm_instance_profile",
             return_value="arn:aws:iam::1:instance-profile/p",
         ):
             self._initialize(mode)
@@ -547,7 +547,7 @@ class TestStandardModeLaunchPaths:
     def test_on_demand_launch_uses_the_template(self, ec2):
         mode = self._mode(ec2)
 
-        with patch("parsl_aws_provider.modes.standard.wait_for_resource"):
+        with patch("parsl_ephemeral_provider.modes.standard.wait_for_resource"):
             mode._create_instance("#!/bin/bash\necho hi\n", "job-1")
 
         kwargs = ec2.run_instances.call_args.kwargs
@@ -569,7 +569,7 @@ class TestStandardModeLaunchPaths:
     def test_on_demand_launch_still_overrides_per_job_fields(self, ec2):
         mode = self._mode(ec2)
 
-        with patch("parsl_aws_provider.modes.standard.wait_for_resource"):
+        with patch("parsl_ephemeral_provider.modes.standard.wait_for_resource"):
             mode._create_instance("#!/bin/bash\necho hi\n", "job-1")
 
         kwargs = ec2.run_instances.call_args.kwargs
@@ -584,7 +584,7 @@ class TestStandardModeLaunchPaths:
         mode = self._mode(ec2)
         mode._launch_template_id = None
 
-        with patch("parsl_aws_provider.modes.standard.wait_for_resource"):
+        with patch("parsl_ephemeral_provider.modes.standard.wait_for_resource"):
             mode._create_instance("#!/bin/bash\necho hi\n", "job-1")
 
         kwargs = ec2.run_instances.call_args.kwargs
@@ -601,7 +601,7 @@ class TestStandardModeLaunchPaths:
         """
         mode = self._mode(ec2, use_spot=True)
 
-        with patch("parsl_aws_provider.modes.standard.wait_for_resource"):
+        with patch("parsl_ephemeral_provider.modes.standard.wait_for_resource"):
             mode._create_instance("#!/bin/bash\necho hi\n", "job-1")
 
         ec2.request_spot_instances.assert_not_called()
@@ -620,7 +620,7 @@ class TestStandardModeLaunchPaths:
         """
         mode = self._mode(ec2, use_spot=True)
 
-        with patch("parsl_aws_provider.modes.standard.wait_for_resource"):
+        with patch("parsl_ephemeral_provider.modes.standard.wait_for_resource"):
             mode._create_instance("#!/bin/bash\necho hi\n", "job-1")
 
         kwargs = ec2.run_instances.call_args.kwargs
@@ -631,7 +631,7 @@ class TestStandardModeLaunchPaths:
     def test_spot_max_price_becomes_spot_options(self, ec2):
         mode = self._mode(ec2, use_spot=True, spot_max_price="0.05")
 
-        with patch("parsl_aws_provider.modes.standard.wait_for_resource"):
+        with patch("parsl_ephemeral_provider.modes.standard.wait_for_resource"):
             mode._create_instance("#!/bin/bash\necho hi\n", "job-1")
 
         kwargs = ec2.run_instances.call_args.kwargs
@@ -650,7 +650,7 @@ class TestStandardModeLaunchPaths:
             "SpotInstanceRequests": [{"InstanceId": "i-1"}]
         }
 
-        with patch("parsl_aws_provider.modes.standard.wait_for_resource"):
+        with patch("parsl_ephemeral_provider.modes.standard.wait_for_resource"):
             mode._create_instance("#!/bin/bash\necho hi\n", "job-1")
 
         ec2.request_spot_instances.assert_called_once()
@@ -734,7 +734,7 @@ class TestSpotFleetLaunchTemplate:
         session.client.return_value = ec2
         session.resource.return_value = MagicMock()
         with patch(
-            "parsl_aws_provider.compute.spot_fleet.CredentialManager"
+            "parsl_ephemeral_provider.compute.spot_fleet.CredentialManager"
         ) as cred_cls:
             cred_cls.return_value.create_boto3_session.return_value = session
             return SpotFleetManager(provider)
@@ -898,7 +898,7 @@ class TestBastionWorkerMetadataOptions:
     """
 
     def _script(self):
-        from parsl_aws_provider.modes.detached import DetachedMode
+        from parsl_ephemeral_provider.modes.detached import DetachedMode
 
         mode = DetachedMode(
             provider_id="test-provider",

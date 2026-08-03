@@ -14,22 +14,50 @@ requires = ["setuptools>=77.0.1", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
-include = ["parsl_aws_provider*"]
+include = ["parsl_ephemeral_provider*"]
 
 # packages.find collects modules, not data files, so without this the
 # CloudFormation and Terraform templates are omitted from the wheel and
 # get_cf_template() cannot find bastion.yml in an installed package (#112).
 [tool.setuptools.package-data]
-parsl_aws_provider = [
+parsl_ephemeral_provider = [
     "templates/cloudformation/*.yml",
     "templates/terraform/*/*.tf",
 ]
 
 [project]
-name = "parsl-aws-provider"
+name = "parsl-ephemeral-provider"
 version = "0.8.0"
-description = "A modern, flexible AWS provider for the Parsl parallel scripting library"
+# "for AWS" relationally, never "AWS provider". AWS Trademark Guidelines s7 (rev.
+# 2026-07-17): "You will not combine, abbreviate, telescope, or hyphenate AWS Marks
+# with any other words" and "will not incorporate AWS Marks into the names of your
+# organization, products, or services". s13 permits plain-text factual reference in
+# the form [Your Brand] [relational phrase] [AWS Mark] -- "YourApp for Amazon S3" --
+# so the mark belongs in this description, not in the distribution name. #189 named
+# this project `parsl-aws-provider`, which s7 does not survive.
+description = "An independent Parsl provider for running ephemeral compute on AWS"
 readme = "README.md"
+# Not decoration, and not optional. These were **empty**, which meant the
+# distribution name carried 100% of discoverability -- so dropping "aws" from the
+# name would genuinely have cut findability to near zero. PyPI indexes name,
+# summary and keywords, and s13 permits the mark in all the factual ones. Net
+# effect is *more* discoverable than before the rename, not less. Keep in sync with
+# the GitHub topics.
+keywords = [
+    "parsl",
+    "aws",
+    "ec2",
+    "spot-instances",
+    "ec2-fleet",
+    "lambda",
+    "fargate",
+    "ecs",
+    "ephemeral",
+    "hpc",
+    "workflow",
+    "scientific-computing",
+    "globus-compute",
+]
 requires-python = ">=3.10"
 # PEP 639: an SPDX expression string, not the legacy {text = ...} table. The two
 # forms cannot be mixed -- declaring license-files below makes setuptools validate
@@ -146,13 +174,13 @@ docs = [
 # inside a git clone (#198). Nothing terminates instances automatically -- Parsl
 # never calls provider.shutdown() -- so this is the tool that bounds the bill after
 # a crash, and it was the one thing not distributed.
-parsl-aws-cleanup = "parsl_aws_provider.cleanup:main"
+parsl-ephemeral-cleanup = "parsl_ephemeral_provider.cleanup:main"
 
 [project.urls]
-"Homepage" = "https://github.com/scttfrdmn/parsl-aws-provider"
-"Bug Tracker" = "https://github.com/scttfrdmn/parsl-aws-provider/issues"
+"Homepage" = "https://github.com/scttfrdmn/parsl-ephemeral-provider"
+"Bug Tracker" = "https://github.com/scttfrdmn/parsl-ephemeral-provider/issues"
 # GitHub Pages, not Read the Docs. This read
-# `https://parsl-aws-provider.readthedocs.io` and 404'd -- as did the old name,
+# `https://parsl-ephemeral-provider.readthedocs.io` and 404'd -- as did the old name,
 # so it was a pre-existing dead link the #189 rename carried forward rather than
 # fallout from it. RTD was never configured: no `.readthedocs.yaml`, no project
 # under either name.
@@ -161,8 +189,8 @@ parsl-aws-cleanup = "parsl_aws_provider.cleanup:main"
 # PyPI landing page, so this had to resolve before the first publish (#180) or be
 # dropped. CI's `docs` job had been building the HTML on every PR all along and
 # never publishing it; `deploy-docs` now ships it on pushes to main (#191).
-"Documentation" = "https://scttfrdmn.github.io/parsl-aws-provider/"
-"Changelog" = "https://github.com/scttfrdmn/parsl-aws-provider/blob/main/CHANGELOG.md"
+"Documentation" = "https://scttfrdmn.github.io/parsl-ephemeral-provider/"
+"Changelog" = "https://github.com/scttfrdmn/parsl-ephemeral-provider/blob/main/CHANGELOG.md"
 
 # [tool.uv] conflicts removed with the localstack dependency (#125). The pin
 # existed because globus-compute-sdk requires dill==0.3.9 while localstack<4.10
@@ -197,7 +225,7 @@ python_functions = "test_*"
 python_classes = "Test*"
 addopts = [
     "--strict-markers",
-    "--cov=parsl_aws_provider",
+    "--cov=parsl_ephemeral_provider",
     "--cov-report=term-missing",
     "--cov-report=html",
     "--cov-report=xml",
@@ -225,7 +253,7 @@ markers = [
 ]
 
 [tool.coverage.run]
-source = ["parsl_aws_provider"]
+source = ["parsl_ephemeral_provider"]
 branch = true
 omit = [
     "tests/*",
@@ -270,7 +298,7 @@ search = 'version = "{current_version}"'
 replace = 'version = "{new_version}"'
 
 [[tool.bumpversion.files]]
-filename = "parsl_aws_provider/__init__.py"
+filename = "parsl_ephemeral_provider/__init__.py"
 search = '__version__ = "{current_version}"'
 replace = '__version__ = "{new_version}"'
 
