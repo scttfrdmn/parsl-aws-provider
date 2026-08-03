@@ -42,8 +42,15 @@ license = "Apache-2.0"
 # .dist-info/licenses/ and in the sdist. NOTICE carries the independent-project
 # disclaimer and the AWS/Parsl/Globus trademark attribution (#189).
 license-files = ["LICENSE", "NOTICE"]
+# Name only, no email. This carried a placeholder address that would have shipped
+# in the wheel's METADATA as an Author-email header -- worse than absent, because
+# tooling treats it as a real contact. PEP 621 makes `email` optional, so omitting
+# the key is valid and leaves METADATA carrying `Author` alone. Security reports go
+# through the private GitHub advisory path in SECURITY.md, not to a maintainer
+# mailbox, so no address is load-bearing. Verified against a built wheel and sdist:
+# neither PKG-INFO nor METADATA emits an Author-email line.
 authors = [
-    {name = "Scott Friedman and Project Contributors", email = "email@example.com"}
+    {name = "Scott Friedman and Project Contributors"}
 ]
 classifiers = [
     "Development Status :: 3 - Alpha",
