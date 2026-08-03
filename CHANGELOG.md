@@ -8,6 +8,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **moto is retired from the integration suite** (#183). The two remaining
+  moto-backed files —
+  `tests/integration/test_serverless_mode_spot_fleet_integration.py` and
+  `tests/integration/test_detached_mode_spot_fleet_integration.py`, 7 `mock_aws`
+  sites — now run against substrate, leaving no `mock_aws` anywhere under
+  `tests/integration/`. The 37 sites in `tests/unit/` stay on moto deliberately:
+  that suite must remain container-free, so `moto[cloudformation]` remains a
+  dependency.
+
+  The move adds coverage rather than swapping like for like:
+
+  - **The detached tests exercise the default CloudFormation bastion.** They
+    passed `bastion_host_type="direct"` only because moto's CloudFormation
+    handler reads `properties["ImageId"]` directly and resolves no launch
+    template, raising `KeyError` on a `bastion.yml` real CloudFormation accepts.
+    Substrate deploys it end to end, so the path users actually get is now
+    covered.
+  - **The `aws:ec2:fleet-id` workaround is deleted, not ported.** Two fleet-status
+    tests hand-applied the tag because moto does not, which meant the lookup was
+    only ever passing on a tag the test itself supplied. Substrate stamps it, as
+    real EC2 does.
+  - **A fleet deletion is now observable.** The old cleanup test patched
+    `boto3.client` and asserted a `MagicMock` had received
+    `cancel_spot_fleet_requests` — the legacy API #86 removed and the provider no
+    longer calls, so that assertion could not fail whatever the code did. It now
+    creates a real fleet and asserts cleanup deletes it.
+  - **A deployed ECS task definition is read back.** New coverage of the
+    `!Split`-inside-`ContainerDefinitions` path that substrate#521/#526/#527 each
+    broke while still reporting success.
+
+  Integration goes **131 → 133 passed**; conformance **5 passed** and unit and
+  security **1202 passed / 3 skipped** are unchanged.
 - **The substrate emulator pin moves `0.87.1` → `0.88.0`**, in
   `docker-compose.substrate.yml` and `.github/workflows/ci.yml` together. This
   closes the last four emulation gaps filed from this repository, each verified
@@ -346,6 +378,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   4.0.1).
 
 ### Fixed
+- **The integration suite is idempotent against a long-lived emulator.** Four
+  tests derived resource names from IDs that collided after truncation, so a
+  second run without `make substrate-reset` failed on `AlreadyExists`. Provider
+  resource names truncate the ID they embed — `parsl-bastion-{workflow_id[:8]}`,
+  `parsl-{ecs,lambda}-{job_id[:8]}`, `parsl-lambda-code-{provider_id[:8]}` — so
+  `f"test-job-{uuid…}"` is the same name for every test. The random component now
+  leads. Three of the four are pre-existing in `test_substrate_modes.py`; moto hid
+  the class of bug entirely by giving each test a fresh mock. Worth knowing beyond
+  the tests: two live workflows whose IDs share eight characters collide on one
+  stack.
 - **The declared build requirement could not build this package.**
   `[build-system] requires` read `setuptools>=42`, but PEP 639 support — the
   `license = "Apache-2.0"` SPDX string and `license-files = [...]` this project

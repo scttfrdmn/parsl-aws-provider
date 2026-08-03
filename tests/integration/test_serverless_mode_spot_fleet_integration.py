@@ -1,17 +1,35 @@
 """Integration tests for ServerlessMode with SpotFleet functionality.
 
-These run the mode against moto, which intercepts the HTTP layer, so the real
-CloudFormation templates are deployed and the real ``describe_*`` response shapes
-are exercised. Nothing on the mode is stubbed.
+These run the mode against [substrate](https://github.com/scttfrdmn/substrate),
+the emulator this suite standardised on in #125, rather than moto (#183). Nothing
+on the mode is stubbed: the real CloudFormation templates are deployed and the real
+``describe_*`` response shapes are exercised.
 
-The template's spot fleet branch is one deliberate omission: moto's
-``AWS::EC2::SpotFleet`` handler reads
-``SpotFleetRequestConfigData["LaunchSpecifications"]`` unconditionally
-(``moto/ec2/models/spot_requests.py``), while ``ecs_worker.yml`` -- like current
-AWS guidance -- declares ``LaunchTemplateConfigs``. Deploying that branch dies
-inside moto with ``KeyError: 'LaunchSpecifications'``, a simulator gap rather
-than a package defect, so ``_get_spot_fleet_status()`` is exercised against a
-directly created fleet request instead.
+Moving here waited on four substrate fixes, all filed from this repository and all
+in ``0.88.0``: [#521](https://github.com/scttfrdmn/substrate/issues/521)
+(``Fn::Split`` yielded only its first element, which silently truncated
+``ecs_worker.yml``'s ``Command``),
+[#526](https://github.com/scttfrdmn/substrate/issues/526) (an intrinsic nested
+inside a structured property was never resolved),
+[#527](https://github.com/scttfrdmn/substrate/issues/527) (a deployed task
+definition kept CloudFormation's PascalCase keys, so ``describe_task_definition``
+returned ``[{}]``) and [#528](https://github.com/scttfrdmn/substrate/issues/528)
+(CloudWatch Logs read operations returned PascalCase members, so every field parsed
+to ``None``).
+
+Two things improved in the move rather than merely carrying over:
+
+* **The ``aws:ec2:fleet-id`` workaround is gone, not ported.** moto applies no such
+  tag, so the two fleet-status tests hand-applied it -- and a fleet whose tag the
+  test itself supplied cannot show that the lookup works. Substrate stamps it
+  (substrate#443) *and* now rejects manual ``aws:``-prefixed keys as reserved, the
+  way real EC2 does, so the tag being present is now an emulator behaviour the code
+  is genuinely tested against.
+* **The spot-fleet branch of ``ecs_worker.yml`` is no longer excluded.** moto's
+  ``AWS::EC2::SpotFleet`` handler reads
+  ``SpotFleetRequestConfigData["LaunchSpecifications"]`` unconditionally while the
+  template -- like current AWS guidance -- declares ``LaunchTemplateConfigs``, so
+  deploying that branch died with ``KeyError: 'LaunchSpecifications'``.
 
 SPDX-License-Identifier: Apache-2.0
 SPDX-FileCopyrightText: 2025-2026 Scott Friedman and Project Contributors
@@ -23,17 +41,7 @@ import uuid
 import zipfile
 from unittest.mock import patch
 
-import boto3
 import pytest
-
-try:
-    # moto 5 replaced the per-service decorators (mock_ec2, mock_iam, ...) with a
-    # single mock_aws.
-    from moto import mock_aws
-
-    MOTO_AVAILABLE = True
-except ImportError:
-    MOTO_AVAILABLE = False
 
 from parsl_ephemeral_provider.modes.serverless import ServerlessMode
 from parsl_ephemeral_provider.constants import (
@@ -49,7 +57,7 @@ from parsl_ephemeral_provider.constants import (
 
 pytestmark = [
     pytest.mark.integration,
-    pytest.mark.skipif(not MOTO_AVAILABLE, reason="moto not installed"),
+    pytest.mark.substrate,
 ]
 
 
@@ -70,54 +78,57 @@ class MockStateStore:
         self.states.pop(state_key, None)
 
 
-@pytest.fixture(autouse=True)
-def moto():
-    """Activate moto around each test *and* around its fixtures.
-
-    ``@mock_aws`` as a class decorator wraps only the ``test_*`` methods, so a
-    fixture that provisions a VPC runs outside the mock and hits real AWS. An
-    autouse fixture is entered before the fixtures that depend on it, so the
-    whole graph is covered.
-    """
-    with mock_aws():
-        yield
-
-
 class TestServerlessModeSpotFleetIntegration:
-    """Integration tests for ServerlessMode against moto."""
+    """Integration tests for ServerlessMode against the emulator."""
 
     @pytest.fixture
-    def aws_session(self):
-        """A real boto3 session; moto intercepts its calls."""
-        return boto3.Session(region_name="us-east-1")
-
-    @pytest.fixture
-    def network(self, aws_session):
-        """Pre-provision the VPC, subnet, and security group.
+    def network(self, substrate_network):
+        """The caller-supplied network.
 
         Since #69 no mode creates network resources -- all three IDs are
-        caller-supplied and required for the ECS worker type.
+        caller-supplied and required for the ECS worker type -- and ``modes/base.py``
+        *verifies* each with a ``describe_*`` call, so they have to be real
+        emulator-side resources rather than ``vpc-12345`` placeholders.
         """
-        ec2 = aws_session.client("ec2")
-        vpc_id = ec2.create_vpc(CidrBlock="10.0.0.0/16")["Vpc"]["VpcId"]
-        subnet_id = ec2.create_subnet(VpcId=vpc_id, CidrBlock="10.0.0.0/24")["Subnet"][
-            "SubnetId"
-        ]
-        security_group_id = ec2.create_security_group(
-            GroupName=f"parsl-test-{uuid.uuid4().hex[:8]}",
-            Description="Test security group",
-            VpcId=vpc_id,
-        )["GroupId"]
-        return {
-            "vpc_id": vpc_id,
-            "subnet_id": subnet_id,
-            "security_group_id": security_group_id,
-        }
+        return substrate_network
+
+    @pytest.fixture
+    def aws_session(self, substrate_session):
+        """A session whose clients reach the emulator.
+
+        ``substrate_session`` wraps ``.client`` rather than expecting each call site
+        to pass ``endpoint_url``, so the mode's own clients -- built internally from
+        this session -- reach the emulator too.
+        """
+        return substrate_session
+
+    @staticmethod
+    def _job_id(label):
+        """A job ID unique in its **first eight characters**.
+
+        Not merely unique: the ECS and Lambda stack names are
+        ``parsl-{ecs,lambda}-{job_id[:8]}`` (``modes/serverless.py:564,717``), so
+        ``test-job-1`` and ``test-job-2`` are the same stack. moto never showed this
+        -- each test got a fresh mock -- while emulator state lives for the server
+        process's lifetime, so the second submit met ``AlreadyExists``.
+
+        The truncation is a real provider constraint rather than a test artefact:
+        two jobs whose IDs share eight characters collide on one stack. Same shape
+        as the bastion stack's ``workflow_id[:8]``. Worth knowing before it is met
+        in an account instead of an emulator.
+        """
+        return f"{uuid.uuid4().hex[:8]}-{label}"
 
     def _mode(self, aws_session, **overrides):
-        """Build a ServerlessMode with a unique provider ID."""
+        """Build a ServerlessMode with a unique provider ID.
+
+        The random part leads for the same reason as in ``_job_id``: the staging
+        bucket is ``parsl-lambda-code-{provider_id[:8]}``
+        (``modes/serverless.py:645``), so a ``test-``-prefixed ID gives every
+        provider in the file near-identical bucket names.
+        """
         kwargs = {
-            "provider_id": f"test-{uuid.uuid4()}",
+            "provider_id": f"{uuid.uuid4().hex[:8]}-test",
             "session": aws_session,
             "state_store": MockStateStore(),
             "worker_type": WORKER_TYPE_ECS,
@@ -158,10 +169,11 @@ class TestServerlessModeSpotFleetIntegration:
         """
         serverless_mode.initialize()
 
-        resource_id = serverless_mode.submit_job("test-job-1", "echo hello", 2)
+        job_id = self._job_id("job-1")
+        resource_id = serverless_mode.submit_job(job_id, "echo hello", 2)
 
         resource = serverless_mode.resources[resource_id]
-        assert resource["job_id"] == "test-job-1"
+        assert resource["job_id"] == job_id
         assert resource["command"] == "echo hello"
         assert resource["status"] == STATUS_PENDING
         assert resource["resource_type"] == RESOURCE_TYPE_ECS_TASK
@@ -174,18 +186,58 @@ class TestServerlessModeSpotFleetIntegration:
         outputs = {out["OutputKey"] for out in stack["Outputs"]}
         assert {"ClusterName", "ServiceName"} <= outputs
 
-    def test_submit_lambda_job_stages_a_real_zip_in_s3(self, aws_session):
+    def test_submit_ecs_job_deploys_a_readable_task_definition(self, serverless_mode):
+        """The deployed task definition reads back with its command intact.
+
+        This is the assertion moto could not support and substrate could not until
+        ``0.88.0``: three separate defects each returned a *successful* but empty or
+        truncated container list, so a stack that deployed a broken task definition
+        looked identical to one that worked. ``Command`` is the interesting field
+        because the template routes it through ``!Split`` inside
+        ``ContainerDefinitions`` -- the exact shape of substrate#521 and #526.
+        """
+        serverless_mode.initialize()
+        resource_id = serverless_mode.submit_job(
+            self._job_id("job-td"), "echo hello", 1
+        )
+        stack_name = serverless_mode.resources[resource_id]["stack_name"]
+
+        outputs = {
+            out["OutputKey"]: out["OutputValue"]
+            for out in serverless_mode.cf_client.describe_stacks(StackName=stack_name)[
+                "Stacks"
+            ][0]["Outputs"]
+        }
+
+        task_def = serverless_mode.session.client("ecs").describe_task_definition(
+            taskDefinition=outputs["TaskDefinitionArn"]
+        )["taskDefinition"]
+
+        containers = task_def["containerDefinitions"]
+        assert containers, "task definition deployed with no containers"
+        assert containers[0]["command"], "the command was lost between CFN and ECS"
+
+    def test_submit_lambda_job_stages_a_real_zip_in_s3(self, aws_session, network):
         """A Lambda submit stages an intact archive and deploys the function.
 
         The deployment package used to be latin1-decoded into the
         `CodeZipContent` CloudFormation parameter. That is neither the base64 the
-        template documents nor legal XML, so CloudFormation's own DescribeStacks
-        echo came back unparseable and the job reported UNKNOWN forever (#116).
+        template documents nor legal XML -- 117 of its codepoints are control
+        characters XML 1.0 forbids in character data -- so CloudFormation's own
+        DescribeStacks echo came back unparseable and the job reported UNKNOWN
+        forever (#116).
+
+        The parameter echo is therefore what this asserts on, since an unparseable
+        echo is precisely how that defect presented. A ``CodeSize`` comparison would
+        be the more obvious check and is the wrong one here: a CFN-deployed function
+        reports ``CodeSize: 0`` on substrate ``0.88.0`` where a direct
+        ``create_function`` reports the true size, so the assertion would fail for an
+        emulator reason while saying nothing about #116.
         """
-        mode = self._mode(aws_session, worker_type=WORKER_TYPE_LAMBDA)
+        mode = self._mode(aws_session, worker_type=WORKER_TYPE_LAMBDA, **network)
         mode.initialize()
 
-        resource_id = mode.submit_job("test-job-lambda", "echo hi", 1)
+        resource_id = mode.submit_job(self._job_id("job-lambda"), "echo hi", 1)
         resource = mode.resources[resource_id]
 
         assert resource["resource_type"] == RESOURCE_TYPE_LAMBDA_FUNCTION
@@ -200,21 +252,34 @@ class TestServerlessModeSpotFleetIntegration:
         )
         assert zipfile.ZipFile(io.BytesIO(body)).namelist() == ["handler.py"]
 
+        # The archive travels by S3 reference, and the string parameters round-trip
+        # through DescribeStacks -- the echo that used to come back unparseable.
+        stack = mode.cf_client.describe_stacks(StackName=resource["stack_name"])[
+            "Stacks"
+        ][0]
+        params = {p["ParameterKey"]: p["ParameterValue"] for p in stack["Parameters"]}
+        assert params["CodeS3Bucket"] == resource["code_bucket"]
+        assert params["CodeS3Key"] == resource["code_key"]
+        assert params["CodeZipContent"] == "", "the archive must not travel inline"
+
+        # And the function was really deployed from that reference.
+        resource_types = {
+            r["ResourceType"]
+            for r in mode.cf_client.describe_stack_resources(
+                StackName=resource["stack_name"]
+            )["StackResources"]
+        }
+        assert "AWS::Lambda::Function" in resource_types
+
         # The status query parses -- it could not while the parameter carried
         # XML-illegal control characters.
         assert mode.get_job_status([resource_id])[resource_id] == STATUS_PENDING
 
-        # And the function was really deployed from that archive.
-        function = aws_session.client("lambda").get_function(
-            FunctionName="parsl-lambda-test-job-lambda"
-        )
-        assert function["Configuration"]["CodeSize"] == len(body)
-
-    def test_cleanup_removes_the_staged_lambda_code(self, aws_session):
+    def test_cleanup_removes_the_staged_lambda_code(self, aws_session, network):
         """Cleaning up a Lambda job deletes its staged package and bucket."""
-        mode = self._mode(aws_session, worker_type=WORKER_TYPE_LAMBDA)
+        mode = self._mode(aws_session, worker_type=WORKER_TYPE_LAMBDA, **network)
         mode.initialize()
-        resource_id = mode.submit_job("test-job-lambda-2", "echo hi", 1)
+        resource_id = mode.submit_job(self._job_id("job-lambda-2"), "echo hi", 1)
         bucket = mode.resources[resource_id]["code_bucket"]
         key = mode.resources[resource_id]["code_key"]
 
@@ -228,7 +293,7 @@ class TestServerlessModeSpotFleetIntegration:
         mode.cleanup_infrastructure()
         assert bucket not in [b["Name"] for b in s3.list_buckets()["Buckets"]]
 
-    def test_a_caller_supplied_bucket_is_reused_and_kept(self, aws_session):
+    def test_a_caller_supplied_bucket_is_reused_and_kept(self, aws_session, network):
         """A configured lambda_code_bucket is staged into, never deleted.
 
         The parameter used to be ``checkpoint_bucket``, whose checkpointing half
@@ -236,25 +301,25 @@ class TestServerlessModeSpotFleetIntegration:
         behaviour under a name that describes it.
         """
         s3 = aws_session.client("s3")
-        s3.create_bucket(Bucket="parsl-test-caller-bucket")
+        caller_bucket = f"parsl-test-caller-{uuid.uuid4().hex[:8]}"
+        s3.create_bucket(Bucket=caller_bucket)
 
         mode = self._mode(
             aws_session,
             worker_type=WORKER_TYPE_LAMBDA,
-            lambda_code_bucket="parsl-test-caller-bucket",
+            lambda_code_bucket=caller_bucket,
+            **network,
         )
         mode.initialize()
-        resource_id = mode.submit_job("test-job-lambda-3", "echo hi", 1)
+        resource_id = mode.submit_job(self._job_id("job-lambda-3"), "echo hi", 1)
 
-        assert mode.resources[resource_id]["code_bucket"] == "parsl-test-caller-bucket"
+        assert mode.resources[resource_id]["code_bucket"] == caller_bucket
 
         mode.cleanup_resources([resource_id])
         mode.cleanup_infrastructure()
 
         # The caller's bucket survives: only a bucket the mode created is deleted.
-        assert "parsl-test-caller-bucket" in [
-            b["Name"] for b in s3.list_buckets()["Buckets"]
-        ]
+        assert caller_bucket in [b["Name"] for b in s3.list_buckets()["Buckets"]]
 
     def test_a_failed_submit_leaves_nothing_behind(self, serverless_mode):
         """A submit that fails mid-flight does not leak a stack or a record."""
@@ -266,7 +331,7 @@ class TestServerlessModeSpotFleetIntegration:
             side_effect=RuntimeError("boom"),
         ):
             with pytest.raises(Exception, match="Failed to submit job"):
-                serverless_mode.submit_job("test-job-fail", "echo hello", 1)
+                serverless_mode.submit_job(self._job_id("job-fail"), "echo hello", 1)
 
         # Tracking is created before dispatch now, so the failure path has to
         # remove it again -- otherwise a phantom job would be polled forever.
@@ -295,11 +360,19 @@ class TestServerlessModeSpotFleetIntegration:
         ``describe_fleets``, which knows nothing about an ``sfr-`` request, so it
         took the "EC2 has forgotten this fleet" branch and returned COMPLETED --
         the assertion was against an API the code no longer calls.
+
+        Nothing tags the instances here. ``aws:ec2:fleet-id`` is the only supported
+        way to enumerate an instant fleet's instances -- ``DescribeFleetInstances``
+        rejects this fleet type outright, and ``DescribeFleets`` reports the original
+        launch without dropping instances that have since terminated -- and the
+        emulator stamps it, as real EC2 does (substrate#443). The moto version had to
+        hand-apply the tag, which meant the lookup was passing on a tag the test
+        itself had supplied.
         """
         serverless_mode.initialize()
         ec2 = serverless_mode.session.client("ec2")
         template = ec2.create_launch_template(
-            LaunchTemplateName="parsl-test-fleet-template",
+            LaunchTemplateName=f"parsl-test-fleet-{uuid.uuid4().hex[:8]}",
             LaunchTemplateData={
                 "ImageId": "ami-12345678",
                 "InstanceType": "t3.small",
@@ -328,28 +401,8 @@ class TestServerlessModeSpotFleetIntegration:
         )
         fleet_id = fleet["FleetId"]
 
-        # Real EC2 tags every fleet-launched instance with `aws:ec2:fleet-id`,
-        # and that tag is the only supported way to enumerate an instant fleet's
-        # instances: DescribeFleetInstances rejects this fleet type outright, and
-        # DescribeFleets reports the original launch without dropping instances
-        # that have since terminated. **moto** does not apply it, so it is set
-        # here -- otherwise the lookup comes back empty and a running fleet
-        # reports COMPLETED for want of a tag rather than for any behaviour of
-        # the code under test.
-        #
-        # This file stays on moto even though substrate now applies the tag
-        # itself (substrate#443, 0.85.0): six tests here drive `cf_client`, and
-        # substrate does not emulate CloudFormation. Note the workaround is only
-        # viable *because* it is moto -- substrate now enforces the real rule
-        # that `aws:` keys are reserved and rejects create_tags outright, which
-        # is why the substrate-backed copy of this pattern in
-        # test_spot_interruption_substrate.py had to drop it.
         instance_ids = [i for g in fleet["Instances"] for i in g["InstanceIds"]]
         assert instance_ids, "fleet launched nothing; nothing to assert about"
-        ec2.create_tags(
-            Resources=instance_ids,
-            Tags=[{"Key": "aws:ec2:fleet-id", "Value": fleet_id}],
-        )
 
         assert serverless_mode._get_spot_fleet_status(fleet_id) == STATUS_RUNNING
 
@@ -365,7 +418,7 @@ class TestServerlessModeSpotFleetIntegration:
         serverless_mode.initialize()
         ec2 = serverless_mode.session.client("ec2")
         template = ec2.create_launch_template(
-            LaunchTemplateName="parsl-test-fleet-template-2",
+            LaunchTemplateName=f"parsl-test-fleet-{uuid.uuid4().hex[:8]}",
             LaunchTemplateData={
                 "ImageId": "ami-12345678",
                 "InstanceType": "t3.small",
@@ -394,10 +447,6 @@ class TestServerlessModeSpotFleetIntegration:
         )
         fleet_id = fleet["FleetId"]
         instance_ids = [i for g in fleet["Instances"] for i in g["InstanceIds"]]
-        ec2.create_tags(  # moto does not apply it; see above
-            Resources=instance_ids,
-            Tags=[{"Key": "aws:ec2:fleet-id", "Value": fleet_id}],
-        )
 
         ec2.terminate_instances(InstanceIds=instance_ids)
 
@@ -410,7 +459,7 @@ class TestServerlessModeSpotFleetIntegration:
     def test_cancel_job_deletes_the_stack(self, serverless_mode):
         """Cancelling a job marks it CANCELLED and deletes its stack."""
         serverless_mode.initialize()
-        resource_id = serverless_mode.submit_job("test-job-2", "echo hello", 2)
+        resource_id = serverless_mode.submit_job(self._job_id("job-2"), "echo hello", 2)
         stack_name = serverless_mode.resources[resource_id]["stack_name"]
 
         cancel_results = serverless_mode.cancel_jobs([resource_id])
@@ -426,18 +475,19 @@ class TestServerlessModeSpotFleetIntegration:
     def test_list_resources_groups_by_worker_type(self, serverless_mode):
         """Submitted jobs are listed under their worker type."""
         serverless_mode.initialize()
-        resource_id = serverless_mode.submit_job("test-job-3", "echo hello", 2)
+        job_id = self._job_id("job-3")
+        resource_id = serverless_mode.submit_job(job_id, "echo hello", 2)
 
         resources = serverless_mode.list_resources()
 
         assert len(resources["ecs_tasks"]) == 1
         assert resources["ecs_tasks"][0]["id"] == resource_id
-        assert resources["ecs_tasks"][0]["job_id"] == "test-job-3"
+        assert resources["ecs_tasks"][0]["job_id"] == job_id
 
     def test_cleanup_resources_drops_tracking(self, serverless_mode):
         """Cleaning up a resource deletes its stack and drops the tracking."""
         serverless_mode.initialize()
-        resource_id = serverless_mode.submit_job("test-job-4", "echo hello", 2)
+        resource_id = serverless_mode.submit_job(self._job_id("job-4"), "echo hello", 2)
         stack_name = serverless_mode.resources[resource_id]["stack_name"]
 
         serverless_mode.cleanup_resources([resource_id])
@@ -514,8 +564,9 @@ class TestServerlessModeSpotFleetIntegration:
             "NodesPerBlock": "2",
             "SpotMaxPricePercentage": "80",
         }
+        stack_name = f"parsl-ecs-parameter-check-{uuid.uuid4().hex[:8]}"
         cf.create_stack(
-            StackName="parsl-ecs-parameter-check",
+            StackName=stack_name,
             TemplateBody=get_cf_template("ecs_worker.yml"),
             Parameters=[
                 {"ParameterKey": key, "ParameterValue": value}
@@ -524,5 +575,5 @@ class TestServerlessModeSpotFleetIntegration:
             Capabilities=["CAPABILITY_IAM"],
         )
 
-        stack = cf.describe_stacks(StackName="parsl-ecs-parameter-check")["Stacks"][0]
+        stack = cf.describe_stacks(StackName=stack_name)["Stacks"][0]
         assert stack["StackStatus"] == "CREATE_COMPLETE"

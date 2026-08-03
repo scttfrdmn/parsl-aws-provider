@@ -12,6 +12,13 @@ leaves them alone -- deleting a caller's network would be the same class of bug 
 the serverless security-group deletion fixed in #100. The old
 ``assert mode.vpc_id is None`` after cleanup asserted the opposite.
 
+Job IDs here lead with their random part rather than a ``test-job-`` prefix. The
+stack names derive from ``job_id[:8]`` (``modes/serverless.py:564,717``), so
+``f"test-job-{uuid…}"`` truncated to the same ``test-job`` for all three tests and
+the suite passed only against a freshly reset emulator -- a second run met
+``AlreadyExists``. #183 found this while moving the spot-fleet files off moto, where
+a fresh mock per test hid it.
+
 SPDX-License-Identifier: Apache-2.0
 SPDX-FileCopyrightText: 2025-2026 Scott Friedman and Project Contributors
 """
@@ -115,7 +122,7 @@ class TestStandardModeSubstrate:
         try:
             mode.initialize()
 
-            job_id = f"test-job-{uuid.uuid4().hex[:8]}"
+            job_id = f"{uuid.uuid4().hex[:8]}-test-job"
             resource_id = mode.submit_job(job_id, "echo hello", 1)
 
             assert resource_id in mode.resources
@@ -136,9 +143,11 @@ class TestStandardModeSubstrate:
 class TestDetachedModeSubstrate:
     """Integration tests for DetachedMode using substrate.
 
-    ``bastion_host_type="direct"`` throughout: the CloudFormation bastion is not
-    reachable here, since substrate serves no ``cloudformation`` endpoint. That
-    path is covered against real AWS in ``tests/aws/``.
+    ``bastion_host_type="direct"`` throughout, which is now a choice rather than a
+    constraint: substrate has served CloudFormation since ``0.87.0`` and deploys
+    ``bastion.yml`` end to end since ``0.87.1``. The default stack path is covered by
+    ``test_detached_mode_spot_fleet_integration.py``, so keeping ``direct`` here means
+    both bastion paths get exercised instead of only one.
     """
 
     def _mode(self, session, network, store, provider_id, **overrides):
@@ -202,7 +211,7 @@ class TestDetachedModeSubstrate:
         try:
             mode.initialize()
 
-            job_id = f"test-job-{uuid.uuid4().hex[:8]}"
+            job_id = f"{uuid.uuid4().hex[:8]}-test-job"
             resource_id = mode.submit_job(job_id, "echo hello", 1)
 
             assert resource_id in mode.resources
@@ -318,7 +327,7 @@ class TestServerlessModeSubstrate:
         try:
             mode.initialize()
 
-            job_id = f"test-job-{uuid.uuid4().hex[:8]}"
+            job_id = f"{uuid.uuid4().hex[:8]}-test-job"
             resource_id = mode.submit_job(job_id, "echo hello", 1)
 
             assert resource_id in mode.resources

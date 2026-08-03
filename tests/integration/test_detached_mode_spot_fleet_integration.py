@@ -1,26 +1,35 @@
 """Integration tests for the SpotFleet functionality in DetachedMode.
 
-These tests use the moto library to mock AWS services for realistic integration testing.
+These run the mode against [substrate](https://github.com/scttfrdmn/substrate),
+the emulator this suite standardised on in #125, rather than moto (#183). The
+switch is not like-for-like: it *adds* coverage.
+
+The old moto version passed ``bastion_host_type="direct"``, because since #86
+``bastion.yml`` puts ``ImageId`` in a launch template and has the
+``AWS::EC2::Instance`` reference it -- one template serving both the on-demand and
+the spot bastion. moto's CloudFormation handler reads ``properties["ImageId"]``
+directly (``moto/ec2/models/instances.py:400``) and resolves no launch template,
+so it raises ``KeyError: 'ImageId'`` on a stack real CloudFormation accepts.
+Substrate deploys that template end to end as of ``0.87.1``
+([substrate#516](https://github.com/scttfrdmn/substrate/issues/516),
+[#517](https://github.com/scttfrdmn/substrate/issues/517)), so these tests now
+exercise the **default** ``cloudformation`` bastion path -- the one users get --
+instead of the fallback chosen to work around a simulator gap.
+
+The spot-fleet lifecycle is likewise real here: ``test_cleanup_deletes_the_fleet``
+creates an actual ``CreateFleet`` fleet and asserts cleanup deletes it. The moto
+version patched ``boto3.client`` and asserted against a ``MagicMock``'s
+``cancel_spot_fleet_requests`` -- an API the provider stopped calling in #86, so
+that assertion could not have failed however the code behaved.
 
 SPDX-License-Identifier: Apache-2.0
 SPDX-FileCopyrightText: 2025-2026 Scott Friedman and Project Contributors
 """
 
-import unittest
-from unittest.mock import MagicMock, patch
-import boto3
-import pytest
 import json
+import uuid
 
-try:
-    # Check if moto is available — importing the decorator is the probe; a
-    # bare `import moto` alongside it was redundant. moto 5 replaced the
-    # per-service decorators with a single mock_aws.
-    from moto import mock_aws
-
-    MOTO_AVAILABLE = True
-except ImportError:
-    MOTO_AVAILABLE = False
+import pytest
 
 from parsl_ephemeral_provider.modes.detached import DetachedMode
 from parsl_ephemeral_provider.constants import (
@@ -31,181 +40,163 @@ from parsl_ephemeral_provider.constants import (
     STATUS_CANCELED,
 )
 
-
-# Skip all tests if moto is not installed
-pytestmark = pytest.mark.skipif(not MOTO_AVAILABLE, reason="moto not installed")
+pytestmark = [
+    pytest.mark.integration,
+    pytest.mark.substrate,
+]
 
 
 class MockStateStore:
-    """Mock state store implementation for testing.
-
-    Keyed like the real stores, so writing one key does not disturb another.
-    """
+    """Keyed state store, matching the real stores' two-argument interface."""
 
     def __init__(self):
-        """Initialize with empty state."""
         self.states = {}
 
     def save_state(self, state_key, state_data):
-        """Save state under a key."""
         self.states[state_key] = state_data
         return True
 
     def load_state(self, state_key):
-        """Load state stored under a key."""
         return self.states.get(state_key)
 
     def delete_state(self, state_key):
-        """Delete state stored under a key."""
         self.states.pop(state_key, None)
 
 
-@mock_aws
-class TestDetachedModeSpotFleetIntegration(unittest.TestCase):
-    """Integration tests for DetachedMode SpotFleet functionality using moto."""
+class TestDetachedModeSpotFleetIntegration:
+    """Integration tests for DetachedMode SpotFleet functionality."""
 
-    def setUp(self):
-        """Set up test environment."""
-        # Create boto3 clients directly with moto
-        self.ec2_client = boto3.client("ec2", region_name="us-east-1")
-        self.iam_client = boto3.client("iam", region_name="us-east-1")
-        self.ssm_client = boto3.client("ssm", region_name="us-east-1")
-        self.cf_client = boto3.client("cloudformation", region_name="us-east-1")
+    @pytest.fixture
+    def image_id(self, substrate_session):
+        """A registered AMI, rather than a made-up ``ami-`` string.
 
-        # Create boto3 session
-        self.session = boto3.Session(region_name="us-east-1")
-
-        # Create state store
-        self.state_store = MockStateStore()
-
-        # Create a VPC for testing
-        vpc_response = self.ec2_client.create_vpc(CidrBlock="10.0.0.0/16")
-        self.vpc_id = vpc_response["Vpc"]["VpcId"]
-
-        # Create a subnet
-        subnet_response = self.ec2_client.create_subnet(
-            VpcId=self.vpc_id, CidrBlock="10.0.0.0/24"
-        )
-        self.subnet_id = subnet_response["Subnet"]["SubnetId"]
-
-        # Create a security group
-        sg_response = self.ec2_client.create_security_group(
-            GroupName="test-sg", Description="Test security group", VpcId=self.vpc_id
-        )
-        self.security_group_id = sg_response["GroupId"]
-
-        # Create a dummy AMI
-        ami_response = self.ec2_client.register_image(
-            Name="test-ami",
+        ``bastion.yml`` passes it into a launch template that the bastion instance
+        resolves, so it has to be an image the emulator will actually serve.
+        """
+        return substrate_session.client("ec2").register_image(
+            Name=f"parsl-test-ami-{uuid.uuid4().hex[:8]}",
             RootDeviceName="/dev/sda1",
             BlockDeviceMappings=[{"DeviceName": "/dev/sda1", "Ebs": {"VolumeSize": 8}}],
-        )
-        self.ami_id = ami_response["ImageId"]
+        )["ImageId"]
 
-        # Create IAM role for spot fleet
-        trust_policy = {
-            "Version": "2012-10-17",
-            "Statement": [
-                {
-                    "Effect": "Allow",
-                    "Principal": {"Service": "spotfleet.amazonaws.com"},
-                    "Action": "sts:AssumeRole",
-                }
-            ],
-        }
+    @pytest.fixture
+    def workflow_id(self):
+        """Unique per test, and unique **in its first eight characters**.
 
-        # Create role
-        self.iam_client.create_role(
-            RoleName="SpotFleetRole",
-            AssumeRolePolicyDocument=json.dumps(trust_policy),
-            Description="Role for Spot Fleet",
-        )
+        Two reasons it has to be unique. SSM parameter paths are keyed on it, and
+        emulator state lives for the server process's lifetime, so a fixed value
+        meets the previous run's parameters rather than starting clean.
 
-        # Create SSM parameters path for workflow
-        self.workflow_id = "test-workflow-id"
-        self.provider_id = "test-provider-id"
+        The eight-character part is the subtle one: the bastion stack is named
+        ``parsl-bastion-{workflow_id[:8]}`` (``modes/detached.py:458``), so an id
+        like ``test-workflow-<random>`` truncates to ``test-wor`` for every test in
+        the file and the second ``initialize()`` dies on ``AlreadyExists``. The
+        random part therefore leads.
 
-        # Create DetachedMode instance with SpotFleet enabled.
-        #
-        # `bastion_host_type="direct"` rather than the "cloudformation" default:
-        # since #86 bastion.yml puts `ImageId` in a launch template and has the
-        # AWS::EC2::Instance reference it, which is what lets one template serve
-        # both the on-demand and the spot bastion. moto's CloudFormation handler
-        # for AWS::EC2::Instance reads `properties["ImageId"]` directly
-        # (moto/ec2/models/instances.py:400) and resolves no launch template, so
-        # it raises `KeyError: 'ImageId'` on a stack real CloudFormation accepts.
-        # The direct path launches with `run_instances`, which moto does model.
-        # The CloudFormation bastion is covered in `tests/aws/` against real AWS.
-        #
-        # `create_vpc=False` used to be passed here. #69 removed the parameter --
-        # every mode now requires the three network IDs, which are supplied
-        # above -- and the mode's `**kwargs` swallowed it silently rather than
-        # rejecting it, so it read as configuration while doing nothing.
-        self.detached_mode = DetachedMode(
-            provider_id=self.provider_id,
-            session=self.session,
-            state_store=self.state_store,
-            workflow_id=self.workflow_id,
-            bastion_host_type="direct",
-            bastion_instance_type="t2.micro",
-            instance_type="t2.micro",
-            image_id=self.ami_id,
-            vpc_id=self.vpc_id,
-            subnet_id=self.subnet_id,
-            security_group_id=self.security_group_id,
+        That truncation is a real provider constraint, not a test artefact: two
+        concurrent workflows whose ids share a prefix collide on the same stack.
+        Worth knowing before it is met in an account rather than an emulator.
+        """
+        return f"{uuid.uuid4().hex[:8]}-test-workflow"
+
+    @pytest.fixture
+    def detached_mode(
+        self, substrate_session, substrate_network, image_id, workflow_id
+    ):
+        """A spot-fleet DetachedMode on the default CloudFormation bastion path.
+
+        No ``create_vpc``: #69 removed the parameter -- every mode now requires the
+        three network IDs, which ``substrate_network`` provisions -- and the mode's
+        ``**kwargs`` swallowed it silently rather than rejecting it, so it read as
+        configuration while doing nothing.
+
+        No ``region`` either. The mode would merely store it, while its clients
+        come from the session, which follows ``AWS_TEST_REGION``. Substrate
+        partitions state by region, so naming a different one here is how you get
+        a ``NotFound`` for a resource that was just created successfully.
+        """
+        mode = DetachedMode(
+            provider_id=f"test-provider-{uuid.uuid4().hex[:8]}",
+            session=substrate_session,
+            state_store=MockStateStore(),
+            workflow_id=workflow_id,
+            bastion_instance_type="t3.micro",
+            instance_type="t3.micro",
+            image_id=image_id,
+            vpc_id=substrate_network["vpc_id"],
+            subnet_id=substrate_network["subnet_id"],
+            security_group_id=substrate_network["security_group_id"],
             use_spot_fleet=True,
-            instance_types=["t2.micro", "t2.small", "m5.small"],
+            instance_types=["t3.micro", "t3.small", "m5.large"],
             nodes_per_block=2,
             spot_max_price_percentage=80,
         )
+        try:
+            yield mode
+        finally:
+            mode.cleanup_infrastructure()
 
-    @patch("time.sleep", return_value=None)  # Don't actually sleep during tests
-    def test_submit_job_with_spot_fleet(self, mock_sleep):
-        """Test submitting a job with SpotFleet options."""
-        # Submit a job
+    def test_initialize_deploys_the_bastion_stack(self, detached_mode):
+        """The default bastion path deploys ``bastion.yml`` and reports its stack.
+
+        This is the case moto could not run at all, and the reason the file moved:
+        the template's ``AWS::EC2::Instance`` resolves its ``ImageId`` through an
+        ``AWS::EC2::LaunchTemplate``, which moto's CloudFormation handler does not
+        do.
+        """
+        detached_mode.initialize()
+
+        assert detached_mode.initialized is True
+        assert detached_mode.bastion_id
+        # A stack ARN, not an `i-`: the bastion is stack-managed on this path.
+        assert ":stack/" in detached_mode.bastion_id
+
+    def test_submit_job_with_spot_fleet(self, detached_mode, workflow_id):
+        """A submitted job hands the bastion its full spot-fleet configuration.
+
+        The real ``bastion.yml`` is deployed rather than stubbed: patching
+        ``get_cf_template`` out is what let #112 -- it raised
+        ``ModuleNotFoundError`` on every call, and the templates never shipped in
+        the wheel -- go unnoticed at all four of its call sites.
+        """
+        detached_mode.initialize()
+
         job_id = "test-job-1"
-        command = "echo 'Hello, world!'"
-        tasks_per_node = 1
+        resource_id = detached_mode.submit_job(job_id, "echo 'Hello, world!'", 1)
 
-        # The real bastion.yml is used here rather than a stub: patching
-        # get_cf_template out is what let #112 (it raised ModuleNotFoundError on
-        # every call, and the templates never shipped in the wheel) go unnoticed
-        # at all four of its call sites.
-        self.detached_mode.initialize()
-        resource_id = self.detached_mode.submit_job(job_id, command, tasks_per_node)
+        assert resource_id in detached_mode.resources
+        assert detached_mode.resources[resource_id]["job_id"] == job_id
+        assert detached_mode.resources[resource_id]["status"] == STATUS_PENDING
 
-        # Verify resource is tracked
-        self.assertIn(resource_id, self.detached_mode.resources)
-        self.assertEqual(self.detached_mode.resources[resource_id]["job_id"], job_id)
-        self.assertEqual(
-            self.detached_mode.resources[resource_id]["status"], STATUS_PENDING
+        ssm = detached_mode.session.client("ssm")
+        job_param = ssm.get_parameter(
+            Name=f"/parsl/workflows/{workflow_id}/jobs/{job_id}"
+        )
+        status_param = ssm.get_parameter(
+            Name=f"/parsl/workflows/{workflow_id}/status/{job_id}"
         )
 
-        # Verify SSM parameters were created
-        job_param = self.ssm_client.get_parameter(
-            Name=f"/parsl/workflows/{self.workflow_id}/jobs/{job_id}"
-        )
-        status_param = self.ssm_client.get_parameter(
-            Name=f"/parsl/workflows/{self.workflow_id}/status/{job_id}"
-        )
-
-        # Verify job data contains SpotFleet options
+        # The bastion polls these parameters and is the thing that launches the
+        # fleet, so anything the fleet needs has to be in the job document.
         job_data = json.loads(job_param["Parameter"]["Value"])
-        self.assertTrue(job_data["use_spot_fleet"])
-        self.assertEqual(len(job_data["instance_types"]), 3)
-        self.assertIn("t2.micro", job_data["instance_types"])
-        self.assertIn("t2.small", job_data["instance_types"])
-        self.assertEqual(job_data["nodes_per_block"], 2)
-        self.assertEqual(job_data["spot_max_price_percentage"], 80)
+        assert job_data["use_spot_fleet"] is True
+        assert job_data["instance_types"] == ["t3.micro", "t3.small", "m5.large"]
+        assert job_data["nodes_per_block"] == 2
+        assert job_data["spot_max_price_percentage"] == 80
 
-        # Verify job status is PENDING
-        status_data = json.loads(status_param["Parameter"]["Value"])
-        self.assertEqual(status_data["status"], STATUS_PENDING)
+        assert (
+            json.loads(status_param["Parameter"]["Value"])["status"] == STATUS_PENDING
+        )
 
-    @patch("time.sleep", return_value=None)  # Don't actually sleep during tests
-    def test_get_job_status_with_spot_fleet(self, mock_sleep):
-        """Test getting job status for a SpotFleet job."""
-        # Create a job status parameter with SpotFleet information
+    def test_get_job_status_adopts_the_bastions_fleet_details(
+        self, detached_mode, workflow_id
+    ):
+        """Status is read from SSM and the fleet details are copied into tracking.
+
+        The bastion, not the provider, launches the fleet, so the fleet ID and its
+        instance list only reach the provider through the status parameter.
+        """
+        detached_mode.initialize()
         job_id = "test-job-2"
         status_data = {
             "status": STATUS_RUNNING,
@@ -214,17 +205,14 @@ class TestDetachedModeSpotFleetIntegration(unittest.TestCase):
             "resource_type": RESOURCE_TYPE_SPOT_FLEET,
             "all_instance_ids": ["i-spot1", "i-spot2"],
         }
-
-        # Put the status in SSM
-        self.ssm_client.put_parameter(
-            Name=f"/parsl/workflows/{self.workflow_id}/status/{job_id}",
+        detached_mode.session.client("ssm").put_parameter(
+            Name=f"/parsl/workflows/{workflow_id}/status/{job_id}",
             Value=json.dumps(status_data),
             Type="String",
         )
 
-        # Create resource tracking
         resource_id = f"spot-fleet-{job_id}"
-        self.detached_mode.resources = {
+        detached_mode.resources = {
             resource_id: {
                 "job_id": job_id,
                 "status": STATUS_PENDING,
@@ -232,54 +220,27 @@ class TestDetachedModeSpotFleetIntegration(unittest.TestCase):
             }
         }
 
-        # Get job status
-        status = self.detached_mode.get_job_status([resource_id])
+        status = detached_mode.get_job_status([resource_id])
 
-        # Verify status
-        self.assertEqual(status[resource_id], STATUS_RUNNING)
+        assert status[resource_id] == STATUS_RUNNING
+        resource = detached_mode.resources[resource_id]
+        assert resource["status"] == STATUS_RUNNING
+        assert resource["fleet_request_id"] == "sfr-12345"
+        assert resource["resource_type"] == RESOURCE_TYPE_SPOT_FLEET
+        assert resource["all_instance_ids"] == ["i-spot1", "i-spot2"]
 
-        # Verify resource was updated with SpotFleet information
-        self.assertEqual(
-            self.detached_mode.resources[resource_id]["status"], STATUS_RUNNING
-        )
-        self.assertEqual(
-            self.detached_mode.resources[resource_id]["fleet_request_id"], "sfr-12345"
-        )
-        self.assertEqual(
-            self.detached_mode.resources[resource_id]["resource_type"],
-            RESOURCE_TYPE_SPOT_FLEET,
-        )
-        self.assertEqual(
-            self.detached_mode.resources[resource_id]["all_instance_ids"],
-            ["i-spot1", "i-spot2"],
-        )
-
-    @patch("time.sleep", return_value=None)  # Don't actually sleep during tests
-    def test_cancel_job_with_spot_fleet(self, mock_sleep):
-        """Test canceling a SpotFleet job."""
-        # Create a job parameter for a SpotFleet job
+    def test_cancel_job_with_spot_fleet(self, detached_mode, workflow_id):
+        """Cancelling writes the fleet IDs the bastion needs to tear down."""
+        detached_mode.initialize()
         job_id = "test-job-3"
-        job_data = {
-            "command": 'echo "test"',
-            "image_id": self.ami_id,
-            "instance_type": "t2.micro",
-            "subnet_id": self.subnet_id,
-            "security_group_id": self.security_group_id,
-            "use_spot_fleet": True,
-            "instance_types": ["t2.micro", "t2.small"],
-            "nodes_per_block": 2,
-        }
-
-        # Put the job data in SSM
-        self.ssm_client.put_parameter(
-            Name=f"/parsl/workflows/{self.workflow_id}/jobs/{job_id}",
-            Value=json.dumps(job_data),
+        detached_mode.session.client("ssm").put_parameter(
+            Name=f"/parsl/workflows/{workflow_id}/jobs/{job_id}",
+            Value=json.dumps({"command": 'echo "test"', "use_spot_fleet": True}),
             Type="String",
         )
 
-        # Create resource tracking with SpotFleet information
         resource_id = f"spot-fleet-{job_id}"
-        self.detached_mode.resources = {
+        detached_mode.resources = {
             resource_id: {
                 "job_id": job_id,
                 "status": STATUS_RUNNING,
@@ -289,90 +250,93 @@ class TestDetachedModeSpotFleetIntegration(unittest.TestCase):
             }
         }
 
-        # Cancel the job
-        status = self.detached_mode.cancel_jobs([resource_id])
+        status = detached_mode.cancel_jobs([resource_id])
 
-        # Verify cancel status
-        self.assertEqual(status[resource_id], STATUS_CANCELED)
-        self.assertEqual(
-            self.detached_mode.resources[resource_id]["status"], STATUS_CANCELED
+        assert status[resource_id] == STATUS_CANCELED
+        assert detached_mode.resources[resource_id]["status"] == STATUS_CANCELED
+
+        cancel_param = detached_mode.session.client("ssm").get_parameter(
+            Name=f"/parsl/workflows/{workflow_id}/cancel"
         )
-
-        # Verify cancel parameter was created in SSM
-        cancel_param = self.ssm_client.get_parameter(
-            Name=f"/parsl/workflows/{self.workflow_id}/cancel"
-        )
-
-        # Verify cancel parameter contains SpotFleet information
         cancel_data = json.loads(cancel_param["Parameter"]["Value"])
-        self.assertIn(job_id, cancel_data["job_ids"])
-        self.assertIn("spot_fleet_jobs", cancel_data)
-        self.assertEqual(cancel_data["spot_fleet_jobs"][job_id], "sfr-12345")
+        assert job_id in cancel_data["job_ids"]
+        assert cancel_data["spot_fleet_jobs"][job_id] == "sfr-12345"
 
-    @patch("time.sleep", return_value=None)  # Don't actually sleep during tests
-    def test_cleanup_spot_fleet_resources(self, mock_sleep):
-        """Test cleaning up SpotFleet resources."""
-        # Create necessary params in SSM
+    def test_cleanup_deletes_the_fleet_and_its_ssm_records(
+        self, detached_mode, workflow_id, substrate_network
+    ):
+        """Cleanup deletes the real fleet, then drops its SSM parameters.
+
+        The fleet here is a genuine ``CreateFleet`` fleet, so the deletion is
+        observable. The moto version patched ``boto3.client`` and asserted a
+        ``MagicMock`` had received ``cancel_spot_fleet_requests`` -- the legacy API
+        #86 removed, which ``cleanup_resources`` no longer calls, so the assertion
+        held no matter what the code did. Deleting a fleet is also not optional
+        for an instant fleet: it is what terminates the instances.
+        """
+        detached_mode.initialize()
+        ec2 = detached_mode.session.client("ec2")
+
+        template = ec2.create_launch_template(
+            LaunchTemplateName=f"parsl-test-fleet-{uuid.uuid4().hex[:8]}",
+            LaunchTemplateData={
+                "ImageId": detached_mode.image_id,
+                "InstanceType": "t3.micro",
+            },
+        )["LaunchTemplate"]
+        fleet_id = ec2.create_fleet(
+            Type="instant",
+            LaunchTemplateConfigs=[
+                {
+                    "LaunchTemplateSpecification": {
+                        "LaunchTemplateId": template["LaunchTemplateId"],
+                        "Version": str(template["LatestVersionNumber"]),
+                    },
+                    "Overrides": [
+                        {
+                            "InstanceType": "t3.micro",
+                            "SubnetId": substrate_network["subnet_id"],
+                        }
+                    ],
+                }
+            ],
+            TargetCapacitySpecification={
+                "TotalTargetCapacity": 1,
+                "DefaultTargetCapacityType": "spot",
+            },
+        )["FleetId"]
+
         job_id = "test-job-4"
+        ssm = detached_mode.session.client("ssm")
+        for suffix, value in (
+            ("jobs", {"command": "echo test"}),
+            ("status", {"status": STATUS_RUNNING}),
+        ):
+            ssm.put_parameter(
+                Name=f"/parsl/workflows/{workflow_id}/{suffix}/{job_id}",
+                Value=json.dumps(value),
+                Type="String",
+            )
 
-        # Create job data parameter
-        self.ssm_client.put_parameter(
-            Name=f"/parsl/workflows/{self.workflow_id}/jobs/{job_id}",
-            Value=json.dumps({"command": "echo test"}),
-            Type="String",
-        )
-
-        # Create job status parameter
-        self.ssm_client.put_parameter(
-            Name=f"/parsl/workflows/{self.workflow_id}/status/{job_id}",
-            Value=json.dumps({"status": STATUS_RUNNING}),
-            Type="String",
-        )
-
-        # Mock a SpotFleet resource
         resource_id = f"spot-fleet-{job_id}"
-        self.detached_mode.resources = {
+        detached_mode.resources = {
             resource_id: {
                 "job_id": job_id,
                 "status": STATUS_RUNNING,
                 "resource_type": RESOURCE_TYPE_SPOT_FLEET,
-                "fleet_request_id": "sfr-12345",
-                "all_instance_ids": ["i-spot1", "i-spot2"],
+                "fleet_request_id": fleet_id,
             }
         }
 
-        # Clean up resources
-        with patch("boto3.client") as mock_boto_client:
-            # Mock the EC2 client's cancel_spot_fleet_requests method
-            mock_ec2_client = MagicMock()
-            mock_boto_client.return_value = mock_ec2_client
-            mock_ec2_client.cancel_spot_fleet_requests.return_value = {
-                "SuccessfulFleetRequests": [
-                    {
-                        "SpotFleetRequestId": "sfr-12345",
-                        "CurrentSpotFleetRequestState": "cancelled_terminating",
-                        "PreviousSpotFleetRequestState": "active",
-                    }
-                ]
-            }
+        detached_mode.cleanup_resources([resource_id])
 
-            # Call cleanup
-            self.detached_mode.cleanup_resources([resource_id])
+        assert resource_id not in detached_mode.resources
 
-        # Verify resource was removed from tracking
-        self.assertNotIn(resource_id, self.detached_mode.resources)
+        fleet = ec2.describe_fleets(FleetIds=[fleet_id])["Fleets"][0]
+        assert fleet["FleetState"].startswith("deleted")
 
-        # Verify SSM parameters were deleted
-        with self.assertRaises(self.ssm_client.exceptions.ParameterNotFound):
-            self.ssm_client.get_parameter(
-                Name=f"/parsl/workflows/{self.workflow_id}/jobs/{job_id}"
-            )
-
-        with self.assertRaises(self.ssm_client.exceptions.ParameterNotFound):
-            self.ssm_client.get_parameter(
-                Name=f"/parsl/workflows/{self.workflow_id}/status/{job_id}"
-            )
-
-
-if __name__ == "__main__":
-    unittest.main()
+        for suffix in ("jobs", "status"):
+            with pytest.raises(ssm.exceptions.ParameterNotFound):
+                ssm.get_parameter(
+                    Name=f"/parsl/workflows/{workflow_id}/{suffix}/{job_id}"
+                )
