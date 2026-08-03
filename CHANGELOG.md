@@ -341,6 +341,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   forms cannot be mixed (#189).
 
 ### Removed
+- **2,746 lines of code no package module imported** (#90): `compute/ec2.py`
+  (1,201), `network/vpc.py` (704), `network/security.py` (687), `utils/logging.py`
+  (154), and the eight files under `templates/terraform/`. The `network/` package
+  is gone entirely — its `__init__.py` held a docstring and nothing else.
+
+  `EC2Manager`, `VPCManager` and `SecurityGroupManager` routed nothing: the modes
+  call boto3 directly, and #69 removed VPC creation from the provider outright, so
+  the only callers these classes ever had were their own tests. `utils/logging.py`
+  was imported by neither the package nor the tests and measured 0% covered. The
+  Terraform modules were never deployed by any code path — CloudFormation is the
+  only IaC surface, and `[tool.setuptools.package-data]` no longer ships a `.tf`
+  glob.
+
+  **`security/` was deliberately left alone**, against #90's original body. That
+  body called `security/encryption.py` "fully unreferenced"; it is imported by
+  `security/__init__.py` and named in its `__all__`, as are `network_policy.py`
+  and `cidr_manager.py`, and all three are covered. Removing exported modules is
+  a breaking change that belongs in a major, not in a dead-code sweep. The
+  structural difference is exactly that: `network/__init__.py` exported nothing.
+
+  Three test files were **split rather than deleted**, because dead-code tests and
+  live-code coverage were interleaved in them. 22 tests of the removed classes
+  went; four assertions were preserved by moving them onto code that survives:
+
+  - `test_lambda_manager_error_handler_initialization` is the old `EC2Manager`
+    test retargeted — `LambdaManager` declares the identical `max_attempts=5,
+    base_delay=2.0`, so the assertions carry over unchanged onto a manager the
+    modes route through.
+  - `test_network_setup_rejects_a_missing_id_by_name` replaces a test that made
+    `create_vpc` fail. No surviving manager calls `create_vpc`, so that assertion
+    could not fail whatever the code did; the rewrite pins what
+    `_setup_network_resources()` actually does, which is validate the three
+    caller-supplied IDs and name the missing ones.
+  - A `VcpuLimitExceeded` row was added to the fleet-error parametrization.
+    `TestEC2ManagerQuotaErrors` was its **only** coverage, and it is half of a
+    live branch (`compute/spot_fleet.py:409`) whose other half was already
+    covered — so deleting that class would have quietly dropped coverage of
+    shipping code inside a diff that reads as removing dead code.
+
+  Net effect: unit and security tests 1,202 → 1,174 passed (22 deleted tests plus
+  6 `test_license_headers.py` cases, which are parametrized one per source file),
+  integration 133 → 134, and the mypy baseline 76 → **59** errors.
 - **`docs/roadmap.md` and `docs/release_notes.md`, both published to the site**
   (#199). CLAUDE.md's first rule prohibits standalone planning documents and status
   reports, and these were both — but the reason to delete rather than update them

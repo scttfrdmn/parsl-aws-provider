@@ -77,9 +77,9 @@ responsibility rather than a default it picks for you:
 ### Template Security
 
 The provider deploys CloudFormation stacks for the detached-mode bastion and for
-the serverless Lambda and ECS workers. The Terraform templates under
-`parsl_ephemeral_provider/templates/terraform/` are referenced by no code path and
-deploy nothing.
+the serverless Lambda and ECS workers. Those are the only templates it ships: the
+unused Terraform modules were removed in v0.9.0 (#90), so there is no longer a
+second set of infrastructure definitions to review or keep current.
 
 - Review the CloudFormation templates before running a mode that deploys them
 - Use AWS CloudFormation Guard or other policy-as-code tools

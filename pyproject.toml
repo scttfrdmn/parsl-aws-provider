@@ -17,12 +17,12 @@ build-backend = "setuptools.build_meta"
 include = ["parsl_ephemeral_provider*"]
 
 # packages.find collects modules, not data files, so without this the
-# CloudFormation and Terraform templates are omitted from the wheel and
-# get_cf_template() cannot find bastion.yml in an installed package (#112).
+# CloudFormation templates are omitted from the wheel and get_cf_template()
+# cannot find bastion.yml in an installed package (#112). The Terraform glob
+# that sat beside this one went with #90 -- those modules deployed nothing.
 [tool.setuptools.package-data]
 parsl_ephemeral_provider = [
     "templates/cloudformation/*.yml",
-    "templates/terraform/*/*.tf",
 ]
 
 [project]

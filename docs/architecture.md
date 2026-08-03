@@ -43,11 +43,16 @@ parsl_ephemeral_provider/
 └── templates/cloudformation/   # bastion, ec2_worker, lambda_worker, ecs_worker
 ```
 
-`network/`, `compute/ec2.py`, `utils/logging.py`, and `templates/terraform/` are
-not reachable from any live path; they are scheduled for removal in v0.9.0
-([#90](https://github.com/scttfrdmn/parsl-ephemeral-provider/issues/90)).
-`security/encryption.py` is *not* among them — it is exported from
-`security/__init__.py` and covered, so #90's original body was wrong to list it.
+`network/`, `compute/ec2.py`, `utils/logging.py`, and `templates/terraform/` were
+removed in v0.9.0
+([#90](https://github.com/scttfrdmn/parsl-ephemeral-provider/issues/90)) — 2,746
+LOC that no package module imported. The modes call boto3 directly and #69 removed
+VPC creation outright, so `EC2Manager`, `VPCManager` and `SecurityGroupManager`
+routed nothing; their only callers were their own tests.
+
+`security/` was *not* touched. Its modules are exported from `security/__init__.py`
+and covered, so removing them would be a public-API break — #90's original body was
+wrong to list `encryption.py` as unreferenced.
 
 ## Operating modes
 
@@ -132,8 +137,8 @@ v0.6.0 defect that leaked baked AMIs and lost `job_map`). See
 
 CloudFormation templates ship inside the wheel and are loaded with
 `get_cf_template()`, not by filesystem path — a wheel install has no source tree.
-The Terraform modules under `templates/terraform/` are referenced by nothing and
-are slated for removal in v0.9.0
+CloudFormation is the only IaC surface: the unused Terraform modules under
+`templates/terraform/` were removed in v0.9.0
 ([#90](https://github.com/scttfrdmn/parsl-ephemeral-provider/issues/90)).
 
 ## Error handling and recovery
