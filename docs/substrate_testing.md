@@ -200,6 +200,29 @@ blocker: each is a hazard to what a *teardown or assertion* can be trusted to pr
 The EventBridge row is a gap this project turns to its advantage rather than one it
 works around.
 
+> [!IMPORTANT]
+> **The pin stays on `0.88.0`, and bumping it is blocked on
+> [substrate#560](https://github.com/scttfrdmn/substrate/issues/560).** `0.89.0` and
+> `0.90.0` between them fix all three rows below — including both defects this
+> repository filed, #544 and #545 — so the bump is wanted. It cannot land yet:
+> substrate gives a resource with no explicit physical name **the logical ID
+> verbatim**, and a logical ID is only unique within a stack while an IAM role name
+> is account-global. So a second stack from the same template collides with
+> `EntityAlreadyExists`, and 6 integration tests fail. `bastion.yml`
+> (`BastionHostRole`) and `ecs_worker.yml` (`TaskRole`, `TaskExecutionRole`) all
+> deliberately omit the name, which is the practice that makes a template
+> deployable more than once.
+>
+> The create was *already* failing on `0.88.0` — `0.89.0`'s rollback is only what
+> made it visible, since the stack previously still reported `CREATE_COMPLETE`. So
+> these six tests pass on the current pin for the wrong reason, which is worth
+> knowing before trusting them.
+>
+> Diagnosing it needed `DisableRollback=True` plus `DescribeStackResources`:
+> `DescribeStackEvents` answers `UnsupportedOperation` ("substrate models stack
+> status, not per-resource stack events"), so the failing resource is not reachable
+> that way.
+
 | Gap | Effect | Upstream |
 |---|---|---|
 | `DeleteStack` does not delete the stack's resources | The stack record goes and `describe_stacks` then raises `ValidationError` correctly, but an S3 bucket and an IAM role both outlive their stack. A teardown assertion that only checks the stack passes for the wrong reason. Re-probed against `0.88.0`: a CFN-created bucket is still listed after `DeleteStack` | [substrate#518](https://github.com/scttfrdmn/substrate/issues/518) |

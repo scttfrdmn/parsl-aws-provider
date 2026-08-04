@@ -40,8 +40,11 @@ Fleet, Lambda, or Fargate, scaled from zero and torn down when you are done.**
 
 ## Install
 
-Not yet on PyPI ([#180](https://github.com/scttfrdmn/parsl-ephemeral-provider/issues/180)),
-so install from the repository:
+```bash
+uv add parsl-ephemeral-provider
+```
+
+Or, for unreleased changes, from the repository:
 
 ```bash
 uv add git+https://github.com/scttfrdmn/parsl-ephemeral-provider

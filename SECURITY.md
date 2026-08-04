@@ -10,9 +10,10 @@ The following versions of Parsl Ephemeral Provider are currently being supported
 | < 0.9   | :x:                |
 
 The project is pre-1.0 and alpha: only the latest minor line receives security
-fixes, and there are no backports. Nothing has been published to PyPI yet
-([#180](https://github.com/scttfrdmn/parsl-ephemeral-provider/issues/180)), so every
-existing install is from source.
+fixes, and there are no backports. v0.9.0 is the first release published to PyPI
+([#180](https://github.com/scttfrdmn/parsl-ephemeral-provider/issues/180)); anything
+earlier exists only as a git tag, so a security fix reaches you by upgrading
+rather than by a patch to an older line.
 
 ## Reporting a Vulnerability
 
