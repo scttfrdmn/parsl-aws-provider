@@ -66,6 +66,13 @@ mode that implements it — setting one elsewhere raises
 `lambda_memory` and `lambda_timeout` remain spelled `memory_size` and `timeout`
 at the provider.
 
+Since v0.10.0 that guard also covers the four options #136 left alone (#155):
+`bastion_instance_type` on detached mode, `memory_size` and `timeout` on
+serverless. They had been accepted on every mode since before the guard existed,
+so this is a compatibility break — code that passed one harmlessly now raises,
+which is the point: there is no longer a second class of option that looks
+configured and is not. `compute_type` is handled differently; see below.
+
 ### `vpc_id, subnet_id, security_group_id are required`
 
 As of v0.7.0 the provider never creates network resources. Supply your own; see
@@ -86,6 +93,14 @@ attribute to `None` and failed much later inside `RunInstances` with an opaque
 provider level; leaving it at the `ec2` default in serverless mode leaves
 `ServerlessMode` on *its* internal `auto` heuristic. Set `lambda` or `ecs`
 explicitly.
+
+### `compute_type='lambda' is supported only by mode='serverless'`
+
+Standard and detached mode launch EC2 instances, so `ec2` is the only value they
+can honour (#155). The mirror case cannot be an error, because it is the default:
+`compute_type="ec2"` on `mode="serverless"` **warns** instead, since
+`ServerlessMode` ignores the value and falls back to its own `auto`. If you see
+that warning and did not intend `auto`, pass `lambda` or `ecs`.
 
 ### `TypeCheckError: argument "mode" ... is not an instance of str`
 

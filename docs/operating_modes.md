@@ -157,6 +157,7 @@ with the bastion and the tracked jobs — you do not need to pass an ID back in.
 
 | Option | Default | What it controls |
 |---|---|---|
+| `bastion_instance_type` | `"t3.micro"` | Instance type for the bastion itself |
 | `idle_timeout` | `30` | Minutes of inactivity before the bastion shuts itself down |
 | `preserve_bastion` | `True` | Whether the bastion survives `cleanup_infrastructure()` |
 | `bastion_host_type` | `"cloudformation"` | Stack-managed bastion, or `"direct"` for a plain `RunInstances` |
@@ -169,7 +170,10 @@ Pass `preserve_bastion=False` to have it torn down instead.
 These are accepted only on `mode="detached"`; setting one on another mode raises
 `ProviderConfigurationError`, because the provider forwards them from the
 detached branch only and they would otherwise appear configured while having no
-effect.
+effect. `bastion_instance_type` joined that guard in v0.10.0
+([#155](https://github.com/scttfrdmn/parsl-ephemeral-provider/issues/155)); it had
+been accepted on every mode since before the guard existed, so a standard-mode
+provider that passes it now raises instead of ignoring it.
 
 Note `idle_timeout` governs only the bastion. It is unrelated to the provider's
 `max_idle_time`, which is deprecated and ignored
@@ -250,7 +254,14 @@ provider = EphemeralProvider(
 `compute_type` is the provider-facing name for what `ServerlessMode` calls
 `worker_type`. `compute_type="ec2"` (the default) has no meaning here and leaves
 the mode on its own default of `auto`, which selects Lambda for short single-task
-commands and ECS otherwise.
+commands and ECS otherwise. Since v0.10.0 that case **logs a warning** rather
+than passing silently
+([#155](https://github.com/scttfrdmn/parsl-ephemeral-provider/issues/155)) — it
+cannot raise, because it is the default, so a caller who never mentioned
+`compute_type` would be broken by an error. The reverse *is* an error:
+`compute_type="lambda"` or `"ecs"` on standard or detached mode raises
+`ProviderConfigurationError`, since those modes launch EC2 instances and can
+honour no other value.
 
 ### Serverless-mode options
 
@@ -288,7 +299,11 @@ sizes](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/AWS_Fargate.h
 stack.
 
 These are accepted only on `mode="serverless"`; setting one on another mode
-raises `ProviderConfigurationError`.
+raises `ProviderConfigurationError`. `memory_size` and `timeout` joined that
+guard in v0.10.0
+([#155](https://github.com/scttfrdmn/parsl-ephemeral-provider/issues/155)) — they
+had been accepted everywhere since before the guard existed, so passing either on
+standard or detached mode now raises rather than being ignored.
 
 ### When to use
 

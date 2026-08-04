@@ -7,6 +7,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **BREAKING: the four remaining mode-specific options are now guarded** (#155).
+  `bastion_instance_type` on `mode="detached"`, and `memory_size` / `timeout` on
+  `mode="serverless"`, join the guard #136 built for the other eight: setting one
+  on a mode that does not implement it raises `ProviderConfigurationError` instead
+  of being accepted and ignored.
+
+  This is a compatibility break, and deliberately so. #136 left these four alone
+  precisely *because* guarding them breaks callers who pass them harmlessly
+  today — but the cost of leaving them was a second class of option that looks
+  configured and is not. `bastion_instance_type="m5.large"` on standard mode was
+  accepted in silence and had no effect anywhere. Either behaviour is defensible;
+  having both, split across otherwise identical options, is not.
+
+  `compute_type` is the fourth and gets different treatment, because its default
+  is not inert. `"ec2"` is meaningful on standard and detached mode — the only
+  value they can honour — and meaningless on serverless, where `ServerlessMode`
+  ignores it and falls back to its own `"auto"`. So:
+
+  - `compute_type="lambda"` or `"ecs"` on standard or detached mode now **raises**.
+    Those modes launch EC2 instances; the request cannot be honoured at all.
+  - `compute_type="ec2"` on `mode="serverless"` now **warns**, naming the `auto`
+    fallback it actually gets. It cannot raise: `"ec2"` is the default, so a
+    caller who never mentioned `compute_type` would be broken by an error.
+
+  A guard keyed on "value differs from the default" — the shape the other eleven
+  options use — would have got this backwards, staying silent on the case that
+  actually confuses people (leaving it at `ec2` in serverless mode) and failing on
+  the innocent one. That asymmetry is why #136 deferred it rather than folding it
+  into the same tuple.
+
+  `bastion_instance_type`'s default moved from a literal `"t3.micro"` in the
+  signature to `DEFAULT_BASTION_INSTANCE_TYPE`, for the reason the other guard
+  constants exist: a guard comparing against a copied-out value stops firing the
+  moment the real default changes.
+
+  One in-tree caller needed fixing, and it is the one #155 predicted:
+  `test_emitted_set_is_derived_from_the_signature` passed every constructor
+  parameter on a single standard-mode provider. It now builds one provider per
+  owning mode, which preserves the "no hand-maintained list" property that test
+  exists for — and a new companion test asserts the complement, that no
+  constructor parameter has fallen out of the sample set altogether.
+
 ## [0.9.0] - 2026-08-03
 
 ### Changed
