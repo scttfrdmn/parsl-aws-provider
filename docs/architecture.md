@@ -22,7 +22,7 @@ parsl_ephemeral_provider/
 ├── globus_compute.py           # EphemeralComputeProvider subclass
 ├── constants.py                # AWS constants and defaults
 ├── exceptions.py               # Exception hierarchy
-├── error_handling.py           # Retry/backoff framework (used by compute/)
+├── error_handling.py           # Retry/backoff and polling framework
 ├── modes/
 │   ├── base.py                 # OperatingMode interface
 │   ├── standard.py             # Direct client-to-worker
@@ -148,9 +148,30 @@ CloudFormation is the only IaC surface: the unused Terraform modules under
 - Exponential backoff with jitter for transient AWS API errors, via
   `error_handling.py`
 
-`error_handling.py` is used by the `compute/` managers. The `modes/` hand-roll
-their own polling loops instead; keeping both is tracked as
-[#91](https://github.com/scttfrdmn/parsl-ephemeral-provider/issues/91).
+`error_handling.py` offers two shapes, and which one applies depends on how the
+failure presents:
+
+- **`retry_with_backoff`** wraps a call that *raises*. Used throughout the
+  `compute/` managers.
+- **`poll_until`** waits on a call that *succeeds* and returns a not-yet answer —
+  an instance absent from SSM, a fleet block short of `running`. Used by
+  `StandardMode`'s three readiness waits. A retry decorator cannot express this:
+  nothing is thrown, so it would fire zero times and return the not-yet answer as
+  the result. Added in v0.10.0
+  ([#91](https://github.com/scttfrdmn/parsl-ephemeral-provider/issues/91)), which
+  replaced the modes' hand-rolled flat-interval polling loops.
+
+Both take a `RetryConfig` for the delay schedule, so a poll and a retry back off
+and jitter identically. `poll_until` ignores its `max_attempts` — a poll is bounded
+by wall clock, since a slow boot legitimately takes dozens of attempts.
+
+`utils/aws.py:wait_for_resource` occupies adjacent ground but is not
+interchangeable: it dispatches to *named* boto3 waiters, so it covers only states
+AWS itself publishes a waiter for. Derived states — "this fleet block is running",
+which `SpotFleetManager` computes from instance states — need `poll_until`.
+
+The two `time.sleep` calls in `modes/detached.py` are inside the generated bastion
+script's string literal, which runs on the bastion with no access to this package.
 
 ## Security considerations
 

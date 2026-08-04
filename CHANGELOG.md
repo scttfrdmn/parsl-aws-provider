@@ -50,6 +50,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   exists for — and a new companion test asserts the complement, that no
   constructor parameter has fallen out of the sample set altogether.
 
+### Added
+- **`error_handling.poll_until()`, and `StandardMode`'s waits now use it** (#91).
+  Three hand-rolled `while time.time() < deadline` loops in `modes/standard.py` —
+  the EC2 Fleet block wait in `_create_spot_fleet_instance`, `_wait_for_ssm_online`,
+  and `_wait_for_worker_ready` — polled AWS on flat `time.sleep(10)` / `sleep(15)`
+  intervals while `error_handling.py` sat unused by the modes. They now share the
+  framework's backoff-and-jitter schedule, so a set of providers launched together
+  no longer polls SSM and EC2 in lockstep for the whole boot.
+
+  The framework needed a new entry point rather than the existing decorator, and
+  #91's body was wrong about this: it claimed the fleet poll "benefits from
+  `retry_with_backoff` as-is". It does not. `retry_with_backoff` fires on an
+  exception, and `SpotFleetManager.get_block_status` swallows every exception and
+  returns the last known status string — so the decorator would have fired zero
+  times at the site the issue nominated as its best fit. All three are
+  **success-polls**: the call succeeds and returns a *not-yet* answer. That shape
+  had no home in the framework, which is what `poll_until` adds; it takes a
+  predicate, a wall-clock timeout, and a `RetryConfig` used purely for its
+  delay math (`max_attempts` is deliberately ignored — a boot legitimately takes
+  forty polls).
+
+  `utils/aws.py:wait_for_resource` was considered first and cannot serve these:
+  it dispatches to *named* boto3 waiters, and no boto3 waiter exists for "fleet
+  block reached RUNNING", which `SpotFleetManager` derives from instance states.
+
+  Two details are load-bearing rather than incidental:
+
+  - **The polls narrow which errors they tolerate.** `poll_until` reads any
+    exception as "not yet", which is right for the `ClientError` these polls
+    expect and wrong for everything else — a missing credential would otherwise
+    be retried in silence until the timeout expired, turning an instant failure
+    into a five-minute one. An `on_error` hook re-raises anything that is not a
+    `ClientError`.
+  - **The fleet predicate returns a status rather than a bool**, so a terminal
+    FAILED/CANCELED/COMPLETED block fails immediately instead of being polled for
+    the full ten minutes. Raising from inside a predicate would have been read as
+    "not yet" and swallowed.
+
+  `OperatingModeError` and `ResourceCreationError` are still what these methods
+  raise on timeout; the primitive's `TimeoutError` is converted at each site.
+  The two `time.sleep` calls in `modes/detached.py` are inside the generated
+  bastion script's string literal, not module code, and are out of scope.
+
 ## [0.9.0] - 2026-08-03
 
 ### Changed

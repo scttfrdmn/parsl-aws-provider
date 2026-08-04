@@ -10,7 +10,7 @@ SPDX-FileCopyrightText: 2025-2026 Scott Friedman and Project Contributors
 import logging
 import time
 import random
-from typing import Dict, List, Optional, Any, Type
+from typing import Callable, Dict, List, Optional, Any, Type, TypeVar
 from dataclasses import dataclass, field
 from enum import Enum
 import functools
@@ -22,6 +22,9 @@ from botocore.exceptions import (
 )
 
 logger = logging.getLogger(__name__)
+
+# The value a poll predicate yields once it is satisfied; see poll_until().
+T = TypeVar("T")
 
 
 class ErrorSeverity(Enum):
@@ -634,3 +637,95 @@ def retry_with_backoff(
         return wrapper
 
     return decorator
+
+
+def poll_until(
+    predicate: Callable[[], Optional[T]],
+    *,
+    timeout: float,
+    description: str,
+    retry_config: Optional[RetryConfig] = None,
+    on_error: Optional[Callable[[Exception], None]] = None,
+) -> T:
+    """Poll *predicate* until it returns a truthy value, with backoff and jitter.
+
+    This is the framework's entry point for a **success-poll**, which is a
+    different shape from :func:`retry_with_backoff` and cannot be expressed with
+    it (#91). The decorator retries a call that *raised*; here the call
+    **succeeds** and returns a not-yet answer -- an instance that has not
+    appeared in ``describe_instance_information``, a fleet block that has not
+    reached ``running``. Nothing is thrown, so the decorator would never fire
+    and the loop would run exactly once.
+
+    Before this existed, ``modes/`` hand-rolled three of these with flat
+    ``time.sleep(10)``/``sleep(15)`` intervals, which is the concrete debt #91
+    tracked: no jitter, so N providers started together poll AWS in lockstep,
+    and no shared notion of a bounded wait.
+
+    Parameters
+    ----------
+    predicate : Callable[[], Optional[T]]
+        Called once per attempt. Return a truthy value to stop and have it
+        returned; return ``None`` or any falsey value to keep waiting. Raising
+        is treated as "not yet" -- see *on_error*.
+    timeout : float
+        Total seconds to keep polling before giving up. This bounds wall-clock
+        time, not attempt count: unlike ``RetryConfig.max_attempts``, a caller
+        waiting for a 10-minute boot wants a deadline rather than a number of
+        tries.
+    description : str
+        What is being waited for, used in the timeout message and debug logs.
+        Phrase it as a noun so the message reads "timed out waiting for {…}".
+    retry_config : Optional[RetryConfig]
+        Supplies the delay schedule via :meth:`RetryConfig.get_delay`, so a poll
+        gets the same exponential backoff and jitter as a retry. Defaults to
+        ``RetryConfig()``. ``max_attempts`` is deliberately **not** consulted --
+        *timeout* is the bound here.
+    on_error : Optional[Callable[[Exception], None]]
+        Called with any exception the predicate raises, then polling continues.
+        Use it to log at the level the caller wants. When omitted, exceptions
+        are logged at debug: a poll's early attempts are *expected* to fail
+        (the resource does not exist yet), so warning on each one turns normal
+        operation into a wall of noise.
+
+    Returns
+    -------
+    T
+        The first truthy value *predicate* returned.
+
+    Raises
+    ------
+    TimeoutError
+        If *timeout* elapses with no truthy result. Callers that owe their own
+        exception type should catch this and re-raise; ``modes/standard.py``
+        converts it to ``OperatingModeError``.
+    """
+    config = retry_config or RetryConfig()
+    deadline = time.time() + timeout
+    attempt = 0
+
+    while True:
+        attempt += 1
+        try:
+            result = predicate()
+            if result:
+                logger.debug(f"{description}: satisfied on attempt {attempt}")
+                return result
+        except Exception as e:  # noqa: BLE001 -- a raise means "not yet"
+            if on_error is not None:
+                on_error(e)
+            else:
+                logger.debug(f"{description}: attempt {attempt} raised {e}")
+
+        delay = config.get_delay(attempt)
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            break
+        # Never sleep past the deadline: a capped delay of 60s against 5s of
+        # remaining budget would otherwise overshoot the timeout by 55s and
+        # skip a final attempt the caller had time for.
+        time.sleep(min(delay, remaining))
+        if time.time() >= deadline:
+            break
+
+    raise TimeoutError(f"Timed out after {timeout}s waiting for {description}")
