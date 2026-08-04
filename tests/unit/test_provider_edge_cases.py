@@ -15,9 +15,11 @@ import warnings
 from unittest.mock import MagicMock, patch
 
 import pytest
+from botocore.exceptions import ClientError, NoCredentialsError
 
 from parsl.jobs.states import JobState
 
+from parsl_ephemeral_provider.error_handling import RetryConfig
 from parsl_ephemeral_provider.constants import (
     DEFAULT_BASTION_HOST_TYPE,
     DEFAULT_BASTION_IDLE_TIMEOUT,
@@ -32,11 +34,17 @@ from parsl_ephemeral_provider.constants import (
     DEFAULT_PRESERVE_BASTION,
     DEFAULT_WARM_POOL_SIZE,
     DEFAULT_WARM_POOL_TTL,
+    STATUS_FAILED,
     STATUS_INTERRUPTED,
+    STATUS_PENDING,
+    STATUS_RUNNING,
+    STATUS_UNKNOWN,
 )
 from parsl_ephemeral_provider.exceptions import (
+    OperatingModeError,
     ProviderConfigurationError,
     ProviderError,
+    ResourceCreationError,
 )
 from parsl_ephemeral_provider.provider import EphemeralProvider
 from parsl_ephemeral_provider.state.base import STATE_KEY_MODE, STATE_KEY_PROVIDER
@@ -1830,3 +1838,251 @@ class TestRunningResourcesSurviveCleanup:
             provider, _ = _make_provider(tmp_dir)
 
         assert provider.max_idle_time == DEFAULT_MAX_IDLE_TIME
+
+
+# ---------------------------------------------------------------------------
+# TestModePollsUseTheFramework
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestModePollsUseTheFramework:
+    """StandardMode's SSM waits go through ``poll_until`` (#91).
+
+    These sites used to be hand-rolled ``while time.time() < deadline`` loops
+    with flat ``time.sleep(10)``/``sleep(15)`` intervals: no jitter, so providers
+    started together polled AWS in lockstep, and no shared notion of a bounded
+    wait. These tests pin the behaviour that changed, not the fact that a
+    particular function is called.
+    """
+
+    @pytest.fixture
+    def tmp_dir(self):
+        with tempfile.TemporaryDirectory() as d:
+            yield d
+
+    @staticmethod
+    def _mode(tmp_dir, **overrides):
+        """Build a StandardMode with a mocked session and a fast poll schedule."""
+        from parsl_ephemeral_provider.modes.standard import StandardMode
+
+        provider_id = f"test-{uuid.uuid4().hex[:8]}"
+        state_file = os.path.join(tmp_dir, f"{provider_id}.json")
+        params = dict(
+            provider_id=provider_id,
+            session=MagicMock(),
+            state_store=FileStateStore(file_path=state_file, provider_id=provider_id),
+            image_id="ami-12345678",
+            vpc_id="vpc-test00001",
+            subnet_id="subnet-test001",
+            security_group_id="sg-test00001",
+        )
+        params.update(overrides)
+        mode = StandardMode(**params)
+        # Per-instance override of the class-level schedule, so the tests do not
+        # wait out the real 5s-to-30s backoff.
+        mode._ssm_poll_config = RetryConfig(base_delay=0.001, max_delay=0.01)
+        return mode
+
+    def test_ssm_online_poll_retries_until_the_instance_appears(self, tmp_dir):
+        """An instance absent from SSM is a not-yet answer, not a failure."""
+        mode = self._mode(tmp_dir)
+        ssm = mode.session.client.return_value
+        ssm.describe_instance_information.side_effect = [
+            {"InstanceInformationList": []},
+            {"InstanceInformationList": []},
+            {"InstanceInformationList": [{"InstanceId": "i-123"}]},
+        ]
+
+        mode._wait_for_ssm_online("i-123", timeout=5)
+
+        assert ssm.describe_instance_information.call_count == 3
+
+    def test_ssm_online_timeout_still_raises_operating_mode_error(self, tmp_dir):
+        """The exception type is public API; ``poll_until`` raises TimeoutError.
+
+        Callers catch ``OperatingModeError``, so the conversion must happen
+        inside the mode rather than leaking the primitive's own type.
+        """
+        mode = self._mode(tmp_dir)
+        ssm = mode.session.client.return_value
+        ssm.describe_instance_information.return_value = {"InstanceInformationList": []}
+
+        with pytest.raises(OperatingModeError, match="did not become available in SSM"):
+            mode._wait_for_ssm_online("i-123", timeout=0.05)
+
+    def test_ssm_online_poll_tolerates_client_error(self, tmp_dir):
+        """A ClientError mid-boot is expected and must not abort the wait."""
+        mode = self._mode(tmp_dir)
+        ssm = mode.session.client.return_value
+        ssm.describe_instance_information.side_effect = [
+            ClientError(
+                error_response={"Error": {"Code": "InvalidInstanceId"}},
+                operation_name="DescribeInstanceInformation",
+            ),
+            {"InstanceInformationList": [{"InstanceId": "i-123"}]},
+        ]
+
+        mode._wait_for_ssm_online("i-123", timeout=5)
+
+        assert ssm.describe_instance_information.call_count == 2
+
+    def test_ssm_online_poll_fails_fast_on_a_non_client_error(self, tmp_dir):
+        """A credentials failure must not be retried for the full timeout.
+
+        ``poll_until`` treats any exception as "not yet", which is right for the
+        ClientError above and wrong here: no amount of waiting fixes a missing
+        credential, and swallowing it would turn an instant failure into a
+        five-minute one. The mode narrows the tolerance with ``on_error``.
+        """
+        mode = self._mode(tmp_dir)
+        ssm = mode.session.client.return_value
+        ssm.describe_instance_information.side_effect = NoCredentialsError()
+
+        with pytest.raises(NoCredentialsError):
+            mode._wait_for_ssm_online("i-123", timeout=300)
+
+        assert ssm.describe_instance_information.call_count == 1
+
+    def test_worker_ready_poll_retries_until_the_marker_lands(self, tmp_dir):
+        """The ready check re-sends its command until the marker exists."""
+        mode = self._mode(tmp_dir)
+        ssm = mode.session.client.return_value
+        ssm.send_command.return_value = {"Command": {"CommandId": "cmd-1"}}
+        ssm.get_command_invocation.side_effect = [
+            {"StatusDetails": "Failed"},
+            {"StatusDetails": "Success"},
+        ]
+
+        with patch(
+            "parsl_ephemeral_provider.modes.standard.SSM_INVOCATION_SETTLE_SECONDS", 0
+        ):
+            mode._wait_for_worker_ready("i-123", timeout=5)
+
+        assert ssm.send_command.call_count == 2
+
+    def test_worker_ready_timeout_raises_operating_mode_error(self, tmp_dir):
+        """Same public exception type as before #91."""
+        mode = self._mode(tmp_dir)
+        ssm = mode.session.client.return_value
+        ssm.send_command.return_value = {"Command": {"CommandId": "cmd-1"}}
+        ssm.get_command_invocation.return_value = {"StatusDetails": "Failed"}
+
+        with patch(
+            "parsl_ephemeral_provider.modes.standard.SSM_INVOCATION_SETTLE_SECONDS", 0
+        ):
+            with pytest.raises(OperatingModeError, match="ready marker not found"):
+                mode._wait_for_worker_ready("i-123", timeout=0.05)
+
+    def test_poll_schedules_have_jitter(self):
+        """Jitter is the concrete gain over the flat sleeps #91 replaced.
+
+        Without it, N providers launched together poll SSM and EC2 in lockstep
+        for the whole boot, which is what makes a fleet of them throttle.
+        """
+        from parsl_ephemeral_provider.modes.standard import StandardMode
+
+        for config in (StandardMode._ssm_poll_config, StandardMode._fleet_poll_config):
+            assert config.jitter is True
+            assert config.exponential_backoff is True
+            # Bounded, so a slow boot is not polled hundreds of times.
+            assert config.max_delay <= 60.0
+
+
+# ---------------------------------------------------------------------------
+# TestFleetBlockPoll
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestFleetBlockPoll:
+    """The fleet-block wait distinguishes terminal from provisional (#91).
+
+    ``get_block_status`` never raises -- its ``except`` returns the last known
+    status string -- so a retry decorator could never fire here, contrary to what
+    #91's body claimed. It is a success-poll, and the states it returns split
+    three ways: RUNNING is the answer, FAILED/CANCELED/COMPLETED must fail
+    immediately rather than wait out the timeout, and anything else means keep
+    polling.
+    """
+
+    @pytest.fixture
+    def tmp_dir(self):
+        with tempfile.TemporaryDirectory() as d:
+            yield d
+
+    @pytest.fixture
+    def mode(self, tmp_dir):
+        from parsl_ephemeral_provider.modes.standard import StandardMode
+
+        provider_id = f"test-{uuid.uuid4().hex[:8]}"
+        state_file = os.path.join(tmp_dir, f"{provider_id}.json")
+        m = StandardMode(
+            provider_id=provider_id,
+            session=MagicMock(),
+            state_store=FileStateStore(file_path=state_file, provider_id=provider_id),
+            image_id="ami-12345678",
+            vpc_id="vpc-test00001",
+            subnet_id="subnet-test001",
+            security_group_id="sg-test00001",
+        )
+        m._fleet_poll_config = RetryConfig(base_delay=0.001, max_delay=0.01)
+        # Injected rather than requested via use_spot_fleet=True: constructing a
+        # real SpotFleetManager against a MagicMock session fails in audit
+        # logging, and the manager is stubbed here regardless.
+        m.spot_fleet_manager = MagicMock()
+        m.spot_fleet_manager.create_blocks.return_value = {
+            "block-1": {"instance_ids": ["i-123"], "fleet_request_id": "fleet-1"}
+        }
+        return m
+
+    @staticmethod
+    def _run_args():
+        return {
+            "UserData": "#!/bin/bash\n",
+            "TagSpecifications": [{"Tags": [{"Key": "JobId", "Value": "job-1"}]}],
+        }
+
+    def test_pending_is_polled_until_running(self, mode):
+        """PENDING is provisional: keep asking."""
+        mode.spot_fleet_manager.get_block_status.side_effect = [
+            STATUS_PENDING,
+            STATUS_PENDING,
+            STATUS_RUNNING,
+        ]
+
+        assert mode._create_spot_fleet_instance(self._run_args()) == "block-1"
+        assert mode.spot_fleet_manager.get_block_status.call_count == 3
+
+    def test_a_terminal_status_fails_without_waiting_out_the_timeout(self, mode):
+        """FAILED is an answer, so it must not be polled for ten minutes.
+
+        Returning the status out of the predicate rather than raising inside it
+        is what makes this possible: an exception raised in a predicate is read
+        as "not yet" and swallowed.
+        """
+        mode.spot_fleet_manager.get_block_status.return_value = STATUS_FAILED
+
+        start = time.time()
+        with pytest.raises(ResourceCreationError, match="failed with status FAILED"):
+            mode._create_spot_fleet_instance(self._run_args())
+
+        assert time.time() - start < 5.0
+        assert mode.spot_fleet_manager.get_block_status.call_count == 1
+
+    def test_a_block_that_never_settles_times_out_and_is_discarded(self, mode):
+        """A timed-out block must be cleaned up, not left billing."""
+        mode.spot_fleet_manager.get_block_status.return_value = STATUS_UNKNOWN
+
+        with patch.object(mode, "_discard_failed_fleet_block") as discard:
+            with patch(
+                "parsl_ephemeral_provider.modes.standard."
+                "DEFAULT_RESOURCE_CREATION_TIMEOUT",
+                0.05,
+            ):
+                with pytest.raises(
+                    ResourceCreationError, match="did not reach RUNNING"
+                ):
+                    mode._create_spot_fleet_instance(self._run_args())
+
+        discard.assert_called_once_with("block-1")

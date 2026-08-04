@@ -33,6 +33,7 @@ from parsl_ephemeral_provider.constants import (
     STATUS_UNKNOWN,
     STATUS_WARM,
 )
+from parsl_ephemeral_provider.error_handling import RetryConfig, poll_until
 from parsl_ephemeral_provider.exceptions import (
     OperatingModeError,
     ResourceCreationError,
@@ -56,6 +57,26 @@ from parsl_ephemeral_provider.utils.aws import (
 
 logger = logging.getLogger(__name__)
 
+# SendCommand is asynchronous: get_command_invocation returns InvocationDoesNotExist
+# for a moment after it returns. Not a retry interval -- see _wait_for_worker_ready.
+SSM_INVOCATION_SETTLE_SECONDS = 5
+
+
+def _swallow_client_errors(exc: Exception) -> None:
+    """Log an AWS error a poll should tolerate, and re-raise anything else.
+
+    ``poll_until`` treats any exception as "not satisfied yet", which is right
+    for the ``ClientError`` these polls expect -- an instance absent from SSM,
+    an invocation that has not landed. It is wrong for everything else: a
+    missing credential or a typo in a parameter name would otherwise be retried
+    silently until the timeout expired, turning an immediate failure into a
+    five-minute one. This narrows the tolerance back to what the hand-rolled
+    loops had before #91.
+    """
+    if not isinstance(exc, ClientError):
+        raise exc
+    logger.debug(f"SSM poll tolerated: {exc}")
+
 
 class StandardMode(OperatingMode):
     """Standard operating mode implementation.
@@ -66,6 +87,17 @@ class StandardMode(OperatingMode):
     This mode supports regular EC2 instances, spot instances, and spot fleet
     requests for more reliable and cost-effective computation.
     """
+
+    # Delay schedule for the SSM readiness polls (#91). These replaced flat
+    # 10s/15s intervals: starting tighter finds an instance that registers
+    # quickly sooner, the cap keeps a slow boot from being polled hundreds of
+    # times, and the jitter stops N providers launched together from hitting
+    # SSM in lockstep -- which was the concrete cost of hand-rolling these.
+    _ssm_poll_config = RetryConfig(base_delay=5.0, max_delay=30.0)
+
+    # The fleet-block poll is coarser: EC2 Fleet capacity is fulfilled on the
+    # order of a minute, so polling it every few seconds only burns API quota.
+    _fleet_poll_config = RetryConfig(base_delay=10.0, max_delay=60.0)
 
     def __init__(
         self,
@@ -1215,21 +1247,27 @@ class StandardMode(OperatingMode):
             If the instance does not appear in SSM within *timeout* seconds.
         """
         ssm = self.session.client("ssm")
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            try:
-                resp = ssm.describe_instance_information(
-                    Filters=[{"Key": "InstanceIds", "Values": [instance_id]}]
-                )
-                if resp.get("InstanceInformationList"):
-                    logger.debug(f"Instance {instance_id} is online in SSM")
-                    return
-            except ClientError as e:
-                logger.debug(f"SSM describe_instance_information: {e}")
-            time.sleep(10)
-        raise OperatingModeError(
-            f"Instance {instance_id} did not become available in SSM within {timeout}s"
-        )
+
+        def registered() -> bool:
+            resp = ssm.describe_instance_information(
+                Filters=[{"Key": "InstanceIds", "Values": [instance_id]}]
+            )
+            return bool(resp.get("InstanceInformationList"))
+
+        try:
+            poll_until(
+                registered,
+                timeout=timeout,
+                description=f"instance {instance_id} to register with SSM",
+                retry_config=self._ssm_poll_config,
+                on_error=_swallow_client_errors,
+            )
+        except TimeoutError as e:
+            raise OperatingModeError(
+                f"Instance {instance_id} did not become available in SSM "
+                f"within {timeout}s"
+            ) from e
+        logger.debug(f"Instance {instance_id} is online in SSM")
 
     def _wait_for_worker_ready(self, instance_id: str, timeout: int = 600) -> None:
         """Wait for the worker ready marker on an instance via SSM RunCommand.
@@ -1250,31 +1288,40 @@ class StandardMode(OperatingMode):
             If the ready marker is not found within *timeout* seconds.
         """
         ssm = self.session.client("ssm")
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            try:
-                resp = ssm.send_command(
-                    InstanceIds=[instance_id],
-                    DocumentName="AWS-RunShellScript",
-                    Parameters={"commands": ["test -f /var/run/parsl_worker_ready"]},
-                    Comment="Parsl worker ready check",
-                )
-                command_id = resp["Command"]["CommandId"]
-                # Brief wait then check the result
-                time.sleep(5)
-                invocation = ssm.get_command_invocation(
-                    CommandId=command_id,
-                    InstanceId=instance_id,
-                )
-                if invocation.get("StatusDetails") == "Success":
-                    logger.debug(f"Worker ready on {instance_id}")
-                    return
-            except ClientError as e:
-                logger.debug(f"SSM ready check: {e}")
-            time.sleep(15)
-        raise OperatingModeError(
-            f"Worker ready marker not found on {instance_id} within {timeout}s"
-        )
+
+        def marker_present() -> bool:
+            resp = ssm.send_command(
+                InstanceIds=[instance_id],
+                DocumentName="AWS-RunShellScript",
+                Parameters={"commands": ["test -f /var/run/parsl_worker_ready"]},
+                Comment="Parsl worker ready check",
+            )
+            command_id = resp["Command"]["CommandId"]
+            # Not a retry interval: SendCommand is asynchronous, so the
+            # invocation does not exist to be read for a moment after it
+            # returns. This pause stays inside the predicate and deliberately
+            # stays flat -- backing it off would only delay the first read of a
+            # command that always takes about the same time to land.
+            time.sleep(SSM_INVOCATION_SETTLE_SECONDS)
+            invocation = ssm.get_command_invocation(
+                CommandId=command_id,
+                InstanceId=instance_id,
+            )
+            return bool(invocation.get("StatusDetails") == "Success")
+
+        try:
+            poll_until(
+                marker_present,
+                timeout=timeout,
+                description=f"worker ready marker on {instance_id}",
+                retry_config=self._ssm_poll_config,
+                on_error=_swallow_client_errors,
+            )
+        except TimeoutError as e:
+            raise OperatingModeError(
+                f"Worker ready marker not found on {instance_id} within {timeout}s"
+            ) from e
+        logger.debug(f"Worker ready on {instance_id}")
 
     def _dispatch_ssm_command(self, instance_id: str, command: str, job_id: str) -> str:
         """Dispatch a shell command to an EC2 instance via SSM SendCommand.
@@ -1698,22 +1745,38 @@ class StandardMode(OperatingMode):
             # above -- so a timeout here no longer conflates "no spot capacity"
             # with "slow to boot".
             max_wait = DEFAULT_RESOURCE_CREATION_TIMEOUT
-            start_time = time.time()
+            # Bind the manager locally: the guard above narrowed it away from
+            # None, but that narrowing does not reach inside a closure.
+            fleet_manager = self.spot_fleet_manager
 
-            while time.time() - start_time < max_wait:
-                status = self.spot_fleet_manager.get_block_status(block_id)
+            def settled_status() -> Optional[str]:
+                """Return the block status once it stops being provisional.
+
+                Only RUNNING and the three terminal states are answers; anything
+                else (PENDING, UNKNOWN) means keep waiting. Returning the status
+                rather than a bool lets the terminal case be handled below --
+                raising from inside a predicate would be read as "not yet"
+                and swallowed by ``poll_until``.
+                """
+                status = fleet_manager.get_block_status(block_id)
                 logger.debug(f"EC2 Fleet block {block_id} status: {status}")
+                if status in (
+                    STATUS_RUNNING,
+                    STATUS_FAILED,
+                    STATUS_CANCELED,
+                    STATUS_COMPLETED,
+                ):
+                    return str(status)
+                return None
 
-                if status == STATUS_RUNNING:
-                    break
-                elif status in [STATUS_FAILED, STATUS_CANCELED, STATUS_COMPLETED]:
-                    self._discard_failed_fleet_block(block_id)
-                    raise ResourceCreationError(
-                        f"EC2 Fleet block failed with status {status}"
-                    )
-
-                time.sleep(10)
-            else:
+            try:
+                final_status = poll_until(
+                    settled_status,
+                    timeout=max_wait,
+                    description=f"EC2 Fleet block {block_id} to reach RUNNING",
+                    retry_config=self._fleet_poll_config,
+                )
+            except TimeoutError as e:
                 logger.error(
                     f"Timeout waiting for EC2 Fleet block {block_id} to reach RUNNING"
                 )
@@ -1721,6 +1784,12 @@ class StandardMode(OperatingMode):
                 raise ResourceCreationError(
                     f"EC2 Fleet block {block_id} did not reach RUNNING "
                     f"state within {max_wait}s"
+                ) from e
+
+            if final_status != STATUS_RUNNING:
+                self._discard_failed_fleet_block(block_id)
+                raise ResourceCreationError(
+                    f"EC2 Fleet block failed with status {final_status}"
                 )
 
             # Register the fleet with the spot interruption monitor if enabled.

@@ -17,6 +17,7 @@ from parsl_ephemeral_provider.error_handling import (
     ErrorAnalyzer,
     ErrorRecoveryHandler,
     RobustErrorHandler,
+    poll_until,
     retry_with_backoff,
 )
 
@@ -463,3 +464,189 @@ class TestRetryDecorator:
 
         # Error should be recorded in handler
         assert len(error_handler.error_history) > 0
+
+
+class TestPollUntil:
+    """Tests for the success-poll primitive (#91).
+
+    ``poll_until`` exists because ``retry_with_backoff`` cannot express these
+    waits: the predicate *succeeds* and returns a not-yet answer rather than
+    raising, so the decorator would fire zero times. Several tests below pin
+    exactly that distinction.
+    """
+
+    # A schedule short enough that the whole class runs in well under a second.
+    FAST = RetryConfig(base_delay=0.01, max_delay=0.05)
+
+    def test_returns_the_first_truthy_value(self):
+        """The predicate's value is what comes back, not just True."""
+        result = poll_until(
+            lambda: "i-abc123",
+            timeout=1.0,
+            description="an instance ID",
+            retry_config=self.FAST,
+        )
+        assert result == "i-abc123"
+
+    def test_polls_until_the_predicate_flips(self):
+        """A falsey answer means keep waiting, and is not an error."""
+        calls = 0
+
+        def ready():
+            nonlocal calls
+            calls += 1
+            return calls >= 3
+
+        assert (
+            poll_until(
+                ready,
+                timeout=1.0,
+                description="readiness",
+                retry_config=self.FAST,
+            )
+            is True
+        )
+        assert calls == 3
+
+    def test_a_falsey_predicate_is_not_an_exception(self):
+        """The case ``retry_with_backoff`` cannot serve.
+
+        The predicate never raises, so a retry decorator would call it once and
+        return the not-yet answer as if it were the result. ``poll_until`` must
+        keep going instead -- this is the whole reason #91 needed a second
+        primitive rather than the existing one.
+        """
+        answers = iter([None, False, 0, "", "i-final"])
+        result = poll_until(
+            lambda: next(answers),
+            timeout=1.0,
+            description="a value after four falsey answers",
+            retry_config=self.FAST,
+        )
+        assert result == "i-final"
+
+    def test_timeout_raises_with_the_description(self):
+        """The message must name what was being waited for, not just time out."""
+        with pytest.raises(TimeoutError, match="SSM registration"):
+            poll_until(
+                lambda: False,
+                timeout=0.05,
+                description="SSM registration",
+                retry_config=self.FAST,
+            )
+
+    def test_timeout_is_respected_despite_a_long_delay_schedule(self):
+        """A delay larger than the remaining budget must not overshoot.
+
+        With ``base_delay=10`` the first sleep would be ten seconds, so a 0.1s
+        timeout has to clamp it. Without the clamp the call would block for the
+        full delay and report a 0.1s timeout ten seconds late.
+        """
+        start = time.time()
+        with pytest.raises(TimeoutError):
+            poll_until(
+                lambda: False,
+                timeout=0.1,
+                description="something that never happens",
+                retry_config=RetryConfig(base_delay=10.0, max_delay=60.0),
+            )
+        assert time.time() - start < 2.0
+
+    def test_a_raising_predicate_is_treated_as_not_yet(self):
+        """Early attempts are expected to fail; the poll absorbs that."""
+        calls = 0
+
+        def flaky():
+            nonlocal calls
+            calls += 1
+            if calls < 3:
+                raise ClientError(
+                    error_response={
+                        "Error": {"Code": "InvalidInstanceId", "Message": "nope"}
+                    },
+                    operation_name="DescribeInstanceInformation",
+                )
+            return "online"
+
+        assert (
+            poll_until(
+                flaky,
+                timeout=1.0,
+                description="an instance that 404s twice",
+                retry_config=self.FAST,
+            )
+            == "online"
+        )
+        assert calls == 3
+
+    def test_on_error_sees_every_exception(self):
+        """The hook is how a caller narrows which errors are tolerable."""
+        seen = []
+        calls = 0
+
+        def flaky():
+            nonlocal calls
+            calls += 1
+            if calls < 3:
+                raise ConnectionError(f"attempt {calls}")
+            return True
+
+        poll_until(
+            flaky,
+            timeout=1.0,
+            description="a flaky check",
+            retry_config=self.FAST,
+            on_error=seen.append,
+        )
+        assert [str(e) for e in seen] == ["attempt 1", "attempt 2"]
+
+    def test_on_error_can_reraise_to_fail_fast(self):
+        """An ``on_error`` that raises must abort the poll immediately.
+
+        This is how ``modes/standard.py`` keeps a credentials failure from being
+        retried silently for five minutes: tolerate ``ClientError``, re-raise
+        anything else. If the raise were swallowed, the poll would burn the
+        whole timeout on an error that could never resolve.
+        """
+
+        def fatal(exc):
+            raise exc
+
+        def always_raises():
+            raise NoCredentialsError()
+
+        with pytest.raises(NoCredentialsError):
+            poll_until(
+                always_raises,
+                timeout=5.0,
+                description="a poll that should fail fast",
+                retry_config=self.FAST,
+                on_error=fatal,
+            )
+
+    def test_max_attempts_does_not_bound_the_poll(self):
+        """Only *timeout* bounds a poll -- ``RetryConfig.max_attempts`` is unused.
+
+        ``RetryConfig`` is shared with the retry decorator, where
+        ``max_attempts`` is the bound. Reusing the dataclass for its delay math
+        must not import that bound: a boot that takes 40 polls is normal, and a
+        default ``max_attempts=3`` would abort it after three.
+        """
+        calls = 0
+
+        def ready_on_tenth():
+            nonlocal calls
+            calls += 1
+            return calls >= 10
+
+        assert poll_until(
+            ready_on_tenth,
+            timeout=5.0,
+            description="the tenth attempt",
+            retry_config=RetryConfig(max_attempts=3, base_delay=0.001, max_delay=0.01),
+        )
+        assert calls == 10
+
+    def test_default_retry_config_is_usable(self):
+        """Omitting *retry_config* must not require the caller to build one."""
+        assert poll_until(lambda: True, timeout=1.0, description="an immediate answer")
