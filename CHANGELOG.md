@@ -93,6 +93,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The two `time.sleep` calls in `modes/detached.py` are inside the generated
   bastion script's string literal, not module code, and are out of scope.
 
+- **Real-AWS coverage for three options that had none** (#166).
+  `tests/aws/test_unverified_options_e2e.py`, 8 cases marked
+  `@pytest.mark.aws @pytest.mark.slow`. Each covers a path whose failure mode is
+  "AWS accepted the request and did not honour it" — which every mock and the
+  emulator both report as success, so no amount of `tests/unit` or
+  `tests/integration` work could reach them.
+
+  - **`ecs_container_image` on Fargate.** #136 made the option forwardable and
+    moved the default off `public.ecr.aws/lambda/python:3.9`, but nothing had
+    watched a container start from a caller-chosen image. The tests read the
+    container's own stdout out of the CloudWatch log group `ecs_worker.yml`
+    already provisions, and assert the *Python version* it reports — a
+    non-default `python:3.11-slim` is used precisely so the assertion fails if
+    the default silently wins, which is the regression #136 fixed. A second case
+    reads `stoppedReason` and the container exit codes, because a task that
+    cannot pull its image still reaches `STOPPED`; "reached STOPPED" is evidence
+    of nothing.
+  - **`preserve_bastion` and `idle_timeout`.** Both halves of the flag, not just
+    the removing one: a `preserve_bastion=True` bastion that gets torn down is a
+    detached workflow the client can never reconnect to, and a test covering only
+    `False` would pass against an implementation that always deleted. These call
+    `cleanup_infrastructure()` directly, because `shutdown()` forces
+    `preserve_bastion = False` before calling it and so cannot distinguish the
+    two settings. The self-termination case calls nothing at all and waits for the
+    bastion to reach a terminal state on its own.
+  - **`S3State(create_bucket_if_not_exists=True)` against real S3.** The
+    `CreateBucket` → `PutPublicAccessBlock` → `PutBucketTagging` sequence, plus
+    the `LocationConstraint` asymmetry (`us-east-1` rejects the parameter every
+    other region requires) that an emulator cannot expose because it accepts
+    either form. substrate#446 had left `PUT ?publicAccessBlock` unrouted on
+    exactly this path.
+
+  Writing these surfaced two facts about the API worth recording:
+
+  - **`create_bucket_if_not_exists` is not reachable through
+    `EphemeralProvider`.** The constructor takes `s3_bucket` and `s3_key`, but
+    `_initialize_state_store` builds the store with only `provider`,
+    `bucket_name`, and `key_prefix` — so a provider *always* takes the
+    already-exists branch, and a caller who wants the bucket created must
+    construct `S3State` themselves. The tests do that, and say why. The gap is
+    wider than #166 described and is not closed here.
+  - **`ecs_worker.yml` splits `Command` on commas**, via
+    `!Split [',', !Ref Command]`, so a shell string passed to `submit()` arrives
+    as a single argv[0] and the container exits before running anything. The
+    tests join their argv through a helper that documents this.
+
 ## [0.9.0] - 2026-08-03
 
 ### Changed
