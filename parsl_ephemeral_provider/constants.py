@@ -439,6 +439,11 @@ DEFAULT_ONE_SHOT = False  # each instance runs one command then terminates
 DEFAULT_BASTION_IDLE_TIMEOUT = 30  # minutes of inactivity before self-shutdown
 DEFAULT_PRESERVE_BASTION = True  # bastion survives cleanup_infrastructure()
 DEFAULT_BASTION_HOST_TYPE = "cloudformation"  # or "direct" (RunInstances)
+# The bastion runs an orchestrator loop, not compute, so the smallest burstable
+# type is the right default. Named here for the same reason as the three above:
+# #155 extends the detached-only guard to cover it, and the guard compares
+# against this constant rather than a copied-out "t3.micro".
+DEFAULT_BASTION_INSTANCE_TYPE = "t3.micro"
 
 # Lambda defaults (minimal for imports)
 DEFAULT_LAMBDA_TIMEOUT = 300

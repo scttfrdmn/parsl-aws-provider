@@ -6,6 +6,7 @@ SPDX-License-Identifier: Apache-2.0
 SPDX-FileCopyrightText: 2025-2026 Scott Friedman and Project Contributors
 """
 
+import logging
 import os
 import tempfile
 import time
@@ -20,10 +21,13 @@ from parsl.jobs.states import JobState
 from parsl_ephemeral_provider.constants import (
     DEFAULT_BASTION_HOST_TYPE,
     DEFAULT_BASTION_IDLE_TIMEOUT,
+    DEFAULT_BASTION_INSTANCE_TYPE,
     DEFAULT_ECS_CONTAINER_IMAGE,
     DEFAULT_ECS_CPU,
     DEFAULT_ECS_MEMORY,
+    DEFAULT_LAMBDA_MEMORY,
     DEFAULT_LAMBDA_RUNTIME,
+    DEFAULT_LAMBDA_TIMEOUT,
     DEFAULT_MAX_IDLE_TIME,
     DEFAULT_PRESERVE_BASTION,
     DEFAULT_WARM_POOL_SIZE,
@@ -1310,19 +1314,31 @@ class TestStandardOnlyOptionGuard:
 # ---------------------------------------------------------------------------
 
 #: Options only DetachedMode implements, with a non-default value for each.
+#:
+#: ``bastion_instance_type`` was added by #155, which extended the guard to the
+#: four options #136 deliberately left alone. It sits in the same list because it
+#: is mode-specific in exactly the same way -- the only difference was that it had
+#: been accepted since before the guard existed.
 DETACHED_ONLY_OPTIONS = [
     ("idle_timeout", 5),
     ("preserve_bastion", False),
     ("bastion_host_type", "direct"),
     ("workflow_id", "wf-136"),
+    ("bastion_instance_type", "m5.large"),
 ]
 
 #: Options only ServerlessMode implements, with a non-default value for each.
+#:
+#: ``memory_size`` and ``timeout`` are #155's other two. ``compute_type`` is the
+#: fourth and is *not* here: its default is meaningful on the other modes, so it
+#: needs different treatment -- see TestComputeTypeGuard.
 SERVERLESS_ONLY_OPTIONS = [
     ("lambda_runtime", "python3.11"),
     ("ecs_task_cpu", 256),
     ("ecs_task_memory", 512),
     ("ecs_container_image", "myrepo/myimage:latest"),
+    ("memory_size", 2048),
+    ("timeout", 600),
 ]
 
 
@@ -1368,6 +1384,15 @@ class TestModeSpecificOptionForwarding:
 
         assert getattr(provider.operating_mode, option) == value
 
+    #: The two provider names ServerlessMode spells differently. The provider
+    #: forwards ``memory_size``/``timeout``; the mode stores them as
+    #: ``lambda_memory``/``lambda_timeout``, so asserting on the provider-side
+    #: name would fail on an attribute the mode does not have.
+    _SERVERLESS_MODE_ATTR = {
+        "memory_size": "lambda_memory",
+        "timeout": "lambda_timeout",
+    }
+
     @pytest.mark.parametrize("option,value", SERVERLESS_ONLY_OPTIONS)
     def test_a_serverless_option_reaches_the_mode(self, option, value):
         """As above, for the serverless branch."""
@@ -1375,7 +1400,8 @@ class TestModeSpecificOptionForwarding:
             "serverless", compute_type="ecs", **{option: value}
         )
 
-        assert getattr(provider.operating_mode, option) == value
+        attr = self._SERVERLESS_MODE_ATTR.get(option, option)
+        assert getattr(provider.operating_mode, attr) == value
 
     @pytest.mark.parametrize("option,value", DETACHED_ONLY_OPTIONS)
     @pytest.mark.parametrize("mode", ["standard", "serverless"])
@@ -1434,6 +1460,13 @@ class TestModeSpecificOptionForwarding:
             ecs_task_cpu=DEFAULT_ECS_CPU,
             ecs_task_memory=DEFAULT_ECS_MEMORY,
             ecs_container_image=DEFAULT_ECS_CONTAINER_IMAGE,
+            # #155's three. Same reasoning as above, and it applies harder here:
+            # bastion_instance_type's default was the literal "t3.micro" in the
+            # signature until #155 moved it to a constant, precisely so this
+            # comparison could not drift out from under the guard.
+            bastion_instance_type=DEFAULT_BASTION_INSTANCE_TYPE,
+            memory_size=DEFAULT_LAMBDA_MEMORY,
+            timeout=DEFAULT_LAMBDA_TIMEOUT,
         )
 
         assert provider.mode_type.value == mode
@@ -1468,6 +1501,83 @@ class TestModeSpecificOptionForwarding:
         provider = _construct_with_real_mode("detached")
 
         assert provider.operating_mode.workflow_id
+
+
+# ---------------------------------------------------------------------------
+# TestComputeTypeGuard (#155)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestComputeTypeGuard:
+    """``compute_type`` is the one #155 option that cannot use the shared guard.
+
+    Its default is ``"ec2"``, which is *meaningful* on standard and detached mode
+    -- the only value they can honour -- and meaningless on serverless, where
+    ``ServerlessMode`` ignores it in favour of its own ``"auto"``. So the two
+    directions are asymmetric, and both halves matter:
+
+    * ``lambda``/``ecs`` on an EC2 mode is a request the provider cannot satisfy,
+      so it raises like any other misplaced option.
+    * ``ec2`` on serverless mode is the *default*, so raising would break a
+      caller who never mentioned ``compute_type`` at all. It warns instead.
+
+    A guard keyed on "value != default", the shape the other options use, would
+    have got this exactly backwards: silent on the confusing case and fatal on
+    the innocent one.
+    """
+
+    @pytest.mark.parametrize("mode", ["standard", "detached"])
+    @pytest.mark.parametrize("compute_type", ["lambda", "ecs"])
+    def test_a_serverless_compute_type_is_refused_on_an_ec2_mode(
+        self, mode, compute_type
+    ):
+        with pytest.raises(
+            ProviderConfigurationError, match="supported only by"
+        ) as excinfo:
+            _construct(mode, compute_type=compute_type)
+
+        message = str(excinfo.value)
+        assert compute_type in message and mode in message
+
+    @pytest.mark.parametrize("mode", ["standard", "detached"])
+    def test_the_default_compute_type_is_accepted_on_an_ec2_mode(self, mode):
+        """``ec2`` is what these modes do, so it must pass in silence.
+
+        Explicit as well as defaulted: a guard that only skipped the *unset* case
+        would reject a caller who spelled out the documented default.
+        """
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            assert _construct(mode, compute_type="ec2").mode_type.value == mode
+
+    def test_the_default_compute_type_warns_on_serverless(self, caplog):
+        """The case the "value != default" shape would have missed entirely.
+
+        Leaving ``compute_type`` at ``ec2`` on serverless mode is what actually
+        confuses people: it reads as "run on EC2" and in fact selects
+        ``ServerlessMode``'s ``auto`` heuristic. Warn, naming the fallback.
+        """
+        with caplog.at_level(logging.WARNING):
+            _construct("serverless")
+
+        assert "compute_type='ec2' has no meaning in serverless mode" in caplog.text
+        assert "auto" in caplog.text
+
+    @pytest.mark.parametrize("compute_type", ["lambda", "ecs"])
+    def test_an_explicit_serverless_compute_type_does_not_warn(
+        self, compute_type, caplog
+    ):
+        """The other half: having chosen, the caller must not be nagged.
+
+        Without this, "warn on serverless" could be implemented as an
+        unconditional warning and still pass the test above.
+        """
+        with caplog.at_level(logging.WARNING):
+            provider = _construct("serverless", compute_type=compute_type)
+
+        assert provider.compute_type.value == compute_type
+        assert "has no meaning in serverless mode" not in caplog.text
 
 
 # ---------------------------------------------------------------------------

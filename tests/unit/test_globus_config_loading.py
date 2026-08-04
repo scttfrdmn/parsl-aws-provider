@@ -94,12 +94,18 @@ print("RESULT " + json.dumps(out))
 """
 
 
-def _make_provider(tmp_path, **extra_kwargs) -> EphemeralComputeProvider:
+def _make_provider(
+    tmp_path, mode: str = "standard", **extra_kwargs
+) -> EphemeralComputeProvider:
     """Build a provider with every AWS interaction mocked out.
 
     `_initialize_operating_mode` is patched because `provider.__init__` calls
     `initialize()` unconditionally, and `StandardMode.initialize()` creates a
     real launch template and IAM instance profile.
+
+    *mode* is a parameter because since #155 no single mode accepts every
+    option: the mode-specific ones are guarded, so the signature-coverage test
+    below has to construct one provider per owning mode.
     """
     provider_id = f"test-{uuid.uuid4().hex[:8]}"
     state_store = FileStateStore(
@@ -123,7 +129,7 @@ def _make_provider(tmp_path, **extra_kwargs) -> EphemeralComputeProvider:
             region="us-east-1",
             image_id="ami-0123456789abcdef0",
             instance_type="t3.micro",
-            mode="standard",
+            mode=mode,
             vpc_id=VPC_ID,
             subnet_id=SUBNET_ID,
             security_group_id=SG_ID,
@@ -626,6 +632,14 @@ class TestEveryParameterSurvivesTheRoundTrip:
         behind. Passing every parameter the constructor accepts and asserting
         each appears is what makes a newly added option a passing case for free
         rather than a silent omission.
+
+        Since #155 the sample is split by owning mode. Every mode-specific
+        option is now refused on the wrong mode, so one standard-mode provider
+        can no longer carry the whole set -- `bastion_instance_type` and
+        `memory_size`/`timeout` were only accepted here because they were the
+        four options #136 left unguarded. Splitting keeps the coverage
+        assertion; collapsing it back to one provider would silently drop those
+        options from the set it checks.
         """
         import inspect
 
@@ -638,7 +652,7 @@ class TestEveryParameterSurvivesTheRoundTrip:
         # them, and region/mode/network because they are its positional shape.
         # one_shot is handled separately below -- the constructor rejects it
         # alongside warm_pool_size, and both belong in the covered set.
-        sample = {
+        mode_agnostic = {
             "max_blocks": 4,
             "min_blocks": 1,
             "init_blocks": 1,
@@ -652,9 +666,6 @@ class TestEveryParameterSurvivesTheRoundTrip:
             "spot_interruption_handling": True,
             "auto_shutdown": False,
             "max_idle_time": 900,
-            "bastion_instance_type": "t3.small",
-            "memory_size": 2048,
-            "timeout": 600,
             "use_public_ips": False,
             "custom_ami": True,
             "iam_instance_profile_arn": "arn:aws:iam::1:instance-profile/p",
@@ -662,23 +673,109 @@ class TestEveryParameterSurvivesTheRoundTrip:
             "status_polling_interval": 30,
             "waiter_delay": 10,
             "waiter_max_attempts": 30,
-            "warm_pool_size": 1,
-            "warm_pool_ttl": 300,
             "use_spot": True,
         }
-        provider = _make_provider(tmp_path, **sample)
-        yaml_text = provider._build_user_config_template()
+        # One entry per owning mode. The mode-specific options are exactly the
+        # ones the two _reject_wrong_mode_options() call sites guard.
+        per_mode = {
+            "standard": {"warm_pool_size": 1, "warm_pool_ttl": 300},
+            "detached": {
+                "bastion_instance_type": "t3.small",
+                "idle_timeout": 5,
+                "preserve_bastion": False,
+                "bastion_host_type": "direct",
+                "workflow_id": "wf-1",
+            },
+            "serverless": {
+                "compute_type": "lambda",
+                "memory_size": 2048,
+                "timeout": 600,
+                "lambda_runtime": "python3.11",
+                "ecs_task_cpu": 2048,
+                "ecs_task_memory": 4096,
+                "ecs_container_image": "python:3.11-slim",
+            },
+        }
 
-        missing = [
-            name
-            for name in signature.parameters
-            if name in sample
-            and name not in _SKIP_PARAMS
-            and f"    {name}:" not in yaml_text
-        ]
+        missing = []
+        for mode, mode_options in per_mode.items():
+            sample = {**mode_agnostic, **mode_options}
+            provider = _make_provider(tmp_path, mode=mode, **sample)
+            yaml_text = provider._build_user_config_template()
+            missing += [
+                f"{mode}:{name}"
+                for name in signature.parameters
+                if name in sample
+                and name not in _SKIP_PARAMS
+                and f"    {name}:" not in yaml_text
+            ]
         assert not missing, f"passed but not emitted: {missing}"
 
         one_shot = _make_provider(
             tmp_path, one_shot=True, auto_create_instance_profile=True
         )
         assert "    one_shot:" in one_shot._build_user_config_template()
+
+    def test_every_signature_parameter_is_covered_by_some_sample(self, tmp_path):
+        """The sample set above must not fall behind the signature either.
+
+        `test_emitted_set_is_derived_from_the_signature` asserts that everything
+        it *passes* is emitted, which says nothing about an option it forgot to
+        pass -- exactly #138's failure one level up. This pins the complement:
+        every constructor parameter is either passed by that test, supplied by
+        `_make_provider`, or deliberately skipped.
+        """
+        import inspect
+
+        from parsl_ephemeral_provider.globus_compute import _SKIP_PARAMS
+
+        # Supplied by _make_provider's own signature rather than by a sample.
+        fixture_supplied = {
+            "self",
+            "mode",
+            "region",
+            "image_id",
+            "instance_type",
+            "vpc_id",
+            "subnet_id",
+            "security_group_id",
+            "one_shot",  # asserted separately, since it conflicts with the pool
+        }
+        # Subclass-only and deprecated parameters, plus the ones the emitter
+        # deliberately drops. endpoint_url is a connection detail, not a
+        # provisioning one, and max_idle_time's replacement is already covered.
+        by_hand = {
+            "endpoint_url",
+            "cores_per_node",
+            "mem_per_node",
+            "nodes_per_block",
+            "provider_id",
+            "debug",
+            "worker_init",
+            "state_store_type",
+            "s3_bucket",
+            "instance_types",
+            "spot_max_price_percentage",
+            "use_spot_fleet",
+            "additional_tags",
+            "bake_ami",
+            "baked_ami_id",
+            "kwargs",
+        }
+
+        source = inspect.getsource(
+            TestEveryParameterSurvivesTheRoundTrip.test_emitted_set_is_derived_from_the_signature
+        )
+        uncovered = sorted(
+            name
+            for name in inspect.signature(EphemeralProvider.__init__).parameters
+            if name not in fixture_supplied
+            and name not in by_hand
+            and name not in _SKIP_PARAMS
+            and f'"{name}"' not in source
+        )
+        assert not uncovered, (
+            "constructor parameters not exercised by the coverage sample: "
+            f"{uncovered}. Add them to the right per-mode entry, or to `by_hand` "
+            "with a reason."
+        )
