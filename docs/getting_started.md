@@ -2,7 +2,11 @@
 
 ## Installation
 
-**Not yet on PyPI**, so install from the repository:
+```bash
+uv add parsl-ephemeral-provider
+```
+
+For unreleased changes, install from the repository instead:
 
 ```bash
 uv add git+https://github.com/scttfrdmn/parsl-ephemeral-provider
@@ -14,10 +18,9 @@ Or, working from a clone:
 uv sync --extra dev --extra test
 ```
 
-`uv add parsl-ephemeral-provider` will start working once
-[#180](https://github.com/scttfrdmn/parsl-ephemeral-provider/issues/180) is resolved —
-the package name is unregistered, so that command currently fails with "no
-matching distribution found" rather than installing an older version.
+Published since v0.9.0
+([#180](https://github.com/scttfrdmn/parsl-ephemeral-provider/issues/180)); v0.9.0 is
+the first release on PyPI, so there are no earlier versions to pin to.
 
 Python 3.10 or newer is required (Parsl 2026.x dropped 3.9).
 
