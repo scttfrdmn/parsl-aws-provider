@@ -294,9 +294,18 @@ provider = EphemeralProvider(
 `ecs_task_cpu` and `ecs_task_memory` must be a combination Fargate accepts; see
 [Fargate task
 sizes](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/AWS_Fargate.html).
+An invalid pair fails the *task definition*, so the CloudFormation stack rolls
+back before any container starts — which looks nothing like an image problem.
 `lambda_runtime` must be one of the `Runtime` values allowed by
 `templates/cloudformation/lambda_worker.yml`, or CloudFormation rejects the
 stack.
+
+**On ECS, the command is split on commas, not spaces.** `ecs_worker.yml` builds
+the container's argv with `!Split [',', !Ref Command]`, so pass
+`"python,-c,print(1)"` rather than `"python -c print(1)"` — a space-separated
+string arrives as a single argv[0], and the container exits without running
+anything. This applies only to `compute_type="ecs"`; Lambda and the EC2 modes take
+an ordinary shell string.
 
 These are accepted only on `mode="serverless"`; setting one on another mode
 raises `ProviderConfigurationError`. `memory_size` and `timeout` joined that
