@@ -134,6 +134,19 @@ class TestDetachedModeSpotFleetIntegration:
         try:
             yield mode
         finally:
+            # `preserve_bastion` defaults to True, so cleanup alone keeps the
+            # stack -- and its IAM role, which `bastion.yml` deliberately does
+            # not name, outlives it. substrate gives an unnamed resource its
+            # logical ID verbatim (substrate#560), and `BastionHostRole` is
+            # account-global, so the next test in the file met
+            # `EntityAlreadyExists`.
+            #
+            # This was invisible until substrate 0.92.0. Delete-by-ARN silently
+            # no-op'd (substrate#544) and DeleteStack left the stack's resources
+            # standing (substrate#518), so no teardown here removed anything and
+            # the collision was attributed entirely to #560. Both are fixed now,
+            # which makes the fixture's own omission the operative cause.
+            mode.preserve_bastion = False
             mode.cleanup_infrastructure()
 
     def test_initialize_deploys_the_bastion_stack(self, detached_mode):
