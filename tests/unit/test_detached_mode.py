@@ -6,6 +6,7 @@ SPDX-FileCopyrightText: 2025-2026 Scott Friedman and Project Contributors
 
 import pytest
 from unittest.mock import MagicMock, patch
+import base64
 import boto3
 import time
 import json
@@ -15,9 +16,13 @@ from parsl_ephemeral_provider.modes.detached import DetachedMode
 from parsl_ephemeral_provider.state.base import STATE_KEY_MODE
 from parsl_ephemeral_provider.exceptions import (
     OperatingModeError,
+    ResourceCreationError,
     ResourceNotFoundError,
 )
 from parsl_ephemeral_provider.constants import (
+    MAX_CFN_PARAMETER_BYTES,
+    MAX_EC2_USER_DATA_B64_BYTES,
+    MAX_EC2_USER_DATA_BYTES,
     RESOURCE_TYPE_BASTION,
     STATUS_INTERRUPTED,
     STATUS_PENDING,
@@ -684,3 +689,255 @@ class TestDetachedMode:
         assert "update_job_status" in manager_script
         assert "launch_instance" in manager_script
         assert "main()" in manager_script  # Has entry point
+
+
+class TestBastionUserDataSize:
+    """The bastion UserData must fit the mechanism that delivers it (#227).
+
+    Detached mode was wholly non-functional because the init script — a ~32 KB
+    program — was passed as UserData: 10.4x CloudFormation's 4,096 B parameter
+    limit and 2.0x EC2's 16,384 B limit. Nothing in-tree rendered the script and
+    measured it, and substrate enforces neither limit, so the failure only ever
+    appeared against live AWS, at provider *construction*.
+
+    These tests are that missing measurement, and they are **arithmetic on
+    rendered strings** — no session, no emulator, nothing faked. Whether staging
+    actually works is a different question, answered against substrate by
+    ``tests/integration/test_substrate_modes.py::TestDetachedModeSubstrate``,
+    which uploads the script and fetches the URL over HTTP. Asserting
+    ``put_object`` call args against a mock here would duplicate that while
+    proving only that this code calls a method.
+    """
+
+    # Longest presigned URL measured against live AWS: 175 B with static keys,
+    # 1,064 B under a session token (the token alone is ~664 B). The URL is the
+    # one part of the shim whose size is not ours to control, so the budget is
+    # set against the worst case.
+    LONGEST_PRESIGNED_URL = 1064
+
+    @pytest.fixture
+    def mode(self):
+        """A DetachedMode used only to render strings; no AWS call is made."""
+        session = MagicMock(spec=boto3.Session)
+        session.region_name = "us-east-1"
+        return DetachedMode(
+            provider_id="test-provider",
+            session=session,
+            state_store=MagicMock(),
+            workflow_id="test-workflow",
+            vpc_id="vpc-12345",
+            subnet_id="subnet-12345",
+            security_group_id="sg-12345",
+        )
+
+    def test_the_shim_fits_every_delivery_limit(self, mode):
+        """The shim clears all three limits even with the longest URL possible.
+
+        The URL is substituted at its worst-case measured length rather than
+        left to a fixture's short example: a caller using assume-role or
+        session-token credentials gets a URL ~6x longer, and a budget calibrated
+        on static keys would pass here and fail for them.
+        """
+        shim = mode._render_bastion_shim(
+            "https://x/" + "u" * self.LONGEST_PRESIGNED_URL
+        )
+
+        raw = len(shim.encode())
+        encoded = len(base64.b64encode(shim.encode()))
+
+        assert raw < MAX_EC2_USER_DATA_BYTES
+        assert encoded < MAX_EC2_USER_DATA_B64_BYTES
+        # The tightest limit by far, and the one that made the default
+        # bastion_host_type impossible.
+        assert encoded < MAX_CFN_PARAMETER_BYTES
+        assert encoded < MAX_CFN_PARAMETER_BYTES * 3 // 4, (
+            f"shim base64 is {encoded} B against a {MAX_CFN_PARAMETER_BYTES} B "
+            "CloudFormation parameter limit — it is meant to stay a fetch, not "
+            "accumulate logic"
+        )
+
+    def test_the_init_script_itself_would_not_have_fit(self, mode):
+        """Guard the premise: the script really is too big to send inline.
+
+        Without this, the test above could keep passing for the wrong reason —
+        if the script ever shrank below the limits, staging would look like
+        unnecessary machinery and the assertions above would prove nothing.
+        """
+        init_script = mode._prepare_bastion_init_script()
+
+        assert len(init_script.encode()) > MAX_EC2_USER_DATA_BYTES
+        assert len(base64.b64encode(init_script.encode())) > MAX_CFN_PARAMETER_BYTES
+
+    def test_the_shim_fetches_rather_than_carries(self, mode):
+        """UserData downloads the script; it does not contain it."""
+        shim = mode._render_bastion_shim("https://example.test/staged.sh?sig=abc")
+
+        assert shim.startswith("#!/bin/bash")
+        assert "curl" in shim
+        assert "https://example.test/staged.sh?sig=abc" in shim
+        # The script's own content must not have travelled along with it.
+        assert "parsl-bastion-manager.py" not in shim
+        assert "systemd" not in shim
+
+    def test_the_shim_records_failure_instead_of_aborting_silently(self, mode):
+        """A failed fetch must leave evidence, not a mystery.
+
+        The lesson of #225: an instance whose UserData died still reaches
+        ``running`` and still reports CREATE_COMPLETE, so failure has to be
+        written down somewhere to be noticed at all.
+        """
+        shim = mode._render_bastion_shim("https://example.test/staged.sh")
+
+        assert "parsl-bastion-bootstrap.status" in shim
+        assert "FAILED: could not download bastion init script" in shim
+        assert "--retry" in shim  # a transient 5xx should not strand the bastion
+
+    def test_an_oversized_shim_is_refused_at_render_time(self, mode):
+        """The size check fails loudly rather than deferring to AWS.
+
+        This is the regression gate: #227 was a live-only failure precisely
+        because nothing checked before the API call.
+        """
+        with (
+            patch.object(
+                mode,
+                "_stage_bastion_init_script",
+                return_value="https://example.test/staged.sh",
+            ),
+            patch.object(
+                mode,
+                "_render_bastion_shim",
+                return_value="x" * (MAX_EC2_USER_DATA_BYTES + 1),
+            ),
+        ):
+            with pytest.raises(ResourceCreationError, match="over the"):
+                mode._prepare_bastion_user_data()
+
+
+class TestBastionInitScriptShell:
+    """The init script's shell must survive first boot on Amazon Linux 2023.
+
+    #225: the script ran `set -e` and then installed `awscli`, for which AL2023
+    — the default AMI family — has no package. UserData aborted at that line, so
+    the manager script, its service, and the idle-shutdown cron were never
+    installed. The instance still reached `running` and the stack still reported
+    CREATE_COMPLETE, which is why a bastion that orchestrated nothing looked
+    healthy from every angle.
+
+    Every assertion below pins a fact established by booting a real AL2023
+    bastion and reading its logs, not by reasoning about the shell. Each one
+    corresponds to a defect that a passing unit suite did not catch: the package
+    set is the third revision.
+    """
+
+    @pytest.fixture
+    def init_script(self):
+        session = MagicMock(spec=boto3.Session)
+        session.region_name = "us-east-1"
+        session.client.return_value = MagicMock()
+        mode = DetachedMode(
+            provider_id="test-provider",
+            session=session,
+            state_store=MagicMock(),
+            workflow_id="test-workflow",
+            vpc_id="vpc-12345",
+            subnet_id="subnet-12345",
+            security_group_id="sg-12345",
+        )
+        return mode._prepare_bastion_init_script()
+
+    def test_no_awscli_package_install(self, init_script):
+        """AL2023 has no `awscli` package; CLI v2 is preinstalled."""
+        assert "awscli" not in init_script
+
+    def test_package_install_dispatches_on_the_available_manager(self, init_script):
+        """`apt-get || yum` failed on AL2023, where apt-get does not exist."""
+        assert "command -v dnf" in init_script
+        assert "apt-get install -y python3 python3-pip jq awscli" not in init_script
+
+    def test_boto3_comes_from_the_distro_not_pip(self, init_script):
+        """boto3 must be the system package, and pip must not be installed.
+
+        Verified live: `dnf install python3-pip` pulls in **python3.11** and
+        repoints /usr/bin/python3 at it, which breaks `dnf` itself and AWS CLI v2
+        — both python3.9 scripts — with `ModuleNotFoundError: No module named
+        'dnf'`. AL2023 packages boto3 for the system 3.9, so no pip is needed.
+
+        `python3` is likewise absent from the install list: it is already there,
+        and naming it invites the same substitution.
+        """
+        assert "python3-boto3" in init_script
+        assert "python3-pip" not in init_script
+        assert "pip install" not in init_script
+        assert 'python3 -c "import boto3"' in init_script
+
+    def test_a_cron_daemon_is_installed(self, init_script):
+        """AL2023 ships no cron daemon, so `crontab -` was a no-op.
+
+        The idle-shutdown timer is the only thing that reads `idle_timeout`, so
+        without this the option cannot work — a bastion would run until someone
+        reclaimed it, and with `preserve_bastion=True` (the default) nothing
+        ever does.
+        """
+        assert "cronie" in init_script
+        assert "crond" in init_script
+        # The prerequisite check must catch a daemon that is not *running*.
+        # `crontab` being on PATH proved nothing: it is the client, and the
+        # /etc/cron.d drop-in is read only by the daemon.
+        prerequisites = init_script.split("# Verify prerequisites")[1]
+        assert "systemctl is-active crond" in prerequisites
+
+    def test_the_idle_timer_is_registered_somewhere_cron_will_read(self, init_script):
+        """The timer goes in /etc/cron.d, not through `crontab -`.
+
+        Verified live: `(crontab -l 2>/dev/null; echo '...') | crontab -` left
+        /var/spool/cron/root at **0 bytes** on a fresh bastion. `crontab -l` has
+        nothing to list and exits non-zero there, so the subshell contributed
+        nothing and the append landed nowhere — while every command in the
+        pipeline exited 0. So `idle_timeout` was registered on no schedule even
+        after #225 installed cronie.
+
+        A /etc/cron.d file has no read-modify-write step and so no empty-input
+        case. cron ignores such a file unless it is mode 0644, root-owned, and
+        has no dot in its name, and its lines carry a user field.
+
+        Confirmed on the fixed bastion, which is the only evidence that counts
+        here — the drop-in existing proves nothing about cron reading it::
+
+            CROND[25601]: (root) CMD (/usr/local/bin/parsl-idle-shutdown.sh)
+            CROND[25600]: (root) CMDEND (/usr/local/bin/parsl-idle-shutdown.sh)
+            -rw-r--r--. 1 root root 11 /var/run/parsl-last-activity
+
+        The activity file is the script's own output, so it ran, not merely got
+        scheduled.
+        """
+        assert "| crontab -" not in init_script
+
+        assert "/etc/cron.d/parsl-idle-shutdown" in init_script
+        assert "." not in "parsl-idle-shutdown"
+        assert (
+            "*/5 * * * * root /usr/local/bin/parsl-idle-shutdown.sh" in init_script
+        ), "system crontab format requires a user field"
+        assert "chmod 0644 /etc/cron.d/parsl-idle-shutdown" in init_script
+        assert "chown root:root /etc/cron.d/parsl-idle-shutdown" in init_script
+
+        # Written after the script it schedules, or the first firing finds
+        # nothing to run.
+        assert init_script.index(
+            "chmod +x /usr/local/bin/parsl-idle-shutdown.sh"
+        ) < init_script.index("/etc/cron.d/parsl-idle-shutdown")
+
+    def test_the_script_signals_completion(self, init_script):
+        """A sentinel is the only positive evidence UserData ran to the end.
+
+        Instance state, status checks, and stack status are all indifferent to
+        UserData, which is how #225 stayed invisible.
+        """
+        assert "touch /var/run/parsl_bastion_ready" in init_script
+        # After the parts that would have been skipped by the #225 abort.
+        assert init_script.index("parsl-bastion-manager.service") < init_script.index(
+            "parsl_bastion_ready"
+        )
+        assert init_script.index("parsl-idle-shutdown.sh") < init_script.index(
+            "parsl_bastion_ready"
+        )
