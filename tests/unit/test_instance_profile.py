@@ -19,7 +19,10 @@ import yaml
 from botocore.exceptions import ClientError
 from moto import mock_aws
 
-from parsl_ephemeral_provider.exceptions import ResourceNotFoundError
+from parsl_ephemeral_provider.exceptions import (
+    ResourceCreationError,
+    ResourceNotFoundError,
+)
 from parsl_ephemeral_provider.modes.detached import DetachedMode
 from parsl_ephemeral_provider.modes.standard import StandardMode
 from parsl_ephemeral_provider.utils.aws import (
@@ -464,6 +467,34 @@ class TestDeleteSSMInstanceProfile:
             "parsl-ephemeral-ssm-role-abc",
             "parsl-ephemeral-ssm-profile-abc",
         )
+
+    def test_an_inline_listing_failure_reports_failure(self, iam_session):
+        """``AccessDenied`` on ``ListRolePolicies`` must not be reported as success.
+
+        This is the failure mode #229 found, one step earlier: the teardown that
+        skipped inline policies altogether returned ``True`` while leaving every
+        bastion role standing. A caller whose policy omits ``iam:ListRolePolicies``
+        cannot delete the role either, so the honest answer is ``False`` -- the
+        return value is what an operator has to act on, since cleanup logs rather
+        than raises (#195).
+        """
+        session = iam_session
+        get_or_create_ssm_instance_profile(
+            session=session, name_suffix="denied", auto_create=True
+        )
+        real_client = session.client
+        denied = ClientError(
+            {"Error": {"Code": "AccessDenied", "Message": "no"}}, "ListRolePolicies"
+        )
+
+        def patched(service_name, *args, **kwargs):
+            client = real_client(service_name, *args, **kwargs)
+            if service_name == "iam":
+                client.list_role_policies = MagicMock(side_effect=denied)
+            return client
+
+        with patch.object(session, "client", side_effect=patched):
+            assert delete_ssm_instance_profile(session, "denied") is False
 
 
 class TestStandardModeProfileOwnership:
@@ -912,6 +943,54 @@ class TestBastionInstanceProfileLifecycle:
         assert delete_bastion_instance_profile(session, "twice-bastion") is True
         assert delete_bastion_instance_profile(session, "twice-bastion") is True
 
+    def test_an_unresolvable_account_fails_loudly(self, iam_session):
+        """The account ID scopes the SSM statement, so a guess is not acceptable.
+
+        Falling back to a wildcard would hand the bastion every workflow's
+        parameters; falling back to a literal would produce a policy that silently
+        matches nothing. Neither is visible until the manager crash-loops, so this
+        raises at create time instead.
+        """
+        session = iam_session
+        real_client = session.client
+
+        def patched(service_name, *args, **kwargs):
+            if service_name == "sts":
+                broken = MagicMock()
+                broken.get_caller_identity.side_effect = ClientError(
+                    {"Error": {"Code": "AccessDenied", "Message": "no"}},
+                    "GetCallerIdentity",
+                )
+                return broken
+            return real_client(service_name, *args, **kwargs)
+
+        with patch.object(session, "client", side_effect=patched):
+            with pytest.raises(ResourceCreationError, match="account ID"):
+                create_bastion_instance_profile(session, "no-account", "wf-1")
+
+    def test_a_policy_attach_failure_fails_loudly(self, iam_session):
+        """A role created without its inline policy is the #229 bastion again.
+
+        It would boot, register with SSM, report ``active``, and crash-loop on
+        ``AccessDenied`` instead of ``NoCredentialsError`` -- so the create must not
+        return an ARN it cannot stand behind.
+        """
+        session = iam_session
+        real_client = session.client
+        denied = ClientError(
+            {"Error": {"Code": "AccessDenied", "Message": "no"}}, "PutRolePolicy"
+        )
+
+        def patched(service_name, *args, **kwargs):
+            client = real_client(service_name, *args, **kwargs)
+            if service_name == "iam":
+                client.put_role_policy = MagicMock(side_effect=denied)
+            return client
+
+        with patch.object(session, "client", side_effect=patched):
+            with pytest.raises(ResourceCreationError, match="bastion policy"):
+                create_bastion_instance_profile(session, "no-policy", "wf-1")
+
     def test_recreating_rewrites_the_policy(self, iam_session):
         """A second create updates the workflow scope rather than leaving it stale.
 
@@ -933,3 +1012,132 @@ class TestBastionInstanceProfileLifecycle:
 
         assert "wf-new" in resources
         assert "wf-old" not in resources
+
+
+class TestDetachedModeBastionProfileOwnership:
+    """The mode's side of the gate: who created it decides who may delete it."""
+
+    def _mode(self, **kwargs):
+        return DetachedMode(
+            provider_id="own-test",
+            session=MagicMock(spec=boto3.Session),
+            state_store=MagicMock(),
+            workflow_id="wf-own",
+            **NETWORK_IDS,
+            **kwargs,
+        )
+
+    def test_a_supplied_arn_is_returned_unchanged_and_not_created(self):
+        """No pair is created, so there is nothing for cleanup to claim."""
+        arn = "arn:aws:iam::123456789012:instance-profile/mine"
+        mode = self._mode(bastion_instance_profile_arn=arn)
+
+        with patch(
+            "parsl_ephemeral_provider.modes.detached.create_bastion_instance_profile"
+        ) as create:
+            assert mode._resolve_bastion_instance_profile() == arn
+
+        create.assert_not_called()
+        assert mode._owns_bastion_profile is False
+
+    def test_a_supplied_arn_survives_cleanup(self):
+        """The whole point of the gate: it may be attached to other workloads."""
+        arn = "arn:aws:iam::123456789012:instance-profile/mine"
+        mode = self._mode(bastion_instance_profile_arn=arn)
+        mode._resolve_bastion_instance_profile()
+
+        with patch(
+            "parsl_ephemeral_provider.modes.detached.delete_bastion_instance_profile"
+        ) as delete:
+            mode._delete_bastion_instance_profile()
+
+        delete.assert_not_called()
+        assert mode.bastion_instance_profile_arn == arn
+
+    def test_a_created_pair_is_recorded_and_deleted(self):
+        mode = self._mode()
+
+        with patch(
+            "parsl_ephemeral_provider.modes.detached.create_bastion_instance_profile",
+            return_value="arn:aws:iam::123456789012:instance-profile/ours",
+        ) as create:
+            resolved = mode._resolve_bastion_instance_profile()
+
+        create.assert_called_once_with(mode.session, "own-test", "wf-own")
+        assert resolved == "arn:aws:iam::123456789012:instance-profile/ours"
+        assert mode._owns_bastion_profile is True
+
+        with patch(
+            "parsl_ephemeral_provider.modes.detached.delete_bastion_instance_profile"
+        ) as delete:
+            mode._delete_bastion_instance_profile()
+
+        delete.assert_called_once_with(mode.session, "own-test")
+        assert mode._owns_bastion_profile is False
+        assert mode.bastion_instance_profile_arn is None
+
+    def test_ownership_is_persisted_before_the_launch(self):
+        """``save_state`` runs inside the resolver, not after the bastion boots.
+
+        The flag is what authorises cleanup to delete the pair, so a crash between
+        creating the profile and the next save would leak a privileged principal --
+        exactly the #132 failure, reached by a different route.
+        """
+        mode = self._mode()
+        mode.save_state = MagicMock()
+
+        with patch(
+            "parsl_ephemeral_provider.modes.detached.create_bastion_instance_profile",
+            return_value="arn:aws:iam::123456789012:instance-profile/ours",
+        ):
+            mode._resolve_bastion_instance_profile()
+
+        mode.save_state.assert_called_once()
+
+    def test_ownership_survives_a_state_round_trip(self):
+        """A provider reconstructed from state must still know the pair is its own.
+
+        Otherwise the pair outlives the run that created it, which is the leak
+        rather than a variation on it.
+        """
+        mode = self._mode()
+        with patch(
+            "parsl_ephemeral_provider.modes.detached.create_bastion_instance_profile",
+            return_value="arn:aws:iam::123456789012:instance-profile/ours",
+        ):
+            mode._resolve_bastion_instance_profile()
+
+        # Round-trip through what save_state() actually wrote, rather than a state
+        # dict built here: a field the resolver sets and save_state omits is
+        # precisely the defect this test is for, and a hand-built dict would hide
+        # it.
+        state = mode.state_store.save_state.call_args[0][1]
+        restored = self._mode()
+        restored.state_store.load_state.return_value = state
+        restored.load_state()
+
+        assert restored._owns_bastion_profile is True
+        assert (
+            restored.bastion_instance_profile_arn
+            == "arn:aws:iam::123456789012:instance-profile/ours"
+        )
+
+    def test_a_delete_failure_is_logged_rather_than_raised(self):
+        """Cleanup must not mask the caller's real error.
+
+        Ownership is deliberately *not* cleared on failure, so a later sweep still
+        has grounds to delete the pair.
+        """
+        mode = self._mode()
+        mode._owns_bastion_profile = True
+        mode.bastion_instance_profile_arn = "arn:aws:iam::1:instance-profile/ours"
+
+        with patch(
+            "parsl_ephemeral_provider.modes.detached.delete_bastion_instance_profile",
+            side_effect=ClientError(
+                {"Error": {"Code": "AccessDenied", "Message": "no"}}, "DeleteRole"
+            ),
+        ):
+            mode._delete_bastion_instance_profile()
+
+        assert mode._owns_bastion_profile is True
