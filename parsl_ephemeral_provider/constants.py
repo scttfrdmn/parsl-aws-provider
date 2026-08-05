@@ -445,6 +445,26 @@ DEFAULT_BASTION_HOST_TYPE = "cloudformation"  # or "direct" (RunInstances)
 # against this constant rather than a copied-out "t3.micro".
 DEFAULT_BASTION_INSTANCE_TYPE = "t3.micro"
 
+# Delivery limits for the bastion's UserData, and the margin the shim must fit.
+#
+# The bastion init script is a whole program -- ~32 KB of shell wrapping an
+# ~850-line embedded Python orchestrator -- and #227 found it exceeded every
+# mechanism that was being used to deliver it: 10.4x the CloudFormation
+# parameter limit and 2.0x EC2's raw UserData limit. It is now staged in S3 and
+# fetched by a shim small enough that neither limit is a constraint again.
+#
+# Both limits are asserted at render time (`_prepare_bastion_user_data`) so a
+# future edit to the script cannot silently reintroduce #227: the failure would
+# otherwise appear only against live AWS, since substrate enforces neither.
+MAX_CFN_PARAMETER_BYTES = 4096  # CloudFormation parameter value, probed exactly
+MAX_EC2_USER_DATA_BYTES = 16384  # RunInstances UserData, before base64
+MAX_EC2_USER_DATA_B64_BYTES = 25600  # RunInstances UserData, after base64
+# How long the presigned GET on the staged script stays valid. The shim runs
+# once, seconds into first boot, so this only has to outlast instance
+# provisioning -- but a spot bastion can sit in `pending` for minutes, so the
+# window is generous rather than tight.
+BASTION_SCRIPT_URL_TTL = 3600  # seconds
+
 # Lambda defaults (minimal for imports)
 DEFAULT_LAMBDA_TIMEOUT = 300
 # python3.9 reached end of support, and this package requires Python >= 3.10

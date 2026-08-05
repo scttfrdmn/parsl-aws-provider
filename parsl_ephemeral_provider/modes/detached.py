@@ -17,13 +17,18 @@ import uuid
 from typing import Any, Dict, List, Optional
 
 import boto3
+from botocore.config import Config
 from botocore.exceptions import ClientError
 
 from parsl_ephemeral_provider.constants import (
+    BASTION_SCRIPT_URL_TTL,
     DEFAULT_BASTION_HOST_TYPE,
     DEFAULT_BASTION_IDLE_TIMEOUT,
     DEFAULT_PRESERVE_BASTION,
     IMDSV2_METADATA_OPTIONS,
+    MAX_CFN_PARAMETER_BYTES,
+    MAX_EC2_USER_DATA_B64_BYTES,
+    MAX_EC2_USER_DATA_BYTES,
     RESOURCE_TYPE_EC2,
     RESOURCE_TYPE_BASTION,
     RESOURCE_TYPE_CLOUDFORMATION,
@@ -140,6 +145,15 @@ class DetachedMode(OperatingMode):
         self.idle_timeout = idle_timeout
         self.preserve_bastion = preserve_bastion
         self.stack_name = None
+
+        # Where the bastion init script is staged for the instance to fetch
+        # (#227). The script is far too large to pass as UserData directly, so
+        # UserData is a shim that downloads this object. The ownership flag is
+        # the same guard as serverless mode's Lambda code bucket: a bucket this
+        # mode created is deleted at cleanup, one it merely found is not.
+        self._script_bucket: Optional[str] = None
+        self._script_key: Optional[str] = None
+        self._owns_script_bucket = False
 
         # Spot Fleet specific attributes
         self.use_spot_fleet = use_spot_fleet
@@ -337,8 +351,10 @@ class DetachedMode(OperatingMode):
             )
 
         try:
-            # Prepare bastion init script
-            init_script = self._prepare_bastion_init_script()
+            # UserData is the bootstrap shim, not the init script itself: the
+            # script is ~32 KB against EC2's 16 KB limit, so passing it here
+            # failed outright (#227). It is staged in S3 and fetched on boot.
+            init_script = self._prepare_bastion_user_data()
 
             # Prepare instance tags
             tags = [
@@ -457,8 +473,10 @@ class DetachedMode(OperatingMode):
             # Prepare stack name
             self.stack_name = f"parsl-bastion-{self.workflow_id[:8]}"
 
-            # Prepare bastion init script
-            init_script = self._prepare_bastion_init_script()
+            # The stack parameter carries the bootstrap shim, not the init
+            # script: base64 of the script was 42,740 B against a 4,096 B
+            # parameter limit, so create_stack rejected every bastion (#227).
+            init_script = self._prepare_bastion_user_data()
             init_script_b64 = base64.b64encode(init_script.encode()).decode()
 
             # Prepare tags
@@ -600,10 +618,69 @@ class DetachedMode(OperatingMode):
         if self.worker_init:
             init_script += f"# Custom initialization\n{self.worker_init}\n\n"
 
-        # Install required packages
+        # Install required packages.
+        #
+        # This block used to be a single `apt-get ... || yum ...` line including
+        # `awscli`, under `set -e` (#225). On Amazon Linux 2023 -- the default
+        # AMI family -- `apt-get` is absent so the left side failed, and
+        # `awscli` is not an installable package there (CLI v2 ships
+        # preinstalled, and the v1 package was dropped), so the right side
+        # failed too. Under `set -e` UserData aborted here, and everything
+        # below -- the manager script, its service, the idle-shutdown cron --
+        # never happened. The instance still reached `running` and the stack
+        # still reported CREATE_COMPLETE, which is why it went unnoticed.
+        #
+        # The package list is what a live AL2023 bastion actually needs, three
+        # corrections deep (each found by booting one, not by reading):
+        #
+        # - `python3-boto3`, not `pip install boto3`. The manager script imports
+        #   boto3 at module scope and no AMI ships it, so the original line could
+        #   not have produced a working bastion even had every package in it
+        #   resolved. But installing it via pip means first installing pip, and
+        #   `dnf install python3-pip` pulls in **python3.11** and repoints
+        #   /usr/bin/python3 at it -- which breaks `dnf` itself and AWS CLI v2,
+        #   both of which are python3.9 scripts (`ModuleNotFoundError: No module
+        #   named 'dnf'`). AL2023 packages boto3 for the system 3.9; use that.
+        # - `cronie`. AL2023 has no cron daemon installed, so `crontab -` below
+        #   failed with "command not found" and the idle-shutdown timer -- the
+        #   only thing that reads `idle_timeout` -- silently never ran.
+        # - no `python3` in the list. It is already present, and naming it
+        #   invites the same 3.11 substitution.
         init_script += "# Install required packages\n"
-        init_script += "apt-get update -y || yum update -y\n"
-        init_script += "apt-get install -y python3 python3-pip jq awscli || yum install -y python3 python3-pip jq awscli\n\n"
+        init_script += "if command -v dnf >/dev/null 2>&1; then\n"
+        init_script += "    dnf install -y python3-boto3 jq cronie\n"
+        init_script += "elif command -v yum >/dev/null 2>&1; then\n"
+        init_script += "    yum install -y python3-boto3 jq cronie\n"
+        init_script += "elif command -v apt-get >/dev/null 2>&1; then\n"
+        init_script += "    apt-get update -y\n"
+        init_script += "    apt-get install -y python3-boto3 jq cron\n"
+        init_script += "else\n"
+        init_script += '    echo "No supported package manager found" >&2\n'
+        init_script += "    exit 1\n"
+        init_script += "fi\n\n"
+
+        # crond is enabled on install but not started in the same boot.
+        init_script += "systemctl enable --now crond 2>/dev/null || "
+        init_script += "systemctl enable --now cron 2>/dev/null || true\n\n"
+
+        # Fail loudly on a missing prerequisite rather than pressing on and
+        # leaving a bastion that looks healthy but orchestrates nothing. Checking
+        # the outcome rather than the installer's exit status is deliberate: the
+        # `python3-pip` failure above was an installer that *succeeded* and left
+        # the system unable to run its own tools.
+        init_script += "# Verify prerequisites\n"
+        init_script += "for cmd in python3 jq; do\n"
+        init_script += '    command -v "$cmd" >/dev/null 2>&1 || '
+        init_script += '{ echo "Required command $cmd not found" >&2; exit 1; }\n'
+        init_script += "done\n"
+        init_script += 'python3 -c "import boto3" || '
+        init_script += '{ echo "boto3 not importable" >&2; exit 1; }\n'
+        # A *running* daemon, not merely an installed `crontab` client. The
+        # /etc/cron.d drop-in below is read by the daemon alone, so `crontab`
+        # being on PATH proves nothing about whether the timer will ever fire.
+        init_script += "systemctl is-active crond >/dev/null 2>&1 || "
+        init_script += "systemctl is-active cron >/dev/null 2>&1 || "
+        init_script += '{ echo "No cron daemon is running" >&2; exit 1; }\n\n'
 
         # Set up environment variables
         init_script += "# Set up environment variables\n"
@@ -684,11 +761,275 @@ class DetachedMode(OperatingMode):
         # Make idle shutdown script executable
         init_script += "chmod +x /usr/local/bin/parsl-idle-shutdown.sh\n\n"
 
-        # Create cron job for idle shutdown
-        init_script += "# Create cron job for idle shutdown\n"
-        init_script += "(crontab -l 2>/dev/null; echo '*/5 * * * * /usr/local/bin/parsl-idle-shutdown.sh') | crontab -\n\n"
+        # Register the idle-shutdown timer.
+        #
+        # This was `(crontab -l 2>/dev/null; echo '...') | crontab -`, which on a
+        # fresh bastion wrote a **0-byte** /var/spool/cron/root: `crontab -l` has
+        # nothing to list on an instance with no prior crontab, and on AL2023 it
+        # exits non-zero and prints its "no crontab for root" notice to stderr,
+        # so the subshell contributed nothing and -- because the `echo` and the
+        # pipe are evaluated together -- the append landed nowhere. The timer was
+        # registered on no schedule at all, which is the second reason
+        # `idle_timeout` could not work even after #225 installed cronie. Only
+        # reading /var/spool/cron/root on a live bastion showed it; every command
+        # in the pipeline exits 0.
+        #
+        # A file in /etc/cron.d needs no read-modify-write of existing state, so
+        # it has no empty-input case. It takes a user field (crontab(5) system
+        # format), must be mode 0644 and owned by root, and its name must contain
+        # no dot -- cron silently ignores files that violate any of those.
+        init_script += "# Register the idle-shutdown timer\n"
+        init_script += "cat > /etc/cron.d/parsl-idle-shutdown << 'EOL'\n"
+        init_script += "SHELL=/bin/bash\n"
+        init_script += "PATH=/sbin:/bin:/usr/sbin:/usr/bin\n"
+        init_script += "*/5 * * * * root /usr/local/bin/parsl-idle-shutdown.sh\n"
+        init_script += "EOL\n"
+        init_script += "chown root:root /etc/cron.d/parsl-idle-shutdown\n"
+        init_script += "chmod 0644 /etc/cron.d/parsl-idle-shutdown\n\n"
+
+        # Signal completion. The sentinel is the only positive evidence that the
+        # script ran to the end: instance state, status checks, and CloudFormation
+        # stack status are all indifferent to UserData, so #225's silent
+        # truncation looked identical to success from every side. Anything that
+        # wants to know whether a bastion is really orchestrating can check for
+        # this file over SSM.
+        init_script += "# Signal successful completion\n"
+        init_script += "touch /var/run/parsl_bastion_ready\n"
 
         return init_script
+
+    def _ensure_script_bucket(self) -> str:
+        """Return the S3 bucket used to stage the bastion init script.
+
+        A provider-scoped bucket is created on first use and removed by
+        ``cleanup_infrastructure()``. Mirrors serverless mode's
+        ``_ensure_lambda_code_bucket``, including the guard that matters:
+        ``_owns_script_bucket`` stays False for a bucket this mode merely found,
+        which is what stops cleanup from deleting someone else's.
+
+        Returns
+        -------
+        str
+            Name of the bucket to stage the init script in.
+        """
+        if self._script_bucket:
+            return self._script_bucket
+
+        s3 = self.session.client("s3")
+        region = self.session.region_name
+        # provider_id first, as it is the random part: the provider truncates
+        # every ID it embeds to eight characters, and a shared prefix would give
+        # every provider in an account the same bucket name.
+        bucket = f"parsl-bastion-script-{self.provider_id[:8]}"
+
+        try:
+            # us-east-1 is the one region CreateBucket rejects a
+            # LocationConstraint for.
+            if region and region != "us-east-1":
+                s3.create_bucket(
+                    Bucket=bucket,
+                    CreateBucketConfiguration={"LocationConstraint": region},
+                )
+            else:
+                s3.create_bucket(Bucket=bucket)
+            self._owns_script_bucket = True
+            logger.debug(f"Created bastion script bucket {bucket}")
+        except ClientError as e:
+            code = e.response.get("Error", {}).get("Code")
+            # Already ours (a restart, or a rebuilt bastion in the same run).
+            if code not in ("BucketAlreadyOwnedByYou", "BucketAlreadyExists"):
+                raise
+            logger.debug(f"Reusing existing bastion script bucket {bucket}")
+
+        self._script_bucket = bucket
+        return bucket
+
+    def _stage_bastion_init_script(self, init_script: str) -> str:
+        """Upload the init script to S3 and return a presigned URL for it.
+
+        Parameters
+        ----------
+        init_script : str
+            The rendered init script.
+
+        Returns
+        -------
+        str
+            A presigned GET URL valid for ``BASTION_SCRIPT_URL_TTL`` seconds.
+
+        Notes
+        -----
+        A **presigned** URL rather than an ``aws s3 cp`` against the instance's
+        own role, because the direct (``RunInstances``) path attaches no
+        instance profile at all -- ``IamInstanceProfile`` appears nowhere on
+        that path -- so a credentialed fetch would rescue only the
+        CloudFormation bastion. A presigned URL needs no credentials on the
+        instance and so fixes both paths with one mechanism.
+
+        The object is private: the URL carries the authorization, and the
+        bucket keeps its account defaults.
+        """
+        bucket = self._ensure_script_bucket()
+        key = f"bastion-init-{self.workflow_id[:8]}.sh"
+        # SigV4 must be requested explicitly. botocore's *presigner* still
+        # defaults to SigV2 even though `client.meta.config.signature_version`
+        # reports "s3v4" -- verified both ways: the default presign emits
+        # `?AWSAccessKeyId=...&Signature=...`, which every region created after
+        # 2014 rejects, and which the substrate emulator answers with 501.
+        s3 = self.session.client("s3", config=Config(signature_version="s3v4"))
+
+        s3.put_object(
+            Bucket=bucket,
+            Key=key,
+            Body=init_script.encode(),
+            ServerSideEncryption="AES256",
+        )
+        self._script_key = key
+        logger.debug(
+            f"Staged bastion init script ({len(init_script)} B) at s3://{bucket}/{key}"
+        )
+
+        url: str = s3.generate_presigned_url(
+            "get_object",
+            Params={"Bucket": bucket, "Key": key},
+            ExpiresIn=BASTION_SCRIPT_URL_TTL,
+        )
+        return url
+
+    def _render_bastion_shim(self, script_url: str) -> str:
+        """Build the small UserData script that fetches and runs the init script.
+
+        Parameters
+        ----------
+        script_url : str
+            Presigned URL of the staged init script.
+
+        Returns
+        -------
+        str
+            A few hundred bytes of shell -- the actual UserData.
+
+        Notes
+        -----
+        ``curl`` rather than the AWS CLI: it is present on every supported AMI,
+        and unlike ``aws s3 cp`` it needs no credentials for a presigned URL.
+        Deliberately **not** under ``set -e``; instead each step is checked and
+        failure is written to a sentinel file, because a UserData that aborts
+        silently is exactly how #225 went unnoticed -- CloudFormation reports
+        CREATE_COMPLETE either way, since stack health says nothing about
+        UserData.
+        """
+        return f"""#!/bin/bash
+# Parsl bastion bootstrap shim. The real init script is staged in S3 (#227):
+# at ~32 KB it exceeds both the 4 KB CloudFormation parameter limit and the
+# 16 KB EC2 UserData limit, so only this fetch travels as UserData.
+SCRIPT=/var/lib/parsl-bastion-init.sh
+STATUS=/var/log/parsl-bastion-bootstrap.status
+
+if ! curl -fsSL --retry 5 --retry-delay 5 -o "$SCRIPT" '{script_url}'; then
+    echo "FAILED: could not download bastion init script" > "$STATUS"
+    exit 1
+fi
+
+chmod 700 "$SCRIPT"
+if bash "$SCRIPT" >> /var/log/parsl-bastion-init.log 2>&1; then
+    echo "OK" > "$STATUS"
+else
+    echo "FAILED: bastion init script exited $?" > "$STATUS"
+    exit 1
+fi
+"""
+
+    def _prepare_bastion_user_data(self) -> str:
+        """Render the init script, stage it, and return the UserData to send.
+
+        Returns
+        -------
+        str
+            The bootstrap shim -- small enough for every delivery mechanism.
+
+        Raises
+        ------
+        ResourceCreationError
+            If the shim does not fit the limits it is meant to respect.
+
+        Notes
+        -----
+        The size assertion is the point of this seam, not a formality. #227 was
+        undetectable in-tree: nothing rendered the script and measured it, and
+        substrate enforces neither limit, so a 10x overrun reached live AWS and
+        made detached mode unusable. Checking here means a future edit that
+        inflates the payload fails in the unit suite instead.
+        """
+        init_script = self._prepare_bastion_init_script()
+        script_url = self._stage_bastion_init_script(init_script)
+        shim = self._render_bastion_shim(script_url)
+
+        raw = len(shim.encode())
+        encoded = len(base64.b64encode(shim.encode()))
+        # The CloudFormation path sends the base64 form as a stack parameter, so
+        # it is the tightest of the three limits by a wide margin. Checking all
+        # three regardless of bastion_host_type keeps the guarantee independent
+        # of which path a given provider happens to take.
+        for size, limit, what in (
+            (encoded, MAX_CFN_PARAMETER_BYTES, "CloudFormation parameter"),
+            (raw, MAX_EC2_USER_DATA_BYTES, "EC2 UserData"),
+            (encoded, MAX_EC2_USER_DATA_B64_BYTES, "EC2 encoded UserData"),
+        ):
+            if size > limit:
+                raise ResourceCreationError(
+                    f"Bastion UserData shim is {size} B, over the {limit} B "
+                    f"{what} limit. The init script is staged in S3 precisely so "
+                    f"this cannot happen (#227); something has been added to the "
+                    f"shim itself, which must stay small."
+                )
+
+        return shim
+
+    def _delete_staged_bastion_script(self) -> None:
+        """Delete the staged init script object and, if owned, its bucket.
+
+        Failures are logged rather than raised: this runs from cleanup, where
+        masking the caller's real error would be worse than leaving an object
+        behind.
+        """
+        if not self._script_bucket:
+            return
+
+        bucket = self._script_bucket
+        s3 = self.session.client("s3")
+
+        if self._script_key:
+            try:
+                s3.delete_object(Bucket=bucket, Key=self._script_key)
+                logger.debug(
+                    f"Deleted staged bastion script s3://{bucket}/{self._script_key}"
+                )
+            except Exception as e:
+                logger.warning(f"Failed to delete staged bastion script: {e}")
+            finally:
+                self._script_key = None
+
+        # Ownership gate: a bucket supplied or pre-existing is left alone.
+        if not self._owns_script_bucket:
+            return
+
+        try:
+            # A bucket must be empty before it can be deleted; anything left
+            # here is a script whose bastion never reached cleanup.
+            paginator = s3.get_paginator("list_objects_v2")
+            for page in paginator.paginate(Bucket=bucket):
+                objects = [{"Key": obj["Key"]} for obj in page.get("Contents", [])]
+                if objects:
+                    s3.delete_objects(Bucket=bucket, Delete={"Objects": objects})
+
+            s3.delete_bucket(Bucket=bucket)
+            logger.debug(f"Deleted bastion script bucket {bucket}")
+        except Exception as e:
+            logger.warning(f"Failed to delete bastion script bucket {bucket}: {e}")
+        finally:
+            self._script_bucket = None
+            self._owns_script_bucket = False
 
     def _get_bastion_manager_script(self) -> str:
         """Get the Python script for the bastion manager.
@@ -1903,6 +2244,16 @@ if __name__ == '__main__':
 
             self.bastion_id = None
 
+        # The staged init script outlives its bastion otherwise: the object is
+        # only needed during first boot, so once the bastion is gone it is a
+        # leaked object in a leaked bucket (#227). Deliberately *outside* the
+        # branch above, which is gated on `self.bastion_id`: a script staged for
+        # a bastion whose creation then failed would otherwise never be
+        # collected, and that is exactly the path #227 made common. Still
+        # skipped for a preserved bastion, which may be rebuilt from it.
+        if not self.preserve_bastion:
+            self._delete_staged_bastion_script()
+
         # Tear down the monitoring thread only when the bastion is going too --
         # a preserved bastion is still running workers worth watching. (There is
         # no networking to delete here; the comment that used to say so predated
@@ -2061,6 +2412,13 @@ if __name__ == '__main__':
             "bastion_host_type": self.bastion_host_type,
             "stack_name": self.stack_name,
             "spot_interruption_handling": self.spot_interruption_handling,
+            # Without these, a provider reconstructed from state cannot clean up
+            # the script bucket it created -- the same reasoning as #132's
+            # owns_instance_profile: ownership has to survive persistence or
+            # cleanup silently skips what it is responsible for.
+            "script_bucket": self._script_bucket,
+            "script_key": self._script_key,
+            "owns_script_bucket": self._owns_script_bucket,
         }
 
         try:
@@ -2088,6 +2446,11 @@ if __name__ == '__main__':
                     "bastion_host_type", self.bastion_host_type
                 )
                 self.stack_name = state.get("stack_name", self.stack_name)
+                self._script_bucket = state.get("script_bucket", self._script_bucket)
+                self._script_key = state.get("script_key", self._script_key)
+                self._owns_script_bucket = state.get(
+                    "owns_script_bucket", self._owns_script_bucket
+                )
 
                 # Check if spot interruption handling was previously enabled
                 previous_spot_handling = state.get("spot_interruption_handling", False)

@@ -148,6 +148,83 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The ECS and S3 coverage passed against live AWS.
 
 ### Fixed
+- **Detached mode could not create a bastion at all** (#227). The init script the
+  bastion boots from is ~32 KB — 42,740 B base64-encoded — against a **4,096 B**
+  CloudFormation parameter limit and a **16,384 B** `RunInstances` UserData limit.
+  Both bastion paths therefore failed: `create_stack` rejected the parameter
+  outright, and the direct path was refused by EC2. gzip does not rescue it (34 KB
+  compresses to 8,333 B — inside EC2's limit, still double CloudFormation's).
+
+  The script is now uploaded to S3 and UserData carries only a shim that fetches
+  it. The URL is **presigned**, not an `aws s3 cp` against the instance's own
+  role, because the direct path attaches no instance profile (#229), so a
+  credentialed fetch would have rescued only the CloudFormation bastion. One
+  mechanism now fixes both.
+
+  The bucket is provider-scoped, created on first use, and deleted on cleanup
+  **only if this mode created it** — the ownership gate #100 established for the
+  serverless security group. Staged-script cleanup is gated on `preserve_bastion`
+  alone rather than on the bastion having been created, so a script staged for a
+  bastion whose creation then failed is still collected.
+
+  Verified against real AWS: a bastion stack reached `CREATE_COMPLETE` and a
+  direct-path bastion launched, both from a UserData shim under 4,096 B, and the
+  two live cleanup E2E tests that previously errored during construction now pass.
+  Verified against substrate that the presigned URL in UserData really serves the
+  script over HTTP — which caught a defect no mock could: botocore's *presigner*
+  emits SigV2 even when `client.meta.config.signature_version` reports `s3v4`, and
+  SigV2 is rejected by every region created after 2014 (substrate answers 501).
+  `Config(signature_version="s3v4")` is now passed explicitly.
+
+  The size assertions assume the **worst-case** URL. A presigned URL is 175 B with
+  static keys but **1,064 B** under session-token credentials, where the token
+  alone is ~664 B — measured, after an assertion written against the short form
+  would have passed in development and failed for anyone using a role.
+- **The bastion init script aborted on its first `dnf` line, so no bastion ever
+  orchestrated anything** (#225). It ran under `set -e` and then
+  `apt-get install -y python3 python3-pip jq awscli || yum install ...`. On Amazon
+  Linux 2023 — the default AMI family — `apt-get` does not exist, and `awscli` is
+  not an installable package there (CLI v2 ships preinstalled; the v1 package was
+  dropped). Both sides failed, `set -e` aborted, and the manager script, its
+  systemd service and the idle-shutdown timer were never installed. The instance
+  still reached `running` and the stack still reported `CREATE_COMPLETE`.
+
+  The install now dispatches on the available package manager, and the package
+  list is three corrections deep — each found by booting a bastion, not by reading
+  the shell:
+
+  - **`python3-boto3`, not `pip install boto3`.** The manager imports boto3 at
+    module scope and no AMI ships it, so the original line could not have produced
+    a working bastion even had every package in it resolved. But `dnf install
+    python3-pip` pulls in **python3.11** and repoints `/usr/bin/python3` at it,
+    breaking `dnf` itself and AWS CLI v2 — both python3.9 scripts — with
+    `ModuleNotFoundError: No module named 'dnf'`. AL2023 packages boto3 for the
+    system 3.9.
+  - **`cronie`.** AL2023 installs no cron daemon, so the idle-shutdown timer — the
+    only thing that reads `idle_timeout` — was registered against a `crontab` that
+    did not exist.
+  - **no `python3` in the list.** It is already present, and naming it invites the
+    same 3.11 substitution.
+
+  The script now also verifies its prerequisites by outcome rather than by
+  installer exit status (the pip failure was an installer that *succeeded* and left
+  the system unable to run its own tools), and ends by touching
+  `/var/run/parsl_bastion_ready`. That sentinel is the only positive evidence
+  UserData ran to the end: instance state, status checks and stack status are all
+  indifferent to it, which is how this stayed invisible.
+- **The idle-shutdown timer was registered on no schedule** (#225). Even with a
+  cron daemon installed, `(crontab -l 2>/dev/null; echo '...') | crontab -` left
+  `/var/spool/cron/root` at **0 bytes** on a fresh bastion: `crontab -l` has
+  nothing to list there and exits non-zero, so the subshell contributed nothing
+  and the append landed nowhere — while every command in the pipeline exited 0.
+  `idle_timeout` could not work, and with the default `preserve_bastion=True`
+  nothing else reclaims a bastion.
+
+  The timer is now a `/etc/cron.d/parsl-idle-shutdown` drop-in, which has no
+  read-modify-write step and so no empty-input case. The prerequisite check now
+  requires a *running* daemon (`systemctl is-active crond`) rather than the
+  `crontab` client being on `PATH`; the client's presence said nothing about
+  whether the drop-in would ever be read.
 - **The S3 bucket-creation E2E test asserted absence and presence through one
   client.** A boto3 S3 client that has received a 404 for a bucket name keeps
   answering 404 for that name after a *different* client creates the bucket —

@@ -23,11 +23,19 @@ SPDX-License-Identifier: Apache-2.0
 SPDX-FileCopyrightText: 2025-2026 Scott Friedman and Project Contributors
 """
 
+import base64
 import os
+import re
+import urllib.request
 import uuid
 
 import pytest
 
+from parsl_ephemeral_provider.constants import (
+    BASTION_SCRIPT_URL_TTL,
+    MAX_CFN_PARAMETER_BYTES,
+    MAX_EC2_USER_DATA_BYTES,
+)
 from parsl_ephemeral_provider.modes.detached import DetachedMode
 from parsl_ephemeral_provider.modes.serverless import ServerlessMode
 from parsl_ephemeral_provider.modes.standard import StandardMode
@@ -199,6 +207,127 @@ class TestDetachedModeSubstrate:
         assert mode.bastion_id is None
         # Again, the caller's network outlives the mode.
         assert mode.vpc_id == substrate_network["vpc_id"]
+
+    def test_the_bastion_script_is_staged_and_fetchable(
+        self, substrate_session, substrate_network, temp_state_store, provider_id
+    ):
+        """The staged script really is retrievable by the URL in UserData (#227).
+
+        This is the assertion that needed an emulator rather than a mock. The
+        init script is ~32 KB against a 4,096 B CloudFormation parameter limit
+        and a 16,384 B EC2 UserData limit, so it is uploaded to S3 and UserData
+        carries only a presigned fetch. A unit test can show that ``put_object``
+        was *called*; only a real S3 and a real HTTP GET show that the URL the
+        bastion is handed actually returns the script.
+
+        It caught a defect a mock could not: botocore's presigner emits SigV2 by
+        default even when the client reports ``s3v4``, and a SigV2 URL is
+        rejected by every region created after 2014 (substrate answers 501).
+        """
+        mode = self._mode(
+            substrate_session, substrate_network, temp_state_store, provider_id
+        )
+
+        # This test needs the bucket *absent*, so that the mode creates it and
+        # therefore owns it. The name derives from ``provider_id[:8]``, which
+        # truncates to a shared ``test-pro`` across the file, so a bucket left by
+        # a sibling test would make the mode a non-owner and the cleanup
+        # assertions below would fail for the wrong reason.
+        s3 = substrate_session.client("s3")
+        leftover = f"parsl-bastion-script-{mode.provider_id[:8]}"
+        try:
+            for obj in s3.list_objects_v2(Bucket=leftover).get("Contents", []):
+                s3.delete_object(Bucket=leftover, Key=obj["Key"])
+            s3.delete_bucket(Bucket=leftover)
+        except s3.exceptions.NoSuchBucket:
+            pass
+
+        try:
+            user_data = mode._prepare_bastion_user_data()
+            assert mode._owns_script_bucket is True
+
+            # UserData is a fetch, not the program.
+            assert len(user_data.encode()) < MAX_EC2_USER_DATA_BYTES
+            assert len(base64.b64encode(user_data.encode())) < MAX_CFN_PARAMETER_BYTES
+            assert "parsl-bastion-manager.py" not in user_data
+
+            # The object exists where the mode says it staged it.
+            s3 = substrate_session.client("s3")
+            staged = s3.get_object(Bucket=mode._script_bucket, Key=mode._script_key)[
+                "Body"
+            ].read()
+            assert b"parsl-bastion-manager.py" in staged
+            assert len(staged) > MAX_EC2_USER_DATA_BYTES
+
+            # And the URL embedded in UserData serves it, unauthenticated --
+            # which is the whole reason for a presigned URL: the direct path
+            # attaches no instance profile, so the bastion has no credentials
+            # of its own to fetch with.
+            match = re.search(r"'(https?://[^']+)'", user_data)
+            assert match is not None, "no fetch URL found in UserData"
+            with urllib.request.urlopen(match.group(1), timeout=30) as response:
+                assert response.read() == staged
+
+            # A SigV4 URL, not the SigV2 one botocore's presigner emits by
+            # default. That default is what substrate answers 501 to, and what
+            # post-2014 regions reject outright.
+            assert "X-Amz-Algorithm=AWS4-HMAC-SHA256" in match.group(1)
+            assert f"X-Amz-Expires={BASTION_SCRIPT_URL_TTL}" in match.group(1)
+        finally:
+            mode.preserve_bastion = False
+            mode.cleanup_infrastructure()
+
+        # Cleanup removes the object and the bucket the mode created, so a
+        # bastion's script does not outlive it.
+        assert mode._script_key is None
+        assert mode._script_bucket is None
+
+    def test_a_caller_supplied_script_bucket_survives_cleanup(
+        self, substrate_session, substrate_network, temp_state_store, provider_id
+    ):
+        """Cleanup deletes only a bucket this mode created.
+
+        The ownership gate, same hazard class as the serverless security-group
+        deletion fixed in #100: an existing bucket is reused, and
+        ``_owns_script_bucket`` stays False, which is what keeps it.
+        """
+        mode = self._mode(
+            substrate_session, substrate_network, temp_state_store, provider_id
+        )
+
+        s3 = substrate_session.client("s3")
+        bucket = f"parsl-bastion-script-{mode.provider_id[:8]}"
+        create_args = {"Bucket": bucket}
+        if substrate_session.region_name != "us-east-1":
+            create_args["CreateBucketConfiguration"] = {
+                "LocationConstraint": substrate_session.region_name
+            }
+        # Tolerated because the bucket name is what is under test: the mode
+        # derives it from ``provider_id[:8]``, and the ``provider_id`` fixture's
+        # value truncates to a shared ``test-pro`` for every test in the file --
+        # the same "put the random part first" trap the module docstring records
+        # for job IDs. Pre-existing is precisely the state this test wants.
+        try:
+            s3.create_bucket(**create_args)
+        except s3.exceptions.BucketAlreadyExists:
+            pass
+        except s3.exceptions.BucketAlreadyOwnedByYou:
+            pass
+
+        try:
+            mode._prepare_bastion_user_data()
+            assert mode._script_bucket == bucket
+            assert mode._owns_script_bucket is False
+
+            mode.preserve_bastion = False
+            mode.cleanup_infrastructure()
+
+            # The bucket is still there; only the object went.
+            s3.head_bucket(Bucket=bucket)
+        finally:
+            for obj in s3.list_objects_v2(Bucket=bucket).get("Contents", []):
+                s3.delete_object(Bucket=bucket, Key=obj["Key"])
+            s3.delete_bucket(Bucket=bucket)
 
     def test_submit_job_and_status(
         self, substrate_session, substrate_network, temp_state_store, provider_id
