@@ -9,18 +9,28 @@ SPDX-License-Identifier: Apache-2.0
 SPDX-FileCopyrightText: 2025-2026 Scott Friedman and Project Contributors
 """
 
+import re
+import uuid
 from unittest.mock import MagicMock, patch
 
 import boto3
 import pytest
+import yaml
 from botocore.exceptions import ClientError
 from moto import mock_aws
 
 from parsl_ephemeral_provider.exceptions import ResourceNotFoundError
+from parsl_ephemeral_provider.modes.detached import DetachedMode
 from parsl_ephemeral_provider.modes.standard import StandardMode
 from parsl_ephemeral_provider.utils.aws import (
+    BASTION_INLINE_POLICY_NAME,
     _wait_for_instance_profile,
+    bastion_instance_profile_names,
+    bastion_role_policy,
+    create_bastion_instance_profile,
+    delete_bastion_instance_profile,
     delete_ssm_instance_profile,
+    get_cf_template,
     get_or_create_ssm_instance_profile,
     ssm_instance_profile_names,
 )
@@ -663,3 +673,263 @@ class TestStandardModeProfileOwnership:
             mode.initialize()
 
         delete.assert_called_once_with(mock_session, "test-provider")
+
+
+class TestBastionRolePolicy:
+    """The bastion policy has to match what the manager script actually calls.
+
+    A bastion whose policy is missing an action fails the same way a bastion with
+    no policy at all does -- at runtime, inside a loop that ``Restart=always``
+    restarts every ten seconds, while ``systemctl is-active`` keeps reporting
+    ``active`` (#229). So the policy is asserted against the script rather than
+    against a plausible-looking list.
+    """
+
+    def _script_calls(self):
+        """Every AWS API the generated bastion manager script invokes.
+
+        Parsed out of the script rather than listed here: a hand-maintained copy
+        of this list would drift from the script, which is the exact failure the
+        test exists to catch.
+        """
+        mode = DetachedMode(
+            provider_id="policy-test",
+            session=MagicMock(spec=boto3.Session),
+            state_store=MagicMock(),
+            workflow_id="wf-policy",
+            **NETWORK_IDS,
+        )
+        script = mode._get_bastion_manager_script()
+
+        calls = set()
+        # `ssm.get_parameter(...)`, `ec2.run_instances(...)`, and the paginators,
+        # which authorize as the operation they paginate rather than as
+        # `GetPaginator`.
+        for service, method in re.findall(r"\b(ec2|ssm)\.([a-z_]+)\(", script):
+            if method == "get_paginator":
+                continue
+            calls.add((service, method))
+        for service, method in re.findall(
+            r"\b(ec2|ssm)\.get_paginator\(['\"]([a-z_]+)", script
+        ):
+            calls.add((service, method))
+        return calls
+
+    def _policy_actions(self, policy):
+        return {
+            action
+            for statement in policy["Statement"]
+            for action in statement["Action"]
+        }
+
+    @staticmethod
+    def _to_api_name(snake):
+        """``get_parameters_by_path`` -> ``GetParametersByPath``."""
+        return "".join(part.title() for part in snake.split("_"))
+
+    def test_every_call_the_script_makes_is_granted(self):
+        """No action the manager invokes may be missing from the policy.
+
+        This is what found the CloudFormation policy short: it granted neither
+        ``ec2:RunInstances`` nor any of the launch-template or fleet calls, so a
+        bastion deployed by ``bastion.yml`` could not launch a worker either. The
+        direct path's total absence of credentials was the louder half of #229,
+        not the whole of it.
+        """
+        granted = self._policy_actions(
+            bastion_role_policy("us-east-1", "123456789012", "wf-1")
+        )
+        # AmazonSSMManagedInstanceCore covers the agent's own ssm:* traffic, which
+        # is not what the script calls; only the script's calls are checked here.
+        required = {
+            f"{service}:{self._to_api_name(method)}"
+            for service, method in self._script_calls()
+        }
+
+        assert required, "the script parse found nothing, so this proves nothing"
+        assert not required - granted, (
+            f"the manager script calls {sorted(required - granted)}, which the "
+            "bastion policy does not grant"
+        )
+
+    def test_nothing_is_granted_that_the_script_never_calls(self):
+        """The reverse direction: no action beyond what the script needs.
+
+        ``bastion.yml`` granted ``ec2:StartInstances`` and ``ec2:StopInstances``
+        for a script that only ever terminates workers -- and this assertion also
+        caught ``ec2:DescribeInstanceStatus`` and ``ec2:DescribeTags``, which the
+        script has never called either. Least privilege is the point: this role
+        can already terminate instances, so surplus grants on it are not free.
+
+        ``ec2:CreateTags`` is the one grant that is required without appearing as
+        a call. The script tags through ``TagSpecifications`` on
+        ``RunInstances``/``CreateFleet``/``CreateLaunchTemplate``, which AWS
+        authorizes as ``CreateTags`` against the resource being created.
+        """
+        implied_by_tag_specifications = {"ec2:CreateTags"}
+        granted = (
+            self._policy_actions(
+                bastion_role_policy("us-east-1", "123456789012", "wf-1")
+            )
+            - implied_by_tag_specifications
+        )
+        called = {
+            f"{service}:{self._to_api_name(method)}"
+            for service, method in self._script_calls()
+        }
+
+        assert not granted - called, (
+            f"the bastion policy grants {sorted(granted - called)}, which the "
+            "manager script never calls"
+        )
+
+    def test_no_pass_role(self):
+        """``iam:PassRole`` is deliberately absent.
+
+        The manager launches workers with no instance profile, so it passes no
+        role. Granting it would let a compromised bastion attach any passable
+        role to an instance it launches -- a privilege-escalation primitive, not a
+        convenience.
+        """
+        granted = self._policy_actions(
+            bastion_role_policy("us-east-1", "123456789012", "wf-1")
+        )
+
+        assert not any(action.startswith("iam:") for action in granted)
+
+    def test_ssm_is_scoped_to_the_workflow(self):
+        """The parameter path is the control channel, so it must not be broad.
+
+        Job commands live under it. A bastion that could read another workflow's
+        path could read that workflow's commands.
+        """
+        policy = bastion_role_policy("eu-west-1", "999988887777", "wf-scoped")
+        ssm_statements = [
+            statement
+            for statement in policy["Statement"]
+            if any(action.startswith("ssm:") for action in statement["Action"])
+        ]
+
+        assert len(ssm_statements) == 1
+        assert ssm_statements[0]["Resource"] == (
+            "arn:aws:ssm:eu-west-1:999988887777:parameter/parsl/workflows/wf-scoped/*"
+        )
+
+    def test_it_matches_the_cloudformation_template(self):
+        """Both bastion paths run the same script, so both policies must agree.
+
+        Two deployment paths granting different permissions means a bug reachable
+        from one of them only, which is the hardest kind to find -- #229 is an
+        instance of exactly that.
+        """
+        template = yaml.safe_load(
+            # `!Sub` and friends would otherwise stop safe_load; only the
+            # BastionHostPolicy actions are needed, so the tags are neutralised.
+            re.sub(r"!\w+", "", get_cf_template("bastion.yml"))
+        )
+        policies = template["Resources"]["BastionHostRole"]["Properties"]["Policies"]
+        cfn_actions = {
+            action
+            for policy in policies
+            for statement in policy["PolicyDocument"]["Statement"]
+            for action in statement["Action"]
+        }
+        python_actions = self._policy_actions(
+            bastion_role_policy("us-east-1", "123456789012", "wf-1")
+        )
+
+        assert cfn_actions == python_actions
+
+
+class TestBastionInstanceProfileLifecycle:
+    """Create-and-delete for the bastion pair, with the #132 ownership gate."""
+
+    def test_round_trip_leaves_nothing_behind(self, iam_session):
+        """The inline policy must not strand the role.
+
+        This is where the bastion pair differs from the SSM pair: its permissions
+        are inline (scoped to one workflow, so there is nothing reusable to make a
+        managed policy from), and ``delete_role`` refuses while an inline policy
+        remains just as it does for a managed one. The two are listed and removed
+        by different API calls, so a teardown handling only managed policies would
+        delete every SSM pair and no bastion pair.
+        """
+        session = iam_session
+        iam = session.client("iam")
+
+        create_bastion_instance_profile(session, "rt-bastion", "wf-rt")
+        role_name, profile_name = bastion_instance_profile_names("rt-bastion")
+        iam.get_role(RoleName=role_name)
+        iam.get_instance_profile(InstanceProfileName=profile_name)
+        # Precondition: the inline policy really is there, so its removal below
+        # is what makes the delete succeed.
+        assert iam.list_role_policies(RoleName=role_name)["PolicyNames"] == [
+            BASTION_INLINE_POLICY_NAME
+        ]
+
+        assert delete_bastion_instance_profile(session, "rt-bastion") is True
+
+        with pytest.raises(ClientError) as role_gone:
+            iam.get_role(RoleName=role_name)
+        assert role_gone.value.response["Error"]["Code"] == "NoSuchEntity"
+        with pytest.raises(ClientError):
+            iam.get_instance_profile(InstanceProfileName=profile_name)
+
+    def test_the_two_pairs_do_not_collide(self, iam_session):
+        """A bastion pair and an SSM pair for the same provider are distinct.
+
+        A detached-mode provider can hold both, so shared names would mean each
+        creator repairing the other's role and either teardown deleting the
+        other's credentials.
+        """
+        bastion_names = set(bastion_instance_profile_names("same-id"))
+        ssm_names = set(ssm_instance_profile_names("same-id"))
+
+        assert not bastion_names & ssm_names
+
+    def test_the_names_fit_iams_limit(self):
+        """IAM caps role and profile names at 64 characters.
+
+        ``provider_id`` is a UUID by default -- 36 characters -- and a name over
+        the limit fails at ``create_role``, i.e. only on the live path.
+        """
+        for name in bastion_instance_profile_names(str(uuid.uuid4())):
+            assert len(name) <= 64
+
+    def test_is_idempotent(self, iam_session):
+        """Re-creating repairs rather than fails, and re-deleting is not an error.
+
+        ``put_role_policy`` is a replace keyed on the policy name, which is what
+        makes the second create update a role left by an older version whose
+        policy was narrower.
+        """
+        session = iam_session
+
+        first = create_bastion_instance_profile(session, "twice-bastion", "wf-1")
+        second = create_bastion_instance_profile(session, "twice-bastion", "wf-1")
+        assert first == second
+
+        assert delete_bastion_instance_profile(session, "twice-bastion") is True
+        assert delete_bastion_instance_profile(session, "twice-bastion") is True
+
+    def test_recreating_rewrites_the_policy(self, iam_session):
+        """A second create updates the workflow scope rather than leaving it stale.
+
+        A resumed provider whose workflow ID changed would otherwise carry a
+        policy scoped to the previous workflow's parameter path and be unable to
+        read its own jobs.
+        """
+        session = iam_session
+        iam = session.client("iam")
+
+        create_bastion_instance_profile(session, "rescope", "wf-old")
+        create_bastion_instance_profile(session, "rescope", "wf-new")
+
+        role_name, _ = bastion_instance_profile_names("rescope")
+        document = iam.get_role_policy(
+            RoleName=role_name, PolicyName=BASTION_INLINE_POLICY_NAME
+        )["PolicyDocument"]
+        resources = str(document)
+
+        assert "wf-new" in resources
+        assert "wf-old" not in resources

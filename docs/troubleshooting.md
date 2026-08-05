@@ -379,6 +379,31 @@ Then SSM to the bastion and read its journal. The bastion needs outbound access
 for the SSM agent to register — a private subnet requires a NAT gateway or the
 `ssm`/`ssmmessages`/`ec2messages` VPC endpoints.
 
+### The bastion is up and healthy, but no worker ever launches
+
+Check the manager service's *uptime*, not whether it is active:
+
+```bash
+aws ssm start-session --target i-<bastion> --region us-east-1
+sudo systemctl show parsl-bastion-manager -p ActiveEnterTimestamp -p NRestarts
+sudo journalctl -u parsl-bastion-manager -n 50
+```
+
+`systemctl is-active` reports `active` for a service that is crash-looping under
+`Restart=always`, so it cannot tell a working manager from one that dies at every
+start. A high `NRestarts` or an `ActiveEnterTimestamp` seconds old is the tell. Two
+other signals mislead here as well: the UserData sentinel file is touched before the
+manager starts, and SSM `PingStatus: Online` says nothing about the instance profile
+when Default Host Management Configuration is enabled, since DHMC registers
+instances that have no profile at all.
+
+Before v0.10.0 the direct (`bastion_host_type="direct"`) path attached no instance
+profile, so the manager died on `NoCredentialsError` every ten seconds forever
+([#229](https://github.com/scttfrdmn/parsl-ephemeral-provider/issues/229)). If the
+journal shows `NoCredentialsError`, or `AccessDenied` naming an EC2, fleet,
+launch-template, or `ssm:GetParametersByPath` call, upgrade — or supply a profile of
+your own via `bastion_instance_profile_arn`.
+
 ### The bastion is still running after the workflow finished
 
 That is deliberate: the bastion is preserved so you can reconnect. Call
@@ -434,6 +459,12 @@ Two things to know specifically:
   ([#195](https://github.com/scttfrdmn/parsl-ephemeral-provider/issues/195)). Generate a
   current policy with `EphemeralComputeProvider.minimum_iam_policy()`, and reap
   existing orphans with `parsl-ephemeral-cleanup`.
+- **Bastion roles were a second, quieter instance of the same leak** until v0.10.0
+  ([#229](https://github.com/scttfrdmn/parsl-ephemeral-provider/issues/229)). The
+  teardown removed managed policies only, and `delete_role` refuses while an *inline*
+  policy remains — which is what the bastion role carries — so every bastion pair
+  survived while the log said nothing. `parsl-ephemeral-cleanup` now sweeps
+  `parsl-bastion-{role,profile}-*` alongside the worker pairs.
 
 ### Stopped instances with billed EBS volumes
 

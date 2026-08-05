@@ -51,6 +51,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   constructor parameter has fallen out of the sample set altogether.
 
 ### Added
+- **`bastion_instance_profile_arn` on `EphemeralProvider`** (#229), for
+  `mode="detached"`. Supply an instance profile the bastion should assume and it is
+  used as-is and never deleted; leave it unset — the default — and the provider
+  creates a least-privilege pair and deletes it with the bastion. It joins the
+  detached-mode guard, so setting it on another mode raises
+  `ProviderConfigurationError`.
 - **`error_handling.poll_until()`, and `StandardMode`'s waits now use it** (#91).
   Three hand-rolled `while time.time() < deadline` loops in `modes/standard.py` —
   the EC2 Fleet block wait in `_create_spot_fleet_instance`, `_wait_for_ssm_online`,
@@ -148,6 +154,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The ECS and S3 coverage passed against live AWS.
 
 ### Fixed
+- **A directly-launched bastion had no credentials, so its manager loop never ran**
+  (#229). `_create_bastion_direct` attached no instance profile, so the manager
+  script — the entire reason the bastion exists — died on `NoCredentialsError` at
+  its first AWS call and was restarted every ten seconds forever by
+  `Restart=always`. Detached mode on the direct path could not launch a single
+  worker.
+
+  Three separate signals all read healthy while this was true, which is why it
+  survived: `systemctl is-active` cannot distinguish "running" from
+  "crash-looping" under `Restart=always`; the UserData sentinel file is touched
+  before the manager ever starts; and SSM reported `PingStatus: Online`, which
+  proves nothing about an instance profile when Default Host Management
+  Configuration is enabled, since DHMC registers instances that have no profile
+  at all.
+
+  The bastion now gets its own role/profile pair, created before the launch and
+  deleted with it. Ownership is gated exactly as #132 established for the worker
+  profile — a caller-supplied ARN is never deleted — and the flag is persisted in
+  `save_state`/`load_state` and written *immediately* on creation, before the
+  launch that follows can fail.
+- **The CloudFormation bastion could not launch a worker either**, for a different
+  reason: `bastion.yml`'s inline policy was wrong in both directions. Enumerating
+  what the manager script actually calls found it missing `ec2:RunInstances`, both
+  launch-template calls, all three fleet calls, and `ssm:GetParametersByPath` —
+  which is what both polling loops really use, via the `get_parameters_by_path`
+  paginator, so the bastion could not discover jobs at all. It also granted four
+  actions the script has never called (`ec2:StartInstances`, `ec2:StopInstances`,
+  `ec2:DescribeInstanceStatus`, `ec2:DescribeTags`).
+
+  Both paths run the identical script, so the two policies are now generated from
+  and checked against one source of truth: `utils.aws.bastion_role_policy()`. The
+  correspondence is enforced by tests that **parse the generated script** for its
+  `ec2.*` / `ssm.*` calls rather than trusting a maintained list — a hand-kept list
+  would drift from the script, which is the exact failure these tests exist to
+  catch.
 - **Detached mode could not create a bastion at all** (#227). The init script the
   bastion boots from is ~32 KB — 42,740 B base64-encoded — against a **4,096 B**
   CloudFormation parameter limit and a **16,384 B** `RunInstances` UserData limit.
@@ -233,6 +274,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   client, so the create is always cross-client from the test's perspective. The
   pre-check now uses a throwaway client. No product change: `_ensure_bucket_exists`
   heads and creates on the same client, which is the order that works.
+
+### Security
+- **IAM teardown left every bastion role standing while reporting success** (#229).
+  The shared teardown detached *managed* policies only. Managed and inline policies
+  are listed and removed by different API calls, and `delete_role` refuses while
+  **either** remains — so the same code path deleted every worker pair (whose
+  policies are all managed) and no bastion pair (whose permissions are inline),
+  logging no failure. The rewritten `delete_instance_profile_pair` strips both.
+
+  This is the #132 leak class again — a standing IAM principal per run — so
+  `parsl-ephemeral-cleanup`'s orphan sweep now covers both pair kinds. It carries
+  the pair *kind* alongside the suffix, because a bastion orphan reported as a bare
+  suffix would be handed to the worker namer, which would look for a role that does
+  not exist, tolerate its absence, and report success while the bastion role stayed
+  standing.
 
 ## [0.9.0] - 2026-08-03
 

@@ -141,7 +141,8 @@ IAM (required when auto_create_instance_profile=True)
     iam:CreateInstanceProfile, iam:GetInstanceProfile,
     iam:AddRoleToInstanceProfile, iam:PassRole,
     iam:RemoveRoleFromInstanceProfile, iam:DeleteInstanceProfile,
-    iam:ListAttachedRolePolicies, iam:DetachRolePolicy, iam:DeleteRole
+    iam:ListAttachedRolePolicies, iam:DetachRolePolicy,
+    iam:ListRolePolicies, iam:DeleteRolePolicy, iam:DeleteRole
 
     The teardown half is required, not optional: ``cleanup_infrastructure()``
     deletes the pair it created (#132), and cleanup logs rather than raises, so
@@ -955,6 +956,16 @@ class EphemeralComputeProvider(EphemeralProvider):
             # refuses while any policy remains.
             "iam:ListAttachedRolePolicies",
             "iam:DetachRolePolicy",
+            # Inline policies are a separate list under separate calls, and
+            # delete_role refuses while one remains just as it does for a managed
+            # one. The worker role only ever carries managed policies, so these
+            # two are strictly speaking unexercised on this policy's scope -- but
+            # the teardown is shared with the bastion role, whose permissions are
+            # inline, and an AccessDenied on ListRolePolicies aborts the whole
+            # teardown before DeleteRole. Granting them is what makes the shared
+            # path fail closed rather than leak (#229).
+            "iam:ListRolePolicies",
+            "iam:DeleteRolePolicy",
             "iam:DeleteRole",
         ]
 

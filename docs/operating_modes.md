@@ -162,6 +162,7 @@ with the bastion and the tracked jobs — you do not need to pass an ID back in.
 | `preserve_bastion` | `True` | Whether the bastion survives `cleanup_infrastructure()` |
 | `bastion_host_type` | `"cloudformation"` | Stack-managed bastion, or `"direct"` for a plain `RunInstances` |
 | `workflow_id` | generated UUID | Identifier used in bastion state paths and tags; pass the same value to reconnect |
+| `bastion_instance_profile_arn` | `None` | Instance profile the bastion assumes; `None` creates a least-privilege pair and deletes it with the bastion |
 
 `preserve_bastion` defaults to `True`, so **the bastion keeps running and keeps
 billing after shutdown** — that is what makes a later session able to adopt it.
@@ -174,6 +175,20 @@ effect. `bastion_instance_type` joined that guard in v0.10.0
 ([#155](https://github.com/scttfrdmn/parsl-ephemeral-provider/issues/155)); it had
 been accepted on every mode since before the guard existed, so a standard-mode
 provider that passes it now raises instead of ignoring it.
+
+The bastion needs credentials of its own, because the whole point of it is that it
+launches and terminates workers after your client disconnects. Leave
+`bastion_instance_profile_arn` unset and the provider builds a role scoped to
+exactly what the manager script calls — EC2 launch/terminate/describe, fleet and
+launch-template management, and Parameter Store under
+`/parsl/workflows/{workflow_id}/*` — plus `AmazonSSMManagedInstanceCore` for the
+tunnel. `iam:PassRole` is deliberately **not** granted: the manager launches
+workers with no instance profile, so it passes no role, and granting it would let a
+compromised bastion attach any passable role to an instance it launches. Supply
+your own ARN if you need something different; a supplied profile is used as-is and
+never deleted, while a provider-created one is deleted with the bastion — unless
+`preserve_bastion=True`, since revoking a running bastion's credentials would stop
+it launching workers while leaving it up.
 
 Note `idle_timeout` governs only the bastion. It is unrelated to the provider's
 `max_idle_time`, which is deprecated and ignored

@@ -47,6 +47,8 @@ from parsl_ephemeral_provider.modes.base import OperatingMode
 from parsl_ephemeral_provider.state.base import STATE_KEY_MODE, StateStore
 from parsl_ephemeral_provider.utils.aws import (
     architecture_for_instance_type,
+    create_bastion_instance_profile,
+    delete_bastion_instance_profile,
     delete_ec2_fleet,
     get_default_ami,
     normalize_ec2_fleet_allocation_strategy,
@@ -102,6 +104,7 @@ class DetachedMode(OperatingMode):
         nodes_per_block: int = 1,
         spot_max_price_percentage: Optional[int] = None,
         bastion_id: Optional[str] = None,
+        bastion_instance_profile_arn: Optional[str] = None,
         **kwargs: Any,
     ) -> None:
         """Initialize the detached mode.
@@ -132,6 +135,11 @@ class DetachedMode(OperatingMode):
             Number of nodes per block, by default 1
         spot_max_price_percentage : Optional[int], optional
             Maximum spot price as a percentage of on-demand price, by default None
+        bastion_instance_profile_arn : Optional[str], optional
+            Instance profile for the bastion to carry, by default None — in which
+            case one is created and deleted with the bastion. Supply an ARN to use
+            your own, which this mode then never deletes. Ignored on the
+            ``cloudformation`` path, where ``bastion.yml`` declares its own.
         \\*\\*kwargs : Any
             Additional arguments passed to the parent class
         """
@@ -154,6 +162,18 @@ class DetachedMode(OperatingMode):
         self._script_bucket: Optional[str] = None
         self._script_key: Optional[str] = None
         self._owns_script_bucket = False
+
+        # The bastion's own credentials. Only the direct (RunInstances) path uses
+        # these: the CloudFormation path gets its profile from bastion.yml, which
+        # declares and deletes it with the stack.
+        #
+        # The direct path attached no profile at all until #229, so the manager
+        # script -- the entire reason the bastion exists -- died on
+        # NoCredentialsError at its first AWS call and was restarted every ten
+        # seconds forever. Ownership is gated exactly as #132 established for the
+        # worker profile: a caller-supplied ARN is never deleted.
+        self.bastion_instance_profile_arn = bastion_instance_profile_arn
+        self._owns_bastion_profile = False
 
         # Spot Fleet specific attributes
         self.use_spot_fleet = use_spot_fleet
@@ -316,6 +336,68 @@ class DetachedMode(OperatingMode):
                     else:
                         raise
 
+    def _resolve_bastion_instance_profile(self) -> str:
+        """Return the instance profile ARN for a direct-path bastion.
+
+        A caller-supplied ``bastion_instance_profile_arn`` is used as-is and left
+        alone at cleanup. Otherwise a role and profile are created for this
+        provider and ``_owns_bastion_profile`` records that they are ours to
+        delete — the ownership distinction #132 established, for the same reason:
+        deleting a shared profile would break every other workload carrying it.
+
+        Unlike the worker profile this is not optional and has no
+        ``auto_create``-style opt-out. A worker without a profile still runs its
+        command; the bastion *is* an AWS client, so one without credentials does
+        nothing at all (#229).
+
+        Returns
+        -------
+        str
+            ARN of the profile to attach to the bastion instance.
+
+        Raises
+        ------
+        ResourceCreationError
+            If the role or profile cannot be created.
+        """
+        if self.bastion_instance_profile_arn:
+            logger.debug(
+                f"Using supplied bastion instance profile "
+                f"{self.bastion_instance_profile_arn}"
+            )
+            return self.bastion_instance_profile_arn
+
+        arn = create_bastion_instance_profile(
+            self.session, self.provider_id, self.workflow_id
+        )
+        self.bastion_instance_profile_arn = arn
+        self._owns_bastion_profile = True
+        # Persisted immediately, before the launch that follows can fail: the flag
+        # is what authorises cleanup to delete the pair, so a crash between here
+        # and the next save would leak a privileged principal exactly as #132 did.
+        self.save_state()
+        logger.info(f"Created bastion instance profile {arn}")
+        return arn
+
+    def _delete_bastion_instance_profile(self) -> None:
+        """Delete the bastion role and profile, if this mode created them.
+
+        ``_owns_bastion_profile`` is the guard, and it is the whole point: a
+        profile supplied through ``bastion_instance_profile_arn`` is the caller's,
+        and may be attached to instances this provider knows nothing about.
+        """
+        if not self._owns_bastion_profile:
+            return
+
+        try:
+            delete_bastion_instance_profile(self.session, self.provider_id)
+        except Exception as e:
+            # Cleanup must not mask the caller's real error.
+            logger.warning(f"Failed to delete the bastion instance profile: {e}")
+        else:
+            self._owns_bastion_profile = False
+            self.bastion_instance_profile_arn = None
+
     def _create_bastion_direct(self) -> str:
         """Create a bastion host instance directly using EC2.
 
@@ -349,6 +431,12 @@ class DetachedMode(OperatingMode):
             logger.info(
                 f"Using default AMI {self.image_id} for region {self.session.region_name}"
             )
+
+        # Before the launch, not after: a bastion running without credentials is
+        # indistinguishable from a healthy one by every signal short of reading
+        # its journal (#229), so there is no value in launching one that cannot
+        # work.
+        profile_arn = self._resolve_bastion_instance_profile()
 
         try:
             # UserData is the bootstrap shim, not the init script itself: the
@@ -393,6 +481,7 @@ class DetachedMode(OperatingMode):
                 # an SSRF against anything running on it would otherwise hand
                 # over role credentials through an unauthenticated IMDSv1 GET.
                 "MetadataOptions": dict(IMDSV2_METADATA_OPTIONS),
+                "IamInstanceProfile": {"Arn": profile_arn},
             }
 
             # Only send KeyName when there is one. Passing ``KeyName=None``
@@ -2254,6 +2343,17 @@ if __name__ == '__main__':
         if not self.preserve_bastion:
             self._delete_staged_bastion_script()
 
+        # Outside the bastion branch above for the same reason as the staged
+        # script: the profile is created *before* the launch (deliberately, since
+        # a bastion without credentials cannot work), so a launch that then failed
+        # leaves `bastion_id` unset with a real role standing. Gating on
+        # `bastion_id` would leak exactly the case this is here to prevent. A
+        # preserved bastion keeps its profile -- it is still running, and revoking
+        # its credentials would stop it launching workers while leaving it up,
+        # which is the #229 failure reintroduced by cleanup.
+        if not self.preserve_bastion:
+            self._delete_bastion_instance_profile()
+
         # Tear down the monitoring thread only when the bastion is going too --
         # a preserved bastion is still running workers worth watching. (There is
         # no networking to delete here; the comment that used to say so predated
@@ -2419,6 +2519,12 @@ if __name__ == '__main__':
             "script_bucket": self._script_bucket,
             "script_key": self._script_key,
             "owns_script_bucket": self._owns_script_bucket,
+            # Same reasoning again, and here it is a privileged principal rather
+            # than a bucket: without the flag, a mode reconstructed from state
+            # cleans up believing the profile was the caller's and leaves a role
+            # that can launch and terminate instances standing (#229, #132).
+            "bastion_instance_profile_arn": self.bastion_instance_profile_arn,
+            "owns_bastion_profile": self._owns_bastion_profile,
         }
 
         try:
@@ -2450,6 +2556,12 @@ if __name__ == '__main__':
                 self._script_key = state.get("script_key", self._script_key)
                 self._owns_script_bucket = state.get(
                     "owns_script_bucket", self._owns_script_bucket
+                )
+                self.bastion_instance_profile_arn = state.get(
+                    "bastion_instance_profile_arn", self.bastion_instance_profile_arn
+                )
+                self._owns_bastion_profile = state.get(
+                    "owns_bastion_profile", self._owns_bastion_profile
                 )
 
                 # Check if spot interruption handling was previously enabled
