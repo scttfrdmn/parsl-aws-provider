@@ -202,16 +202,15 @@ works around.
 
 > [!IMPORTANT]
 > **The pin stays on `0.88.0`, and bumping it is blocked on
-> [substrate#560](https://github.com/scttfrdmn/substrate/issues/560).** `0.89.0` and
-> `0.90.0` between them fix all three rows below — including both defects this
-> repository filed, #544 and #545 — so the bump is wanted. It cannot land yet:
-> substrate gives a resource with no explicit physical name **the logical ID
-> verbatim**, and a logical ID is only unique within a stack while an IAM role name
-> is account-global. So a second stack from the same template collides with
-> `EntityAlreadyExists`, and 6 integration tests fail. `bastion.yml`
-> (`BastionHostRole`) and `ecs_worker.yml` (`TaskRole`, `TaskExecutionRole`) all
-> deliberately omit the name, which is the practice that makes a template
-> deployable more than once.
+> [substrate#560](https://github.com/scttfrdmn/substrate/issues/560).** `0.89.0`
+> through `0.92.0` fix all three rows below — including both defects this repository
+> filed, #544 and #545 — so the bump is wanted. It cannot land yet: substrate gives
+> a resource with no explicit physical name **the logical ID verbatim**, and a
+> logical ID is only unique within a stack while an IAM role name is account-global.
+> So a second stack from the same template collides with `EntityAlreadyExists`, and
+> 6 integration tests fail. `bastion.yml` (`BastionHostRole`) and `ecs_worker.yml`
+> (`TaskRole`, `TaskExecutionRole`) all deliberately omit the name, which is the
+> practice that makes a template deployable more than once.
 >
 > The create was *already* failing on `0.88.0` — `0.89.0`'s rollback is only what
 > made it visible, since the stack previously still reported `CREATE_COMPLETE`. So
@@ -222,6 +221,41 @@ works around.
 > `DescribeStackEvents` answers `UnsupportedOperation` ("substrate models stack
 > status, not per-resource stack events"), so the failing resource is not reachable
 > that way.
+>
+> **Re-evaluated against `0.92.0`.** Same 6 failures, and probed to be #560
+> unchanged rather than a new cause — `0.92.0` switches on IAM enforcement for a
+> stack's resource calls, so that had to be ruled out. With `DisableRollback=True`:
+>
+> ```
+> BastionHostRole             CREATE_FAILED  EntityAlreadyExists: Role with name BastionHostRole already exists.
+> BastionHostInstanceProfile  CREATE_FAILED  EntityAlreadyExists: Instance Profile BastionHostInstanceProfile already exists.
+> ```
+>
+> The new enforcement does not reach this project: `0.92.0` documents `test`/`test`
+> as resolving to no principal and therefore authorized against nothing, which is
+> what `tests/conftest.py` uses.
+>
+> Bumping now also needs **a second substrate fix**, reachable only because #518 and
+> #544 are fixed: `DeleteStack` deletes an `AWS::IAM::InstanceProfile` without
+> removing its role first, so the delete is refused —
+> `DeleteConflict: Cannot delete entity, must detach all roles first` — and the stack
+> ends `DELETE_FAILED` with the profile standing under its logical-ID name. Note the
+> inverted order in `DescribeStackResources`: `BastionHostRole` reaches
+> `DELETE_COMPLETE` while the profile referencing it fails. So even with #560 fixed
+> for roles, the profile alone would keep the collision. Not yet filed upstream.
+>
+> One unrelated gap found while probing, **pre-existing and not a `0.92.0`
+> regression** (0.88.0 fails identically): `GetFunctionConfiguration` answers
+> `InvalidAction: LambdaPlugin: unknown operation "Unknown"`, while `GetFunction`
+> on the same path prefix works and carries the same `CodeSize`. This project calls
+> neither, so it is recorded rather than blocking.
+
+All three CloudFormation rows below are **fixed upstream and still live here**,
+because the pin cannot move past `0.88.0` — see the note above. Each was re-probed
+on both versions, so the "fixed" claim is measured rather than read off an issue:
+on `0.92.0` a CFN-created bucket is deleted with its stack, `delete_stack` and
+`describe_stacks` both resolve a stack ARN, and a CFN-deployed function reports its
+true `CodeSize` (1,361 B for a zip that `0.88.0` reports as `0`).
 
 | Gap | Effect | Upstream |
 |---|---|---|
