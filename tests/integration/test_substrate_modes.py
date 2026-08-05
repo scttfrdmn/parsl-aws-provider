@@ -30,6 +30,7 @@ import urllib.request
 import uuid
 
 import pytest
+from botocore.exceptions import ClientError
 
 from parsl_ephemeral_provider.constants import (
     BASTION_SCRIPT_URL_TTL,
@@ -328,6 +329,149 @@ class TestDetachedModeSubstrate:
             for obj in s3.list_objects_v2(Bucket=bucket).get("Contents", []):
                 s3.delete_object(Bucket=bucket, Key=obj["Key"])
             s3.delete_bucket(Bucket=bucket)
+
+    def test_the_bucket_is_resolved_once_per_mode(
+        self, substrate_session, substrate_network, temp_state_store, provider_id
+    ):
+        """A second staging call reuses the resolved bucket rather than re-creating.
+
+        The memoized return matters for ownership, not for the API call count:
+        ``create_bucket`` on a bucket you already own answers
+        ``BucketAlreadyOwnedByYou``, which the except branch treats as "reusing
+        an existing bucket" -- so a second pass through it would clear the
+        ownership flag this mode needs to delete what it created.
+        """
+        mode = self._mode(
+            substrate_session, substrate_network, temp_state_store, provider_id
+        )
+
+        s3 = substrate_session.client("s3")
+        bucket = f"parsl-bastion-script-{mode.provider_id[:8]}"
+        try:
+            for obj in s3.list_objects_v2(Bucket=bucket).get("Contents", []):
+                s3.delete_object(Bucket=bucket, Key=obj["Key"])
+            s3.delete_bucket(Bucket=bucket)
+        except s3.exceptions.NoSuchBucket:
+            pass
+
+        try:
+            first = mode._ensure_script_bucket()
+            assert mode._owns_script_bucket is True
+
+            assert mode._ensure_script_bucket() == first
+            assert mode._owns_script_bucket is True
+        finally:
+            mode.preserve_bastion = False
+            mode.cleanup_infrastructure()
+
+    def test_an_unexpected_bucket_error_is_not_swallowed(
+        self, substrate_session, substrate_network, temp_state_store, provider_id
+    ):
+        """Only "already exists" is tolerated; anything else propagates.
+
+        The except branch exists to make a restart or a rebuilt bastion
+        idempotent, and it would be easy to write as a bare ``except
+        ClientError: pass`` -- which would report a bucket that was never
+        created and leave the bastion fetching from nowhere. ``InvalidBucketName``
+        is a real S3 error code, raised here by an uppercase provider ID: bucket
+        names must be lowercase.
+        """
+        mode = self._mode(
+            substrate_session,
+            substrate_network,
+            temp_state_store,
+            f"UPPER-{uuid.uuid4().hex[:8]}",
+        )
+
+        with pytest.raises(ClientError) as excinfo:
+            mode._ensure_script_bucket()
+        assert excinfo.value.response["Error"]["Code"] == "InvalidBucketName"
+
+        # And nothing was recorded, so cleanup has nothing to chase.
+        assert mode._script_bucket is None
+        assert mode._owns_script_bucket is False
+
+    def test_cleanup_empties_a_bucket_holding_another_bastions_script(
+        self, substrate_session, substrate_network, temp_state_store, provider_id
+    ):
+        """Leftover objects are swept, since S3 refuses to delete a full bucket.
+
+        The mode deletes its own ``_script_key`` first, so on the ordinary path
+        the bucket is already empty by the time it is removed. This exercises the
+        case that is not ordinary: a script staged by an earlier bastion whose
+        cleanup never ran -- exactly the leak this bucket's teardown exists to
+        catch. Without the sweep, ``delete_bucket`` answers ``BucketNotEmpty``
+        and the bucket outlives every provider that used it.
+        """
+        mode = self._mode(
+            substrate_session, substrate_network, temp_state_store, provider_id
+        )
+
+        s3 = substrate_session.client("s3")
+        bucket = f"parsl-bastion-script-{mode.provider_id[:8]}"
+        try:
+            for obj in s3.list_objects_v2(Bucket=bucket).get("Contents", []):
+                s3.delete_object(Bucket=bucket, Key=obj["Key"])
+            s3.delete_bucket(Bucket=bucket)
+        except s3.exceptions.NoSuchBucket:
+            pass
+
+        mode._prepare_bastion_user_data()
+        assert mode._owns_script_bucket is True
+
+        # A script from a bastion that never got collected.
+        s3.put_object(
+            Bucket=bucket, Key="bastion-init-orphaned.sh", Body=b"#!/bin/bash\n"
+        )
+
+        mode.preserve_bastion = False
+        mode.cleanup_infrastructure()
+
+        assert mode._script_bucket is None
+        with pytest.raises(ClientError) as excinfo:
+            s3.head_bucket(Bucket=bucket)
+        assert excinfo.value.response["Error"]["Code"] in ("404", "NoSuchBucket")
+
+    def test_cleanup_survives_a_bucket_deleted_underneath_it(
+        self, substrate_session, substrate_network, temp_state_store, provider_id
+    ):
+        """A staged script already gone must not break teardown.
+
+        Cleanup runs on the failure path too, so it has to tolerate the state it
+        finds. Here the bucket is removed behind the mode's back -- an operator
+        sweeping leftovers, or a lifecycle rule -- and both the object delete and
+        the bucket delete raise ``NoSuchBucket``. The mode must log and finish:
+        raising would mask whatever error triggered the cleanup, and would leave
+        the bastion and the caller's network uncollected.
+        """
+        mode = self._mode(
+            substrate_session, substrate_network, temp_state_store, provider_id
+        )
+
+        s3 = substrate_session.client("s3")
+        bucket = f"parsl-bastion-script-{mode.provider_id[:8]}"
+        try:
+            for obj in s3.list_objects_v2(Bucket=bucket).get("Contents", []):
+                s3.delete_object(Bucket=bucket, Key=obj["Key"])
+            s3.delete_bucket(Bucket=bucket)
+        except s3.exceptions.NoSuchBucket:
+            pass
+
+        mode._prepare_bastion_user_data()
+        assert mode._owns_script_bucket is True
+        staged_key = mode._script_key
+
+        # Pull the bucket out from under it.
+        s3.delete_object(Bucket=bucket, Key=staged_key)
+        s3.delete_bucket(Bucket=bucket)
+
+        mode.preserve_bastion = False
+        mode.cleanup_infrastructure()
+
+        # Cleared regardless, so a retry does not chase a bucket that is gone.
+        assert mode._script_key is None
+        assert mode._script_bucket is None
+        assert mode._owns_script_bucket is False
 
     def test_submit_job_and_status(
         self, substrate_session, substrate_network, temp_state_store, provider_id
