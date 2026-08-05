@@ -139,6 +139,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     as a single argv[0] and the container exits before running anything. The
     tests join their argv through a helper that documents this.
 
+  Running that suite live for the first time then found three more, filed rather
+  than fixed here: detached mode cannot create a bastion at all, because the
+  generated init script is 32 KB against a 4 KB CloudFormation parameter limit and
+  a 16 KB EC2 UserData limit (#227, `severity: critical`); the same script would
+  abort at its `awscli` install under `set -e` on Amazon Linux 2023 if it ever
+  reached an instance (#225); and the two API facts above are now #224 and #226.
+  The ECS and S3 coverage passed against live AWS.
+
+### Fixed
+- **The S3 bucket-creation E2E test asserted absence and presence through one
+  client.** A boto3 S3 client that has received a 404 for a bucket name keeps
+  answering 404 for that name after a *different* client creates the bucket —
+  verified live, still failing 15 s later, while `list_buckets` showed the bucket
+  and every other assertion in the test passed against it. `S3State` builds its own
+  client, so the create is always cross-client from the test's perspective. The
+  pre-check now uses a throwaway client. No product change: `_ensure_bucket_exists`
+  heads and creates on the same client, which is the order that works.
+
 ## [0.9.0] - 2026-08-03
 
 ### Changed

@@ -681,10 +681,17 @@ class TestS3BucketCreation:
         deprecated ``ACL="private"`` with this. A bucket created without it is
         world-readable the moment any later policy allows it.
         """
-        s3 = aws_session.client("s3", region_name=aws_region)
-
+        # A *throwaway* client for the pre-check, never reused below. A boto3 S3
+        # client that has seen a 404 for a name goes on answering 404 for that
+        # name for at least 15s after a *different* client creates it -- verified
+        # live: same-client create-then-head succeeds, cross-client does not.
+        # Asserting absence through the same client that later asserts presence
+        # therefore fails on a bucket that demonstrably exists (list_buckets
+        # shows it, and the state round-trip at the end of this test works).
         with pytest.raises(ClientError) as excinfo:
-            s3.head_bucket(Bucket=bucket_name)
+            aws_session.client("s3", region_name=aws_region).head_bucket(
+                Bucket=bucket_name
+            )
         assert excinfo.value.response["Error"]["Code"] in ("404", "NoSuchBucket")
 
         state = S3State(
@@ -693,6 +700,7 @@ class TestS3BucketCreation:
             create_bucket_if_not_exists=True,
         )
 
+        s3 = aws_session.client("s3", region_name=aws_region)
         s3.head_bucket(Bucket=bucket_name)
 
         blocked = s3.get_public_access_block(Bucket=bucket_name)[
