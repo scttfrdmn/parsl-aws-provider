@@ -126,7 +126,7 @@ def main() -> int:
                 max_workers_per_node=2,
                 heartbeat_threshold=600,
                 heartbeat_period=30,
-                encrypted=False,  # see #62
+                encrypted=False,  # same-VPC; else distribute_certificates=True
             )
         ],
         run_dir="runinfo_detached",

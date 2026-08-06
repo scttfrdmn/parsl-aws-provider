@@ -151,7 +151,7 @@ def main() -> int:
                 label=f"{compute_type}_executor",
                 provider=provider,
                 max_workers_per_node=10,
-                encrypted=False,  # see #62
+                encrypted=False,  # same-VPC; else distribute_certificates=True
             )
         ],
         run_dir=f"runinfo_{compute_type}",

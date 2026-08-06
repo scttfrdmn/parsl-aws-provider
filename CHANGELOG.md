@@ -77,6 +77,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   constructor parameter has fallen out of the sample set altogether.
 
 ### Added
+- **`distribute_certificates` on `EphemeralProvider`, for `mode="standard"`**
+  (#62). Parsl's `HighThroughputExecutor` encrypts the worker/interchange channel
+  with CurveZMQ by default, generating the certificates in the driver's `run_dir`
+  and passing that path to workers as `--cert_dir`. An EC2 worker cannot read the
+  driver's filesystem, so `encrypted=True` produced workers that died on a
+  missing directory — which is why every example in this repository set
+  `encrypted=False` and leaned on VPC isolation. Set `distribute_certificates=True`
+  and the default HTEX configuration now works across VPCs, accounts, and the
+  internet.
+
+  The provider publishes the two certificate files a worker actually opens to a
+  Parameter Store `SecureString`, and UserData fetches them before the worker
+  command runs. Nothing is published when the flag is off or when the command
+  carries Parsl's `--cert_dir None` placeholder for `encrypted=False`.
+
+  Which two files is the interesting part, and is why this is off by default:
+  `curvezmq.ClientContext.socket` reads the *server's public key out of*
+  `server.key_secret`, so a worker able to complete a handshake is a worker
+  holding the interchange's server **secret** key. That is Parsl's file layout,
+  not a choice available here. What bounds it: the transport is an encrypted
+  `SecureString` rather than UserData (readable through IMDS for the life of the
+  instance, and returned in plaintext by `DescribeInstanceAttribute`); the
+  certificate directory is created `0700` and each file `0600`, which is what
+  `curvezmq._load_certificate` demands; and the parameters are deleted on
+  shutdown, with their names persisted in the state file so a provider rebuilt
+  after a driver crash still revokes what its predecessor published — whether or
+  not that successor has the flag on.
+
+  No extra IAM or KMS configuration is needed: `AmazonSSMManagedInstanceCore`
+  already grants `ssm:GetParameter`, and the `alias/aws/ssm` key policy already
+  grants `kms:Decrypt` for calls arriving via SSM. Both were confirmed against a
+  live account. `security.certificate_iam_statements()` returns a narrower grant
+  for callers who supply their own `iam_instance_profile_arn`. The flag requires
+  an instance profile for that reason, and joins the standard-mode guard: on
+  another mode it would accept a request for encryption and deliver workers that
+  die on a missing certificate directory.
+
+  The issue proposed this approach and then dismissed it, on the grounds that
+  certificates are generated too late for `submit()` to see them. That is not so:
+  `HighThroughputExecutor.start()` calls `create_certificates()` *before*
+  `initialize_scaling()` interpolates `cert_dir` into `launch_cmd`, so the command
+  reaching `submit_job` already names a directory that exists.
 - **`s3_create_bucket` on `EphemeralProvider`** (#224). `S3State` has accepted
   `create_bucket_if_not_exists` since it was written, but `_initialize_state_store`
   never passed it, so every provider-built S3 store took the already-exists branch

@@ -27,6 +27,7 @@ from parsl_ephemeral_provider.constants import (
     DEFAULT_BASTION_HOST_TYPE,
     DEFAULT_BASTION_IDLE_TIMEOUT,
     DEFAULT_BASTION_INSTANCE_TYPE,
+    DEFAULT_DISTRIBUTE_CERTIFICATES,
     DEFAULT_ECS_CONTAINER_IMAGE,
     DEFAULT_ECS_CPU,
     DEFAULT_ECS_MEMORY,
@@ -346,13 +347,33 @@ class EphemeralProvider(ExecutionProvider, RepresentationMixin):
         When True, each instance runs a single command over SSM and then
         terminates, so the command's exit code determines the job status.
         Default is False.  ``mode="standard"`` only.
+    distribute_certificates : bool, optional
+        When True, publish the executor's CurveZMQ certificates to Parameter
+        Store as a ``SecureString`` and have each worker fetch them before
+        starting, so a ``HighThroughputExecutor`` left at its default
+        ``encrypted=True`` works on EC2.  Default is False.
+        ``mode="standard"`` only.
+
+        Without this, an encrypted executor's workers die with
+        ``FileNotFoundError`` on the certificate directory: the interchange
+        creates it under the driver's ``run_dir``, which a worker cannot read.
+        The documented workaround has been ``encrypted=False``, which is only
+        defensible when a shared VPC provides the isolation instead — not for
+        cross-VPC, cross-account, or over-the-internet workers (#62).
+
+        Note the trade-off before enabling it: what a Parsl worker needs
+        includes the interchange's *server secret key*, because
+        ``curvezmq.ClientContext`` reads the server's public key out of
+        ``server.key_secret``.  Anyone able to read the parameter can therefore
+        impersonate the interchange to a worker.  The parameter is encrypted at
+        rest, scoped to this provider's ID, and deleted on ``shutdown()``.
 
     Raises
     ------
     ProviderConfigurationError
         If ``warm_pool_size``, ``warm_pool_ttl``, ``bake_ami``,
-        ``baked_ami_id``, or ``one_shot`` is set on any mode other than
-        ``"standard"`` — no other mode implements them.
+        ``baked_ami_id``, ``one_shot``, or ``distribute_certificates`` is set on
+        any mode other than ``"standard"`` — no other mode implements them.
 
         If ``idle_timeout``, ``preserve_bastion``, ``bastion_host_type``,
         ``workflow_id``, or ``bastion_instance_profile_arn`` is set on any mode
@@ -424,6 +445,7 @@ class EphemeralProvider(ExecutionProvider, RepresentationMixin):
         bake_ami: bool = DEFAULT_BAKE_AMI,
         baked_ami_id: Optional[str] = None,
         one_shot: bool = DEFAULT_ONE_SHOT,
+        distribute_certificates: bool = DEFAULT_DISTRIBUTE_CERTIFICATES,
         cores_per_node: Optional[int] = None,
         mem_per_node: Optional[float] = None,
         **kwargs: Any,
@@ -549,6 +571,7 @@ class EphemeralProvider(ExecutionProvider, RepresentationMixin):
         self.bake_ami = bake_ami
         self.baked_ami_id = baked_ami_id
         self.one_shot = one_shot
+        self.distribute_certificates = distribute_certificates
 
         # Guard: network IDs are required (provider no longer creates VPC/subnet/SG).
         # Lambda-only serverless is the one exception: functions run in the
@@ -571,6 +594,13 @@ class EphemeralProvider(ExecutionProvider, RepresentationMixin):
         # other mode's get_job_status() knows that status, so those instances are
         # never cleaned up and leak with no error or warning. Refuse the
         # combination rather than silently half-honouring it.
+        #
+        # distribute_certificates (#62) joins the list for a different reason:
+        # nothing leaks, but only StandardMode publishes and revokes the
+        # certificates, so on another mode the flag would accept a request for
+        # encryption and deliver workers that die on a missing certificate
+        # directory -- an option that looks configured and is not, which is the
+        # class of failure #136 and #155 exist to eliminate.
         standard_only = [
             name
             for name, value, default in (
@@ -579,6 +609,11 @@ class EphemeralProvider(ExecutionProvider, RepresentationMixin):
                 ("bake_ami", bake_ami, DEFAULT_BAKE_AMI),
                 ("baked_ami_id", baked_ami_id, None),
                 ("one_shot", one_shot, DEFAULT_ONE_SHOT),
+                (
+                    "distribute_certificates",
+                    distribute_certificates,
+                    DEFAULT_DISTRIBUTE_CERTIFICATES,
+                ),
             )
             if value != default
         ]
@@ -587,9 +622,9 @@ class EphemeralProvider(ExecutionProvider, RepresentationMixin):
                 f"{', '.join(standard_only)} "
                 f"{'are' if len(standard_only) > 1 else 'is'} supported only by "
                 f"mode='standard', not mode='{self.mode_type.value}'. "
-                "The option would be silently ignored by the mode while the "
-                "provider still acted on it, leaking instances that no mode "
-                "would clean up."
+                "No other mode implements it, so it would be accepted and have "
+                "no effect -- and for the warm-pool options the provider would "
+                "still act on them, leaking instances that no mode cleans up."
             )
 
         # Guards: the same reasoning for the detached-only and serverless-only
@@ -722,16 +757,34 @@ class EphemeralProvider(ExecutionProvider, RepresentationMixin):
         # SendCommand, which needs the instance to carry an IAM instance profile
         # holding AmazonSSMManagedInstanceCore. Without one the agent never
         # registers and the command is never delivered.
-        needs_ssm = warm_pool_size > 0 or one_shot
+        #
+        # distribute_certificates needs a profile for a different call --
+        # ssm:GetParameter from inside UserData, plus kms:Decrypt for the
+        # SecureString -- but the same two options satisfy it, and the failure
+        # without one is worse than a rejected config: UserData would exit 1 on
+        # the fetch, leaving an instance that boots, bills, and never registers a
+        # worker.
+        needs_ssm = warm_pool_size > 0 or one_shot or distribute_certificates
         if (
             needs_ssm
             and not auto_create_instance_profile
             and not iam_instance_profile_arn
         ):
-            trigger = "warm_pool_size > 0" if warm_pool_size > 0 else "one_shot=True"
+            if warm_pool_size > 0:
+                trigger = "warm_pool_size > 0"
+                reason = "SSM SendCommand needs IAM permissions"
+            elif one_shot:
+                trigger = "one_shot=True"
+                reason = "SSM SendCommand needs IAM permissions"
+            else:
+                trigger = "distribute_certificates=True"
+                reason = (
+                    "the worker reads its CurveZMQ certificates with "
+                    "ssm:GetParameter, which needs an instance profile"
+                )
             raise ValueError(
                 f"{trigger} requires either auto_create_instance_profile=True "
-                "or iam_instance_profile_arn to be set (SSM SendCommand needs IAM permissions)"
+                f"or iam_instance_profile_arn to be set ({reason})"
             )
 
         # Initialize state
@@ -1135,6 +1188,7 @@ class EphemeralProvider(ExecutionProvider, RepresentationMixin):
                 bake_ami=self.bake_ami,
                 baked_ami_id=self.baked_ami_id,
                 one_shot=self.one_shot,
+                distribute_certificates=self.distribute_certificates,
                 **common_params,
             )
         elif self.mode_type == OperatingModeType.DETACHED:

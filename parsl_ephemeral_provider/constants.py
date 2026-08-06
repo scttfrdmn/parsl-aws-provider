@@ -431,6 +431,12 @@ MAX_WARM_POOL_SIZE = 20
 DEFAULT_BAKE_AMI = False  # bake worker_init into a custom AMI during initialize()
 DEFAULT_ONE_SHOT = False  # each instance runs one command then terminates
 
+# CurveZMQ certificate distribution (#62). Off by default: it publishes the
+# interchange's server secret key to Parameter Store for workers to fetch, which
+# is the right trade for an encrypted channel between networks that share no
+# boundary, but not something to do on a caller's behalf unasked.
+DEFAULT_DISTRIBUTE_CERTIFICATES = False
+
 # Detached-mode bastion defaults.
 #
 # Named here rather than left as literals in DetachedMode.__init__ so the

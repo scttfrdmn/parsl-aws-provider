@@ -73,8 +73,10 @@ Quick example
            HighThroughputExecutor(
                label="aws_executor",
                provider=provider,
-               # See network-prerequisites: CurveZMQ certificates live in the
-               # driver's run_dir and workers cannot read them (#62).
+               # Same-VPC deployment, so it relies on VPC isolation: CurveZMQ
+               # certificates live in the driver's run_dir and workers cannot
+               # read them. Across networks, set distribute_certificates=True on
+               # the provider and leave this at its default (see security.md).
                encrypted=False,
            )
        ]

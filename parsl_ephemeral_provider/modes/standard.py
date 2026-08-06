@@ -40,6 +40,10 @@ from parsl_ephemeral_provider.exceptions import (
     SpotFleetError,
 )
 from parsl_ephemeral_provider.modes.base import OperatingMode
+from parsl_ephemeral_provider.security.curvezmq import (
+    CurveZMQCertificateDistributor,
+    extract_cert_dir,
+)
 from parsl_ephemeral_provider.state.base import STATE_KEY_MODE
 from parsl_ephemeral_provider.compute.spot_fleet import SpotFleetManager
 from parsl_ephemeral_provider.compute.spot_interruption import SpotInterruptionMonitor
@@ -131,6 +135,7 @@ class StandardMode(OperatingMode):
         bake_ami: bool = False,
         baked_ami_id: Optional[str] = None,
         one_shot: bool = False,
+        distribute_certificates: bool = False,
         **kwargs: Any,
     ) -> None:
         """Initialize the standard mode.
@@ -204,6 +209,14 @@ class StandardMode(OperatingMode):
         one_shot : bool, optional
             Whether to dispatch a single command per instance and terminate,
             by default False
+        distribute_certificates : bool, optional
+            Whether to ship the executor's CurveZMQ certificates to workers
+            through Parameter Store, by default False. Needed only when the
+            executor runs with ``encrypted=True`` (Parsl's default) and the
+            workers cannot read the driver's filesystem -- which on EC2 is
+            always. See :mod:`parsl_ephemeral_provider.security.curvezmq` for
+            the security trade-off: the interchange's server secret key is part
+            of what a worker needs, so it is published, and deleted at cleanup.
         """
         # Call parent __init__ with standard params
         super().__init__(
@@ -255,6 +268,14 @@ class StandardMode(OperatingMode):
 
         # One-shot mode: each instance runs exactly one command then terminates
         self.one_shot = one_shot
+
+        # CurveZMQ certificate distribution (#62). The distributor is built
+        # unconditionally so cleanup can adopt parameters out of a state file
+        # written by a run that had the flag on, even if this one does not.
+        self.distribute_certificates = distribute_certificates
+        self._cert_distributor = CurveZMQCertificateDistributor(
+            session=session, provider_id=provider_id
+        )
 
         # Launch template (#85). Built in initialize() so every launch path --
         # on-demand, spot, and fleet -- shares one definition carrying IMDSv2,
@@ -661,6 +682,12 @@ class StandardMode(OperatingMode):
             # Without this, a provider resumed from state would not know it owns
             # the IAM pair and would leave it behind on cleanup (#132).
             "owns_instance_profile": self._owns_instance_profile,
+            # Published CurveZMQ certificate parameters (#62). Same reasoning as
+            # owns_instance_profile, with a sharper edge: these hold the
+            # interchange's server secret key, so a resumed provider that could
+            # not name them would leave that material in Parameter Store
+            # indefinitely.
+            "certificate_parameters": self._cert_distributor.published_parameters,
         }
 
         # Include spot fleet state if applicable
@@ -721,6 +748,14 @@ class StandardMode(OperatingMode):
                 # Reclaim ownership of the IAM pair this provider created on an
                 # earlier run, so cleanup can still delete it (#132).
                 self._owns_instance_profile = state.get("owns_instance_profile", False)
+
+                # Adopt certificate parameters published by an earlier run so
+                # cleanup deletes them even though this process never wrote them
+                # (#62). Unconditional on distribute_certificates: a run started
+                # without the flag must still clean up after one that had it.
+                self._cert_distributor.adopt_published(
+                    state.get("certificate_parameters", []) or []
+                )
 
                 # Restore baked AMI state
                 saved_baked_ami = state.get("baked_ami_id")
@@ -1150,6 +1185,11 @@ class StandardMode(OperatingMode):
         if self.worker_init:
             init_script += f"{self.worker_init}\n"
 
+        # CurveZMQ certificates, before either dispatch path below: on the SSM
+        # path the command arrives later and must find them already on disk, and
+        # on the embedded path the command runs a few lines down.
+        init_script += self._certificate_fetch_lines(command, job_id)
+
         if self._uses_ssm_dispatch():
             # UserData only runs worker_init and drops a ready marker. The command
             # is dispatched later via SSM SendCommand, which reports its exit code
@@ -1177,6 +1217,47 @@ class StandardMode(OperatingMode):
             init_script += "shutdown -h now\n"
 
         return init_script
+
+    # ------------------------------------------------------------------
+    # CurveZMQ certificate distribution (#62)
+    # ------------------------------------------------------------------
+
+    def _certificate_fetch_lines(self, command: str, job_id: str) -> str:
+        """Publish the executor's CurveZMQ certificates and return fetch lines.
+
+        Returns an empty string -- adding nothing to UserData -- unless
+        ``distribute_certificates`` is on *and* the command actually asks for
+        encryption. The second condition matters: HTEX interpolates
+        ``--cert_dir None`` when ``encrypted=False``, and a caller who leaves the
+        flag on while running unencrypted should not have a parameter published
+        for nothing.
+
+        Parameters
+        ----------
+        command : str
+            The command as submitted, carrying HTEX's ``--cert_dir``.
+        job_id : str
+            Job the certificates belong to.
+
+        Returns
+        -------
+        str
+            Shell lines to insert into UserData, or "".
+        """
+        if not self.distribute_certificates:
+            return ""
+
+        cert_dir = extract_cert_dir(command)
+        if cert_dir is None:
+            logger.debug(
+                f"distribute_certificates is on but job {job_id}'s command names "
+                "no certificate directory (encrypted=False, or a launch command "
+                "without --cert_dir). Nothing to publish."
+            )
+            return ""
+
+        self._cert_distributor.publish(job_id, cert_dir)
+        return self._cert_distributor.fetch_script(job_id, cert_dir)
 
     # ------------------------------------------------------------------
     # SSM dispatch helpers (shared by the warm pool and one-shot mode)
@@ -2215,6 +2296,13 @@ class StandardMode(OperatingMode):
             # standing principal carrying AmazonSSMManagedInstanceCore behind and
             # the account walked toward IAM's 1,000-role quota.
             self._delete_instance_profile()
+
+            # Delete any published CurveZMQ certificates (#62). These are
+            # SecureStrings holding the interchange's server secret key, so they
+            # must not outlive the run; revoke_all() is best-effort and logs at
+            # warning rather than raising, on the same reasoning as the IAM
+            # teardown above.
+            self._cert_distributor.revoke_all()
 
             # Clean up Spot Fleet resources if using spot fleet
             if self.use_spot_fleet and self.spot_fleet_manager:

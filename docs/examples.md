@@ -42,7 +42,7 @@ config = Config(
         HighThroughputExecutor(
             label="aws_executor",
             provider=provider,
-            encrypted=False,  # see #62
+            encrypted=False,  # same-VPC; else distribute_certificates=True
         )
     ]
 )

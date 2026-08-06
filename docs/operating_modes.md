@@ -66,8 +66,14 @@ architecture is resolved from AWS's public SSM parameters, so x86_64 and arm64
 Workers connect *outbound* to the Parsl interchange, so the client has to accept
 inbound TCP on the HTEX port range (54000–55000 by default). A laptop behind
 home or office NAT cannot do this without port forwarding or a VPN — use detached
-mode instead. Set `encrypted=False` on `HighThroughputExecutor` for now; CurveZMQ
-certificate distribution is [#62](https://github.com/scttfrdmn/parsl-ephemeral-provider/issues/62).
+mode instead.
+
+Set `encrypted=False` on `HighThroughputExecutor` when the interchange and its
+workers share a VPC — Parsl's CurveZMQ certificates live in the client's
+`run_dir`, which a worker cannot read. When they do *not* share a network
+boundary, keep `encrypted=True` and set `distribute_certificates=True` on the
+provider instead; see [Encryption in transit](security.md#encryption-in-transit)
+for what that ships and what it costs.
 
 ### When to use
 
@@ -107,11 +113,15 @@ These are implemented by `StandardMode` alone, and the provider raises
 | `bake_ami` | `False` | Run `worker_init` once into a custom AMI at `initialize()`. |
 | `baked_ami_id` | `None` | Use an already-baked AMI instead of baking one. |
 | `one_shot` | `False` | Dispatch a single command per instance over SSM; no HTEX. |
+| `distribute_certificates` | `False` | Ship HTEX's CurveZMQ certificates to workers via Parameter Store, so `encrypted=True` works with no shared network boundary. |
 
 `warm_pool_size > 0` and `one_shot=True` both dispatch over SSM, so each requires
 either `auto_create_instance_profile=True` or an explicit
 `iam_instance_profile_arn` — SSM `SendCommand` needs the instance to carry
-`AmazonSSMManagedInstanceCore`.
+`AmazonSSMManagedInstanceCore`. `distribute_certificates=True` requires one for a
+different reason: the worker reads its certificates with `ssm:GetParameter`.
+Because it ships the interchange's server secret key, read
+[Encryption in transit](security.md#encryption-in-transit) before turning it on.
 
 Warm instances are held **Running** and bill at the full instance rate for up to
 `warm_pool_ttl` seconds per idle period, which is why `warm_pool_size` is capped.

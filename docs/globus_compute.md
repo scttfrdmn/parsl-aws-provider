@@ -171,7 +171,9 @@ one that dies silently:
 engine:
   type: GlobusComputeEngine
   # CurveZMQ certificates live in the endpoint host's run_dir, which an EC2
-  # worker cannot read -- see #62. Set true once that is distributed.
+  # worker cannot read. To set this true, also set distribute_certificates:
+  # true on the provider below -- it ships the certificates through Parameter
+  # Store, including the endpoint's server secret key (#62).
   encrypted: false
   provider:
     type: EphemeralComputeProvider
@@ -200,15 +202,31 @@ resolved.
 **`encrypted: false`.** `GlobusComputeEngine` forwards `encrypted` to the wrapped
 `HighThroughputExecutor`, which generates CurveZMQ certificates in its `run_dir`
 **on the endpoint host** and passes that path to workers as `--cert_dir`. An EC2
-worker has no such path and dies with `FileNotFoundError` before registering.
-Same-VPC deployments rely on VPC isolation instead; certificate distribution is
-[#62](https://github.com/scttfrdmn/parsl-ephemeral-provider/issues/62). Pass
-`encrypted=True` to override, once you have a way to distribute the certificates.
+worker has no such path and dies with `FileNotFoundError` before registering. So
+`encrypted=True` on its own does not work; the default relies on VPC isolation.
+
+To run encrypted, pass both flags:
+
+```python
+provider = EphemeralComputeProvider(
+    region="us-east-1",
+    encrypted=True,
+    distribute_certificates=True,
+    auto_create_instance_profile=True,
+)
+```
+
+`distribute_certificates=True` publishes the certificates to a Parameter Store
+`SecureString` that the worker fetches at boot. It ships the endpoint's server
+secret key — unavoidable, because that is the only file Parsl's client context
+reads the server's public key out of — so read
+[Encryption in transit](security.md#encryption-in-transit) first. It is standard
+mode only and requires an instance profile.
 
 ```{note}
 High-Assurance endpoints reject `encrypted: false`
-(`GlobusComputeEngine.assert_ha_compliant()`), so they need #62 resolved before
-they can use this provider at all.
+(`GlobusComputeEngine.assert_ha_compliant()`), so they have no choice: they need
+both flags set.
 ```
 
 ### 3. Start the endpoint
@@ -276,7 +294,7 @@ of its own:
 | `endpoint_id` | `str \| None` | `None` | Endpoint UUID. Emitted as a provider key in the template, and as the `--endpoint-uuid` reminder in `config.yaml`. |
 | `container_image` | `str \| None` | `None` | Image URI. Sets `container_type: docker` and `container_uri` under `engine`. |
 | `display_name` | `str` | `"Ephemeral AWS Endpoint"` | Label shown in the Globus Compute web console. The one key in `config.yaml`. |
-| `encrypted` | `bool` | `False` | CurveZMQ encryption on the engine. `True` needs [#62](https://github.com/scttfrdmn/parsl-ephemeral-provider/issues/62) — see step 2. |
+| `encrypted` | `bool` | `False` | CurveZMQ encryption on the engine. `True` also needs `distribute_certificates=True` — see step 2. |
 
 `worker_init` also differs from the base class: `EphemeralComputeProvider` defaults
 it to a script that installs `globus-compute-endpoint`, not just `parsl`.
@@ -428,10 +446,11 @@ start`.
 
 ## Known limitations
 
-- **CurveZMQ encryption cannot be enabled** for EC2 workers until certificate
-  distribution exists ([#62](https://github.com/scttfrdmn/parsl-ephemeral-provider/issues/62)),
-  so `encrypted` defaults to `False` and High-Assurance endpoints — which reject
-  that — cannot use this provider.
+- **CurveZMQ encryption needs `distribute_certificates=True`,** which means
+  shipping the endpoint's server secret key to each worker through Parameter
+  Store — inherent to Parsl's file layout, not a design choice here. `encrypted`
+  therefore still defaults to `False`. High-Assurance endpoints, which reject
+  that default, must accept the trade; there is no third option.
 - **The bootstrap is a workaround, not the fix.** Resolving the provider inside
   the forked user-endpoint process depends on a `PYTHONPATH`/`sitecustomize` hook
   rather than on anything Globus Compute supports for this. Dotted-path provider
