@@ -51,7 +51,11 @@ Parameters:
 
   Command:
     Type: String
-    Description: Command to run in the container
+    # Run through a shell in the container, so this is an ordinary shell string --
+    # quoting, pipes, and redirection all work, and a comma is just a comma. It
+    # used to be argv, built with !Split [',', ...], which made this the only
+    # command surface in the provider that was not a shell string (#226).
+    Description: Shell command line to run in the container
     Default: ''
 
   VpcId:
@@ -205,7 +209,18 @@ Resources:
         - Name: !Sub 'parsl-container-${WorkflowId}-${JobId}'
           Image: !Ref ContainerImage
           Essential: true
-          Command: !If [HasCommand, !Split [',', !Ref Command], !Ref 'AWS::NoValue']
+          # A shell string, exec'd by /bin/sh, matching what ECSManager's own
+          # _register_task_definition has always done (compute/ecs.py) and what
+          # Lambda (subprocess.run(shell=True)) and the EC2 fleet (a generated
+          # command.sh) do. This was !Split [',', !Ref Command] until #226, which
+          # made a plain "python -c 'print(1)'" arrive as a single argv[0]: the
+          # container failed to exec, and because the stack runs an ECS *Service*
+          # with DesiredCount, the exited task was replaced and billed on a loop.
+          # Nothing distinguished that from a task that ran and finished.
+          Command: !If
+            - HasCommand
+            - ['/bin/sh', '-c', !Ref Command]
+            - !Ref 'AWS::NoValue'
           LogConfiguration:
             LogDriver: awslogs
             Options:

@@ -8,6 +8,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **BREAKING: the ECS command is a shell string, not comma-separated argv** (#226).
+  `ecs_worker.yml` built the container's argv with `!Split [',', !Ref Command]`, so
+  `submit("python -c 'print(1)'")` — the form every other path accepts — arrived as
+  a single `argv[0]`, the container failed to exec, and because the stack runs an
+  ECS *Service* with a `DesiredCount` the exited task was replaced and billed on a
+  loop. Nothing distinguished that from a task that ran and finished: the task
+  definition registered, the stack reached `CREATE_COMPLETE`, the task reached
+  `STOPPED`.
+
+  The template now runs `/bin/sh -c <command>`, matching `ECSManager`'s own
+  `_register_task_definition`, Lambda's `subprocess.run(shell=True)`, and the EC2
+  fleet's generated `command.sh`. Quoting, pipes, redirection, and multi-line
+  commands work; commas are just commas. The image must have a `/bin/sh`, which
+  rules out `FROM scratch` and distroless images.
+
+  This breaks commands written for the old encoding: `"python,-c,print(1)"` now
+  reaches the shell with its commas intact and must be respaced. The issue proposed
+  comma-joining inside `ServerlessMode` instead, which would have hidden the
+  encoding without removing it — a command containing a comma would still have been
+  cut in two, and space-splitting into argv would still have mishandled quotes.
+
+  `ServerlessMode` also stopped collapsing newlines to `;` on the way to
+  CloudFormation. That served the old argv encoding and silently truncated any
+  multi-line command with a comment in it, since everything after the `#` became
+  part of the comment. CloudFormation preserves newlines in a `String` parameter,
+  verified against the live service.
 - **BREAKING: the four remaining mode-specific options are now guarded** (#155).
   `bastion_instance_type` on `mode="detached"`, and `memory_size` / `timeout` on
   `mode="serverless"`, join the guard #136 built for the other eight: setting one

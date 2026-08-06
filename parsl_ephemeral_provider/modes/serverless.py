@@ -742,10 +742,17 @@ class ServerlessMode(OperatingMode):
                         "ParameterKey": "TaskMemory",
                         "ParameterValue": str(self.ecs_task_memory),
                     },
-                    {
-                        "ParameterKey": "Command",
-                        "ParameterValue": command.replace("\n", ";"),
-                    },
+                    # Passed through unaltered. The template exec's it with
+                    # /bin/sh -c since #226, so this is an ordinary shell string
+                    # like every other mode's, and a multi-line command works.
+                    # Newlines used to be collapsed to ';' here, which served the
+                    # old argv-by-comma-split encoding and silently broke any
+                    # command with a comment line -- everything after a '#'
+                    # became part of the comment. CloudFormation preserves
+                    # newlines in a String parameter verbatim; verified against
+                    # the live service by reading a parameter echo back out of a
+                    # stack output.
+                    {"ParameterKey": "Command", "ParameterValue": command},
                     {"ParameterKey": "VpcId", "ParameterValue": self.vpc_id},
                     {"ParameterKey": "SubnetIds", "ParameterValue": self.subnet_id},
                     {

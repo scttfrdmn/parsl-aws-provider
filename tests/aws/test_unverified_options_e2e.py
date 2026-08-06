@@ -240,19 +240,6 @@ class TestEcsContainerImageIsHonoured:
         except Exception as exc:
             logger.warning("ecs_provider shutdown raised (best-effort): %s", exc)
 
-    @staticmethod
-    def _argv(*parts: str) -> str:
-        """Join *parts* the way ``ecs_worker.yml`` expects to receive them.
-
-        The template passes ``Command`` through ``!Split [',', ...]`` to build the
-        container's argv, so a plain shell string arrives as a single argv[0] and
-        the container exits before running anything. Commas -- not spaces -- are
-        the separator, which is not obvious from the provider's
-        ``submit(command)`` signature and is worth stating once here rather than
-        at each call.
-        """
-        return ",".join(parts)
-
     def test_the_configured_image_is_what_runs(
         self, ecs_provider, aws_session, aws_region
     ):
@@ -263,12 +250,13 @@ class TestEcsContainerImageIsHonoured:
         would pass against ``python:3.12-slim`` too, and that is the exact
         regression -- the option silently not being forwarded.
         """
+        # A plain shell string, with quoting in it. Since #226 the template
+        # exec's Command under /bin/sh -c, so this is the same surface every other
+        # mode takes; it used to have to be comma-joined into argv, and the
+        # embedded quotes and spaces would not have survived that.
         job_id = ecs_provider.submit(
-            self._argv(
-                "python",
-                "-c",
-                "import sys; print('PARSL_E2E_PYTHON=%d.%d' % sys.version_info[:2])",
-            ),
+            "python -c \"import sys; print('PARSL_E2E_PYTHON=%d.%d' % "
+            'sys.version_info[:2])"',
             tasks_per_node=1,
         )
 
@@ -313,7 +301,7 @@ class TestEcsContainerImageIsHonoured:
         is about the first task observed to stop, not about the service settling.
         """
         job_id = ecs_provider.submit(
-            self._argv("python", "-c", "print('PARSL_E2E_RAN')"), tasks_per_node=1
+            "python -c \"print('PARSL_E2E_RAN')\"", tasks_per_node=1
         )
 
         cf = aws_session.client("cloudformation", region_name=aws_region)
@@ -366,7 +354,8 @@ class TestEcsContainerImageIsHonoured:
         assert exit_codes and all(code == 0 for code in exit_codes), (
             f"Container exit codes {exit_codes}, stoppedReason={reason!r}. A "
             "non-zero exit with no pull error is the signature of a command the "
-            "image cannot execute -- see _argv() on how ecs_worker.yml splits it."
+            "image cannot execute -- check that the image has a /bin/sh, which "
+            "ecs_worker.yml's Command relies on (#226)."
         )
 
 
