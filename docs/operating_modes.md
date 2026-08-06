@@ -65,8 +65,9 @@ architecture is resolved from AWS's public SSM parameters, so x86_64 and arm64
 
 Workers connect *outbound* to the Parsl interchange, so the client has to accept
 inbound TCP on the HTEX port range (54000–55000 by default). A laptop behind
-home or office NAT cannot do this without port forwarding or a VPN — use detached
-mode instead.
+home or office NAT cannot do this without port forwarding or a VPN — set
+`instance_connect_endpoint_id` (see [Reverse tunnels](#reverse-tunnels)) or use
+detached mode instead.
 
 Set `encrypted=False` on `HighThroughputExecutor` when the interchange and its
 workers share a VPC — Parsl's CurveZMQ certificates live in the client's
@@ -114,6 +115,10 @@ These are implemented by `StandardMode` alone, and the provider raises
 | `baked_ami_id` | `None` | Use an already-baked AMI instead of baking one. |
 | `one_shot` | `False` | Dispatch a single command per instance over SSM; no HTEX. |
 | `distribute_certificates` | `False` | Ship HTEX's CurveZMQ certificates to workers via Parameter Store, so `encrypted=True` works with no shared network boundary. |
+| `instance_connect_endpoint_id` | `None` | Tunnel the interchange onto each worker's loopback, so the driver needs no routable address. Setting it enables tunnelling. |
+| `tunnel_os_user` | `ec2-user` | Remote user the tunnel authenticates as. |
+| `tunnel_private_key_path` | `None` | SSH private key for the tunnel; an ephemeral pair is generated per provider when unset. |
+| `tunnel_public_key_path` | `None` | Matching public key, authorised on each instance. Must be set together with the private key. |
 
 `warm_pool_size > 0` and `one_shot=True` both dispatch over SSM, so each requires
 either `auto_create_instance_profile=True` or an explicit
@@ -127,6 +132,64 @@ Warm instances are held **Running** and bill at the full instance rate for up to
 `warm_pool_ttl` seconds per idle period, which is why `warm_pool_size` is capped.
 Migrating to native ASG warm pools, which hold instances Stopped or Hibernated,
 is [#130](https://github.com/scttfrdmn/parsl-ephemeral-provider/issues/130).
+
+### Reverse tunnels
+
+This is the answer to *"my driver is a laptop behind NAT."* Set
+`instance_connect_endpoint_id` and the provider opens an SSH reverse tunnel to
+every worker through an [EC2 Instance Connect
+Endpoint](network-prerequisites.md#optional-an-ec2-instance-connect-endpoint),
+putting the interchange on the worker's **own loopback**:
+
+```python
+provider = EphemeralProvider(
+    region="us-east-1",
+    instance_type="t3.small",
+    vpc_id="vpc-0abc1234",
+    subnet_id="subnet-0def5678",
+    security_group_id="sg-09ab0000",
+    auto_create_instance_profile=True,
+    instance_connect_endpoint_id="eice-0abc1234",
+)
+```
+
+Then give HTEX loopback, not a routable address — the point is that no driver
+address is involved:
+
+```python
+HighThroughputExecutor(provider=provider, address="127.0.0.1")
+```
+
+If you leave `address_by_query()` in place, HTEX offers the worker both that
+address and loopback, and may win the probe with the unroutable one; the provider
+logs a warning when it sees a non-loopback `-a`.
+
+Because the worker talks to loopback, this also composes better with
+`encrypted=True` than a public IP does — see
+[Encryption in transit](security.md#encryption-in-transit).
+
+**What it costs.** This is the only feature that shells out: it needs an `ssh`
+binary and AWS CLI v2 on the driver (`open-tunnel` has no boto3 equivalent).
+Both are checked up front. It adds three IAM actions, listed in
+[Minimum IAM Permissions](network-prerequisites.md#minimum-iam-permissions).
+
+**Why it is supervised.** A single EICE tunnel is capped at 3600 seconds by the
+API, so a background thread recycles each tunnel before AWS closes it and
+re-establishes any that die. Reconnects complete well inside HTEX's 120-second
+`heartbeat_threshold`, so the interchange does not give up on the manager. The
+SSH key is re-pushed before every connect, because `SendSSHPublicKey` authorises
+it for only about a minute.
+
+**Ordering.** The tunnel is opened *before* the command is dispatched, closed
+when a dispatch fails or resources are cleaned up, and the supervisor plus any
+generated key material is torn down first at `cleanup_infrastructure()`. A worker
+connects as soon as it starts, so a tunnel opened afterwards would race the
+connection it exists to carry. `one_shot=True` and `warm_pool_size > 0` dispatch
+over SSM and get that ordering strictly; on the default UserData path the command
+is already on the instance, so the tunnel and the worker start together.
+
+Nothing here is durable: if the driver dies the tunnels die with it, which is
+correct — the interchange they forward to died too.
 
 ## Detached Mode
 
@@ -397,7 +460,7 @@ standard or detached mode now raises rather than being ignored.
 | Consideration | Standard | Detached | Serverless |
 |---------------|----------|----------|------------|
 | **Client connectivity** | Must stay reachable | Can disconnect | Can disconnect |
-| **Client behind NAT** | No | Yes | Yes |
+| **Client behind NAT** | With `instance_connect_endpoint_id` | Yes | Yes |
 | **Workflow duration** | Minutes to hours | Hours to days | Seconds to hours |
 | **Task duration** | Any | Any | Lambda: <15 min<br>Fargate: any |
 | **Scaling** | Moderate | Moderate | Rapid, massive |
@@ -415,8 +478,10 @@ standard or detached mode now raises rather than being ignored.
   get the two-minute EventBridge warning
 - Set `min_blocks`/`max_blocks` deliberately — `max_blocks` also caps concurrent
   submissions, and a job past that limit raises rather than queueing
-- Run the client on an EC2 instance in the same VPC; a NAT'd laptop will not work
-- Leave `use_public_ips=True` unless you have a VPN or Direct Connect path
+- Run the client on an EC2 instance in the same VPC, or set
+  `instance_connect_endpoint_id` and `address="127.0.0.1"` if it is a NAT'd laptop
+- Leave `use_public_ips=True` unless you have a VPN or Direct Connect path — or a
+  reverse tunnel, which needs neither a public IP nor a NAT gateway
 
 ### Detached mode
 - Use `state_store_type="parameter_store"` so the bastion and client share state
@@ -453,7 +518,10 @@ configuration carries over.
 - Bootstrap output is in `/var/log/cloud-init-output.log` on the instance
 - Worker stdout/stderr is in Parsl's `runinfo/` directory on the client
 - If workers launch but never register, the client is almost certainly not
-  accepting inbound connections on the interchange ports
+  accepting inbound connections on the interchange ports — see
+  [Workers never register](troubleshooting.md#workers-launch-but-never-register)
+- With a reverse tunnel, `ps` for the `ssh` children: one per instance, each
+  holding `-R 127.0.0.1:<port>`. None means the tunnel never opened
 
 ### Detached mode
 - SSM to the bastion and read the orchestrator's journal

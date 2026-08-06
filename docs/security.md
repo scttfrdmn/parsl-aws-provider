@@ -84,6 +84,31 @@ and `iam:PassedToService: ec2.amazonaws.com` on `iam:PassRole`.
 }
 ```
 
+**Reverse tunnels (`instance_connect_endpoint_id`)** — generate rather than copy,
+because the conditions are the point:
+
+```python
+import json
+
+from parsl_ephemeral_provider.network import eice_iam_statements
+
+print(json.dumps(eice_iam_statements(endpoint_id="eice-0abc1234"), indent=2))
+```
+
+Two conditions carry the whole least-privilege claim, and IAM's own evaluator is
+asked to confirm both in `tests/aws/test_eice_tunnel_e2e.py`:
+
+- `ec2-instance-connect:OpenTunnel` is scoped to **`remotePort == 22`**. This
+  design only ever tunnels to sshd and carries the ZMQ ports *inside* that SSH
+  session, so those ports never appear in the policy. Unconditioned, the grant
+  reaches any port on any instance the holder can name.
+- `SendSSHPublicKey` is scoped to **`ec2:osuser == ec2-user`**. Unconditioned, it
+  authorises a key for any OS user on the instance, including root.
+
+Passing `endpoint_id` scopes `OpenTunnel` to one endpoint as well. These are
+permissions for the **driver's** principal; the worker needs nothing extra, since
+the tunnel terminates at its own sshd.
+
 **Serverless mode (Lambda)**:
 
 ```json
@@ -282,6 +307,27 @@ Instances then need a NAT gateway, or VPC endpoints for `ssm`, `ssmmessages`,
 `ec2messages`, and `s3`, to reach AWS APIs and register with SSM. The provider
 does not create either.
 
+### Reverse tunnels instead of an inbound rule
+
+`instance_connect_endpoint_id` removes the client-facing inbound rule entirely.
+The interchange arrives on each worker's own loopback, so the security group needs
+no ingress for 54000–55000 from your client — and the worker needs no route to
+your client at all. Verified against a subnet with no public IP and no NAT
+gateway.
+
+What it adds is narrower: **inbound TCP 22 from the endpoint's security group**.
+That is worth weighing honestly. It is a real SSH listener reachable from the
+endpoint, where before there was none, and the exposure is bounded by three
+things: the endpoint is inside your VPC and reachable only through
+`ec2-instance-connect:OpenTunnel` (an IAM-authorised, CloudTrail-logged call); the
+authorised key is ephemeral, generated per provider, valid for about 60 seconds
+per push, and removed at shutdown; and the driver's grant is conditioned to port
+22 and one OS user (see
+[Additional permissions by mode](#additional-permissions-by-mode)).
+
+If you already run the client on an EC2 instance in the same VPC, the tunnel buys
+nothing — keep the plain outbound arrangement above.
+
 ## Data security
 
 ### Encryption in transit
@@ -302,6 +348,13 @@ the two certificate files a worker actually opens to a Parameter Store
 `SecureString`, and the worker fetches them at boot with `ssm:GetParameter`. Use
 this when the interchange and workers share no network boundary: cross-VPC,
 cross-account, or over the internet.
+
+A third arrangement is worth knowing about: with
+`instance_connect_endpoint_id` the worker connects to its **own loopback**, so the
+ZMQ traffic never crosses a network at all — it rides inside an SSH session. That
+is a stronger transport story than `encrypted=False` over a VPC, and the two
+compose: set both and the CurveZMQ handshake happens over the tunnel. See
+[Reverse tunnels](operating_modes.md#reverse-tunnels).
 
 ```python
 provider = EphemeralProvider(

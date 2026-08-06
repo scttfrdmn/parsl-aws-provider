@@ -683,6 +683,10 @@ class TestEveryParameterSurvivesTheRoundTrip:
                 "warm_pool_size": 1,
                 "warm_pool_ttl": 300,
                 "distribute_certificates": True,
+                "instance_connect_endpoint_id": "eice-0123456789abcdef0",
+                "tunnel_os_user": "ubuntu",
+                "tunnel_private_key_path": "/tmp/k",
+                "tunnel_public_key_path": "/tmp/k.pub",
             },
             "detached": {
                 "bastion_instance_type": "t3.small",

@@ -110,11 +110,20 @@ can inject the session, state store, and resolved AMI.
 
 ### `warm_pool_size ... is supported only by mode='standard'`
 
-`warm_pool_size`, `warm_pool_ttl`, `bake_ami`, `baked_ami_id`, `one_shot`, and
-`distribute_certificates` are implemented by `StandardMode` alone. Setting the
-warm-pool ones on another mode used to leak instances no mode would reclaim
-(#80); `distribute_certificates` would leak nothing but would silently deliver
-workers that die on a missing certificate directory. Both are now rejected.
+`warm_pool_size`, `warm_pool_ttl`, `bake_ami`, `baked_ami_id`, `one_shot`,
+`distribute_certificates`, and the four `instance_connect_endpoint_id` /
+`tunnel_*` options are implemented by `StandardMode` alone. Setting the warm-pool
+ones on another mode used to leak instances no mode would reclaim (#80);
+`distribute_certificates` would leak nothing but would silently deliver workers
+that die on a missing certificate directory. An endpoint ID on detached mode would
+read as a cheaper alternative to the bastion while doing nothing at all. All are
+now rejected.
+
+### `tunnel_private_key_path and tunnel_public_key_path must be set together`
+
+The public key is authorised on the instance and the private key authenticates
+the tunnel, so one without the other cannot connect. Leave both unset to have an
+ephemeral pair generated per provider and removed at shutdown.
 
 ### `warm_pool_size > 0 requires ...`
 
@@ -143,9 +152,14 @@ ever connecting.
    that allows inbound 54000–55000 from the worker security group. Note the
    default VPC security group allows inbound only from itself, so if workers use a
    different group you need an explicit rule.
-2. **Use detached mode** — a bastion owns the worker lifecycle, and the client
+2. **Set `instance_connect_endpoint_id`** and `address="127.0.0.1"`. A reverse
+   tunnel through an EC2 Instance Connect Endpoint puts the interchange on each
+   worker's own loopback, so no client address needs to be routable and no
+   inbound rule is needed. See
+   [Reverse tunnels](operating_modes.md#reverse-tunnels).
+3. **Use detached mode** — a bastion owns the worker lifecycle, and the client
    need not be reachable at all.
-3. **Use one-shot mode** for independent commands; it bypasses HTEX entirely and
+4. **Use one-shot mode** for independent commands; it bypasses HTEX entirely and
    works from anywhere.
 
 **Also check the certificates.** With encryption on, Parsl generates CurveZMQ
@@ -182,6 +196,81 @@ endpoint.
 interface; only the private IP is. Use `address_by_route()` for a same-VPC
 deployment. `address_by_query()` returns the NAT/router WAN address, which nothing
 in the VPC can connect back to.
+
+## Reverse tunnels
+
+### `No usable ssh executable` / `No usable aws executable`
+
+This is the only feature that shells out. `open-tunnel` has no boto3 equivalent —
+the `ec2-instance-connect` API exposes only `SendSSHPublicKey` and
+`SendSerialConsoleSSHPublicKey` — so it needs an `ssh` binary and AWS CLI v2 on
+the **driver**. Install them, or pass explicit paths as `ssh_binary` / `aws_cli`.
+The check runs up front so a missing binary is a configuration error rather than
+a worker that mysteriously never registers.
+
+### `ResourceNotFoundError: instance_connect_endpoint_id eice-... is not usable`
+
+Raised in `initialize()`, alongside the VPC/subnet/SG checks, for the same
+reason: the endpoint is caller-supplied and never created, so a typo would
+otherwise surface at the first submit as an `ssh` process exiting for no visible
+reason, minutes in, after an instance had been billed. Check the ID and the
+region. An endpoint in `create-in-progress` accepts tunnel calls and fails them,
+so wait for `create-complete`.
+
+### `Could not open an EICE reverse tunnel to i-... within 300s`
+
+"Running" is not "sshd is accepting connections" — the `instance_running` waiter
+clears well before the OS finishes booting, so the first few attempts are
+*expected* to fail and are retried. Reaching the deadline means something else:
+
+- the security group has no **inbound TCP 22 from the endpoint**. That rule is the
+  one prerequisite the tunnel adds; see
+  [network prerequisites](network-prerequisites.md#optional-an-ec2-instance-connect-endpoint).
+- the endpoint is in a different subnet from the instance.
+- `tunnel_os_user` does not exist on the AMI. It defaults to `ec2-user`, which is
+  right for Amazon Linux; Ubuntu images want `ubuntu`.
+- the driver's principal lacks `ec2-instance-connect:OpenTunnel` or
+  `SendSSHPublicKey`. The error text carries the underlying `ssh` stderr.
+
+### The tunnel opens, but the worker still never registers
+
+Check the address HTEX gave the worker. With a tunnel the interchange is on the
+worker's **own** loopback, so `address="127.0.0.1"` is correct; leave
+`address_by_query()` in place and HTEX offers both addresses, may win the probe
+with the unroutable one, and the tunnel goes unused. The provider logs a warning
+when the command names a non-loopback `-a`.
+
+### `Permission denied (publickey)` on a reconnect
+
+`send-ssh-public-key` authorises a key for roughly 60 seconds, which is why the
+provider re-pushes it before *every* connect. Seeing this means a connect used a
+stale authorisation — worth reporting, since the supervisor is supposed to make
+it impossible.
+
+### Warnings about reconnecting during cleanup
+
+Expected only if the tunnel outlives the instance. Cleanup closes tunnels before
+terminating anything precisely so the supervisor is not fighting the teardown; a
+run of reconnect warnings during ordinary shutdown means that ordering broke.
+
+### An `ssh` process outlives the run
+
+There should be exactly one `ssh` child per supervised instance and none after
+`shutdown()`. A stray one — reparented to PID 1, holding a forward to an instance
+that no longer exists — means a tunnel was started by something that no longer
+held a reference to it. Two ways that could happen were fixed in #134 (concurrent
+starts overwriting each other's process handle, and a supervision pass reviving a
+tunnel removed after its snapshot), so a survivor now is worth reporting. Find
+them with `ps` for `open-tunnel`; they are safe to `kill`.
+
+### A single tunnel does not survive an hour
+
+By design. The API caps one tunnel at 3600 seconds, so the supervisor recycles
+each one before AWS closes it — a tunnel torn down at the ceiling drops whatever
+was in flight. Reconnects complete well inside HTEX's 120-second
+`heartbeat_threshold`. Nothing is durable across a driver restart: if the driver
+dies the tunnels die with it, which is correct, because the interchange they
+forward to died too.
 
 ## Instance launch failures
 

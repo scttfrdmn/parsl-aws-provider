@@ -77,6 +77,77 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   constructor parameter has fallen out of the sample set altogether.
 
 ### Added
+- **`instance_connect_endpoint_id` and three `tunnel_*` options on
+  `EphemeralProvider`, for `mode="standard"`** (#134). This is the answer to "my
+  driver is a laptop behind NAT". HTEX workers connect *outbound* to the
+  interchange, so the driver has to accept inbound TCP on 54000–55000, which a
+  laptop behind home or office NAT cannot do. The project's only answer until now
+  was detached mode — paying for a bastion to work around a network topology
+  problem. Set `instance_connect_endpoint_id` to a pre-provisioned EC2 Instance
+  Connect Endpoint and the provider opens an SSH reverse tunnel to each worker,
+  putting the interchange on the worker's **own loopback**. Give HTEX
+  `address="127.0.0.1"`; no driver address needs to be routable, and the subnet
+  needs neither a public IP nor a NAT gateway.
+
+  The issue's proposed mechanism does not work, and correcting it shaped the
+  design. `aws ec2-instance-connect open-tunnel --remote-port` is a **forward**
+  tunnel: `--remote-port` is the port to connect to *on the instance*. Pointing it
+  at 54000–55000 forwards driver-side connections to ports on the worker where
+  nothing is listening. What works is to use EICE for the one thing it does —
+  reach port 22 — and let `ssh -R` carry the reverse forward. Verified live
+  against a `t3.micro` with no public IP in a subnet with no NAT: a `zmq.DEALER`
+  on the worker completed a full round trip to a `zmq.ROUTER` bound to driver
+  loopback, which is exactly HTEX's socket pair on exactly its port range.
+
+  Four API constraints, each confirmed against the live service, are why this is a
+  supervised subprocess rather than a config flag:
+
+  - a single tunnel is capped at **3600 seconds** — `--max-tunnel-duration 3601`
+    is rejected before the call is even made, and the CLI's own message ("must be
+    greater than 1 and less than 3600") is off by one, since 3600 itself is
+    accepted — so a background thread recycles each tunnel before AWS closes it;
+    a tunnel torn down at the ceiling drops whatever is in flight. The duration
+    is clamped a second under the ceiling, so it does not matter which of the
+    message and the behaviour is wrong;
+  - the reconnect budget is HTEX's 120-second `heartbeat_threshold`, so
+    reconnects are checked against it;
+  - `send-ssh-public-key` authorises for roughly **60 seconds**, so the key is
+    re-pushed immediately before *every* connect, not once per instance;
+  - endpoint creation takes several minutes, so the endpoint is caller-supplied
+    per #69 and never created. It joins the VPC/subnet/SG in `_verify_resources`,
+    so a typo fails in `initialize()` rather than surfacing minutes later as an
+    `ssh` process exiting for no visible reason.
+
+  Ordering is load-bearing and asserted in both suites: the tunnel is opened
+  *before* the command is dispatched, because a worker connects as soon as it
+  starts; closed when a dispatch fails or resources are cleaned up; and the
+  supervisor and any generated key material are torn down first in
+  `cleanup_infrastructure()`. Leave `tunnel_private_key_path` and
+  `tunnel_public_key_path` unset and an ephemeral pair is generated per provider
+  and removed at shutdown; setting one without the other raises.
+
+  Two tunnel-lifecycle races were caught during development and are covered by
+  regression tests, because both leak an `ssh` process that nothing can reap —
+  unbounded on a long-lived driver. The submit path and the supervision thread
+  both start and stop tunnels, so `EICETunnel` serialises its own lifecycle:
+  without it, two concurrent starts each passed the liveness check, each spawned
+  `ssh`, and the second overwrote the first handle. And because a supervision pass
+  iterates a snapshot, `remove()`/`shutdown()` mark a tunnel retired rather than
+  merely stopping it — otherwise a pass already in flight reconnects a tunnel to
+  an instance being terminated, after the supervisor has dropped its reference.
+
+  Two costs worth naming. This is the only part of the package that shells out —
+  it needs an `ssh` binary and AWS CLI v2 on the driver, because `open-tunnel` has
+  no boto3 equivalent (`ec2-instance-connect` exposes only `SendSSHPublicKey` and
+  `SendSerialConsoleSSHPublicKey`), and both are checked up front. And it needs
+  inbound TCP 22 from the endpoint on the worker security group, in exchange for
+  dropping the client-facing 54000–55000 rule entirely.
+  `network.eice_iam_statements()` returns the driver's grant, scoped with two
+  conditions that IAM's own evaluator is asked to confirm: `OpenTunnel` on
+  `remotePort == 22` alone, and `SendSSHPublicKey` on `ec2:osuser == ec2-user`.
+  All four options join the standard-mode guard — detached mode has its own answer
+  to the same problem, so accepting an endpoint ID there would read as a cheaper
+  alternative that silently did nothing.
 - **`distribute_certificates` on `EphemeralProvider`, for `mode="standard"`**
   (#62). Parsl's `HighThroughputExecutor` encrypts the worker/interchange channel
   with CurveZMQ by default, generating the certificates in the driver's `run_dir`

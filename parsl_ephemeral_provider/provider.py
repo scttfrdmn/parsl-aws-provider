@@ -31,6 +31,7 @@ from parsl_ephemeral_provider.constants import (
     DEFAULT_ECS_CONTAINER_IMAGE,
     DEFAULT_ECS_CPU,
     DEFAULT_ECS_MEMORY,
+    DEFAULT_INSTANCE_CONNECT_ENDPOINT_ID,
     DEFAULT_INSTANCE_TYPE,
     DEFAULT_LAMBDA_MEMORY,
     DEFAULT_LAMBDA_RUNTIME,
@@ -43,6 +44,9 @@ from parsl_ephemeral_provider.constants import (
     DEFAULT_PRESERVE_BASTION,
     DEFAULT_REGION,
     DEFAULT_SPOT_ALLOCATION_STRATEGY,
+    DEFAULT_TUNNEL_OS_USER,
+    DEFAULT_TUNNEL_PRIVATE_KEY_PATH,
+    DEFAULT_TUNNEL_PUBLIC_KEY_PATH,
     DEFAULT_WARM_POOL_SIZE,
     DEFAULT_WARM_POOL_TTL,
     DEFAULT_WORKER_INIT,
@@ -367,12 +371,51 @@ class EphemeralProvider(ExecutionProvider, RepresentationMixin):
         ``server.key_secret``.  Anyone able to read the parameter can therefore
         impersonate the interchange to a worker.  The parameter is encrypted at
         rest, scoped to this provider's ID, and deleted on ``shutdown()``.
+    instance_connect_endpoint_id : str, optional
+        EC2 Instance Connect Endpoint ID to tunnel through.  Default is None,
+        which disables tunnelling; setting it turns it on.  ``mode="standard"``
+        only.
+
+        This is the answer to "my driver is a laptop behind NAT".  HTEX workers
+        connect *outbound* to the interchange, so the driver must accept inbound
+        TCP on 54000–55000 — which a home or office NAT does not permit, and the
+        project's only previous answer was detached mode: pay for a bastion to
+        work around a network topology problem.  With an endpoint set, the
+        provider holds an ``ssh -R`` reverse forward open to each worker through
+        the endpoint, so the interchange appears on the worker's own loopback and
+        **no driver address needs to be routable** (#134).
+
+        Set the executor's ``address="127.0.0.1"`` to match; a routable address
+        left in the list may win HTEX's probe and leave the tunnel unused.
+
+        The endpoint must already exist — creating one takes several minutes, so
+        it is part of the pre-provisioned network the caller supplies (#69).
+        This is also the one feature that shells out: it needs an ``ssh`` binary
+        and AWS CLI v2 on the driver, because ``open-tunnel`` has no boto3
+        equivalent.  The driver's principal needs
+        ``ec2-instance-connect:OpenTunnel`` and ``SendSSHPublicKey``; see
+        :func:`~parsl_ephemeral_provider.network.eice.eice_iam_statements` for a
+        least-privilege policy scoped to port 22.
+    tunnel_os_user : str, optional
+        Remote user the tunnel authenticates as.  Default is ``"ec2-user"``,
+        correct for the Amazon Linux AMIs this provider selects.
+        ``mode="standard"`` only.
+    tunnel_private_key_path : str, optional
+        SSH private key for the tunnel.  Default is None, which generates an
+        ephemeral ed25519 pair per provider and discards it at cleanup.
+        ``mode="standard"`` only.
+    tunnel_public_key_path : str, optional
+        Matching public key, authorised on each instance for the ~60 seconds
+        ``SendSSHPublicKey`` grants.  Default is None.  Supply both key paths or
+        neither.  ``mode="standard"`` only.
 
     Raises
     ------
     ProviderConfigurationError
         If ``warm_pool_size``, ``warm_pool_ttl``, ``bake_ami``,
-        ``baked_ami_id``, ``one_shot``, or ``distribute_certificates`` is set on
+        ``baked_ami_id``, ``one_shot``, ``distribute_certificates``,
+        ``instance_connect_endpoint_id``, ``tunnel_os_user``,
+        ``tunnel_private_key_path``, or ``tunnel_public_key_path`` is set on
         any mode other than ``"standard"`` — no other mode implements them.
 
         If ``idle_timeout``, ``preserve_bastion``, ``bastion_host_type``,
@@ -446,6 +489,12 @@ class EphemeralProvider(ExecutionProvider, RepresentationMixin):
         baked_ami_id: Optional[str] = None,
         one_shot: bool = DEFAULT_ONE_SHOT,
         distribute_certificates: bool = DEFAULT_DISTRIBUTE_CERTIFICATES,
+        instance_connect_endpoint_id: Optional[
+            str
+        ] = DEFAULT_INSTANCE_CONNECT_ENDPOINT_ID,
+        tunnel_os_user: str = DEFAULT_TUNNEL_OS_USER,
+        tunnel_private_key_path: Optional[str] = DEFAULT_TUNNEL_PRIVATE_KEY_PATH,
+        tunnel_public_key_path: Optional[str] = DEFAULT_TUNNEL_PUBLIC_KEY_PATH,
         cores_per_node: Optional[int] = None,
         mem_per_node: Optional[float] = None,
         **kwargs: Any,
@@ -572,6 +621,10 @@ class EphemeralProvider(ExecutionProvider, RepresentationMixin):
         self.baked_ami_id = baked_ami_id
         self.one_shot = one_shot
         self.distribute_certificates = distribute_certificates
+        self.instance_connect_endpoint_id = instance_connect_endpoint_id
+        self.tunnel_os_user = tunnel_os_user
+        self.tunnel_private_key_path = tunnel_private_key_path
+        self.tunnel_public_key_path = tunnel_public_key_path
 
         # Guard: network IDs are required (provider no longer creates VPC/subnet/SG).
         # Lambda-only serverless is the one exception: functions run in the
@@ -601,6 +654,12 @@ class EphemeralProvider(ExecutionProvider, RepresentationMixin):
         # encryption and deliver workers that die on a missing certificate
         # directory -- an option that looks configured and is not, which is the
         # class of failure #136 and #155 exist to eliminate.
+        #
+        # The four tunnel options (#134) are the same case again: only
+        # StandardMode opens, supervises, and closes tunnels. Detached mode has
+        # its own answer to the same problem -- a bastion -- so accepting an
+        # endpoint ID there would look like a cheaper alternative that silently
+        # did nothing.
         standard_only = [
             name
             for name, value, default in (
@@ -613,6 +672,22 @@ class EphemeralProvider(ExecutionProvider, RepresentationMixin):
                     "distribute_certificates",
                     distribute_certificates,
                     DEFAULT_DISTRIBUTE_CERTIFICATES,
+                ),
+                (
+                    "instance_connect_endpoint_id",
+                    instance_connect_endpoint_id,
+                    DEFAULT_INSTANCE_CONNECT_ENDPOINT_ID,
+                ),
+                ("tunnel_os_user", tunnel_os_user, DEFAULT_TUNNEL_OS_USER),
+                (
+                    "tunnel_private_key_path",
+                    tunnel_private_key_path,
+                    DEFAULT_TUNNEL_PRIVATE_KEY_PATH,
+                ),
+                (
+                    "tunnel_public_key_path",
+                    tunnel_public_key_path,
+                    DEFAULT_TUNNEL_PUBLIC_KEY_PATH,
                 ),
             )
             if value != default
@@ -1189,6 +1264,10 @@ class EphemeralProvider(ExecutionProvider, RepresentationMixin):
                 baked_ami_id=self.baked_ami_id,
                 one_shot=self.one_shot,
                 distribute_certificates=self.distribute_certificates,
+                instance_connect_endpoint_id=self.instance_connect_endpoint_id,
+                tunnel_os_user=self.tunnel_os_user,
+                tunnel_private_key_path=self.tunnel_private_key_path,
+                tunnel_public_key_path=self.tunnel_public_key_path,
                 **common_params,
             )
         elif self.mode_type == OperatingModeType.DETACHED:
