@@ -193,13 +193,18 @@ class TestServerlessModeSpotFleetIntegration:
         ``0.88.0``: three separate defects each returned a *successful* but empty or
         truncated container list, so a stack that deployed a broken task definition
         looked identical to one that worked. ``Command`` is the interesting field
-        because the template routes it through ``!Split`` inside
+        because the template builds it with an intrinsic inside
         ``ContainerDefinitions`` -- the exact shape of substrate#521 and #526.
+
+        The command submitted here contains a space and a comma, both of which used
+        to be destructive. Until #226 the template built argv with
+        ``!Split [',', ...]``, so this string would have arrived as the two-element
+        ``["echo hello", " world"]`` -- non-empty, which is all the previous version
+        of this test checked, and which is why it passed against the defect.
         """
         serverless_mode.initialize()
-        resource_id = serverless_mode.submit_job(
-            self._job_id("job-td"), "echo hello", 1
-        )
+        command = "echo hello, world"
+        resource_id = serverless_mode.submit_job(self._job_id("job-td"), command, 1)
         stack_name = serverless_mode.resources[resource_id]["stack_name"]
 
         outputs = {
@@ -215,7 +220,11 @@ class TestServerlessModeSpotFleetIntegration:
 
         containers = task_def["containerDefinitions"]
         assert containers, "task definition deployed with no containers"
-        assert containers[0]["command"], "the command was lost between CFN and ECS"
+        assert containers[0]["command"] == ["/bin/sh", "-c", command], (
+            f"command deployed as {containers[0]['command']!r}. The container runs "
+            "the command through a shell, so it must arrive as a single argument "
+            "and not be split (#226)."
+        )
 
     def test_submit_lambda_job_stages_a_real_zip_in_s3(self, aws_session, network):
         """A Lambda submit stages an intact archive and deploys the function.

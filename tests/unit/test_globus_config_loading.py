@@ -660,6 +660,7 @@ class TestEveryParameterSurvivesTheRoundTrip:
             "profile_name": "aws",
             "state_file_path": "s.json",
             "s3_key": "k.json",
+            "s3_create_bucket": True,
             "parameter_store_path": "/p/x",
             "spot_max_price": "0.05",
             "spot_allocation_strategy": "capacity-optimized",

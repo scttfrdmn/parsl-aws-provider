@@ -7,7 +7,10 @@ SPDX-FileCopyrightText: 2025-2026 Scott Friedman and Project Contributors
 import pytest
 from unittest.mock import MagicMock, patch
 import boto3
+import re
 import time
+
+import yaml
 
 from parsl_ephemeral_provider.modes.serverless import ServerlessMode
 from parsl_ephemeral_provider.state.base import STATE_KEY_MODE
@@ -33,191 +36,195 @@ from parsl_ephemeral_provider.constants import (
 pytestmark = pytest.mark.unit
 
 
+@pytest.fixture
+def mock_session():
+    """Create a mock boto3 session."""
+    session = MagicMock(spec=boto3.Session)
+    session.region_name = "us-east-1"
+    return session
+
+
+@pytest.fixture
+def mock_state_store():
+    """Create a mock state store."""
+    store = MagicMock()
+    store.load_state.return_value = None  # Default to no state
+    return store
+
+
+@pytest.fixture
+def mock_cf_client():
+    """Create a mock CloudFormation client."""
+    client = MagicMock()
+
+    # Mock create_stack
+    client.create_stack.return_value = {"StackId": "stack-12345"}
+
+    # Mock describe_stacks
+    client.describe_stacks.return_value = {
+        "Stacks": [
+            {
+                "StackId": "stack-12345",
+                "StackName": "parsl-lambda-12345",
+                "StackStatus": "CREATE_COMPLETE",
+                "Outputs": [
+                    {
+                        "OutputKey": "LambdaFunctionName",
+                        "OutputValue": "parsl-lambda-function",
+                    },
+                    {"OutputKey": "ClusterName", "OutputValue": "parsl-cluster"},
+                    {"OutputKey": "ServiceName", "OutputValue": "parsl-service"},
+                ],
+            }
+        ]
+    }
+
+    return client
+
+
+@pytest.fixture
+def mock_ec2_client():
+    """Create a mock EC2 client."""
+    client = MagicMock()
+
+    # Mock create_vpc
+    client.create_vpc.return_value = {"Vpc": {"VpcId": "vpc-12345"}}
+
+    # Mock describe_vpcs
+    client.describe_vpcs.return_value = {"Vpcs": [{"VpcId": "vpc-12345"}]}
+
+    # Mock create_subnet
+    client.create_subnet.return_value = {"Subnet": {"SubnetId": "subnet-12345"}}
+
+    # Mock describe_subnets
+    client.describe_subnets.return_value = {"Subnets": [{"SubnetId": "subnet-12345"}]}
+
+    # Mock create_security_group
+    client.create_security_group.return_value = {"GroupId": "sg-12345"}
+
+    # Mock describe_security_groups
+    client.describe_security_groups.return_value = {
+        "SecurityGroups": [{"GroupId": "sg-12345"}]
+    }
+
+    return client
+
+
+@pytest.fixture
+def mock_lambda_client():
+    """Create a mock Lambda client."""
+    client = MagicMock()
+
+    # Mock get_function
+    client.get_function.return_value = {
+        "Configuration": {
+            "FunctionName": "parsl-lambda-function",
+            "FunctionArn": "arn:aws:lambda:us-east-1:123456789012:function:parsl-lambda-function",
+        }
+    }
+
+    # Mock invoke
+    client.invoke.return_value = {
+        "StatusCode": 200,
+        "Payload": MagicMock(
+            read=lambda: '{"statusCode": 200, "body": "Success"}'.encode()
+        ),
+    }
+
+    return client
+
+
+@pytest.fixture
+def mock_ecs_client():
+    """Create a mock ECS client."""
+    client = MagicMock()
+
+    # Mock describe_services
+    client.describe_services.return_value = {
+        "services": [
+            {
+                "serviceName": "parsl-service",
+                "desiredCount": 1,
+                "runningCount": 1,
+                "deployments": [{"status": "PRIMARY", "id": "deployment-12345"}],
+                "events": [{"message": "service has reached a steady state"}],
+            }
+        ]
+    }
+
+    # Mock list_tasks
+    client.list_tasks.return_value = {"taskArns": ["task-arn-12345"]}
+
+    # Mock describe_tasks
+    client.describe_tasks.return_value = {
+        "tasks": [
+            {
+                "taskArn": "task-arn-12345",
+                "lastStatus": "RUNNING",
+                "containers": [{"name": "worker", "lastStatus": "RUNNING"}],
+            }
+        ]
+    }
+
+    return client
+
+
+@pytest.fixture
+def serverless_mode(
+    mock_session,
+    mock_state_store,
+    mock_cf_client,
+    mock_ec2_client,
+    mock_lambda_client,
+    mock_ecs_client,
+    mock_s3_client,
+):
+    """Create a ServerlessMode instance with mocked dependencies."""
+
+    # Configure session to return mock clients
+    def get_client(service_name, **kwargs):
+        if service_name == "cloudformation":
+            return mock_cf_client
+        elif service_name == "ec2":
+            return mock_ec2_client
+        elif service_name == "lambda":
+            return mock_lambda_client
+        elif service_name == "ecs":
+            return mock_ecs_client
+        elif service_name == "s3":
+            # Lambda submits stage their zip here (#116).
+            return mock_s3_client
+        return MagicMock()
+
+    mock_session.client.side_effect = get_client
+
+    # Create mode instance with auto worker type
+    mode = ServerlessMode(
+        provider_id="test-provider",
+        session=mock_session,
+        state_store=mock_state_store,
+        worker_type=WORKER_TYPE_AUTO,
+        lambda_timeout=300,
+        lambda_memory=1024,
+        ecs_task_cpu=1024,
+        ecs_task_memory=2048,
+        region="us-east-1",
+        vpc_id="vpc-12345",
+        subnet_id="subnet-12345",
+        security_group_id="sg-12345",
+    )
+
+    # Mock LambdaManager and ECSManager
+    mode.lambda_manager = MagicMock()
+    mode.lambda_manager._generate_lambda_code.return_value = b"lambda_code_zip"
+
+    mode.ecs_manager = MagicMock()
+
+    return mode
+
+
 class TestServerlessMode:
     """Tests for the ServerlessMode class."""
-
-    @pytest.fixture
-    def mock_session(self):
-        """Create a mock boto3 session."""
-        session = MagicMock(spec=boto3.Session)
-        session.region_name = "us-east-1"
-        return session
-
-    @pytest.fixture
-    def mock_state_store(self):
-        """Create a mock state store."""
-        store = MagicMock()
-        store.load_state.return_value = None  # Default to no state
-        return store
-
-    @pytest.fixture
-    def mock_cf_client(self):
-        """Create a mock CloudFormation client."""
-        client = MagicMock()
-
-        # Mock create_stack
-        client.create_stack.return_value = {"StackId": "stack-12345"}
-
-        # Mock describe_stacks
-        client.describe_stacks.return_value = {
-            "Stacks": [
-                {
-                    "StackId": "stack-12345",
-                    "StackName": "parsl-lambda-12345",
-                    "StackStatus": "CREATE_COMPLETE",
-                    "Outputs": [
-                        {
-                            "OutputKey": "LambdaFunctionName",
-                            "OutputValue": "parsl-lambda-function",
-                        },
-                        {"OutputKey": "ClusterName", "OutputValue": "parsl-cluster"},
-                        {"OutputKey": "ServiceName", "OutputValue": "parsl-service"},
-                    ],
-                }
-            ]
-        }
-
-        return client
-
-    @pytest.fixture
-    def mock_ec2_client(self):
-        """Create a mock EC2 client."""
-        client = MagicMock()
-
-        # Mock create_vpc
-        client.create_vpc.return_value = {"Vpc": {"VpcId": "vpc-12345"}}
-
-        # Mock describe_vpcs
-        client.describe_vpcs.return_value = {"Vpcs": [{"VpcId": "vpc-12345"}]}
-
-        # Mock create_subnet
-        client.create_subnet.return_value = {"Subnet": {"SubnetId": "subnet-12345"}}
-
-        # Mock describe_subnets
-        client.describe_subnets.return_value = {
-            "Subnets": [{"SubnetId": "subnet-12345"}]
-        }
-
-        # Mock create_security_group
-        client.create_security_group.return_value = {"GroupId": "sg-12345"}
-
-        # Mock describe_security_groups
-        client.describe_security_groups.return_value = {
-            "SecurityGroups": [{"GroupId": "sg-12345"}]
-        }
-
-        return client
-
-    @pytest.fixture
-    def mock_lambda_client(self):
-        """Create a mock Lambda client."""
-        client = MagicMock()
-
-        # Mock get_function
-        client.get_function.return_value = {
-            "Configuration": {
-                "FunctionName": "parsl-lambda-function",
-                "FunctionArn": "arn:aws:lambda:us-east-1:123456789012:function:parsl-lambda-function",
-            }
-        }
-
-        # Mock invoke
-        client.invoke.return_value = {
-            "StatusCode": 200,
-            "Payload": MagicMock(
-                read=lambda: '{"statusCode": 200, "body": "Success"}'.encode()
-            ),
-        }
-
-        return client
-
-    @pytest.fixture
-    def mock_ecs_client(self):
-        """Create a mock ECS client."""
-        client = MagicMock()
-
-        # Mock describe_services
-        client.describe_services.return_value = {
-            "services": [
-                {
-                    "serviceName": "parsl-service",
-                    "desiredCount": 1,
-                    "runningCount": 1,
-                    "deployments": [{"status": "PRIMARY", "id": "deployment-12345"}],
-                    "events": [{"message": "service has reached a steady state"}],
-                }
-            ]
-        }
-
-        # Mock list_tasks
-        client.list_tasks.return_value = {"taskArns": ["task-arn-12345"]}
-
-        # Mock describe_tasks
-        client.describe_tasks.return_value = {
-            "tasks": [
-                {
-                    "taskArn": "task-arn-12345",
-                    "lastStatus": "RUNNING",
-                    "containers": [{"name": "worker", "lastStatus": "RUNNING"}],
-                }
-            ]
-        }
-
-        return client
-
-    @pytest.fixture
-    def serverless_mode(
-        self,
-        mock_session,
-        mock_state_store,
-        mock_cf_client,
-        mock_ec2_client,
-        mock_lambda_client,
-        mock_ecs_client,
-        mock_s3_client,
-    ):
-        """Create a ServerlessMode instance with mocked dependencies."""
-
-        # Configure session to return mock clients
-        def get_client(service_name, **kwargs):
-            if service_name == "cloudformation":
-                return mock_cf_client
-            elif service_name == "ec2":
-                return mock_ec2_client
-            elif service_name == "lambda":
-                return mock_lambda_client
-            elif service_name == "ecs":
-                return mock_ecs_client
-            elif service_name == "s3":
-                # Lambda submits stage their zip here (#116).
-                return mock_s3_client
-            return MagicMock()
-
-        mock_session.client.side_effect = get_client
-
-        # Create mode instance with auto worker type
-        mode = ServerlessMode(
-            provider_id="test-provider",
-            session=mock_session,
-            state_store=mock_state_store,
-            worker_type=WORKER_TYPE_AUTO,
-            lambda_timeout=300,
-            lambda_memory=1024,
-            ecs_task_cpu=1024,
-            ecs_task_memory=2048,
-            region="us-east-1",
-            vpc_id="vpc-12345",
-            subnet_id="subnet-12345",
-            security_group_id="sg-12345",
-        )
-
-        # Mock LambdaManager and ECSManager
-        mode.lambda_manager = MagicMock()
-        mode.lambda_manager._generate_lambda_code.return_value = b"lambda_code_zip"
-
-        mode.ecs_manager = MagicMock()
-
-        return mode
 
     def test_init(self, serverless_mode):
         """Test initialization of ServerlessMode."""
@@ -930,3 +937,82 @@ class TestServerlessMode:
         assert state["initialized"] is True
         assert state["resources"] == serverless_mode.resources
         assert state["worker_type"] == WORKER_TYPE_AUTO
+
+
+class TestEcsCommandIsAShellString:
+    """The ECS command surface matches every other mode's (#226).
+
+    ``ecs_worker.yml`` used to build the container's argv with
+    ``!Split [',', !Ref Command]``, and the mode collapsed newlines to ``;`` to
+    suit it. So ``submit("python -c 'print(1)'")`` -- the shape every other path
+    accepts -- arrived as a single ``argv[0]``, the container failed to exec, and
+    because the stack runs an ECS *Service* with a ``DesiredCount`` the exited task
+    was replaced and billed on a loop. Nothing about that was distinguishable from
+    a task that ran and finished: the task definition registered, the stack reached
+    ``CREATE_COMPLETE``, and the task reached ``STOPPED``.
+
+    Two seams, tested separately because they fail independently: the mode must
+    pass the command through untouched, and the template must run it under a shell.
+    """
+
+    @staticmethod
+    def _ecs_params(mode, command):
+        """Submit *command* down the ECS path and return the stack parameters."""
+        mode.worker_type = WORKER_TYPE_ECS
+        mode.initialized = True
+        resource_id = mode.submit_job("job-1", command, 1)
+        assert resource_id in mode.resources
+        return {
+            p["ParameterKey"]: p["ParameterValue"]
+            for p in mode.cf_client.create_stack.call_args[1]["Parameters"]
+        }
+
+    def test_a_shell_string_reaches_cloudformation_unaltered(self, serverless_mode):
+        """Quotes, spaces, and commas all survive.
+
+        A comma is the interesting character: under the old encoding it was the
+        argv separator, so a command that merely *mentioned* one -- a Python tuple,
+        a comma-separated ``--option`` -- was silently cut in two.
+        """
+        command = "python -c \"print('a,b', 1)\""
+        params = self._ecs_params(serverless_mode, command)
+
+        assert params["Command"] == command
+
+    def test_newlines_are_not_collapsed_into_semicolons(self, serverless_mode):
+        """A multi-line command keeps its newlines.
+
+        The mode used to send ``command.replace("\\n", ";")``. That is not merely
+        cosmetic: it makes every line after a ``#`` comment part of that comment,
+        so a script with one comment in it silently stops executing there.
+        CloudFormation preserves newlines in a ``String`` parameter, verified
+        against the live service.
+        """
+        command = "echo one\n# a comment\necho two"
+        params = self._ecs_params(serverless_mode, command)
+
+        assert params["Command"] == command
+        assert ";" not in params["Command"]
+
+    def test_the_template_execs_the_command_through_a_shell(self):
+        """``ecs_worker.yml`` wraps ``Command`` in ``/bin/sh -c``.
+
+        Asserted on the template rather than on a deployed stack because this is
+        the half the mode cannot observe: the mode's job is to hand over an
+        untouched string, and whether that string becomes ``argv`` or a shell line
+        is decided entirely here. A regression to ``!Split`` would leave both other
+        tests in this class passing.
+        """
+        # Intrinsics are stripped so safe_load can read the structure, the same
+        # way test_instance_profile.py reads bastion.yml. `!Ref Command` becomes a
+        # bare `Command` and `!If [c, a, b]` becomes the plain list [c, a, b],
+        # which is enough: what matters is that the command is the operand of a
+        # /bin/sh -c argv and not the input to a split.
+        container = yaml.safe_load(
+            re.sub(r"!\w+", "", get_cf_template("ecs_worker.yml"))
+        )["Resources"]["TaskDefinition"]["Properties"]["ContainerDefinitions"][0]
+
+        condition, present, absent = container["Command"]
+        assert condition == "HasCommand"
+        assert present == ["/bin/sh", "-c", "Command"]
+        assert absent == "AWS::NoValue"

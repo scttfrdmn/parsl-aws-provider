@@ -2086,3 +2086,108 @@ class TestFleetBlockPoll:
                     mode._create_spot_fleet_instance(self._run_args())
 
         discard.assert_called_once_with("block-1")
+
+
+class TestS3CreateBucketForwarding:
+    """``create_bucket_if_not_exists`` was unreachable from the provider (#224).
+
+    ``S3State`` had accepted the flag since it was written and acted on it, but
+    ``_initialize_state_store()`` built the store with three arguments and none of
+    them was this one. So a provider on ``state_store_type="s3"`` *always* took
+    the already-exists branch and failed if the bucket was absent, while
+    ``s3_bucket`` and ``s3_key`` sitting alongside it made the whole area look
+    configurable. Anyone who wanted the bucket created had to build ``S3State``
+    directly, bypassing the provider -- which is what the E2E suite did, with a
+    comment saying why.
+    """
+
+    def _store_kwargs(self, **provider_kwargs):
+        """The kwargs the provider really passes to ``S3StateStore``.
+
+        Patched at the class the provider imports, so the assertion is about the
+        call the provider makes rather than about a store built here.
+        """
+        with (
+            patch(
+                "parsl_ephemeral_provider.provider.create_session"
+            ) as mock_session_factory,
+            patch("parsl_ephemeral_provider.provider.S3StateStore") as store_cls,
+            patch.object(EphemeralProvider, "_load_state", return_value=None),
+            patch.object(
+                EphemeralProvider,
+                "_initialize_operating_mode",
+                return_value=MagicMock(),
+            ),
+        ):
+            mock_session_factory.return_value = MagicMock()
+            EphemeralProvider(
+                region="us-east-1",
+                image_id="ami-12345678",
+                mode="standard",
+                vpc_id="vpc-test00001",
+                subnet_id="subnet-test001",
+                security_group_id="sg-test00001",
+                state_store_type="s3",
+                s3_bucket="some-bucket",
+                **provider_kwargs,
+            )
+
+        return store_cls.call_args.kwargs
+
+    def test_the_flag_reaches_the_store(self):
+        assert self._store_kwargs(s3_create_bucket=True)["create_bucket_if_not_exists"]
+
+    def test_the_default_is_not_to_create(self):
+        """Provisioning a bucket is a side effect a caller opts into.
+
+        Flipping this default would change behaviour for every existing ``s3``
+        config, and a typo'd bucket name would silently create a second bucket
+        rather than failing.
+        """
+        assert self._store_kwargs()["create_bucket_if_not_exists"] is False
+
+    def test_the_flag_is_passed_explicitly_rather_than_omitted(self):
+        """Relying on the store's own default is what made this unreachable.
+
+        The store already defaulted to ``False``, so the old call looked correct
+        and behaved correctly for the default case -- the defect was only visible
+        when a caller wanted the other value. Asserting the key is *present*
+        pins the forwarding rather than the resulting behaviour.
+        """
+        assert "create_bucket_if_not_exists" in self._store_kwargs()
+
+    def test_it_is_accepted_on_every_mode(self):
+        """The state store is mode-agnostic, so this is not a mode-specific option.
+
+        It deliberately does *not* join the ``_reject_wrong_mode_options`` guards:
+        any mode can use the S3 backend.
+        """
+        for mode in ("standard", "detached", "serverless"):
+            with (
+                patch(
+                    "parsl_ephemeral_provider.provider.create_session"
+                ) as mock_session_factory,
+                patch.object(
+                    EphemeralProvider,
+                    "_initialize_state_store",
+                    return_value=MagicMock(),
+                ),
+                patch.object(EphemeralProvider, "_load_state", return_value=None),
+                patch.object(
+                    EphemeralProvider,
+                    "_initialize_operating_mode",
+                    return_value=MagicMock(),
+                ),
+            ):
+                mock_session_factory.return_value = MagicMock()
+                provider = EphemeralProvider(
+                    region="us-east-1",
+                    image_id="ami-12345678",
+                    mode=mode,
+                    vpc_id="vpc-test00001",
+                    subnet_id="subnet-test001",
+                    security_group_id="sg-test00001",
+                    s3_create_bucket=True,
+                )
+
+            assert provider.s3_create_bucket is True

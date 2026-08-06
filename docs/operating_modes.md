@@ -315,12 +315,19 @@ back before any container starts — which looks nothing like an image problem.
 `templates/cloudformation/lambda_worker.yml`, or CloudFormation rejects the
 stack.
 
-**On ECS, the command is split on commas, not spaces.** `ecs_worker.yml` builds
-the container's argv with `!Split [',', !Ref Command]`, so pass
-`"python,-c,print(1)"` rather than `"python -c print(1)"` — a space-separated
-string arrives as a single argv[0], and the container exits without running
-anything. This applies only to `compute_type="ecs"`; Lambda and the EC2 modes take
-an ordinary shell string.
+The command is an ordinary shell string on every path, ECS included. The Fargate
+container runs it as `/bin/sh -c <command>`, so quoting, pipes, redirection, and
+multi-line commands all work — the same as Lambda (`subprocess.run(shell=True)`)
+and the EC2 modes (a generated `command.sh`). The one requirement is that the image
+has a `/bin/sh`; a `FROM scratch` or distroless image does not.
+
+Before v0.10.0, `ecs_worker.yml` built the container's argv with
+`!Split [',', !Ref Command]`, so `"python -c print(1)"` arrived as a single
+`argv[0]` and the container exited without running anything — and because the stack
+runs an ECS *Service* with a `DesiredCount`, the exited task was replaced and
+billed on a loop. Commands written for that encoding (`"python,-c,print(1)"`) now
+reach the shell with the commas intact and must be rewritten with spaces
+([#226](https://github.com/scttfrdmn/parsl-ephemeral-provider/issues/226)).
 
 These are accepted only on `mode="serverless"`; setting one on another mode
 raises `ProviderConfigurationError`. `memory_size` and `timeout` joined that

@@ -298,8 +298,10 @@ before v0.7.0 that message was swallowed by a `TypeError`.
 
 ### `s3_bucket is required when using 's3' state store`
 
-Pass `s3_bucket`. The provider does not create the bucket; create it yourself and
-set default encryption on it.
+Pass `s3_bucket`. By default the provider does not create the bucket — create it
+yourself and set default encryption on it, or pass `s3_create_bucket=True` to have
+the provider create it when absent (it applies a public-access block and tags, but
+not default encryption).
 
 ### State is lost or two runs fight over resources
 

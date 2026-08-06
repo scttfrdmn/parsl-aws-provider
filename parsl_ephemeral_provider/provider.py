@@ -186,6 +186,10 @@ class EphemeralProvider(ExecutionProvider, RepresentationMixin):
         S3 bucket name when using 's3' state store.
     s3_key : str, optional
         S3 key name when using 's3' state store. Default is 'ephemeral_aws_state.json'.
+    s3_create_bucket : bool, optional
+        Whether to create ``s3_bucket`` if it does not exist, when using the 's3'
+        state store. Default is ``False``, so a missing bucket is an error rather
+        than something the provider quietly provisions.
     parameter_store_path : str, optional
         Parameter Store path when using 'parameter_store' state store.
         Default is '/parsl/ephemeral_aws_state'.
@@ -381,6 +385,7 @@ class EphemeralProvider(ExecutionProvider, RepresentationMixin):
         state_file_path: str = "ephemeral_aws_state.json",
         s3_bucket: Optional[str] = None,
         s3_key: str = "ephemeral_aws_state.json",
+        s3_create_bucket: bool = False,
         parameter_store_path: str = "/parsl/ephemeral_aws_state",
         use_spot: bool = False,
         spot_max_price: Optional[str] = None,
@@ -487,6 +492,7 @@ class EphemeralProvider(ExecutionProvider, RepresentationMixin):
         self.state_file_path = state_file_path
         self.s3_bucket = s3_bucket
         self.s3_key = s3_key
+        self.s3_create_bucket = s3_create_bucket
         self.parameter_store_path = parameter_store_path
         self.use_spot = use_spot
         self.spot_max_price = spot_max_price
@@ -1065,10 +1071,17 @@ class EphemeralProvider(ExecutionProvider, RepresentationMixin):
                 raise ProviderConfigurationError(
                     "s3_bucket is required when using 's3' state store"
                 )
+            # create_bucket_if_not_exists was unreachable from here until #224:
+            # the store had accepted the flag since it was written, but this call
+            # never passed it, so every provider-built S3 store took the
+            # already-exists branch and failed on a missing bucket. Anyone who
+            # wanted the bucket created had to build S3State directly, bypassing
+            # the provider.
             return S3StateStore(
                 provider=self,
                 bucket_name=self.s3_bucket,
                 key_prefix=self._s3_key_prefix(),
+                create_bucket_if_not_exists=self.s3_create_bucket,
             )
         else:
             raise ProviderConfigurationError(
