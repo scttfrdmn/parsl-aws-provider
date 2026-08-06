@@ -110,15 +110,19 @@ can inject the session, state store, and resolved AMI.
 
 ### `warm_pool_size ... is supported only by mode='standard'`
 
-`warm_pool_size`, `warm_pool_ttl`, `bake_ami`, `baked_ami_id`, and `one_shot` are
-implemented by `StandardMode` alone. Setting them on another mode used to leak
-instances no mode would reclaim (#80), so it is now rejected.
+`warm_pool_size`, `warm_pool_ttl`, `bake_ami`, `baked_ami_id`, `one_shot`, and
+`distribute_certificates` are implemented by `StandardMode` alone. Setting the
+warm-pool ones on another mode used to leak instances no mode would reclaim
+(#80); `distribute_certificates` would leak nothing but would silently deliver
+workers that die on a missing certificate directory. Both are now rejected.
 
 ### `warm_pool_size > 0 requires ...`
 
 Warm-pool and one-shot dispatch both go over SSM `SendCommand`, so the instance
 needs `AmazonSSMManagedInstanceCore`. Pass either
 `auto_create_instance_profile=True` or an explicit `iam_instance_profile_arn`.
+`distribute_certificates=True` raises the same way, because the worker reads its
+certificates with `ssm:GetParameter`.
 
 ## Workers launch but never register
 
@@ -144,16 +148,35 @@ ever connecting.
 3. **Use one-shot mode** for independent commands; it bypasses HTEX entirely and
    works from anywhere.
 
-**Also check `encrypted=False`:**
+**Also check the certificates.** With encryption on, Parsl generates CurveZMQ
+certificates in the client's `run_dir`, which workers cannot read — so they fail
+to register with no obvious error. Look for `FileNotFoundError` naming a
+`certificates` directory in `/var/log/cloud-init-output.log`. Two ways out:
 
 ```python
+# Same VPC: rely on network isolation.
 HighThroughputExecutor(label="aws", provider=provider, encrypted=False)
 ```
 
-With encryption on, Parsl generates CurveZMQ certificates in the client's
-`run_dir`, which workers cannot read — so they fail to register with no obvious
-error. Certificate distribution is
-[#62](https://github.com/scttfrdmn/parsl-ephemeral-provider/issues/62).
+```python
+# No shared network boundary: ship the certificates to the worker.
+provider = EphemeralProvider(
+    ..., distribute_certificates=True, auto_create_instance_profile=True
+)
+HighThroughputExecutor(label="aws", provider=provider)  # encrypted=True default
+```
+
+`distribute_certificates=True` is standard mode only, requires an instance
+profile, and ships the interchange's server secret key to each worker — see
+[Encryption in transit](security.md#encryption-in-transit).
+
+If a worker with `distribute_certificates=True` still fails, the fetch itself is
+the thing to check. It runs before the worker command and exits 1 on failure, so
+`/var/log/cloud-init-output.log` will carry `parsl-ephemeral: could not fetch
+CurveZMQ certificates from /parsl-ephemeral/certs/...`. That means the instance
+could not read the parameter: most often an `iam_instance_profile_arn` without
+`ssm:GetParameter`, or a private subnet with no NAT gateway and no `ssm` VPC
+endpoint.
 
 **Interchange address.** On EC2, an elastic or public IP is not bound to the
 interface; only the private IP is. Use `address_by_route()` for a same-VPC

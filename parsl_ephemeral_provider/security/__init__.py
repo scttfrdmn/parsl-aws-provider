@@ -19,6 +19,12 @@ from .encryption import (
     StateEncryptor,
     SecureStateManager,
 )
+from .curvezmq import (
+    CurveZMQCertificateDistributor,
+    certificate_iam_statements,
+    extract_cert_dir,
+    read_worker_certificates,
+)
 from .audit import (
     SecurityEventType,
     SecurityEventSeverity,
@@ -48,4 +54,8 @@ __all__ = [
     "SecurityMonitor",
     "AuditLogger",
     "ComplianceFramework",
+    "CurveZMQCertificateDistributor",
+    "certificate_iam_statements",
+    "extract_cert_dir",
+    "read_worker_certificates",
 ]

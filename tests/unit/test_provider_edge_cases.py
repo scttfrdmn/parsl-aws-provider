@@ -1128,6 +1128,10 @@ STANDARD_ONLY_OPTIONS = [
     ("bake_ami", True),
     ("baked_ami_id", "ami-prebaked01"),
     ("one_shot", True),
+    # Only StandardMode publishes and revokes the certificates (#62), so
+    # elsewhere the flag would accept a request for an encrypted channel and
+    # deliver workers that die on a missing certificate directory.
+    ("distribute_certificates", True),
 ]
 
 NON_STANDARD_MODES = ["detached", "serverless"]
@@ -2191,3 +2195,262 @@ class TestS3CreateBucketForwarding:
                 )
 
             assert provider.s3_create_bucket is True
+
+
+@pytest.mark.unit
+class TestCertificateDistributionInStandardMode:
+    """StandardMode's half of #62: publish on submit, revoke on cleanup.
+
+    What a worker actually needs, and that it can really use what is shipped, is
+    covered in ``test_curvezmq_certificates.py`` against real key material. What
+    is left here is the wiring: whether the certificates are published at the
+    right moment, land in UserData ahead of the command, survive a state round
+    trip, and are deleted.
+    """
+
+    #: A launch command shaped like the one HTEX interpolates, minus the path.
+    CMD = (
+        "process_worker_pool.py -a 10.0.1.5 --port=54321 "
+        "--cert_dir {cert_dir} --block_id=0"
+    )
+
+    @pytest.fixture
+    def cert_dir(self, tmp_path):
+        """A real interchange certificate directory, as HTEX would create it."""
+        from parsl import curvezmq
+
+        return str(curvezmq.create_certificates(tmp_path / "driver"))
+
+    def _mode(self, tmp_path, **overrides):
+        """A StandardMode with certificate distribution on and a mocked session."""
+        from parsl_ephemeral_provider.modes.standard import StandardMode
+
+        provider_id = overrides.pop("provider_id", f"test-{uuid.uuid4().hex[:8]}")
+        state_store = overrides.pop(
+            "state_store",
+            FileStateStore(
+                file_path=str(tmp_path / f"{provider_id}.json"),
+                provider_id=provider_id,
+            ),
+        )
+        params = dict(
+            provider_id=provider_id,
+            session=MagicMock(),
+            state_store=state_store,
+            image_id="ami-12345678",
+            distribute_certificates=True,
+            vpc_id="vpc-test00001",
+            subnet_id="subnet-test001",
+            security_group_id="sg-test00001",
+        )
+        params.update(overrides)
+        return StandardMode(**params)
+
+    def _param_name(self, mode, job_id="job-1"):
+        return f"/parsl-ephemeral/certs/{mode.provider_id}/{job_id}"
+
+    def test_userdata_fetches_the_certificates(self, tmp_path, cert_dir):
+        mode = self._mode(tmp_path)
+
+        script = mode._prepare_init_script(self.CMD.format(cert_dir=cert_dir), "job-1")
+
+        assert "aws ssm get-parameter" in script
+        assert self._param_name(mode) in script
+
+    def test_the_fetch_precedes_the_command(self, tmp_path, cert_dir):
+        """Order is the whole point: the worker opens the certificates at start.
+
+        On the SSM-dispatch path the command arrives minutes later so any order
+        would do, but here it runs a few lines down in the same script.
+        """
+        mode = self._mode(tmp_path)
+
+        script = mode._prepare_init_script(self.CMD.format(cert_dir=cert_dir), "job-1")
+
+        assert script.index("get-parameter") < script.index("process_worker_pool.py")
+
+    def test_the_certificates_are_published_as_a_securestring(self, tmp_path, cert_dir):
+        mode = self._mode(tmp_path)
+        ssm = mode.session.client.return_value
+
+        mode._prepare_init_script(self.CMD.format(cert_dir=cert_dir), "job-1")
+
+        assert ssm.put_parameter.call_args.kwargs["Type"] == "SecureString"
+        assert ssm.put_parameter.call_args.kwargs["Name"] == self._param_name(mode)
+
+    def test_nothing_is_published_when_the_flag_is_off(self, tmp_path, cert_dir):
+        """The default must not touch Parameter Store at all."""
+        mode = self._mode(tmp_path, distribute_certificates=False)
+        ssm = mode.session.client.return_value
+
+        script = mode._prepare_init_script(self.CMD.format(cert_dir=cert_dir), "job-1")
+
+        ssm.put_parameter.assert_not_called()
+        assert "get-parameter" not in script
+
+    def test_nothing_is_published_for_an_unencrypted_command(self, tmp_path):
+        """``encrypted=False`` puts the literal "None" in the command.
+
+        Publishing then would write a parameter no worker reads -- and would fail
+        first, trying to read a directory named ``None``.
+        """
+        mode = self._mode(tmp_path)
+        ssm = mode.session.client.return_value
+
+        script = mode._prepare_init_script(self.CMD.format(cert_dir="None"), "job-1")
+
+        ssm.put_parameter.assert_not_called()
+        assert "get-parameter" not in script
+
+    def test_the_ssm_dispatch_path_also_fetches(self, tmp_path, cert_dir):
+        """One-shot and warm-pool UserData carries no command, but still needs certs.
+
+        The command is delivered later by ``SendCommand`` and opens the
+        certificate directory then, so it has to have been populated at boot.
+        """
+        mode = self._mode(tmp_path, one_shot=True)
+
+        script = mode._prepare_init_script(self.CMD.format(cert_dir=cert_dir), "job-1")
+
+        assert "get-parameter" in script
+        assert "/var/run/parsl_worker_ready" in script
+        assert "process_worker_pool.py" not in script
+
+    def test_cleanup_revokes_the_published_certificates(self, tmp_path, cert_dir):
+        mode = self._mode(tmp_path)
+        ssm = mode.session.client.return_value
+        mode._prepare_init_script(self.CMD.format(cert_dir=cert_dir), "job-1")
+
+        mode.cleanup_infrastructure()
+
+        deleted = {c.kwargs["Name"] for c in ssm.delete_parameter.call_args_list}
+        assert self._param_name(mode) in deleted
+
+    def test_published_parameters_survive_a_state_round_trip(self, tmp_path, cert_dir):
+        """A resumed provider must be able to delete what the first run published.
+
+        The state file is the only record of the parameter names, so without this
+        the certificates -- which include the interchange's server secret key --
+        stay in Parameter Store indefinitely.
+        """
+        mode = self._mode(tmp_path)
+        mode._prepare_init_script(self.CMD.format(cert_dir=cert_dir), "job-1")
+        mode.save_state()
+
+        resumed = self._mode(
+            tmp_path, provider_id=mode.provider_id, state_store=mode.state_store
+        )
+        resumed.load_state()
+
+        assert resumed._cert_distributor.published_parameters == [
+            self._param_name(mode)
+        ]
+
+    def test_a_resumed_provider_cleans_up_even_with_the_flag_off(
+        self, tmp_path, cert_dir
+    ):
+        """Adoption is unconditional, and deliberately so.
+
+        Turning the flag off is exactly what someone does after deciding they do
+        not want key material in Parameter Store. That must not be the thing that
+        strands it there.
+        """
+        mode = self._mode(tmp_path)
+        mode._prepare_init_script(self.CMD.format(cert_dir=cert_dir), "job-1")
+        mode.save_state()
+
+        resumed = self._mode(
+            tmp_path,
+            provider_id=mode.provider_id,
+            state_store=mode.state_store,
+            distribute_certificates=False,
+        )
+        resumed.load_state()
+        resumed.cleanup_infrastructure()
+
+        deleted = {
+            c.kwargs["Name"]
+            for c in resumed.session.client.return_value.delete_parameter.call_args_list
+        }
+        assert self._param_name(mode) in deleted
+
+
+@pytest.mark.unit
+class TestCertificateDistributionProviderWiring:
+    """The provider end: the IAM guard, and that the flag reaches the mode."""
+
+    @pytest.fixture
+    def tmp_dir(self):
+        with tempfile.TemporaryDirectory() as d:
+            yield d
+
+    def test_it_is_refused_without_an_instance_profile(self, tmp_dir):
+        """Otherwise UserData exits 1 on the fetch and the instance bills for nothing.
+
+        A rejected config beats an instance that boots, fails to read its
+        certificates, and never registers a worker.
+        """
+        with pytest.raises(ValueError, match="distribute_certificates=True requires"):
+            _make_provider(tmp_dir, distribute_certificates=True)
+
+    def test_the_error_names_the_call_that_needs_the_profile(self, tmp_dir):
+        """Not ``SendCommand``, which is what the shared guard's message used to say.
+
+        The reader would otherwise go looking for an SSM dispatch this
+        configuration does not use.
+        """
+        with pytest.raises(ValueError, match="ssm:GetParameter"):
+            _make_provider(tmp_dir, distribute_certificates=True)
+
+    def test_auto_create_satisfies_the_guard(self, tmp_dir):
+        provider, _ = _make_provider(
+            tmp_dir, distribute_certificates=True, auto_create_instance_profile=True
+        )
+        assert provider.distribute_certificates is True
+
+    def test_a_supplied_profile_satisfies_the_guard(self, tmp_dir):
+        provider, _ = _make_provider(
+            tmp_dir,
+            distribute_certificates=True,
+            iam_instance_profile_arn=_FAKE_IAM_ARN,
+        )
+        assert provider.distribute_certificates is True
+
+    def _mode_kwargs(self, **provider_kwargs):
+        """The kwargs the provider really passes to ``StandardMode``.
+
+        Patched at the name the provider imports, so this asserts about the call
+        the provider makes rather than about a mode constructed here. Forwarding
+        is the step whose omission made ten options unreachable in #136.
+        """
+        with (
+            patch(
+                "parsl_ephemeral_provider.provider.create_session"
+            ) as mock_session_factory,
+            patch("parsl_ephemeral_provider.provider.StandardMode") as mode_cls,
+            patch.object(EphemeralProvider, "_load_state", return_value=None),
+            patch.object(
+                EphemeralProvider, "_initialize_state_store", return_value=MagicMock()
+            ),
+        ):
+            mock_session_factory.return_value = MagicMock()
+            EphemeralProvider(
+                region="us-east-1",
+                image_id="ami-12345678",
+                mode="standard",
+                vpc_id="vpc-test00001",
+                subnet_id="subnet-test001",
+                security_group_id="sg-test00001",
+                **provider_kwargs,
+            )
+
+        return mode_cls.call_args.kwargs
+
+    def test_the_flag_reaches_standard_mode(self):
+        kwargs = self._mode_kwargs(
+            distribute_certificates=True, auto_create_instance_profile=True
+        )
+        assert kwargs["distribute_certificates"] is True
+
+    def test_the_default_is_off(self):
+        assert self._mode_kwargs()["distribute_certificates"] is False

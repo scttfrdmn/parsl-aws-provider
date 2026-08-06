@@ -43,10 +43,13 @@ it is by far the most common failure and it is not an AWS problem.
 
 **`encrypted=False` on the executor.** With encryption on, Parsl generates CurveZMQ
 certificates in the client's `run_dir`, which remote workers cannot read, so they
-fail to register with no useful error. Certificate distribution is
-[#62](https://github.com/scttfrdmn/parsl-ephemeral-provider/issues/62).
-`one_shot_mode.py` is the exception: it builds no executor at all, because there is
-no interchange in that mode.
+fail to register with no useful error. Every example here runs the client and its
+workers in one VPC and relies on that isolation. When they share no network
+boundary, set `distribute_certificates=True` on the provider instead and leave
+`encrypted` at its default — see
+[Encryption in transit](../docs/security.md#encryption-in-transit) for what that
+ships. `one_shot_mode.py` is the exception to all of this: it builds no executor at
+all, because there is no interchange in that mode.
 
 **`provider.shutdown()` in a `finally`.** There is no `atexit` hook, and
 `parsl.clear()` releases Parsl's resources, not AWS ones. If an example is killed

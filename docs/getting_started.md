@@ -69,8 +69,9 @@ config = Config(
             label="aws_executor",
             provider=provider,
             # CurveZMQ certificates live in the client's run_dir, which workers
-            # cannot read. Same-VPC deployments rely on VPC isolation instead;
-            # cross-VPC support is #62.
+            # cannot read, so a same-VPC deployment relies on VPC isolation. Across
+            # networks, set distribute_certificates=True on the provider and drop
+            # this line (see docs/security.md).
             encrypted=False,
         )
     ]

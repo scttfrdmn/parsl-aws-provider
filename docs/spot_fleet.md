@@ -196,7 +196,7 @@ config = Config(
         HighThroughputExecutor(
             label="spot_fleet_executor",
             provider=provider,
-            encrypted=False,  # see #62
+            encrypted=False,  # same-VPC; else distribute_certificates=True
         )
     ],
     retries=3,  # a reclaimed instance loses its in-flight tasks

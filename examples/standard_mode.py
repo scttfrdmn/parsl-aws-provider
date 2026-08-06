@@ -102,8 +102,10 @@ def main() -> int:
                 # several minutes. Do not let Parsl declare the worker MISSING first.
                 heartbeat_threshold=600,
                 heartbeat_period=30,
-                # Required: CurveZMQ certificates live in the driver's run_dir,
-                # which EC2 workers cannot read. See issue #62.
+                # CurveZMQ certificates live in the driver's run_dir, which EC2
+                # workers cannot read, so this same-VPC example relies on VPC
+                # isolation. Across networks, set distribute_certificates=True on
+                # the provider and drop this line.
                 encrypted=False,
             )
         ],

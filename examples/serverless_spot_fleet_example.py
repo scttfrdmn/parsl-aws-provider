@@ -129,7 +129,7 @@ def main() -> int:
                 max_workers_per_node=4,
                 heartbeat_threshold=600,
                 heartbeat_period=30,
-                encrypted=False,  # see #62
+                encrypted=False,  # same-VPC; else distribute_certificates=True
             )
         ],
         # A reclaimed instance loses its in-flight tasks, and the interruption

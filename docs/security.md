@@ -287,12 +287,66 @@ does not create either.
 ### Encryption in transit
 
 Traffic to AWS APIs is HTTPS. Worker-to-interchange ZMQ traffic is a different
-matter: **set `encrypted=False` on `HighThroughputExecutor` for now**. Parsl's
-CurveZMQ certificates are generated in the client's `run_dir`, which workers
-cannot read, so leaving encryption on makes workers fail to register. Same-VPC
-deployments rely on VPC isolation; certificate distribution for cross-VPC and
-internet paths is
-[#62](https://github.com/scttfrdmn/parsl-ephemeral-provider/issues/62).
+matter. Parsl's CurveZMQ certificates are generated in the client's `run_dir`,
+which an EC2 worker cannot read, so `encrypted=True` on its own produces workers
+that die with `FileNotFoundError` on the certificate directory. There are two
+ways to run:
+
+**Rely on VPC isolation** — set `encrypted=False` and keep the interchange and
+its workers inside one VPC. This is the right choice when they already share a
+network boundary, and it is what every example in these docs does.
+
+**Distribute the certificates** — set `distribute_certificates=True` on the
+provider (standard mode only) and leave `encrypted=True`. The provider publishes
+the two certificate files a worker actually opens to a Parameter Store
+`SecureString`, and the worker fetches them at boot with `ssm:GetParameter`. Use
+this when the interchange and workers share no network boundary: cross-VPC,
+cross-account, or over the internet.
+
+```python
+provider = EphemeralProvider(
+    # ... other options ...
+    mode="standard",
+    distribute_certificates=True,
+    # The worker reads its certificates with ssm:GetParameter, so it needs an
+    # instance profile. Either of these satisfies the requirement; without one
+    # the provider refuses to construct.
+    auto_create_instance_profile=True,
+)
+```
+
+#### What distributing certificates costs you
+
+Worth stating plainly, because it is the reason this is off by default.
+
+Parsl's `curvezmq.ClientContext` needs the interchange's **public** key, and it
+only ever reads that key out of `server.key_secret`. So a worker that can
+complete a handshake is a worker holding the interchange's server *secret* key —
+there is no file layout in which it is not. Anyone who obtains those two files
+can impersonate the interchange to a worker.
+
+What bounds the exposure:
+
+- The parameters are `SecureString`, encrypted with the `alias/aws/ssm` managed
+  key. They are never placed in UserData, which is readable for the life of the
+  instance through IMDS and returned in plaintext by `DescribeInstanceAttribute`.
+- On the worker the certificate directory is created mode `0700` and each file
+  `0600` — `curvezmq` refuses to load from a directory with any other mode.
+- The parameters are deleted on `shutdown()`. Their names are persisted in the
+  state file, so a provider reconstructed after a driver crash still deletes
+  what its predecessor published, whether or not that successor has the flag on.
+- The parameters are tagged `ProviderId` and
+  `CreatedBy=parsl-ephemeral-provider`, so anything that does escape cleanup is
+  traceable to the run that created it.
+
+`AmazonSSMManagedInstanceCore` — which `auto_create_instance_profile=True`
+attaches — already grants `ssm:GetParameter`, and the `alias/aws/ssm` key policy
+already grants `kms:Decrypt` for calls arriving via SSM, so no extra IAM or KMS
+configuration is needed. If you supply your own `iam_instance_profile_arn` and
+want the narrowest grant that works,
+`parsl_ephemeral_provider.security.certificate_iam_statements(provider_id)`
+returns it: `ssm:GetParameter` scoped to this provider's parameter path, plus
+`kms:Decrypt` conditioned on `kms:ViaService`.
 
 ### Encryption at rest
 

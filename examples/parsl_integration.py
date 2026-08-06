@@ -221,12 +221,14 @@ def main() -> int:
                 # declare the worker MISSING before it has finished booting.
                 heartbeat_threshold=600,
                 heartbeat_period=30,
-                # REQUIRED for cloud workers: Parsl's HTEX uses CurveZMQ encryption
-                # by default, storing TLS certificates in run_dir on the driver.
-                # Workers on fresh EC2 instances cannot access the driver's local
-                # filesystem, so they fail with FileNotFoundError on the cert_dir.
-                # For same-VPC deployments the VPC fabric provides network isolation;
-                # disable encryption here and rely on VPC security instead.
+                # Parsl's HTEX uses CurveZMQ encryption by default, storing its
+                # certificates in run_dir on the driver. Workers on fresh EC2
+                # instances cannot read the driver's filesystem, so they fail with
+                # FileNotFoundError on the cert_dir. This example runs driver and
+                # workers in one VPC and relies on that isolation. The alternative
+                # is distribute_certificates=True on the provider, which ships the
+                # certificates through Parameter Store; it is what you want when
+                # the two share no network boundary.
                 encrypted=False,
             )
         ],

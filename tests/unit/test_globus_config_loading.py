@@ -679,7 +679,11 @@ class TestEveryParameterSurvivesTheRoundTrip:
         # One entry per owning mode. The mode-specific options are exactly the
         # ones the two _reject_wrong_mode_options() call sites guard.
         per_mode = {
-            "standard": {"warm_pool_size": 1, "warm_pool_ttl": 300},
+            "standard": {
+                "warm_pool_size": 1,
+                "warm_pool_ttl": 300,
+                "distribute_certificates": True,
+            },
             "detached": {
                 "bastion_instance_type": "t3.small",
                 "idle_timeout": 5,

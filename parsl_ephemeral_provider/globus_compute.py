@@ -410,14 +410,20 @@ class EphemeralComputeProvider(EphemeralProvider):
         generates the certificates under its own ``run_dir`` on the *endpoint
         host* and passes that path to workers as ``--cert_dir``, so an EC2
         worker is handed a directory that does not exist on it and dies with
-        ``FileNotFoundError``. Until certificate distribution is implemented
-        (#62), ``True`` cannot work for remote workers and rely on VPC isolation
-        instead. This was hardcoded ``true`` before #138, which made every
-        generated config unusable.
+        ``FileNotFoundError``. So ``True`` alone does not work for remote
+        workers; the default relies on VPC isolation instead. This was hardcoded
+        ``true`` before #138, which made every generated config unusable.
 
-        High-Assurance endpoints are the exception -- ``assert_ha_compliant()``
-        rejects ``encrypted=False``, so those need #62 resolved rather than this
-        default.
+        To run encrypted, pass ``encrypted=True`` **and**
+        ``distribute_certificates=True``, which ships the certificates to each
+        worker through Parameter Store (#62). That includes the endpoint's server
+        secret key, which is inherent to Parsl's file layout rather than a choice
+        -- see ``security/curvezmq.py``. It is standard mode only and needs an
+        instance profile.
+
+        High-Assurance endpoints have no choice in the matter:
+        ``assert_ha_compliant()`` rejects ``encrypted=False``, so they need both
+        flags set.
     \\*\\*kwargs
         All keyword arguments accepted by ``EphemeralProvider``.
     """
@@ -674,8 +680,15 @@ class EphemeralComputeProvider(EphemeralProvider):
                 " which an EC2"
             )
             lines.append(
-                f"{_INDENT2}# worker cannot read -- see #62. Set true once that is"
-                " distributed."
+                f"{_INDENT2}# worker cannot read. To set this true, also set"
+                " distribute_certificates:"
+            )
+            lines.append(
+                f"{_INDENT2}# true on the provider below -- it ships the certificates"
+                " through Parameter"
+            )
+            lines.append(
+                f"{_INDENT2}# Store, including the endpoint's server secret key (#62)."
             )
         lines.append(_yaml_line("encrypted", self.encrypted, indent=_INDENT2))
         lines.append(f"{_INDENT2}max_retries_on_system_failure: 3")

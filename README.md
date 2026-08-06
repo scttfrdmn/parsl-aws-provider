@@ -100,8 +100,9 @@ config = Config(
             provider=provider,
             # CurveZMQ certificates are generated in the client's run_dir, which
             # remote workers cannot read, so they would fail to register with no
-            # useful error. Same-VPC deployments rely on VPC isolation instead;
-            # certificate distribution is #62.
+            # useful error. This same-VPC example relies on VPC isolation instead.
+            # Across networks, set distribute_certificates=True on the provider
+            # and drop this line -- see docs/security.md.
             encrypted=False,
         )
     ]
