@@ -51,6 +51,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   constructor parameter has fallen out of the sample set altogether.
 
 ### Added
+- **`s3_create_bucket` on `EphemeralProvider`** (#224). `S3State` has accepted
+  `create_bucket_if_not_exists` since it was written, but `_initialize_state_store`
+  never passed it, so every provider-built S3 store took the already-exists branch
+  and failed on a missing bucket. Anyone who wanted the bucket provisioned had to
+  construct `S3State` themselves, bypassing the provider. The flag now forwards.
+
+  The default is `False`, matching the store's own default and the previous
+  behaviour: a missing bucket stays an error rather than something the provider
+  quietly provisions. Unlike the mode-specific options, it does not join the
+  wrong-mode guards — the state store is chosen independently of the operating
+  mode, so `s3_create_bucket` is meaningful on all three.
 - **`bastion_instance_profile_arn` on `EphemeralProvider`** (#229), for
   `mode="detached"`. Supply an instance profile the bastion should assume and it is
   used as-is and never deleted; leave it unset — the default — and the provider

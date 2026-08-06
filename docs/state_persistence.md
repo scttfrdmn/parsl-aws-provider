@@ -78,8 +78,31 @@ provider = EphemeralProvider(
 ```
 
 `s3_bucket` is mandatory for this backend — omitting it raises
-`ProviderConfigurationError`. The bucket must already exist; the provider does not
-create it.
+`ProviderConfigurationError`. By default the bucket must already exist; a missing
+one is an error rather than something the provider quietly provisions.
+
+Pass `s3_create_bucket=True` to have the provider create it when it is absent:
+
+```python
+provider = EphemeralProvider(
+    # ... network and compute options ...
+    state_store_type="s3",
+    s3_bucket="my-parsl-state-bucket",
+    s3_create_bucket=True,
+)
+```
+
+Creation also applies a full public-access block and tags the bucket
+`ParslManagedBucket=true`, so it is identifiable later. An existing bucket is
+adopted, not recreated, which is what makes the resume path work — every restart
+constructs the store again. Requires `s3:CreateBucket`, `s3:PutBucketPublicAccessBlock`,
+and `s3:PutBucketTagging` on top of the object permissions.
+
+Note that the provider never *deletes* a bucket it created — no cleanup path calls
+`S3State.delete_bucket_if_empty()`, which exists for callers who want it
+explicitly. State outliving a run is the point of a state store, and an empty
+bucket costs nothing to keep, so the ownership-tracking that `_owns_baked_ami` does
+for AMIs would buy little here.
 
 ## Recommended store by mode
 

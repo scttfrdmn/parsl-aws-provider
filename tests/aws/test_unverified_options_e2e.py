@@ -20,7 +20,9 @@ emulator reports as success:
 3. ``S3State(create_bucket_if_not_exists=True)`` against real S3. Covered under
    moto and under substrate, but never against the service: ``tests/aws``'s
    ``s3_state_bucket`` fixture pre-creates the bucket, so the provider always
-   takes the already-exists branch there.
+   takes the already-exists branch there. #224 made the flag reachable through
+   ``EphemeralProvider(s3_create_bucket=True)``; these tests still drive the store
+   directly, for the reason the class docstring gives.
 
 Run with::
 
@@ -611,13 +613,17 @@ class TestS3BucketCreation:
     sequence ``CreateBucket`` → ``PutPublicAccessBlock`` → ``PutBucketTagging``
     is where real S3 differs most from an emulator.
 
-    ``S3State`` is constructed directly, and not for convenience: **the flag is
-    not reachable from ``EphemeralProvider``**. The constructor takes
-    ``s3_bucket`` and ``s3_key``, but ``_initialize_state_store``
-    (``provider.py:1054``) builds the store with only ``provider``,
-    ``bucket_name``, and ``key_prefix`` -- so a provider always takes the
-    already-exists branch, and a caller who wants the bucket created has to build
-    the store themselves. That is arguably a wider gap than #166 describes.
+    ``S3State`` is constructed directly rather than through a provider. That used
+    to be forced: the flag was not reachable from ``EphemeralProvider`` at all,
+    because ``_initialize_state_store`` built the store with only ``provider``,
+    ``bucket_name``, and ``key_prefix``, so every provider-built store took the
+    already-exists branch. #224 added ``s3_create_bucket`` and forwards it, so a
+    provider can now reach this path -- but the direct construction stays,
+    because building a real ``EphemeralProvider`` reaches AWS and creates a launch
+    template and an IAM role, none of which this class is about. The forwarding
+    itself is pinned under unit test
+    (``test_provider_edge_cases.py::TestS3CreateBucketForwarding``); what only a
+    live run can settle is what the store then does to real S3.
     """
 
     @pytest.fixture
