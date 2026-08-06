@@ -68,11 +68,6 @@ POLL_INTERVAL_S = 15
 #: SSM registration plus worker_init on real iron, matching the one-shot suite.
 MAX_WAIT_S = 900
 
-#: Where the worker's certificates land. An absolute path outside the driver's
-#: layout on purpose: the fetch script recreates whatever ``--cert_dir`` names,
-#: and using the driver's own run_dir path would hide a failure to do so.
-WORKER_CERT_DIR = "/opt/parsl-e2e-certs"
-
 #: Appending to a file instead of pip-installing Parsl. Nothing here needs Parsl
 #: on the worker -- the certificates are validated with hashlib and os.stat, and
 #: whether they *work* is settled by the handshake test in the unit suite.
@@ -148,15 +143,21 @@ def _validation_command(driver_cert_dir: str) -> str:
     one: the provider never asks where the certificates are, it reads the path
     out of the command string. The ``:`` no-op carries the flag without needing a
     ``process_worker_pool.py`` on the instance.
+
+    The probe looks for the certificates at the *driver's* path, because that is
+    what the design does: the fetch script recreates whatever ``--cert_dir``
+    names, so the command HTEX already interpolated needs no rewriting. Pointing
+    the flag at some other worker-side directory would not be a stricter check,
+    it would be an impossible one -- the driver reads that path to publish from.
     """
     probe = (
         "import hashlib, os, stat, sys\n"
-        "cert_dir = " + repr(WORKER_CERT_DIR) + "\n"
+        "cert_dir = " + repr(driver_cert_dir) + "\n"
         "expected = " + repr(_cert_digests(driver_cert_dir)) + "\n" + _PROBE_BODY
     )
     return "\n".join(
         [
-            f": --cert_dir {WORKER_CERT_DIR}",
+            f": --cert_dir {driver_cert_dir}",
             "python3 - <<'PARSL_E2E_PROBE'",
             probe,
             "PARSL_E2E_PROBE",
@@ -526,8 +527,17 @@ class TestCleanupAcrossProviderLifetime:
             kwargs.update(overrides)
             return EphemeralProvider(**kwargs)
 
-        first = _provider()
+        # Both providers auto-create an instance profile, so every exit path has
+        # to shut them down or this test leaks the IAM pair #132 exists to stop.
+        # `first` is never shut down inside the body: the scenario is a driver
+        # that vanished mid-run, and if its own cleanup ran there would be
+        # nothing left for `second` to prove. "Vanished" must not outlast the
+        # test, though, so the teardown below covers it.
+        published: list = []
+        pending = []
         try:
+            first = _provider()
+            pending.append(first)
             first.operating_mode._prepare_init_script(
                 _validation_command(driver_cert_dir), "job-restart"
             )
@@ -535,35 +545,37 @@ class TestCleanupAcrossProviderLifetime:
             assert published
             first._save_state()
             first.operating_mode.save_state()
-        finally:
-            # Deliberately not shutdown(): the point is a driver that vanished
-            # without cleaning up.
-            pass
 
-        second = _provider(distribute_certificates=False)
-        assert second.provider_id == first.provider_id, (
-            "the successor did not adopt the persisted provider_id, so it read "
-            "no state and could not know what to delete"
-        )
-        assert (
-            second.operating_mode._cert_distributor.published_parameters == published
-        ), "the successor did not adopt the parameter names from the state file"
+            second = _provider(distribute_certificates=False)
+            pending.append(second)
+            assert second.provider_id == first.provider_id, (
+                "the successor did not adopt the persisted provider_id, so it "
+                "read no state and could not know what to delete"
+            )
+            assert (
+                second.operating_mode._cert_distributor.published_parameters
+                == published
+            ), "the successor did not adopt the parameter names from the state file"
 
-        try:
+            # The deletion under test. Ordered before first's teardown so it is
+            # unambiguously the successor that removed them.
+            pending.remove(second)
             second.shutdown()
+
+            remaining = [name for name in published if _parameter_exists(ssm, name)]
         finally:
-            try:
-                for name in published:
+            for provider in pending:
+                try:
+                    provider.shutdown()
+                except Exception as exc:
+                    logger.warning("teardown shutdown raised (ignored): %s", exc)
+            for name in published:
+                try:
                     if _parameter_exists(ssm, name):
                         ssm.delete_parameter(Name=name)
-            except Exception as exc:
-                logger.warning("belt-and-braces delete raised (ignored): %s", exc)
-            try:
-                first.shutdown()
-            except Exception as exc:
-                logger.warning("first.shutdown raised (ignored): %s", exc)
+                except Exception as exc:
+                    logger.warning("belt-and-braces delete raised (ignored): %s", exc)
 
-        remaining = [name for name in published if _parameter_exists(ssm, name)]
         assert not remaining, (
             f"the restarted provider did not delete {remaining}, so the server "
             "secret key would stay in Parameter Store indefinitely"
