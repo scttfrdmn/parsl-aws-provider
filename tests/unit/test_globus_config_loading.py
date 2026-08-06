@@ -685,6 +685,9 @@ class TestEveryParameterSurvivesTheRoundTrip:
                 "preserve_bastion": False,
                 "bastion_host_type": "direct",
                 "workflow_id": "wf-1",
+                "bastion_instance_profile_arn": (
+                    "arn:aws:iam::123456789012:instance-profile/my-bastion"
+                ),
             },
             "serverless": {
                 "compute_type": "lambda",

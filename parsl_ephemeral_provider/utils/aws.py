@@ -1903,21 +1903,45 @@ def get_or_create_ssm_instance_profile(
     get_or_create_iam_role(
         iam_client=iam,
         role_name=role_name,
-        assume_role_policy={
-            "Version": "2012-10-17",
-            "Statement": [
-                {
-                    "Effect": "Allow",
-                    "Principal": {"Service": "ec2.amazonaws.com"},
-                    "Action": "sts:AssumeRole",
-                }
-            ],
-        },
+        assume_role_policy=EC2_ASSUME_ROLE_POLICY,
         policy_arns=["arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"],
         description=f"SSM instance role for Parsl ({name_suffix})",
     )
 
-    # Ensure the instance profile exists and has the role attached
+    return _ensure_instance_profile(session, profile_name, role_name)
+
+
+#: Trust policy letting EC2 assume a role, so an instance can carry it.
+#:
+#: Shared by the worker (SSM) role and the bastion role rather than written out
+#: at each site: the two roles differ in what they may *do*, never in who may
+#: assume them, and a copied-out trust policy is where that distinction quietly
+#: erodes.
+EC2_ASSUME_ROLE_POLICY: Dict[str, Any] = {
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Effect": "Allow",
+            "Principal": {"Service": "ec2.amazonaws.com"},
+            "Action": "sts:AssumeRole",
+        }
+    ],
+}
+
+
+def _ensure_instance_profile(
+    session: boto3.Session, profile_name: str, role_name: str
+) -> str:
+    """Get-or-create *profile_name*, holding *role_name*, and return its ARN.
+
+    Both the create and the attach are idempotent, so concurrent callers naming
+    the same profile converge on it rather than one of them failing. Waits for
+    EC2 to accept the profile before returning — see
+    ``_wait_for_instance_profile`` for why ``get_instance_profile`` succeeding is
+    not enough.
+    """
+    iam = session.client("iam")
+
     try:
         response = iam.get_instance_profile(InstanceProfileName=profile_name)
         existing_arn: str = response["InstanceProfile"]["Arn"]
@@ -1962,6 +1986,189 @@ def ssm_instance_profile_names(name_suffix: str) -> Tuple[str, str]:
     )
 
 
+def bastion_instance_profile_names(name_suffix: str) -> Tuple[str, str]:
+    """Return the bastion ``(role_name, profile_name)`` pair for *name_suffix*.
+
+    Derived rather than stored, for the same reason as
+    ``ssm_instance_profile_names``. Kept separate from that pair because the two
+    roles carry different permissions: the worker role only needs SSM, while the
+    bastion role can launch and terminate instances.
+
+    IAM caps both names at 64 characters. *name_suffix* is a provider ID — a
+    UUID, 36 characters — so the longest name here is 58.
+    """
+    return (
+        f"parsl-bastion-role-{name_suffix}",
+        f"parsl-bastion-profile-{name_suffix}",
+    )
+
+
+def bastion_role_policy(
+    region: str, account_id: str, workflow_id: str
+) -> Dict[str, Any]:
+    """Return the inline policy granting a bastion exactly what it calls.
+
+    ``bastion.yml``'s ``BastionHostPolicy`` is the same set, and the two are meant
+    to stay in step: a bastion deployed by CloudFormation and one launched by
+    ``RunInstances`` run the identical manager script, so a permission missing
+    from either is a bug in that path only, which is the hardest kind to notice.
+
+    The list is derived from what ``_get_bastion_manager_script`` actually calls,
+    not from what a bastion plausibly needs, and a test asserts the correspondence
+    in both directions. Enumerating the script found the CloudFormation policy
+    both **too narrow and too wide**: it omitted ``ec2:RunInstances``, the two
+    launch-template calls and all three fleet calls — so a spot-fleet job on the
+    CFN path could not launch a worker either — while granting
+    ``ec2:StartInstances``, ``ec2:StopInstances``, ``ec2:DescribeInstanceStatus``
+    and ``ec2:DescribeTags``, none of which the script calls (the bastion
+    terminates workers rather than stopping them, and it reads worker state
+    through ``DescribeInstances`` alone).
+
+    Three actions need explaining:
+
+    - ``iam:PassRole`` is absent, deliberately. The manager launches workers with
+      no instance profile, so it passes no role. Adding it would let a compromised
+      bastion attach any passable role to an instance it launches, which is a
+      privilege-escalation primitive rather than a convenience.
+    - ``ec2:CreateTags`` is unavoidably broad. The script tags through
+      ``TagSpecifications`` on ``RunInstances``/``CreateFleet``/
+      ``CreateLaunchTemplate``, which AWS authorizes as ``CreateTags`` against the
+      resource being created — a resource whose ID does not exist yet, so it
+      cannot be named in the policy.
+    - The SSM parameter path is scoped to this workflow. That is the one place the
+      policy is genuinely tight, and it is the important one: the parameters are
+      the whole control channel, so a bastion that could read another workflow's
+      path could read its job commands.
+    """
+    return {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Effect": "Allow",
+                "Action": [
+                    # Reading worker state for status reporting.
+                    "ec2:DescribeInstances",
+                    # Launching workers: the direct path and the fleet path.
+                    "ec2:RunInstances",
+                    "ec2:CreateLaunchTemplate",
+                    "ec2:DeleteLaunchTemplate",
+                    "ec2:CreateFleet",
+                    "ec2:DescribeFleets",
+                    # Deleting an instant fleet is what terminates its instances,
+                    # so this is a teardown permission, not a tidiness one.
+                    "ec2:DeleteFleets",
+                    "ec2:TerminateInstances",
+                    "ec2:CreateTags",
+                ],
+                "Resource": "*",
+            },
+            {
+                "Effect": "Allow",
+                "Action": [
+                    "ssm:GetParameter",
+                    "ssm:GetParametersByPath",
+                    "ssm:PutParameter",
+                    "ssm:DeleteParameter",
+                ],
+                "Resource": (
+                    f"arn:aws:ssm:{region}:{account_id}:"
+                    f"parameter/parsl/workflows/{workflow_id}/*"
+                ),
+            },
+        ],
+    }
+
+
+def create_bastion_instance_profile(
+    session: boto3.Session, name_suffix: str, workflow_id: str
+) -> str:
+    """Create (or reuse) an instance profile the bastion manager can work with.
+
+    The direct ``RunInstances`` bastion path had no profile at all (#229), so
+    ``parsl-bastion-manager.py`` raised ``NoCredentialsError`` on its first AWS
+    call and, under ``Restart=always``, crash-looped every ten seconds. Nothing
+    the bastion exists to do — polling for jobs, launching workers, terminating
+    them — had ever worked on that path.
+
+    ``AmazonSSMManagedInstanceCore`` comes as a managed policy; the rest is inline
+    because it is scoped to one workflow's parameter path and so is not reusable.
+
+    Parameters
+    ----------
+    session : boto3.Session
+        AWS session used to build the IAM and STS clients.
+    name_suffix : str
+        Discriminator for the role and profile names — the provider ID, so the
+        pair is traceable to its provider and to the state that owns it.
+    workflow_id : str
+        Scopes the SSM parameter statement. The bastion reads and writes only its
+        own workflow's parameters.
+
+    Returns
+    -------
+    str
+        ARN of the instance profile, ready to pass as ``IamInstanceProfile``.
+
+    Raises
+    ------
+    ResourceCreationError
+        If the role or profile cannot be created or retrieved.
+    """
+    iam = session.client("iam")
+    role_name, profile_name = bastion_instance_profile_names(name_suffix)
+    region = session.region_name or DEFAULT_REGION
+
+    try:
+        account_id: str = session.client("sts").get_caller_identity()["Account"]
+    except Exception as e:
+        raise ResourceCreationError(
+            f"Failed to resolve the account ID for the bastion role policy: {e}"
+        ) from e
+
+    get_or_create_iam_role(
+        iam_client=iam,
+        role_name=role_name,
+        assume_role_policy=EC2_ASSUME_ROLE_POLICY,
+        policy_arns=["arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"],
+        description=f"Bastion manager role for Parsl ({name_suffix})",
+    )
+
+    # put_role_policy is a full replace keyed on the policy name, so this is
+    # idempotent and also repairs a role left behind by an older version whose
+    # policy was narrower.
+    try:
+        iam.put_role_policy(
+            RoleName=role_name,
+            PolicyName=BASTION_INLINE_POLICY_NAME,
+            PolicyDocument=json.dumps(
+                bastion_role_policy(region, account_id, workflow_id)
+            ),
+        )
+    except ClientError as e:
+        raise ResourceCreationError(
+            f"Failed to attach the bastion policy to role {role_name}: {e}"
+        ) from e
+
+    return _ensure_instance_profile(session, profile_name, role_name)
+
+
+#: Name of the bastion role's inline policy. Matches ``bastion.yml``'s
+#: ``PolicyName``, so the two paths present the same thing to an operator
+#: reading the console.
+BASTION_INLINE_POLICY_NAME = "BastionHostPolicy"
+
+
+def delete_bastion_instance_profile(session: boto3.Session, name_suffix: str) -> bool:
+    """Delete the bastion role and instance profile named for *name_suffix*.
+
+    The inverse of ``create_bastion_instance_profile``. **Only for a pair this
+    provider created** — ``DetachedMode._owns_bastion_profile`` is the gate.
+    """
+    return delete_instance_profile_pair(
+        session, *reversed(bastion_instance_profile_names(name_suffix))
+    )
+
+
 def delete_ssm_instance_profile(session: boto3.Session, name_suffix: str) -> bool:
     """Delete the SSM role and instance profile named for *name_suffix*.
 
@@ -1969,16 +2176,6 @@ def delete_ssm_instance_profile(session: boto3.Session, name_suffix: str) -> boo
     pair this provider created** — see ``StandardMode._owns_instance_profile``. A
     caller-supplied profile belongs to the caller, and deleting it would break
     every other workload using it.
-
-    IAM enforces the teardown order: a profile holding a role cannot be deleted,
-    and a role that is still in a profile or has policies attached cannot be
-    deleted either. So it goes role-out-of-profile, profile, policies-off-role,
-    role. Getting this wrong yields ``DeleteConflict`` rather than a partial
-    success, which is why the order is not a matter of taste.
-
-    Every step tolerates ``NoSuchEntity``: cleanup runs on paths that may already
-    have partially completed, and a missing resource is the desired end state
-    rather than an error.
 
     Parameters
     ----------
@@ -1992,10 +2189,58 @@ def delete_ssm_instance_profile(session: boto3.Session, name_suffix: str) -> boo
     -------
     bool
         True if the pair is gone (including "was already gone"), False if
+        something could not be deleted.
+    """
+    return delete_instance_profile_pair(
+        session, *reversed(ssm_instance_profile_names(name_suffix))
+    )
+
+
+def delete_instance_profile_pair(
+    session: boto3.Session, profile_name: str, role_name: str
+) -> bool:
+    """Delete instance profile *profile_name* and role *role_name*.
+
+    The inverse of ``_ensure_instance_profile`` plus its role. **Only call this
+    for a pair this provider created** — ``StandardMode._owns_instance_profile``
+    and ``DetachedMode._owns_bastion_profile`` are the two gates. A
+    caller-supplied profile belongs to the caller, and deleting it would break
+    every other workload using it.
+
+    IAM enforces the teardown order: a profile holding a role cannot be deleted,
+    and a role that is still in a profile or has policies attached cannot be
+    deleted either. So it goes role-out-of-profile, profile, policies-off-role,
+    role. Getting this wrong yields ``DeleteConflict`` rather than a partial
+    success, which is why the order is not a matter of taste. It is also the
+    order substrate's CloudFormation gets wrong — it deletes the profile while
+    the role is still in it — so this is worth keeping in one place.
+
+    Both attachment kinds are stripped. ``delete_role`` refuses while *either* a
+    managed policy or an inline policy remains, and the two are listed and
+    removed by different API calls; the bastion role carries an inline policy
+    while the SSM worker role carries a managed one, so handling only one kind
+    would strand whichever role used the other.
+
+    Every step tolerates ``NoSuchEntity``: cleanup runs on paths that may already
+    have partially completed, and a missing resource is the desired end state
+    rather than an error.
+
+    Parameters
+    ----------
+    session : boto3.Session
+        AWS session used to build the IAM client.
+    profile_name : str
+        Name of the instance profile to delete.
+    role_name : str
+        Name of the role to remove from it and then delete.
+
+    Returns
+    -------
+    bool
+        True if the pair is gone (including "was already gone"), False if
         something could not be deleted. Never raises: a cleanup failure must not
         mask whatever the caller was originally doing.
     """
-    role_name, profile_name = ssm_instance_profile_names(name_suffix)
     iam = session.client("iam")
     ok = True
 
@@ -2043,6 +2288,28 @@ def delete_ssm_instance_profile(session: boto3.Session, name_suffix: str) -> boo
             f"Detaching {policy['PolicyArn']} from role {role_name}",
             lambda p=policy: iam.detach_role_policy(
                 RoleName=role_name, PolicyArn=p["PolicyArn"]
+            ),
+        )
+
+    # Inline policies are a separate list under a separate call, and block
+    # delete_role just as managed ones do. The bastion role's own permissions are
+    # inline (they are scoped to one workflow's parameter path, so there is
+    # nothing reusable to make a managed policy out of), so omitting this would
+    # leave every bastion role behind while appearing to succeed for the worker
+    # roles that only ever carry managed policies.
+    try:
+        inline = iam.list_role_policies(RoleName=role_name).get("PolicyNames", [])
+    except ClientError as e:
+        if e.response["Error"]["Code"] not in ("NoSuchEntity", "NoSuchEntityException"):
+            logger.warning(f"Listing inline policies on role {role_name} failed: {e}")
+            ok = False
+        inline = []
+
+    for policy_name in inline:
+        ok &= _tolerate_missing(
+            f"Deleting inline policy {policy_name} from role {role_name}",
+            lambda n=policy_name: iam.delete_role_policy(
+                RoleName=role_name, PolicyName=n
             ),
         )
 

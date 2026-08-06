@@ -19,6 +19,7 @@ SPDX-FileCopyrightText: 2025-2026 Scott Friedman and Project Contributors
 
 import re
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import boto3
 import pytest
@@ -29,6 +30,10 @@ from parsl_ephemeral_provider.cleanup import (
     _SECURITY_GROUP_NAME_PATTERNS,
     AWSResourceCleaner,
     main,
+)
+from parsl_ephemeral_provider.utils.aws import (
+    bastion_instance_profile_names,
+    ssm_instance_profile_names,
 )
 
 pytestmark = pytest.mark.unit
@@ -92,6 +97,22 @@ def _launch(session, tags):
         TagSpecifications=[{"ResourceType": "instance", "Tags": tags}],
     )
     return response["Instances"][0]["InstanceId"]
+
+
+_TRUST_POLICY = (
+    '{"Version": "2012-10-17", "Statement": [{"Effect": "Allow", '
+    '"Principal": {"Service": "ec2.amazonaws.com"}, "Action": "sts:AssumeRole"}]}'
+)
+
+
+def _make_pair(session, role_name, profile_name):
+    """Create a role attached to an instance profile, as a leaked run leaves it."""
+    iam = session.client("iam")
+    iam.create_role(RoleName=role_name, AssumeRolePolicyDocument=_TRUST_POLICY)
+    iam.create_instance_profile(InstanceProfileName=profile_name)
+    iam.add_role_to_instance_profile(
+        InstanceProfileName=profile_name, RoleName=role_name
+    )
 
 
 class TestInstanceDiscovery:
@@ -244,6 +265,141 @@ class TestSecurityGroupDiscovery:
         assert group_id not in found
 
 
+class TestIAMPairDiscovery:
+    """Two kinds of pair leak, and the sweep has to tell them apart.
+
+    The worker pair (#132) and the bastion pair (#229) are named differently and
+    are deleted *by name*, so a bastion orphan reported as a bare suffix would be
+    handed to the worker namer, which would look for a role that does not exist,
+    tolerate its absence, and report success while the bastion role stayed
+    standing. That is the reason the kind travels with the suffix.
+    """
+
+    def test_a_worker_pair_is_found(self, aws):
+        _make_pair(aws, *ssm_instance_profile_names("prov-1"))
+
+        cleaner = AWSResourceCleaner(region="us-east-1")
+
+        assert ("ssm", "prov-1") in cleaner.get_parsl_iam_resources()
+
+    def test_a_bastion_pair_is_found(self, aws):
+        _make_pair(aws, *bastion_instance_profile_names("wf-1"))
+
+        cleaner = AWSResourceCleaner(region="us-east-1")
+
+        assert ("bastion", "wf-1") in cleaner.get_parsl_iam_resources()
+
+    def test_both_kinds_are_found_in_one_sweep_and_kept_distinct(self, aws):
+        """A run that used both leaks both, and they must not be conflated."""
+        _make_pair(aws, *ssm_instance_profile_names("shared"))
+        _make_pair(aws, *bastion_instance_profile_names("shared"))
+
+        cleaner = AWSResourceCleaner(region="us-east-1")
+        found = cleaner.get_parsl_iam_resources()
+
+        assert ("ssm", "shared") in found
+        assert ("bastion", "shared") in found
+
+    def test_an_unrelated_role_is_left_alone(self, aws):
+        iam = aws.client("iam")
+        iam.create_role(
+            RoleName="someone-elses-role", AssumeRolePolicyDocument=_TRUST_POLICY
+        )
+
+        cleaner = AWSResourceCleaner(region="us-east-1")
+
+        assert cleaner.get_parsl_iam_resources() == []
+
+    def test_a_half_orphan_is_still_reported(self, aws):
+        """A partial teardown leaves one half, and the sweep unions both listings.
+
+        A role with no profile is exactly what an interrupted teardown leaves --
+        the profile is deleted first, because IAM requires that order -- so a sweep
+        that only scanned profiles would miss the standing principal, which is the
+        half that matters.
+        """
+        role_name, _ = ssm_instance_profile_names("orphan-role")
+        aws.client("iam").create_role(
+            RoleName=role_name, AssumeRolePolicyDocument=_TRUST_POLICY
+        )
+
+        cleaner = AWSResourceCleaner(region="us-east-1")
+
+        assert ("ssm", "orphan-role") in cleaner.get_parsl_iam_resources()
+
+    def test_a_listing_failure_is_logged_rather_than_raised(self, aws):
+        """``AccessDenied`` on IAM must not abort the EC2 half of the sweep.
+
+        The tool's whole purpose is bounding a bill after a crash, and instances
+        cost far more than a role. A user whose policy omits ``iam:ListRoles``
+        should still get their instances terminated.
+        """
+        cleaner = AWSResourceCleaner(region="us-east-1")
+        cleaner.iam_client = MagicMock()
+        cleaner.iam_client.get_paginator.side_effect = Exception("AccessDenied")
+
+        assert cleaner.get_parsl_iam_resources() == []
+
+
+class TestIAMPairDeletion:
+    """The delete has to use the right namer for the reported kind."""
+
+    def test_a_worker_pair_is_deleted(self, aws):
+        role_name, profile_name = ssm_instance_profile_names("prov-1")
+        _make_pair(aws, role_name, profile_name)
+
+        cleaner = AWSResourceCleaner(region="us-east-1")
+
+        assert cleaner.delete_iam_resources([("ssm", "prov-1")]) is True
+        assert cleaner.get_parsl_iam_resources() == []
+
+    def test_a_bastion_pair_is_deleted_despite_its_inline_policy(self, aws):
+        """The bastion role's permissions are inline, and inline blocks DeleteRole.
+
+        This is #229's quieter half: the shared teardown detached *managed*
+        policies only, so it deleted every worker pair and no bastion pair while
+        logging no failure at all. The inline policy here is the precondition that
+        makes this test meaningful.
+        """
+        role_name, profile_name = bastion_instance_profile_names("wf-1")
+        _make_pair(aws, role_name, profile_name)
+        aws.client("iam").put_role_policy(
+            RoleName=role_name,
+            PolicyName="BastionHostPolicy",
+            PolicyDocument=(
+                '{"Version": "2012-10-17", "Statement": [{"Effect": "Allow", '
+                '"Action": "ec2:DescribeInstances", "Resource": "*"}]}'
+            ),
+        )
+
+        cleaner = AWSResourceCleaner(region="us-east-1")
+
+        assert cleaner.delete_iam_resources([("bastion", "wf-1")]) is True
+        assert cleaner.get_parsl_iam_resources() == []
+
+    def test_deleting_nothing_succeeds(self, aws):
+        cleaner = AWSResourceCleaner(region="us-east-1")
+
+        assert cleaner.delete_iam_resources([]) is True
+
+    def test_the_kind_selects_the_namer(self, aws):
+        """Report a bastion suffix and the *bastion* names must be deleted.
+
+        Pinned through the call rather than by inspecting names, because the
+        failure this guards against is silent success: the worker namer applied to
+        a bastion suffix produces names for resources that do not exist, every
+        step tolerates ``NoSuchEntity``, and the pair survives while the tool
+        prints a tick.
+        """
+        _make_pair(aws, *bastion_instance_profile_names("wf-1"))
+        _make_pair(aws, *ssm_instance_profile_names("wf-1"))
+
+        cleaner = AWSResourceCleaner(region="us-east-1")
+        cleaner.delete_iam_resources([("bastion", "wf-1")])
+
+        assert cleaner.get_parsl_iam_resources() == [("ssm", "wf-1")]
+
+
 class TestFiltersMatchThePackage:
     """The filters must name strings the package actually writes.
 
@@ -289,6 +445,60 @@ class TestFiltersMatchThePackage:
             f"{DEFAULT_SECURITY_GROUP_NAME!r} matches none of "
             f"{_SECURITY_GROUP_NAME_PATTERNS}"
         )
+
+
+class TestCleanupAll:
+    """The orchestration, which is where ordering matters."""
+
+    def test_confirmed_cleanup_deletes_both_pair_kinds(self, aws, monkeypatch):
+        """The end-to-end sweep, past the confirmation prompt.
+
+        Both kinds go in together because the reporting loop and the delete branch
+        each look the names up through ``_PAIR_NAMERS[kind]``, and a mismatch there
+        is silent: the wrong namer yields resources that do not exist, every step
+        tolerates ``NoSuchEntity``, and the tool prints a tick.
+        """
+        _make_pair(aws, *ssm_instance_profile_names("prov-1"))
+        _make_pair(aws, *bastion_instance_profile_names("wf-1"))
+        monkeypatch.setattr("builtins.input", lambda _: "yes")
+
+        cleaner = AWSResourceCleaner(region="us-east-1")
+
+        assert cleaner.cleanup_all() is True
+        assert cleaner.get_parsl_iam_resources() == []
+
+    def test_declining_the_prompt_deletes_nothing(self, aws, monkeypatch):
+        """Answering anything but yes must leave the account untouched."""
+        _make_pair(aws, *ssm_instance_profile_names("prov-1"))
+        monkeypatch.setattr("builtins.input", lambda _: "no")
+
+        cleaner = AWSResourceCleaner(region="us-east-1")
+
+        assert cleaner.cleanup_all() is False
+        assert cleaner.get_parsl_iam_resources() == [("ssm", "prov-1")]
+
+    def test_no_input_available_cancels_rather_than_deletes(self, aws, monkeypatch):
+        """Piped into a script with no stdin, the safe answer is no.
+
+        ``EOFError`` from ``input()`` must not fall through to the deletes.
+        """
+        _make_pair(aws, *ssm_instance_profile_names("prov-1"))
+        monkeypatch.setattr(
+            "builtins.input", lambda _: (_ for _ in ()).throw(EOFError())
+        )
+
+        cleaner = AWSResourceCleaner(region="us-east-1")
+
+        assert cleaner.cleanup_all() is False
+        assert cleaner.get_parsl_iam_resources() == [("ssm", "prov-1")]
+
+    def test_a_dry_run_reports_iam_pairs_without_deleting(self, aws):
+        _make_pair(aws, *bastion_instance_profile_names("wf-1"))
+
+        cleaner = AWSResourceCleaner(region="us-east-1")
+
+        assert cleaner.cleanup_all(dry_run=True) is True
+        assert cleaner.get_parsl_iam_resources() == [("bastion", "wf-1")]
 
 
 class TestEntryPoint:

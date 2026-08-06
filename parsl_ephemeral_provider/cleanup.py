@@ -26,22 +26,32 @@ SPDX-FileCopyrightText: 2025-2026 Scott Friedman and Project Contributors
 import logging
 import sys
 import time
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import boto3
 
 from parsl_ephemeral_provider.utils.aws import (
-    delete_ssm_instance_profile,
+    bastion_instance_profile_names,
+    delete_instance_profile_pair,
     ssm_instance_profile_names,
 )
 
 logger = logging.getLogger(__name__)
 
-# Both halves of the pair are named for the provider_id, so the suffix is what
-# identifies an orphan. See ssm_instance_profile_names().
-_ROLE_PREFIX, _PROFILE_PREFIX = (
-    prefix[: -len("suffix")] for prefix in ssm_instance_profile_names("suffix")
-)
+# Two kinds of role/profile pair leak, not one: the SSM worker pair (#132) and
+# the bastion pair a direct-path detached run creates (#229). Both halves of each
+# pair are named for the provider_id, so the suffix is what identifies an orphan.
+#
+# The prefixes are derived from the naming functions rather than written out, so a
+# rename cannot leave the sweep matching nothing while still reporting success.
+_PAIR_NAMERS = {
+    "ssm": ssm_instance_profile_names,
+    "bastion": bastion_instance_profile_names,
+}
+_PAIR_PREFIXES = {
+    kind: tuple(prefix[: -len("suffix")] for prefix in namer("suffix"))
+    for kind, namer in _PAIR_NAMERS.items()
+}
 
 # The package tags EC2 resources two different ways, and a sweep that knows only
 # one of them misses whole modes:
@@ -278,20 +288,28 @@ class AWSResourceCleaner:
             logger.info(f"✅ All {success_count} security groups deleted successfully")
             return True
 
-    def get_parsl_iam_resources(self) -> List[str]:
-        """Get the provider_id suffixes of orphaned SSM roles and instance profiles.
+    def get_parsl_iam_resources(self) -> List[Tuple[str, str]]:
+        """Get the orphaned role/profile pairs as ``(kind, provider_id)`` tuples.
 
         Roles and profiles can be orphaned independently — a partial teardown may
-        leave one without the other — so both listings are scanned and the suffixes
+        leave one without the other — so both listings are scanned and the results
         unioned. IAM is a global service, so this is not scoped by ``--region``.
+
+        The kind has to be carried alongside the suffix because the two pairs are
+        named differently and are deleted by name: a bastion orphan reported as a
+        bare suffix would be handed to the SSM namer, which would look for a role
+        that does not exist, tolerate its absence, and report success while the
+        bastion role stayed standing.
         """
-        suffixes = set()
+        pairs = set()
 
         try:
             for page in self.iam_client.get_paginator("list_roles").paginate():
                 for role in page["Roles"]:
-                    if role["RoleName"].startswith(_ROLE_PREFIX):
-                        suffixes.add(role["RoleName"][len(_ROLE_PREFIX) :])
+                    name = role["RoleName"]
+                    for kind, (role_prefix, _) in _PAIR_PREFIXES.items():
+                        if name.startswith(role_prefix):
+                            pairs.add((kind, name[len(role_prefix) :]))
         except Exception as e:
             logger.error(f"Error listing IAM roles: {e}")
 
@@ -300,33 +318,34 @@ class AWSResourceCleaner:
             for page in paginator.paginate():
                 for profile in page["InstanceProfiles"]:
                     name = profile["InstanceProfileName"]
-                    if name.startswith(_PROFILE_PREFIX):
-                        suffixes.add(name[len(_PROFILE_PREFIX) :])
+                    for kind, (_, profile_prefix) in _PAIR_PREFIXES.items():
+                        if name.startswith(profile_prefix):
+                            pairs.add((kind, name[len(profile_prefix) :]))
         except Exception as e:
             logger.error(f"Error listing IAM instance profiles: {e}")
 
-        return sorted(suffixes)
+        return sorted(pairs)
 
-    def delete_iam_resources(self, suffixes: List[str]) -> bool:
-        """Delete the SSM role and instance profile for each suffix."""
-        if not suffixes:
+    def delete_iam_resources(self, pairs: List[Tuple[str, str]]) -> bool:
+        """Delete the role and instance profile for each ``(kind, suffix)`` pair."""
+        if not pairs:
             logger.info("No IAM roles or instance profiles to delete")
             return True
 
         success_count = 0
-        for suffix in suffixes:
-            role_name, profile_name = ssm_instance_profile_names(suffix)
-            if delete_ssm_instance_profile(self.session, suffix):
-                logger.info(f"✅ Deleted IAM role/profile pair: {suffix}")
+        for kind, suffix in pairs:
+            role_name, profile_name = _PAIR_NAMERS[kind](suffix)
+            if delete_instance_profile_pair(self.session, profile_name, role_name):
+                logger.info(f"✅ Deleted {kind} IAM role/profile pair: {suffix}")
                 success_count += 1
             else:
                 logger.warning(
                     f"❌ Failed to fully delete {role_name} / {profile_name}"
                 )
 
-        if success_count < len(suffixes):
+        if success_count < len(pairs):
             logger.info(
-                f"Successfully deleted {success_count}/{len(suffixes)} "
+                f"Successfully deleted {success_count}/{len(pairs)} "
                 "IAM role/profile pairs"
             )
             logger.info(
@@ -350,7 +369,7 @@ class AWSResourceCleaner:
         # Get all resources
         instances = self.get_parsl_instances()
         security_groups = self.get_parsl_security_groups()
-        iam_suffixes = self.get_parsl_iam_resources()
+        iam_pairs = self.get_parsl_iam_resources()
 
         # Report what was found
         logger.info(f"Found {len(instances)} instances to clean up:")
@@ -363,12 +382,12 @@ class AWSResourceCleaner:
         for sg in security_groups:
             logger.info(f"  {sg['id']} - {sg['name']}")
 
-        logger.info(f"\nFound {len(iam_suffixes)} IAM role/profile pairs to clean up:")
-        for suffix in iam_suffixes:
-            role_name, profile_name = ssm_instance_profile_names(suffix)
+        logger.info(f"\nFound {len(iam_pairs)} IAM role/profile pairs to clean up:")
+        for kind, suffix in iam_pairs:
+            role_name, profile_name = _PAIR_NAMERS[kind](suffix)
             logger.info(f"  {role_name} / {profile_name}")
 
-        if not instances and not security_groups and not iam_suffixes:
+        if not instances and not security_groups and not iam_pairs:
             logger.info("🎉 No resources to clean up!")
             return True
 
@@ -381,7 +400,7 @@ class AWSResourceCleaner:
         try:
             response = input(
                 f"Delete {len(instances)} instances, {len(security_groups)} security "
-                f"groups and {len(iam_suffixes)} IAM role/profile pairs? (yes/no): "
+                f"groups and {len(iam_pairs)} IAM role/profile pairs? (yes/no): "
             )
             if response.lower() not in ["yes", "y"]:
                 logger.info("❌ Cleanup cancelled by user")
@@ -428,9 +447,9 @@ class AWSResourceCleaner:
         # Delete IAM roles and instance profiles last: IAM refuses to delete a
         # profile that is still attached to an instance, so the terminations above
         # have to have settled first.
-        if iam_suffixes:
+        if iam_pairs:
             logger.info("\nCleaning up IAM roles and instance profiles...")
-            if not self.delete_iam_resources(iam_suffixes):
+            if not self.delete_iam_resources(iam_pairs):
                 success = False
 
         if success:

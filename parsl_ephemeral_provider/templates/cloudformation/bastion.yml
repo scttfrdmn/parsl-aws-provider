@@ -87,6 +87,23 @@ Resources:
             Action: sts:AssumeRole
       ManagedPolicyArns:
         - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      # Kept in step with utils.aws.bastion_role_policy(), which grants the same
+      # set to a direct-path bastion (#229). Both paths run the identical manager
+      # script, so a permission present in one policy and not the other is a bug
+      # confined to a single deployment path -- the hardest kind to notice.
+      #
+      # Enumerating what the script actually calls found this list both too
+      # narrow and too wide. Missing: RunInstances, the two launch-template calls
+      # and all three fleet calls, so no bastion deployed by this template could
+      # launch a worker either -- the direct path's total lack of credentials
+      # (#229) was the louder failure, not the only one. Removed: StartInstances
+      # and StopInstances (the bastion terminates workers rather than stopping
+      # them), and DescribeInstanceStatus and DescribeTags, none of which the
+      # script has ever called.
+      #
+      # GetParametersByPath is what the two polling loops actually use, via the
+      # get_parameters_by_path paginator. Granting only GetParameter would leave
+      # the bastion unable to discover jobs at all.
       Policies:
         - PolicyName: BastionHostPolicy
           PolicyDocument:
@@ -95,17 +112,23 @@ Resources:
               - Effect: Allow
                 Action:
                   - ec2:DescribeInstances
-                  - ec2:DescribeInstanceStatus
-                  - ec2:StartInstances
-                  - ec2:StopInstances
+                  - ec2:RunInstances
+                  - ec2:CreateLaunchTemplate
+                  - ec2:DeleteLaunchTemplate
+                  - ec2:CreateFleet
+                  - ec2:DescribeFleets
+                  - ec2:DeleteFleets
                   - ec2:TerminateInstances
+                  # Unavoidably broad: the script tags through TagSpecifications
+                  # on create calls, which AWS authorizes as CreateTags against a
+                  # resource whose ID does not exist yet.
                   - ec2:CreateTags
-                  - ec2:DescribeTags
                 Resource: '*'
               - Effect: Allow
                 Action:
-                  - ssm:PutParameter
                   - ssm:GetParameter
+                  - ssm:GetParametersByPath
+                  - ssm:PutParameter
                   - ssm:DeleteParameter
                 Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/parsl/workflows/${WorkflowId}/*'
       Tags:
