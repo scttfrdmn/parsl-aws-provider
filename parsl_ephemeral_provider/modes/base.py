@@ -494,6 +494,21 @@ class OperatingMode(abc.ABC):
             "GroupIds",
             ("InvalidGroup.NotFound", "InvalidGroupId.Malformed"),
         ),
+        # The EICE endpoint (#134) is verified here for the same reason as the
+        # other three: it is caller-supplied and never created, and the failure
+        # otherwise arrives at the first submit, inside a ProxyCommand, as an ssh
+        # process exiting for no visible reason. Both codes confirmed live.
+        # Optional -- absent on every mode but standard, and None there unless
+        # tunnelling was asked for, so the loop's falsy skip covers it.
+        (
+            "instance_connect_endpoint_id",
+            "describe_instance_connect_endpoints",
+            "InstanceConnectEndpointIds",
+            (
+                "InvalidInstanceConnectEndpointId.NotFound",
+                "InvalidInstanceConnectEndpointId.Malformed",
+            ),
+        ),
     )
 
     def _verify_resources(self) -> None:

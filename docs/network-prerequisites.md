@@ -29,6 +29,63 @@ PyPI/package mirrors).  No inbound rules are required by the provider itself.
 | Egress | TCP | 54000–55000 | interchange IP/32 | Parsl ZMQ interchange |
 | Egress | All | All | 0.0.0.0/0 | (permissive alternative) |
 
+The egress rule for 54000–55000 assumes the interchange is reachable from EC2.
+If your driver is behind NAT it is not — see
+[Optional: an EC2 Instance Connect Endpoint](#optional-an-ec2-instance-connect-endpoint),
+which removes that rule entirely.
+
+---
+
+## Optional: an EC2 Instance Connect Endpoint
+
+Needed only for `instance_connect_endpoint_id`, which lets workers reach an
+interchange on a driver that has no routable address — a laptop behind home or
+office NAT
+([#134](https://github.com/scttfrdmn/parsl-ephemeral-provider/issues/134)). See
+[Reverse tunnels](operating_modes.md#reverse-tunnels) for what it does and when
+to use it.
+
+Like the VPC, subnet, and security group, the endpoint is **caller-supplied and
+never created by the provider**: creation takes several minutes, which is not
+something to discover inside `initialize()`. A bad ID fails there anyway,
+alongside the other three, rather than surfacing later as an `ssh` process
+exiting for no visible reason.
+
+One endpoint serves every instance in its subnet, so this is a one-off.
+
+```bash
+aws ec2 create-instance-connect-endpoint \
+  --subnet-id subnet-0def5678 \
+  --security-group-ids sg-09ab0000 \
+  --region us-east-1
+# wait for State=create-complete, then:
+aws ec2 describe-instance-connect-endpoints \
+  --query 'InstanceConnectEndpoints[].{Id:InstanceConnectEndpointId,State:State}'
+```
+
+Terraform:
+
+```hcl
+resource "aws_ec2_instance_connect_endpoint" "parsl" {
+  subnet_id          = aws_subnet.parsl_public.id
+  security_group_ids = [aws_security_group.parsl_workers.id]
+}
+
+output "parsl_eice_id" { value = aws_ec2_instance_connect_endpoint.parsl.id }
+```
+
+The security group needs **inbound TCP 22 from the endpoint** — that is the only
+port the tunnel ever opens, and the ZMQ ports ride inside the SSH session:
+
+| Direction | Protocol | Port | Source | Purpose |
+|-----------|----------|------|--------|---------|
+| Ingress | TCP | 22 | the endpoint's SG, or the VPC CIDR | EICE reaches sshd |
+
+With a tunnel in use the **egress rule for 54000–55000 is not needed at all**:
+the interchange arrives on the worker's own loopback, so nothing leaves the VPC
+for it. The subnet does not need a public IP or a NAT gateway either, which is
+the configuration this was verified against.
+
 ---
 
 ## Minimum IAM Permissions
@@ -56,6 +113,26 @@ creates a launch template, so it needed `ssm:GetParameter`,
 `ec2:CreateLaunchTemplate`, `ec2:DescribeInstanceTypes`, `ec2:DescribeVpcs`, and
 `sts:GetCallerIdentity` — none of which it granted
 ([#195](https://github.com/scttfrdmn/parsl-ephemeral-provider/issues/195)).
+
+If you use a reverse tunnel, the driver needs three more actions, which
+`minimum_iam_policy()` does not include because the feature is opt-in. Generate
+them the same way rather than copying:
+
+```python
+import json
+
+from parsl_ephemeral_provider.network import eice_iam_statements
+
+print(json.dumps(eice_iam_statements(endpoint_id="eice-0abc1234"), indent=2))
+```
+
+The grant is `ec2-instance-connect:OpenTunnel` **conditioned on
+`remotePort == 22`**, `SendSSHPublicKey` conditioned on
+`ec2:osuser == ec2-user`, and describe. Both conditions are load-bearing and
+IAM's own evaluator is asked to confirm them in
+`tests/aws/test_eice_tunnel_e2e.py`: unconditioned, `OpenTunnel` reaches any port
+on any instance the holder can name, and `SendSSHPublicKey` authorises a key for
+any OS user including root.
 
 The **workers** are separate and need much less: attaching the AWS-managed
 `AmazonSSMManagedInstanceCore` to the instance profile is the whole requirement,

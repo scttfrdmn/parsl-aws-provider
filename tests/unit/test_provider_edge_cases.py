@@ -12,6 +12,7 @@ import tempfile
 import time
 import uuid
 import warnings
+from contextlib import contextmanager
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -1132,6 +1133,14 @@ STANDARD_ONLY_OPTIONS = [
     # elsewhere the flag would accept a request for an encrypted channel and
     # deliver workers that die on a missing certificate directory.
     ("distribute_certificates", True),
+    # Only StandardMode opens, supervises, and closes reverse tunnels (#134).
+    # Detached mode has its own answer to the same problem -- a bastion -- so
+    # accepting an endpoint ID there would read as a cheaper alternative that
+    # silently did nothing.
+    ("instance_connect_endpoint_id", "eice-0123456789abcdef0"),
+    ("tunnel_os_user", "ubuntu"),
+    ("tunnel_private_key_path", "/tmp/tunnel-key"),
+    ("tunnel_public_key_path", "/tmp/tunnel-key.pub"),
 ]
 
 NON_STANDARD_MODES = ["detached", "serverless"]
@@ -2454,3 +2463,392 @@ class TestCertificateDistributionProviderWiring:
 
     def test_the_default_is_off(self):
         assert self._mode_kwargs()["distribute_certificates"] is False
+
+
+@pytest.mark.unit
+class TestReverseTunnelsInStandardMode:
+    """StandardMode's half of #134: when a tunnel opens, and when it closes.
+
+    The tunnel mechanism itself -- argv, key push, reconnect, the 3600s ceiling --
+    is covered in ``test_eice_tunnel.py``. What is left here is the wiring, and
+    the wiring is where this feature can go wrong quietly: a tunnel opened after
+    dispatch races the connection it exists to carry, and one left open after
+    termination has the supervisor reconnecting to a dead instance for the rest of
+    the run.
+
+    ``EICETunnelSupervisor`` is patched at the name ``standard.py`` imports, so
+    nothing here starts an ``ssh``.
+    """
+
+    #: HTEX's shape. ``-a 127.0.0.1`` is what a tunnelled executor should use:
+    #: the reverse forward puts the interchange on the worker's own loopback.
+    CMD = "process_worker_pool.py -a 127.0.0.1 --port=54321 --block_id=0"
+
+    ENDPOINT = "eice-0123456789abcdef0"
+
+    def _mode(self, tmp_path, **overrides):
+        """A StandardMode with tunnelling on and a supplied key pair.
+
+        A supplied pair rather than a generated one so no test shells out to
+        ``ssh-keygen``; key generation is covered in ``test_eice_tunnel.py``.
+        """
+        from parsl_ephemeral_provider.modes.standard import StandardMode
+
+        provider_id = overrides.pop("provider_id", f"test-{uuid.uuid4().hex[:8]}")
+        private = tmp_path / "k"
+        private.write_text("PRIVATE")
+        public = tmp_path / "k.pub"
+        public.write_text("ssh-ed25519 AAAA test\n")
+        params = dict(
+            provider_id=provider_id,
+            session=MagicMock(),
+            state_store=FileStateStore(
+                file_path=str(tmp_path / f"{provider_id}.json"),
+                provider_id=provider_id,
+            ),
+            image_id="ami-12345678",
+            vpc_id="vpc-test00001",
+            subnet_id="subnet-test001",
+            security_group_id="sg-test00001",
+            instance_connect_endpoint_id=self.ENDPOINT,
+            tunnel_private_key_path=str(private),
+            tunnel_public_key_path=str(public),
+        )
+        params.update(overrides)
+        mode = StandardMode(**params)
+        mode.initialized = True
+        return mode
+
+    @contextmanager
+    def _patched_supervisor(self):
+        with patch(
+            "parsl_ephemeral_provider.modes.standard.EICETunnelSupervisor"
+        ) as cls:
+            cls.return_value.ports = [54321]
+            yield cls
+
+    # --- when a tunnel is opened at all ---
+
+    def test_no_endpoint_means_no_tunnel(self, tmp_path):
+        """The default must not construct a supervisor.
+
+        Constructing one resolves ``ssh`` and ``aws`` on PATH, which must not
+        become a requirement for every user of this provider.
+        """
+        mode = self._mode(tmp_path, instance_connect_endpoint_id=None)
+        with self._patched_supervisor() as cls:
+            mode._open_reverse_tunnel("i-1", self.CMD)
+        cls.assert_not_called()
+        assert mode._tunnel_supervisor is None
+
+    def test_a_command_with_no_port_opens_nothing(self, tmp_path):
+        """A caller-supplied command that is not a worker pool has nothing to forward.
+
+        Refusing would be wrong -- the provider runs arbitrary commands -- so this
+        is a no-op, which is why it is asserted rather than assumed.
+        """
+        mode = self._mode(tmp_path)
+        with self._patched_supervisor() as cls:
+            mode._open_reverse_tunnel("i-1", "echo hello")
+        cls.assert_not_called()
+
+    def test_the_supervisor_is_built_from_the_command_port(self, tmp_path):
+        # The port comes out of the command, not from configuration: the provider
+        # is never told where the interchange bound.
+        mode = self._mode(tmp_path)
+        with self._patched_supervisor() as cls:
+            mode._open_reverse_tunnel("i-1", self.CMD)
+
+        kwargs = cls.call_args.kwargs
+        assert kwargs["ports"] == [54321]
+        assert kwargs["endpoint_id"] == self.ENDPOINT
+        cls.return_value.add.assert_called_once_with("i-1")
+
+    def test_the_supervisor_is_reused_across_instances(self, tmp_path):
+        # One supervisor thread for the provider, one tunnel per instance.
+        mode = self._mode(tmp_path)
+        with self._patched_supervisor() as cls:
+            mode._open_reverse_tunnel("i-1", self.CMD)
+            mode._open_reverse_tunnel("i-2", self.CMD)
+
+        assert cls.call_count == 1
+        assert [c.args[0] for c in cls.return_value.add.call_args_list] == [
+            "i-1",
+            "i-2",
+        ]
+
+    def test_a_routable_address_is_warned_about(self, tmp_path, caplog):
+        """Otherwise the tunnel looks broken when it is the config that is wrong.
+
+        HTEX probes every address it is given, so a routable one may win and the
+        tunnel goes unused. Warned rather than rewritten: the command is the
+        caller's.
+        """
+        mode = self._mode(tmp_path)
+        with self._patched_supervisor(), caplog.at_level(logging.WARNING):
+            mode._open_reverse_tunnel(
+                "i-1", "process_worker_pool.py -a 54.1.2.3 --port=54321"
+            )
+        assert "127.0.0.1" in caplog.text
+
+    def test_loopback_draws_no_warning(self, tmp_path, caplog):
+        mode = self._mode(tmp_path)
+        with self._patched_supervisor(), caplog.at_level(logging.WARNING):
+            mode._open_reverse_tunnel("i-1", self.CMD)
+        assert "address" not in caplog.text.lower()
+
+    def test_a_first_connect_is_retried_then_gives_up(self, tmp_path, monkeypatch):
+        """ "running" is not "sshd is accepting connections".
+
+        The instance_running waiter clears well before the OS finishes booting, so
+        the first attempts are expected to fail. Failing the submit on the first
+        one would make cold starts flaky; never giving up would hang it.
+        """
+        from parsl_ephemeral_provider.modes import standard as standard_module
+
+        mode = self._mode(tmp_path)
+        monkeypatch.setattr(standard_module.time, "sleep", lambda _s: None)
+        clock = iter([0.0] + [float(n) for n in range(0, 2000, 400)])
+        monkeypatch.setattr(standard_module.time, "time", lambda: next(clock))
+
+        with self._patched_supervisor() as cls:
+            cls.return_value.add.side_effect = RuntimeError("Connection refused")
+            with pytest.raises(OperatingModeError, match="Connection refused"):
+                mode._open_reverse_tunnel("i-1", self.CMD)
+
+        assert cls.return_value.add.call_count > 1
+
+    def test_a_retried_connect_that_succeeds_does_not_raise(
+        self, tmp_path, monkeypatch
+    ):
+        from parsl_ephemeral_provider.modes import standard as standard_module
+
+        mode = self._mode(tmp_path)
+        monkeypatch.setattr(standard_module.time, "sleep", lambda _s: None)
+
+        with self._patched_supervisor() as cls:
+            cls.return_value.add.side_effect = [
+                RuntimeError("Connection refused"),
+                MagicMock(),
+            ]
+            mode._open_reverse_tunnel("i-1", self.CMD)
+
+        assert cls.return_value.add.call_count == 2
+
+    # --- ordering against dispatch ---
+
+    def test_the_tunnel_precedes_the_ssm_dispatch(self, tmp_path):
+        """The ordering assertion this class exists for.
+
+        The worker connects to the interchange as soon as the command starts, so a
+        tunnel opened afterwards races the connection it carries. Recorded as a
+        call order rather than inspected per call, because the defect is precisely
+        an inversion of the two.
+        """
+        mode = self._mode(tmp_path, one_shot=True)
+        calls = []
+        with (
+            self._patched_supervisor(),
+            patch.object(mode, "_create_instance", return_value="i-1"),
+            patch.object(mode, "_wait_for_ssm_online"),
+            patch.object(mode, "_wait_for_worker_ready"),
+            patch.object(
+                mode,
+                "_open_reverse_tunnel",
+                side_effect=lambda *a: calls.append("tunnel"),
+            ),
+            patch.object(
+                mode,
+                "_dispatch_ssm_command",
+                side_effect=lambda *a: calls.append("dispatch") or "cmd-1",
+            ),
+        ):
+            mode.submit_job("job-1", self.CMD, 1)
+
+        assert calls == ["tunnel", "dispatch"]
+
+    def test_a_reused_warm_instance_gets_its_tunnel_before_dispatch(self, tmp_path):
+        # A warm instance may already have a live tunnel, in which case add() is a
+        # no-op -- but it may equally have been adopted from a state file, so this
+        # path cannot assume one exists.
+        mode = self._mode(
+            tmp_path, warm_pool_size=1, iam_instance_profile_arn=_FAKE_IAM_ARN
+        )
+        mode._warm_instances = ["i-warm"]
+        mode.resources = {"i-warm": {"type": "ec2", "status": "WARM"}}
+        calls = []
+        with (
+            self._patched_supervisor(),
+            patch.object(
+                mode,
+                "_open_reverse_tunnel",
+                side_effect=lambda *a: calls.append("tunnel"),
+            ),
+            patch.object(
+                mode,
+                "_dispatch_ssm_command",
+                side_effect=lambda *a: calls.append("dispatch") or "cmd-1",
+            ),
+        ):
+            assert mode.submit_job("job-1", self.CMD, 1) == "i-warm"
+
+        assert calls == ["tunnel", "dispatch"]
+
+    def test_a_failed_dispatch_closes_the_tunnel(self, tmp_path):
+        """The instance is about to be terminated, so the tunnel must go with it.
+
+        Otherwise the supervisor spends the rest of the run reconnecting to an
+        instance that no longer exists.
+        """
+        mode = self._mode(tmp_path, one_shot=True)
+        with (
+            self._patched_supervisor() as cls,
+            patch.object(mode, "_create_instance", return_value="i-1"),
+            patch.object(mode, "_wait_for_ssm_online"),
+            patch.object(mode, "_wait_for_worker_ready"),
+            patch.object(mode, "_force_terminate"),
+            patch.object(
+                mode, "_dispatch_ssm_command", side_effect=RuntimeError("no agent")
+            ),
+        ):
+            with pytest.raises(OperatingModeError):
+                mode.submit_job("job-1", self.CMD, 1)
+
+        cls.return_value.remove.assert_any_call("i-1")
+
+    # --- teardown ---
+
+    def test_cleanup_resources_closes_the_tunnel_first(self, tmp_path):
+        mode = self._mode(tmp_path)
+        with self._patched_supervisor() as cls:
+            mode._open_reverse_tunnel("i-1", self.CMD)
+            mode.resources = {"i-1": {"type": "ec2", "job_id": "job-1"}}
+            mode.cleanup_resources(["i-1"])
+
+        cls.return_value.remove.assert_called_once_with("i-1")
+
+    def test_cleanup_resources_tolerates_ids_that_never_had_a_tunnel(self, tmp_path):
+        # It is called with every resource ID, including ones submitted before
+        # tunnelling was ever used.
+        mode = self._mode(tmp_path)
+        mode.resources = {"i-1": {"type": "ec2", "job_id": "job-1"}}
+        mode.cleanup_resources(["i-1"])  # no supervisor exists at all
+
+    def test_cleanup_infrastructure_stops_the_supervisor(self, tmp_path):
+        """The thread must not outlive the provider.
+
+        It is a daemon, so it would not block exit -- but it would spend the
+        remaining life of the process reconnecting to terminated instances.
+        """
+        mode = self._mode(tmp_path)
+        with self._patched_supervisor() as cls:
+            mode._open_reverse_tunnel("i-1", self.CMD)
+            mode.cleanup_infrastructure()
+
+        cls.return_value.shutdown.assert_called_once()
+        assert mode._tunnel_supervisor is None
+
+    def test_generated_key_material_is_removed_at_cleanup(self, tmp_path):
+        """A generated key is never persisted, so cleanup must delete the directory.
+
+        It authorises SSH as the OS user; leaving it in ``/tmp`` after the run
+        would outlive every instance it could reach, but is still key material
+        with no reason to exist.
+        """
+        mode = self._mode(
+            tmp_path, tunnel_private_key_path=None, tunnel_public_key_path=None
+        )
+        with self._patched_supervisor():
+            mode._open_reverse_tunnel("i-1", self.CMD)
+            key_dir = mode._tunnel_key_dir
+            assert key_dir is not None and os.path.isdir(key_dir)
+            mode.cleanup_infrastructure()
+
+        assert not os.path.exists(key_dir)
+        assert mode._tunnel_key_dir is None
+
+    def test_half_a_key_pair_is_refused_at_construction(self, tmp_path):
+        """Not at the first submit, minutes and one paid instance later."""
+        with pytest.raises(ValueError, match="must be set together"):
+            self._mode(tmp_path, tunnel_public_key_path=None)
+
+    def test_the_endpoint_id_is_verified_with_the_other_network_ids(self, tmp_path):
+        """An endpoint typo must fail in initialize(), not inside a ProxyCommand.
+
+        Both error codes were confirmed against real AWS. Without this the failure
+        arrives at the first submit as an ssh process exiting for no visible
+        reason.
+        """
+        from botocore.exceptions import ClientError
+
+        from parsl_ephemeral_provider.exceptions import ResourceNotFoundError
+
+        mode = self._mode(tmp_path)
+        ec2 = mode.session.client.return_value
+        ec2.describe_instance_connect_endpoints.side_effect = ClientError(
+            {
+                "Error": {
+                    "Code": "InvalidInstanceConnectEndpointId.NotFound",
+                    "Message": "does not exist",
+                }
+            },
+            "DescribeInstanceConnectEndpoints",
+        )
+
+        with pytest.raises(ResourceNotFoundError, match=self.ENDPOINT):
+            mode._verify_resources()
+
+
+@pytest.mark.unit
+class TestReverseTunnelProviderWiring:
+    """The provider end of #134: the options reach the mode, or are refused."""
+
+    ENDPOINT = "eice-0123456789abcdef0"
+
+    def _mode_kwargs(self, **provider_kwargs):
+        """The kwargs the provider really passes to ``StandardMode``."""
+        with (
+            patch(
+                "parsl_ephemeral_provider.provider.create_session"
+            ) as mock_session_factory,
+            patch("parsl_ephemeral_provider.provider.StandardMode") as mode_cls,
+            patch.object(EphemeralProvider, "_load_state", return_value=None),
+            patch.object(
+                EphemeralProvider, "_initialize_state_store", return_value=MagicMock()
+            ),
+        ):
+            mock_session_factory.return_value = MagicMock()
+            EphemeralProvider(
+                region="us-east-1",
+                image_id="ami-12345678",
+                mode="standard",
+                vpc_id="vpc-test00001",
+                subnet_id="subnet-test001",
+                security_group_id="sg-test00001",
+                **provider_kwargs,
+            )
+        return mode_cls.call_args.kwargs
+
+    def test_the_endpoint_reaches_standard_mode(self):
+        # Forwarding is the step whose omission made ten options unreachable in
+        # #136; this asserts the call the provider makes, not a mode built here.
+        kwargs = self._mode_kwargs(instance_connect_endpoint_id=self.ENDPOINT)
+        assert kwargs["instance_connect_endpoint_id"] == self.ENDPOINT
+
+    def test_all_four_options_reach_standard_mode(self):
+        kwargs = self._mode_kwargs(
+            instance_connect_endpoint_id=self.ENDPOINT,
+            tunnel_os_user="ubuntu",
+            tunnel_private_key_path="/tmp/k",
+            tunnel_public_key_path="/tmp/k.pub",
+        )
+        assert kwargs["tunnel_os_user"] == "ubuntu"
+        assert kwargs["tunnel_private_key_path"] == "/tmp/k"
+        assert kwargs["tunnel_public_key_path"] == "/tmp/k.pub"
+
+    def test_the_default_is_no_tunnelling(self):
+        assert self._mode_kwargs()["instance_connect_endpoint_id"] is None
+
+    # Refusal on the other modes is covered by TestStandardOnlyOptionGuard,
+    # which drives every standard-only option through both of them; the four
+    # tunnel options are entries in its STANDARD_ONLY_OPTIONS list.

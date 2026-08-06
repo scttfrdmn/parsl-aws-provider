@@ -9,9 +9,15 @@ SPDX-FileCopyrightText: 2025-2026 Scott Friedman and Project Contributors
 """
 
 import logging
+import os
+import shutil
+
+# Only ssh-keygen, at an absolute path with a fixed argv; see _ensure_tunnel_keys.
+import subprocess  # nosec B404
+import tempfile
 import time
 import uuid
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import boto3
 from botocore.exceptions import ClientError
@@ -19,6 +25,7 @@ from botocore.exceptions import ClientError
 from parsl_ephemeral_provider.constants import (
     DEFAULT_RESOURCE_CREATION_TIMEOUT,
     DEFAULT_SPOT_ALLOCATION_STRATEGY,
+    DEFAULT_TUNNEL_OS_USER,
     EC2_STATUS_MAPPING,
     IMDSV2_METADATA_OPTIONS,
     LAUNCH_TEMPLATE_NAME_PREFIX,
@@ -32,6 +39,8 @@ from parsl_ephemeral_provider.constants import (
     STATUS_RUNNING,
     STATUS_UNKNOWN,
     STATUS_WARM,
+    TUNNEL_OPEN_RETRY_DELAY,
+    TUNNEL_OPEN_TIMEOUT,
 )
 from parsl_ephemeral_provider.error_handling import RetryConfig, poll_until
 from parsl_ephemeral_provider.exceptions import (
@@ -40,6 +49,11 @@ from parsl_ephemeral_provider.exceptions import (
     SpotFleetError,
 )
 from parsl_ephemeral_provider.modes.base import OperatingMode
+from parsl_ephemeral_provider.network.eice import (
+    EICETunnelSupervisor,
+    extract_addresses,
+    extract_worker_ports,
+)
 from parsl_ephemeral_provider.security.curvezmq import (
     CurveZMQCertificateDistributor,
     extract_cert_dir,
@@ -136,6 +150,10 @@ class StandardMode(OperatingMode):
         baked_ami_id: Optional[str] = None,
         one_shot: bool = False,
         distribute_certificates: bool = False,
+        instance_connect_endpoint_id: Optional[str] = None,
+        tunnel_os_user: str = DEFAULT_TUNNEL_OS_USER,
+        tunnel_private_key_path: Optional[str] = None,
+        tunnel_public_key_path: Optional[str] = None,
         **kwargs: Any,
     ) -> None:
         """Initialize the standard mode.
@@ -217,6 +235,25 @@ class StandardMode(OperatingMode):
             always. See :mod:`parsl_ephemeral_provider.security.curvezmq` for
             the security trade-off: the interchange's server secret key is part
             of what a worker needs, so it is published, and deleted at cleanup.
+        instance_connect_endpoint_id : Optional[str], optional
+            EC2 Instance Connect Endpoint to tunnel through, by default None
+            (no tunnelling). Setting it is what enables the reverse tunnel that
+            lets workers reach an interchange on a driver with no inbound
+            reachability -- a laptop behind NAT, which previously required
+            detached mode and a bastion. The endpoint must already exist:
+            creating one takes several minutes, so it belongs to the
+            pre-provisioned network the caller supplies (#69). See
+            :mod:`parsl_ephemeral_provider.network.eice`.
+        tunnel_os_user : str, optional
+            Remote user the tunnel authenticates as, by default ``ec2-user``
+            (correct for the Amazon Linux AMIs in ``constants.py``).
+        tunnel_private_key_path : Optional[str], optional
+            SSH private key for the tunnel, by default None -- an ephemeral
+            ed25519 pair is generated per provider and discarded at cleanup.
+        tunnel_public_key_path : Optional[str], optional
+            Matching public key, authorised on each instance for the ~60 seconds
+            ``SendSSHPublicKey`` grants, by default None. Supply both paths or
+            neither.
         """
         # Call parent __init__ with standard params
         super().__init__(
@@ -276,6 +313,34 @@ class StandardMode(OperatingMode):
         self._cert_distributor = CurveZMQCertificateDistributor(
             session=session, provider_id=provider_id
         )
+
+        # EICE reverse tunnels (#134). The endpoint is caller-supplied: creating
+        # one takes several minutes, so it belongs in the pre-provisioned network
+        # story (#69) rather than in initialize().
+        #
+        # The supervisor is built lazily, at the first submit that has a port to
+        # forward, for two reasons: the ports come out of the command rather than
+        # from configuration, and constructing it resolves `ssh`/`aws` on PATH,
+        # which should not be a hard requirement for a provider that is merely
+        # loaded from a state file.
+        self.instance_connect_endpoint_id = instance_connect_endpoint_id
+        self.tunnel_os_user = tunnel_os_user
+        self.tunnel_private_key_path = tunnel_private_key_path
+        self.tunnel_public_key_path = tunnel_public_key_path
+        self._tunnel_supervisor: Optional[EICETunnelSupervisor] = None
+        self._tunnel_key_dir: Optional[str] = None
+
+        # Half a key pair is caught here rather than at the first submit. The
+        # alternative -- generating the missing half -- would silently ignore the
+        # path the caller did give, and the failure would otherwise arrive minutes
+        # into a run, after an instance had been paid for.
+        if bool(tunnel_private_key_path) != bool(tunnel_public_key_path):
+            raise ValueError(
+                "tunnel_private_key_path and tunnel_public_key_path must be set "
+                "together: the public key is authorised on the instance and the "
+                "private key authenticates the tunnel, so one without the other "
+                "cannot connect. Leave both unset to have a pair generated."
+            )
 
         # Launch template (#85). Built in initialize() so every launch path --
         # on-demand, spot, and fleet -- shares one definition carrying IMDSv2,
@@ -1069,6 +1134,12 @@ class StandardMode(OperatingMode):
                     logger.info(
                         f"Reusing warm instance {warm_instance_id} for job {job_id}"
                     )
+                    # Before dispatch, not after: the worker connects to the
+                    # interchange as soon as it starts, so a tunnel opened
+                    # afterwards would race the connection it exists to carry.
+                    # A warm instance may already have one from its previous job,
+                    # in which case add() returns the live tunnel unchanged.
+                    self._open_reverse_tunnel(warm_instance_id, command)
                     ssm_command_id = self._dispatch_ssm_command(
                         warm_instance_id, command, job_id
                     )
@@ -1134,6 +1205,10 @@ class StandardMode(OperatingMode):
                 try:
                     self._wait_for_ssm_online(instance_id)
                     self._wait_for_worker_ready(instance_id)
+                    # The SSM paths are the ones the tunnel fits cleanly: the
+                    # command has not been delivered yet, so the tunnel is
+                    # provably up before anything tries to use it.
+                    self._open_reverse_tunnel(instance_id, command)
                     ssm_command_id = self._dispatch_ssm_command(
                         instance_id, command, job_id
                     )
@@ -1148,12 +1223,23 @@ class StandardMode(OperatingMode):
                         f"SSM dispatch failed for instance {instance_id}: {ssm_err}. "
                         "Terminating it; the command was never delivered."
                     )
+                    # The tunnel may already be open — this branch also catches a
+                    # tunnel that failed to open — and the instance it points at
+                    # is about to be terminated, so close it or the supervisor
+                    # spends the rest of the run reconnecting to nothing.
+                    self._close_reverse_tunnel(instance_id)
                     self._force_terminate(instance_id)
                     self.resources.pop(instance_id, None)
                     self.save_state()
                     raise
             else:
                 self.resources[instance_id] = resource_data
+                # UserData path: the command is already on the instance, so unlike
+                # the SSM paths this cannot be ordered before delivery. It is not
+                # a race in practice — worker_init runs first, and the worker's
+                # ZMQ DEALER reconnects on its own — but it is the reason the SSM
+                # paths are the better pairing for tunnelling.
+                self._open_reverse_tunnel(instance_id, command)
 
             # Save state
             self.save_state()
@@ -1258,6 +1344,173 @@ class StandardMode(OperatingMode):
 
         self._cert_distributor.publish(job_id, cert_dir)
         return self._cert_distributor.fetch_script(job_id, cert_dir)
+
+    # ------------------------------------------------------------------
+    # EICE reverse tunnels (#134)
+    # ------------------------------------------------------------------
+
+    def _ensure_tunnel_keys(self) -> Tuple[str, str]:
+        """Return (private, public) key paths, generating an ephemeral pair if needed.
+
+        A generated key lives in a 0700 temporary directory for the life of the
+        provider and is never persisted. That is deliberate: the key authorises
+        SSH as ``tunnel_os_user``, and ``send-ssh-public-key`` re-authorises it
+        for only about a minute at a time, so there is nothing to gain by keeping
+        it and something to lose by writing it where another process can read it.
+        """
+        if self.tunnel_private_key_path and self.tunnel_public_key_path:
+            return self.tunnel_private_key_path, self.tunnel_public_key_path
+
+        if self._tunnel_key_dir is None:
+            self._tunnel_key_dir = tempfile.mkdtemp(prefix="parsl-eice-")
+            os.chmod(self._tunnel_key_dir, 0o700)
+            private = os.path.join(self._tunnel_key_dir, "tunnel_key")
+            keygen = shutil.which("ssh-keygen")
+            if keygen is None:
+                raise OperatingModeError(
+                    "instance_connect_endpoint_id is set but ssh-keygen is not on "
+                    "PATH, so no tunnel keypair can be generated. Install OpenSSH "
+                    "or supply tunnel_private_key_path and tunnel_public_key_path."
+                )
+            # ed25519 rather than RSA: smaller, and generated in milliseconds,
+            # which matters because this runs on the submit path.
+            # Absolute path from shutil.which, fixed argv, no shell.
+            subprocess.run(  # noqa: S603 # nosec B603 B607
+                [
+                    keygen,
+                    "-t",
+                    "ed25519",
+                    "-N",
+                    "",
+                    "-q",
+                    "-f",
+                    private,
+                    "-C",
+                    f"parsl-ephemeral-{self.provider_id}",
+                ],
+                check=True,
+                stdin=subprocess.DEVNULL,
+            )
+            self.tunnel_private_key_path = private
+            self.tunnel_public_key_path = f"{private}.pub"
+            logger.debug(
+                f"Generated an ephemeral tunnel keypair in {self._tunnel_key_dir}"
+            )
+
+        if not self.tunnel_private_key_path or not self.tunnel_public_key_path:
+            # Unreachable via either branch above, but raising beats returning a
+            # None that would surface as an ssh argv built from the string "None".
+            raise OperatingModeError(
+                "No tunnel keypair is available after key resolution; set "
+                "tunnel_private_key_path and tunnel_public_key_path explicitly."
+            )
+        return self.tunnel_private_key_path, self.tunnel_public_key_path
+
+    def _open_reverse_tunnel(self, instance_id: str, command: str) -> None:
+        """Open a reverse tunnel so *instance_id* can reach the interchange.
+
+        Called after the instance is running. The ports come from the command,
+        because the provider is never told where the interchange bound -- HTEX
+        interpolates ``--port=`` into the launch command and that is the only
+        record the provider sees.
+
+        Does nothing when tunnelling is off, or when the command names no port
+        (a caller-supplied command that is not an HTEX worker pool has nothing to
+        forward).
+        """
+        endpoint_id = self.instance_connect_endpoint_id
+        if not endpoint_id:
+            return
+
+        ports = extract_worker_ports(command)
+        if not ports:
+            logger.debug(
+                f"instance_connect_endpoint_id is set but job command for "
+                f"{instance_id} names no --port, so there is nothing to forward. "
+                "This is expected for a command that is not an HTEX worker pool."
+            )
+            return
+
+        addresses = extract_addresses(command)
+        if addresses and addresses not in ("127.0.0.1", "localhost"):
+            # Worth a warning rather than a rewrite: the command is the caller's,
+            # and HTEX probes every address it was given. If a routable one is in
+            # the list it may win the probe and the tunnel goes unused -- which
+            # looks like the tunnel not working.
+            logger.warning(
+                f"The worker command names addresses {addresses!r}, but a reverse "
+                "tunnel puts the interchange on the worker's own loopback. Set "
+                "the executor's address='127.0.0.1' so the probe uses the "
+                "tunnel; otherwise HTEX may prefer an address that is not "
+                "reachable from the worker."
+            )
+
+        if self._tunnel_supervisor is None:
+            private_key, public_key = self._ensure_tunnel_keys()
+            self._tunnel_supervisor = EICETunnelSupervisor(
+                session=self.session,
+                endpoint_id=endpoint_id,
+                ports=ports,
+                private_key_path=private_key,
+                public_key_path=public_key,
+                os_user=self.tunnel_os_user,
+                region=self.session.region_name,
+            )
+        elif set(ports) - set(self._tunnel_supervisor.ports):
+            # Each executor gets its own interchange port, so a second executor
+            # sharing this provider needs its ports added. Existing tunnels do
+            # not pick them up until they are recycled, which is why this warns.
+            logger.warning(
+                f"Job on {instance_id} needs ports {ports}, but the supervisor "
+                f"was built for {self._tunnel_supervisor.ports}. Existing tunnels "
+                "forward only their original ports."
+            )
+
+        # Retried, because "running" is not "sshd is accepting connections" --
+        # the waiter clears well before the OS finishes booting. Each attempt
+        # re-pushes the key, which is required anyway: the authorisation from the
+        # previous attempt has a ~60s life.
+        deadline = time.time() + TUNNEL_OPEN_TIMEOUT
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                self._tunnel_supervisor.add(instance_id)
+                break
+            except Exception as exc:
+                if time.time() >= deadline:
+                    raise OperatingModeError(
+                        f"Could not open an EICE reverse tunnel to {instance_id} "
+                        f"within {TUNNEL_OPEN_TIMEOUT}s ({attempt} attempts): "
+                        f"{exc}. Without the tunnel the worker cannot reach the "
+                        "interchange, so the job would never run."
+                    ) from exc
+                logger.debug(
+                    f"Tunnel attempt {attempt} for {instance_id} failed ({exc}); "
+                    f"retrying in {TUNNEL_OPEN_RETRY_DELAY}s"
+                )
+                time.sleep(TUNNEL_OPEN_RETRY_DELAY)
+
+        logger.info(
+            f"Opened an EICE reverse tunnel to {instance_id}, forwarding "
+            f"{ports} from driver loopback"
+        )
+
+    def _close_reverse_tunnel(self, instance_id: str) -> None:
+        """Close the tunnel to *instance_id*, if one is open."""
+        if self._tunnel_supervisor is not None:
+            self._tunnel_supervisor.remove(instance_id)
+
+    def _shutdown_tunnels(self) -> None:
+        """Close every tunnel and remove any generated key material."""
+        if self._tunnel_supervisor is not None:
+            self._tunnel_supervisor.shutdown()
+            self._tunnel_supervisor = None
+        if self._tunnel_key_dir is not None:
+            shutil.rmtree(self._tunnel_key_dir, ignore_errors=True)
+            self._tunnel_key_dir = None
+            self.tunnel_private_key_path = None
+            self.tunnel_public_key_path = None
 
     # ------------------------------------------------------------------
     # SSM dispatch helpers (shared by the warm pool and one-shot mode)
@@ -2171,6 +2424,12 @@ class StandardMode(OperatingMode):
         if not resource_ids:
             return
 
+        # Close tunnels first. Ordered before termination so the supervisor is not
+        # reconnecting to an instance that is shutting down: that would surface as
+        # a run of alarming reconnect warnings during ordinary cleanup.
+        for resource_id in resource_ids:
+            self._close_reverse_tunnel(resource_id)
+
         ec2 = self.session.client("ec2")
 
         # Group IDs by resource type
@@ -2230,6 +2489,12 @@ class StandardMode(OperatingMode):
         This cleans up the VPC, subnet, and security group if they were created by the provider.
         """
         logger.info("Cleaning up infrastructure")
+
+        # Stop the tunnel supervisor before anything is terminated (#134). Its
+        # thread reconnects tunnels it finds dead, so leaving it running through
+        # termination would have it fighting the cleanup, and its thread and
+        # generated key material have to go regardless of what follows fails.
+        self._shutdown_tunnels()
 
         # Collect EC2 instance IDs before cleanup so we can wait for termination.
         # cleanup_all() sends terminate requests but does not wait; instances remain

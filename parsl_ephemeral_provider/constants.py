@@ -437,6 +437,22 @@ DEFAULT_ONE_SHOT = False  # each instance runs one command then terminates
 # boundary, but not something to do on a caller's behalf unasked.
 DEFAULT_DISTRIBUTE_CERTIFICATES = False
 
+# EICE reverse tunnels (#134). No default endpoint, and none is ever created:
+# creating one takes several minutes, so it belongs to the pre-provisioned
+# network the caller supplies (#69). Setting the ID is what turns tunnelling on.
+DEFAULT_INSTANCE_CONNECT_ENDPOINT_ID = None
+DEFAULT_TUNNEL_OS_USER = "ec2-user"  # matches the Amazon Linux AMIs above
+DEFAULT_TUNNEL_PRIVATE_KEY_PATH = None  # generated per-provider when unset
+DEFAULT_TUNNEL_PUBLIC_KEY_PATH = None
+
+# How long to keep retrying the first connect to a new instance. "running" is not
+# "sshd is up": the instance_running waiter clears well before the OS finishes
+# booting, so the first few attempts are expected to fail. Bounded well inside
+# HTEX's 120s heartbeat_threshold per attempt, but allowed several minutes in
+# total because a cold boot legitimately takes that long.
+TUNNEL_OPEN_TIMEOUT = 300
+TUNNEL_OPEN_RETRY_DELAY = 10
+
 # Detached-mode bastion defaults.
 #
 # Named here rather than left as literals in DetachedMode.__init__ so the
